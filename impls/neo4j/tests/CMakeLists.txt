@@ -1,8 +1,8 @@
-# clink_neo4j_tests - the Neo4j sink in isolation. The unit tests drive the sink
-# against an in-process httplib server standing in for the Query API, so they
-# link the vendored httplib too. The live tests (test_neo4j_live.cpp) run only
-# when CLINK_NEO4J_TEST_ENDPOINT names a server; scripts/neo4j-live.sh starts the
-# pinned one and fails on any skip.
+# clink_neo4j_tests - the Neo4j sink and lookup in isolation. The unit tests
+# drive them against in-process httplib servers standing in for the Query API,
+# so they link the vendored httplib too. The live tests (test_neo4j_live.cpp,
+# test_neo4j_lookup_live.cpp) run only when CLINK_NEO4J_TEST_ENDPOINT names a
+# server; scripts/neo4j-live.sh starts the pinned one and fails on any skip.
 
 add_executable(clink_neo4j_tests
     register.cpp
@@ -12,6 +12,10 @@ add_executable(clink_neo4j_tests
     test_neo4j_reply.cpp
     test_neo4j_sink.cpp
     test_neo4j_live.cpp
+    test_neo4j_lookup_options.cpp
+    test_neo4j_lookup_reply.cpp
+    test_neo4j_lookup.cpp
+    test_neo4j_lookup_live.cpp
 )
 target_link_libraries(clink_neo4j_tests PRIVATE
     clink::core

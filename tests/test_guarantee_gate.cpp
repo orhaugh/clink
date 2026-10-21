@@ -373,6 +373,20 @@ TEST_F(GuaranteeGateTest, AsyncLookupsAndWasmUdfsAreClassifiedConservatively) {
               std::string::npos);
 }
 
+TEST_F(GuaranteeGateTest, ANeo4jLookupIsCurrentStateAndSoNotReplayDeterministic) {
+    auto g = sql_graph();
+    g.ops.insert(
+        g.ops.begin() + 1,
+        op("neo4j_lookup_join_row", "lookupjoin_1", {"src"}, {{"function_name", "neo4j"}}));
+    g.ops[2].inputs = {"lookupjoin_1"};
+    const auto facts = pipeline_facts_from_graph(g, durable_checkpointing());
+    EXPECT_FALSE(facts.determinism.deterministic());
+    EXPECT_TRUE(facts.determinism.calls_external_service);
+    ASSERT_EQ(facts.determinism.sources_of_nondeterminism.size(), 1u);
+    EXPECT_NE(facts.determinism.sources_of_nondeterminism[0].find("Neo4j lookup 'lookupjoin_1'"),
+              std::string::npos);
+}
+
 TEST_F(GuaranteeGateTest, APluginGraphWithNoDeclarationsIsUnknownNotClean) {
     // No determinism_coverage claim and no per-op declarations: the ops are
     // native code the engine cannot inspect. "Nothing found" must be

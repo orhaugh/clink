@@ -4399,7 +4399,9 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
                                                                 std::move(dim_cols),
                                                                 equi_shape->right_key,
                                                                 jt == JoinType::LeftOuter,
-                                                                arrow::schema(std::move(fields)));
+                                                                arrow::schema(std::move(fields)),
+                                                                equi_shape->left_key,
+                                                                &right_def);
             } else {
                 auto left_scan = make_table_plan(left_ref.name, left_def, left_ref.loc.pos);
                 auto right_scan = make_table_plan(right_ref.name, right_def, right_ref.loc.pos);

@@ -22,7 +22,7 @@ using clink::config::JsonObject;
 using clink::config::JsonValue;
 using clink::neo4j::Column;
 using clink::neo4j::Kind;
-using clink::neo4j::Neo4jSinkError;
+using clink::neo4j::Neo4jError;
 using clink::neo4j::parse_column_types;
 using clink::sql::Row;
 
@@ -60,7 +60,7 @@ std::string refused(const std::string& types, const Row& row) {
     try {
         std::string out;
         clink::neo4j::encode_row(parse_column_types(types), row, out);
-    } catch (const Neo4jSinkError& e) {
+    } catch (const Neo4jError& e) {
         EXPECT_EQ(e.code(), clink::neo4j::code::kValueInvalid);
         return e.what();
     }

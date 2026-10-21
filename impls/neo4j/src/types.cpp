@@ -185,8 +185,8 @@ const char* kind_of(const JsonValue& v) {
 }
 
 [[noreturn]] void wrong(const std::string& path, const SqlType& t, const std::string& why) {
-    throw Neo4jSinkError(code::kValueInvalid,
-                         "neo4j sink: column '" + path + "' (" + t.spelling + "): " + why);
+    throw Neo4jError(code::kValueInvalid,
+                     "neo4j sink: column '" + path + "' (" + t.spelling + "): " + why);
 }
 
 void typed(std::string_view type, std::string_view value_text, std::string& out) {
@@ -468,7 +468,7 @@ std::vector<Column> parse_column_types(const std::string& spec) {
     for (const auto entry : split_top(spec, ';')) {
         const auto colon = entry.find(':');
         if (colon == std::string_view::npos || colon == 0) {
-            throw Neo4jSinkError(
+            throw Neo4jError(
                 code::kOptionInvalid,
                 "neo4j sink: sql_column_types entry '" + std::string(entry) + "' is not name:TYPE");
         }
@@ -502,6 +502,126 @@ void encode_row(const std::vector<Column>& columns, const clink::sql::Row& row, 
         encode_value(c.type, it == row.values.end() ? kNull : it->second, c.name, out);
     }
     out += "}}";
+}
+
+void encode_value_as(const SqlType& type,
+                     const JsonValue& value,
+                     const std::string& name,
+                     std::string& out) {
+    encode_value(type, value, name, out);
+}
+
+JsonValue decode_result(const Column& column, const JsonValue& typed) {
+    const auto refuse = [&](const std::string& why) {
+        throw Neo4jError(
+            code::kValueInvalid,
+            "neo4j sink: column '" + column.name + "' (" + column.type.spelling + "): " + why);
+    };
+    if (!typed.is_object() || !typed.contains("$type") || !typed.at("$type").is_string() ||
+        !typed.contains("_value")) {
+        refuse("the reply holds a value that is not typed JSON");
+    }
+    const std::string& type = typed.at("$type").as_string();
+    const JsonValue& v = typed.at("_value");
+    if (type == "Null") {
+        return JsonValue{};
+    }
+    const auto integer = [&]() -> std::int64_t {
+        std::int64_t i = 0;
+        if (!v.is_string() || !parse_int(v.as_string(), i)) {
+            refuse("the reply's Integer is not a whole number from -2^63 to 2^63-1");
+        }
+        return i;
+    };
+    switch (column.type.kind) {
+        case Kind::TinyInt:
+        case Kind::SmallInt:
+        case Kind::Integer:
+        case Kind::BigInt: {
+            if (type != "Integer") {
+                refuse("the statement returned " + type + ", not an Integer" +
+                       (type == "Float" ? "; use toInteger() in the statement, or declare DOUBLE"
+                                        : std::string{}));
+            }
+            const std::int64_t i = integer();
+            std::int64_t lo = std::numeric_limits<std::int64_t>::min();
+            std::int64_t hi = std::numeric_limits<std::int64_t>::max();
+            if (column.type.kind == Kind::TinyInt) {
+                lo = std::numeric_limits<std::int8_t>::min();
+                hi = std::numeric_limits<std::int8_t>::max();
+            } else if (column.type.kind == Kind::SmallInt) {
+                lo = std::numeric_limits<std::int16_t>::min();
+                hi = std::numeric_limits<std::int16_t>::max();
+            } else if (column.type.kind == Kind::Integer) {
+                lo = std::numeric_limits<std::int32_t>::min();
+                hi = std::numeric_limits<std::int32_t>::max();
+            }
+            if (i < lo || i > hi) {
+                refuse(
+                    "the statement returned an Integer outside the type's range; declare a "
+                    "wider type");
+            }
+            return JsonValue{i};
+        }
+        case Kind::Double: {
+            if (type == "Integer") {
+                const std::int64_t i = integer();
+                const auto d = static_cast<double>(i);
+                if (d >= 9223372036854775808.0 || static_cast<std::int64_t>(d) != i) {
+                    refuse(
+                        "the statement returned an Integer that DOUBLE cannot hold exactly; "
+                        "declare BIGINT");
+                }
+                return JsonValue{d};
+            }
+            if (type != "Float") {
+                refuse("the statement returned " + type + ", not a Float");
+            }
+            if (!v.is_string()) {
+                refuse("the reply's Float is not a number");
+            }
+            const std::string& text = v.as_string();
+            if (text == "NaN") {
+                return JsonValue{std::numeric_limits<double>::quiet_NaN()};
+            }
+            if (text == "Infinity" || text == "-Infinity") {
+                const double inf = std::numeric_limits<double>::infinity();
+                return JsonValue{text.front() == '-' ? -inf : inf};
+            }
+            double d = 0;
+            const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), d);
+            if (text.empty() || ec != std::errc{} || ptr != text.data() + text.size()) {
+                refuse("the reply's Float is not a number");
+            }
+            return JsonValue{d};
+        }
+        case Kind::Boolean:
+            if (type != "Boolean" || !v.is_bool()) {
+                refuse("the statement returned " + type + ", not a Boolean");
+            }
+            return JsonValue{v.as_bool()};
+        case Kind::Varchar: {
+            if (type != "String" || !v.is_string()) {
+                refuse("the statement returned " + type + ", not a String" +
+                       (type == "List" ? "; join a list into text in the statement" : ""));
+            }
+            const std::string& s = v.as_string();
+            if (!valid_utf8(s)) {
+                refuse("the statement returned text that is not valid UTF-8");
+            }
+            if (!s.empty() && s.front() == clink::config::kDecimalSentinel) {
+                refuse(
+                    "the statement returned text beginning with U+0001, which a VARCHAR value "
+                    "cannot carry");
+            }
+            return JsonValue{s};
+        }
+        default:
+            refuse(
+                "a lookup returns TINYINT, SMALLINT, INTEGER, BIGINT, DOUBLE, BOOLEAN or "
+                "VARCHAR columns");
+    }
+    return JsonValue{};
 }
 
 bool format_date(std::int64_t days, std::string& out) {

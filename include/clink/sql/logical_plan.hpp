@@ -747,7 +747,9 @@ public:
                       std::vector<std::string> dim_columns,
                       std::string dim_key_column,
                       bool outer,
-                      std::shared_ptr<arrow::Schema> schema);
+                      std::shared_ptr<arrow::Schema> schema,
+                      std::string probe_key_column = {},
+                      const TableDef* dim_table = nullptr);
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
     // Mutable probe-input slot, used by the optimizer's predicate pushdown to
@@ -765,6 +767,11 @@ public:
     }
     [[nodiscard]] const std::string& dim_key_column() const noexcept { return dim_key_column_; }
     [[nodiscard]] bool outer() const noexcept { return outer_; }
+    // The probe column on the other side of the ON equality, and the lookup
+    // table's declaration (its columns and options), for a lookup the planner
+    // lowers to a connector's own operator.
+    [[nodiscard]] const std::string& probe_key_column() const noexcept { return probe_key_column_; }
+    [[nodiscard]] const TableDef* dim_table() const noexcept { return dim_table_; }
 
     [[nodiscard]] std::string kind() const override { return "LookupJoin"; }
     [[nodiscard]] std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
@@ -778,6 +785,8 @@ private:
     std::vector<std::string> probe_columns_;
     std::vector<std::string> dim_columns_;
     std::string dim_key_column_;
+    std::string probe_key_column_;
+    const TableDef* dim_table_{nullptr};
     bool outer_;
     std::shared_ptr<arrow::Schema> schema_;
 };

@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/config/json.hpp"
 #include "clink/http_connector/http_request.hpp"
 
 namespace clink::neo4j {
@@ -25,8 +26,14 @@ struct Reply {
     // only for a transaction it has finished, so with no errors this is the
     // proof of a commit.
     bool has_bookmarks{false};
+    std::string bookmark;  // the first of them, for a lookup's bookmark column
     bool has_fields{false};
-    std::vector<std::string> fields;        // data.fields: the statement's result columns
+    std::vector<std::string> fields;  // data.fields: the statement's result columns
+    // data.values, as far as a lookup reads it: whether it is an array of rows,
+    // how many rows it holds, and the first.
+    bool has_values{false};
+    std::size_t row_count{0};
+    clink::config::JsonArray first_row;
     std::optional<std::string> query_type;  // r, w, rw, s (servers from 2026.07)
     bool has_plan{false};
     std::vector<std::string> plan_operators;  // every operatorType in queryPlan, "@..." dropped
@@ -93,5 +100,24 @@ struct Outcome {
 // What the EXPLAIN of the configured statement says against the parameter
 // contract: one line per problem, empty when the statement is accepted.
 [[nodiscard]] std::vector<std::string> statement_problems(const Reply& explain);
+
+// One lookup read. Committed here means answered: a complete reply with no
+// errors whose data holds the result columns and an array of rows; `reply`
+// gets the parsed body. A read changes nothing, so every verdict but Refused,
+// UnknownFinal and TlsRefused is safe to retry.
+[[nodiscard]] Outcome judge_read(const clink::http_connector::BoundedResponse& r, Reply& reply);
+
+// What the EXPLAIN of a lookup statement says against the lookup's contract,
+// one line per problem, empty when accepted: the server must class it a read
+// (query type r) when it reports a type; its plan must hold no write or
+// schema operator, no procedure call, no LOAD CSV and no CALL { ... } IN
+// TRANSACTIONS; it must return exactly `columns`, by name; and it may take no
+// parameter but $key.
+[[nodiscard]] std::vector<std::string> lookup_statement_problems(
+    const Reply& explain, const std::vector<std::string>& columns);
+
+// The plan operators that read without an index (a label or all-nodes scan),
+// for the warning a lookup logs at open.
+[[nodiscard]] std::vector<std::string> scan_operators(const Reply& explain);
 
 }  // namespace clink::neo4j

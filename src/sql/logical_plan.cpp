@@ -270,7 +270,9 @@ LogicalLookupJoin::LogicalLookupJoin(std::unique_ptr<LogicalPlan> input,
                                      std::vector<std::string> dim_columns,
                                      std::string dim_key_column,
                                      bool outer,
-                                     std::shared_ptr<arrow::Schema> schema)
+                                     std::shared_ptr<arrow::Schema> schema,
+                                     std::string probe_key_column,
+                                     const TableDef* dim_table)
     : input_(std::move(input)),
       function_name_(std::move(function_name)),
       probe_alias_(std::move(probe_alias)),
@@ -278,6 +280,8 @@ LogicalLookupJoin::LogicalLookupJoin(std::unique_ptr<LogicalPlan> input,
       probe_columns_(std::move(probe_columns)),
       dim_columns_(std::move(dim_columns)),
       dim_key_column_(std::move(dim_key_column)),
+      probe_key_column_(std::move(probe_key_column)),
+      dim_table_(dim_table),
       outer_(outer),
       schema_(std::move(schema)) {}
 

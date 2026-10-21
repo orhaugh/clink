@@ -14,7 +14,7 @@
 
 #include "options.hpp"
 
-using clink::neo4j::Neo4jSinkError;
+using clink::neo4j::Neo4jError;
 using clink::neo4j::parse_options;
 using clink::neo4j::SinkOptions;
 namespace code = clink::neo4j::code;
@@ -31,7 +31,7 @@ std::map<std::string, std::string> base() {
 std::pair<std::string, std::string> refusal(const std::map<std::string, std::string>& params) {
     try {
         (void)parse_options(params, 0, 1);
-    } catch (const Neo4jSinkError& e) {
+    } catch (const Neo4jError& e) {
         return {e.code(), e.what()};
     }
     return {};

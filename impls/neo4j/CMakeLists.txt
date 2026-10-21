@@ -1,7 +1,9 @@
 # clink::neo4j - a sink that writes rows to Neo4j through the Query API
 # (POST /db/<database>/query/v2), one implicit transaction per batch, with the
-# rows as a typed $rows parameter. It reuses clink::http_connector's HTTP client
-# for transport and adds no dependency of its own; that client is the gate.
+# rows as a typed $rows parameter, and a read-only lookup that enriches SQL rows
+# with one parameterised read per key. It reuses clink::http_connector's HTTP
+# client for transport and adds no dependency of its own; that client is the
+# gate.
 
 if(CLINK_WITH_NEO4J STREQUAL "OFF")
     message(STATUS "clink::neo4j - CLINK_WITH_NEO4J=OFF; target not defined")
@@ -18,6 +20,8 @@ if(NOT TARGET clink::http_connector)
 endif()
 
 add_library(clink_neo4j STATIC
+    src/connection.cpp
+    src/lookup.cpp
     src/neo4j_sink.cpp
     src/options.cpp
     src/register_factories.cpp

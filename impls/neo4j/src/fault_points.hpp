@@ -1,6 +1,7 @@
 #pragma once
 
-// Named CLINK_FAULT_POINT sites for the Neo4j sink's recovery tests. They
+// Named CLINK_FAULT_POINT sites for the Neo4j sink's and lookup's recovery
+// tests. They
 // compile to nothing without CLINK_FAULT_INJECTION.
 
 namespace clink::neo4j::points {
@@ -11,5 +12,11 @@ inline constexpr char kBeforeRequest[] = "neo4j.before_request";
 // The server has reported the batch committed, and the sink has not yet
 // returned: the checkpoint whose barrier asked for it cannot have completed.
 inline constexpr char kAfterCommit[] = "neo4j.after_commit";
+
+// A lookup's request is built and about to be sent, on a request thread.
+inline constexpr char kLookupBeforeRequest[] = "neo4j.lookup_before_request";
+// A lookup has its answer and has not yet handed it to the operator: the
+// probe row it enriches is still in flight.
+inline constexpr char kLookupAfterReply[] = "neo4j.lookup_after_reply";
 
 }  // namespace clink::neo4j::points

@@ -64,6 +64,7 @@
 #include "clink/sql/delta_row_sink.hpp"
 #include "clink/sql/expr_lowering.hpp"
 #include "clink/sql/json_string_to_row_columnar.hpp"
+#include "clink/sql/lookup_join.hpp"
 #include "clink/sql/model_provider.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/partitioned_list.hpp"
@@ -13706,51 +13707,23 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error("async_lookup_join_row: function '" + fn_name +
                                          "' is not registered in AsyncFunctionRegistry::global()");
             }
-            auto split_csv = [](const std::string& csv) {
-                std::vector<std::string> out;
-                std::size_t start = 0;
-                while (start <= csv.size()) {
-                    auto comma = csv.find(',', start);
-                    if (comma == std::string::npos) {
-                        if (start < csv.size()) {
-                            out.push_back(csv.substr(start));
-                        }
-                        break;
-                    }
-                    out.push_back(csv.substr(start, comma - start));
-                    start = comma + 1;
-                }
-                return out;
-            };
-            const std::string probe_alias = ctx.param_or("probe_alias", "");
-            const std::string dim_alias = ctx.param_or("dim_alias", "");
-            auto probe_cols = split_csv(ctx.param_or("probe_columns", ""));
-            auto dim_cols = split_csv(ctx.param_or("dim_columns", ""));
+            clink::sql::LookupJoinShape shape;
+            shape.probe_alias = ctx.param_or("probe_alias", "");
+            shape.dim_alias = ctx.param_or("dim_alias", "");
+            shape.probe_columns =
+                clink::sql::split_lookup_columns(ctx.param_or("probe_columns", ""));
+            shape.dim_columns = clink::sql::split_lookup_columns(ctx.param_or("dim_columns", ""));
             const std::size_t max_in_flight =
                 static_cast<std::size_t>(std::stoull(ctx.param_or("max_in_flight", "64")));
             const auto ordered_str = ctx.param_or("ordered", "true");
             const bool ordered = (ordered_str != "false" && ordered_str != "0");
 
-            AsyncLookupFn wrapper =
-                [dim_fn = std::move(dim_fn), probe_alias, dim_alias, probe_cols, dim_cols](
-                    const Row& probe) -> clink::async::Task<Row> {
+            // The probe is taken by value, so the coroutine frame owns its copy
+            // for as long as the lookup runs.
+            AsyncLookupFn wrapper = [dim_fn = std::move(dim_fn), shape = std::move(shape)](
+                                        Row probe) -> clink::async::Task<Row> {
                 Row dim = co_await dim_fn(probe);
-                Row out;
-                for (const auto& c : probe_cols) {
-                    auto it = probe.values.find(c);
-                    out.values[probe_alias + "_" + c] =
-                        it != probe.values.end() ? it->second : clink::config::JsonValue{};
-                }
-                for (const auto& c : dim_cols) {
-                    auto it = dim.values.find(c);
-                    out.values[dim_alias + "_" + c] =
-                        it != dim.values.end() ? it->second : clink::config::JsonValue{};
-                }
-                // Preserve the probe's changelog kind: a lookup join is a
-                // per-row enrichment, so a delete/update_before probe row must
-                // stay a delete/update_before downstream.
-                clink::sql::copy_row_kind(probe, out);
-                co_return out;
+                co_return clink::sql::merge_lookup_row(shape, probe, dim);
             };
             return std::make_shared<AsyncLookupOperator<Row, Row>>(
                 std::move(wrapper), max_in_flight, ordered, "async_lookup_join_row");

@@ -69,8 +69,36 @@ TEST(Neo4jFactory, TheFactoryRefusesBadOptionsWithTheirCode) {
     try {
         (void)factory->build(ctx);
         FAIL() << "an exactly-once request was accepted";
-    } catch (const clink::neo4j::Neo4jSinkError& e) {
+    } catch (const clink::neo4j::Neo4jError& e) {
         EXPECT_EQ(e.code(), clink::neo4j::code::kGuaranteeUnsupported);
+    }
+}
+
+TEST(Neo4jFactory, TheLookupJoinOperatorIsRegisteredAndRefusesBadOptions) {
+    const auto* factory = clink::cluster::OperatorRegistry::default_instance().find_operator(
+        "neo4j_lookup_join_row", "row", "row");
+    ASSERT_NE(factory, nullptr) << "neo4j_lookup_join_row is not registered row to row";
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"probe_alias", "s"},
+                  {"dim_alias", "d"},
+                  {"probe_columns", "id"},
+                  {"dim_columns", "id,name"},
+                  {"join_type", "left_outer"},
+                  {"probe_key_column", "id"},
+                  {"probe_key_type", "BIGINT"},
+                  {"dim_key_column", "id"},
+                  {"dim_column_types", "id:BIGINT;name:VARCHAR"},
+                  {"neo4j.endpoint", "http://127.0.0.1:7474"},
+                  {"neo4j.statement", "MATCH (a:Account {id: $key}) RETURN a.name AS name"}};
+    // Built without connecting: the statement is checked when it opens.
+    EXPECT_NE(factory->build(ctx), nullptr);
+    ctx.params["neo4j.max_in_flight"] = "0";
+    try {
+        (void)factory->build(ctx);
+        FAIL() << "max_in_flight=0 was accepted";
+    } catch (const clink::neo4j::Neo4jError& e) {
+        EXPECT_EQ(e.code(), clink::neo4j::code::kOptionInvalid);
+        EXPECT_EQ(std::string(e.what()).rfind("neo4j lookup: ", 0), 0U) << e.what();
     }
 }
 

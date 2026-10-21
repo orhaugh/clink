@@ -31,8 +31,8 @@
 
 using clink::config::JsonObject;
 using clink::config::JsonValue;
+using clink::neo4j::Neo4jError;
 using clink::neo4j::Neo4jSink;
-using clink::neo4j::Neo4jSinkError;
 using clink::neo4j::parse_options;
 using clink::neo4j::testing::FakeQueryApi;
 using clink::neo4j::testing::kCommitted;
@@ -103,7 +103,7 @@ struct Rig {
 std::string refusal_code(const std::function<void()>& f) {
     try {
         f();
-    } catch (const Neo4jSinkError& e) {
+    } catch (const Neo4jError& e) {
         return e.code();
     }
     return {};
@@ -151,7 +151,7 @@ TEST(Neo4jSink, OpenRefusesCredentialsWithoutQuotingThem) {
     try {
         rig.sink->open();
         FAIL() << "a 401 was accepted";
-    } catch (const Neo4jSinkError& e) {
+    } catch (const Neo4jError& e) {
         EXPECT_EQ(e.code(), code::kAuthentication);
         const std::string m = e.what();
         EXPECT_NE(m.find("database 'neo4j'"), std::string::npos) << m;
@@ -287,7 +287,7 @@ TEST(Neo4jSink, ARefusedBatchFailsTheBarrierOnceAndKeepsItsRows) {
     try {
         rig.sink->on_barrier(clink::CheckpointBarrier{clink::CheckpointId{1}});
         FAIL() << "a refused batch let the barrier through";
-    } catch (const Neo4jSinkError& e) {
+    } catch (const Neo4jError& e) {
         EXPECT_EQ(e.code(), code::kServerRefused);
         const std::string m = e.what();
         EXPECT_NE(m.find("ConstraintValidationFailed"), std::string::npos) << m;

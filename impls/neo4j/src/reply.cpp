@@ -159,12 +159,27 @@ Reply parse_reply(std::string_view body) {
         out.has_bookmarks = std::any_of(arr.begin(), arr.end(), [](const JsonValue& v) {
             return v.is_string() && !v.as_string().empty();
         });
+        for (const auto& v : arr) {
+            if (v.is_string() && !v.as_string().empty()) {
+                out.bookmark = v.as_string();
+                break;
+            }
+        }
     }
     if (const auto* data = member(root, "data")) {
         if (const auto* fields = member(*data, "fields"); fields != nullptr && fields->is_array()) {
             out.has_fields = true;
             for (const auto& f : fields->as_array()) {
                 out.fields.push_back(f.is_string() ? f.as_string() : f.serialize(0));
+            }
+        }
+        if (const auto* values = member(*data, "values"); values != nullptr && values->is_array()) {
+            const auto& rows = values->as_array();
+            out.has_values = std::all_of(
+                rows.begin(), rows.end(), [](const JsonValue& row) { return row.is_array(); });
+            out.row_count = rows.size();
+            if (out.has_values && !rows.empty()) {
+                out.first_row = rows.front().as_array();
             }
         }
     }
@@ -316,6 +331,152 @@ Outcome judge_check(const BoundedResponse& r, Reply& reply) {
         return Outcome{Verdict::Committed, ErrorClass::Other, {}, {}};
     }
     return refused_by_status(r.status, Verdict::Unknown, "a reply without a Neo4j error");
+}
+
+Outcome judge_read(const BoundedResponse& r, Reply& reply) {
+    if (!r.complete) {
+        Outcome o = transport(r);
+        if (r.failure == BoundedResponse::Failure::TooLarge) {
+            o.detail = "the reply passed max_response_bytes, and a lookup reads at most one row";
+        } else if (o.verdict == Verdict::Unknown) {
+            o.detail = "the reply was lost after the request was sent: " + r.error;
+        }
+        return o;
+    }
+    reply = parse_reply(r.body);
+    if (!reply.parsed) {
+        return refused_by_status(r.status,
+                                 Verdict::Unknown,
+                                 "the reply is not a Neo4j JSON reply (cut short, or from "
+                                 "something other than the server)");
+    }
+    if (!reply.errors.empty()) {
+        const auto& e = reply.errors.front();
+        Outcome o;
+        o.code = e.code;
+        o.detail = describe(e);
+        o.error_class = classify_code(e.code);
+        o.verdict = o.error_class == ErrorClass::Retryable ? Verdict::RolledBack : Verdict::Refused;
+        return o;
+    }
+    if (r.status < 200 || r.status >= 300) {
+        return refused_by_status(r.status, Verdict::Unknown, "a reply without a Neo4j error");
+    }
+    if (!reply.has_fields || !reply.has_values) {
+        return Outcome{Verdict::Refused,
+                       ErrorClass::Other,
+                       {},
+                       "HTTP " + std::to_string(r.status) +
+                           ": the reply has no result columns or rows, so it is not a Query API "
+                           "result"};
+    }
+    if (reply.row_count > 0 && reply.first_row.size() != reply.fields.size()) {
+        return Outcome{Verdict::Refused,
+                       ErrorClass::Other,
+                       {},
+                       "the reply's row holds " + std::to_string(reply.first_row.size()) +
+                           " values for " + std::to_string(reply.fields.size()) +
+                           " result columns"};
+    }
+    return Outcome{Verdict::Committed, ErrorClass::Other, {}, {}};
+}
+
+std::vector<std::string> lookup_statement_problems(const Reply& explain,
+                                                   const std::vector<std::string>& columns) {
+    std::vector<std::string> out;
+    if (explain.query_type && *explain.query_type != "r") {
+        out.push_back("the server classes the statement as query type '" + *explain.query_type +
+                      "', not a read (r); a lookup must only read");
+    }
+    // Writes and schema commands, by the operators that plan them; the query
+    // type says the same on servers that report one.
+    static constexpr std::array<std::string_view, 10> kWrites{"Create",
+                                                              "Merge",
+                                                              "LockingMerge",
+                                                              "Delete",
+                                                              "DetachDelete",
+                                                              "Set",
+                                                              "Remove",
+                                                              "Foreach",
+                                                              "Drop",
+                                                              "DoNothingIfExists"};
+    bool write = false;
+    bool procedure = false;
+    bool load_csv = false;
+    bool in_transactions = false;
+    for (const auto& op : explain.plan_operators) {
+        write = write || std::any_of(kWrites.begin(), kWrites.end(), [&](std::string_view w) {
+                    return starts(op, w);
+                });
+        procedure = procedure || starts(op, "ProcedureCall");
+        load_csv = load_csv || starts(op, "LoadCSV");
+        in_transactions = in_transactions || op.find("TransactionForeach") != std::string::npos ||
+                          op.find("TransactionApply") != std::string::npos;
+    }
+    if (write) {
+        out.push_back("the statement's plan writes to the graph or changes the schema");
+    }
+    if (procedure) {
+        out.push_back(
+            "the statement calls a procedure; a lookup refuses procedure calls, because whether "
+            "a procedure only reads cannot be established from the plan");
+    }
+    if (load_csv) {
+        out.push_back(
+            "the statement uses LOAD CSV, which reads a file or URL from the server; a lookup "
+            "reads only the graph");
+    }
+    if (in_transactions) {
+        out.push_back("the statement uses CALL { ... } IN TRANSACTIONS");
+    }
+    if (!explain.has_plan && !explain.query_type) {
+        out.push_back(
+            "the server reported neither a query type nor a plan for the statement, so it "
+            "cannot be checked as read-only");
+    }
+    std::vector<std::string> missing;
+    for (const auto& c : columns) {
+        if (std::find(explain.fields.begin(), explain.fields.end(), c) == explain.fields.end()) {
+            missing.push_back(c);
+        }
+    }
+    std::vector<std::string> extra;
+    for (const auto& f : explain.fields) {
+        if (std::find(columns.begin(), columns.end(), f) == columns.end()) {
+            extra.push_back(f);
+        }
+    }
+    const auto joined = [](const std::vector<std::string>& v) {
+        std::string s;
+        for (const auto& x : v) {
+            s += (s.empty() ? "" : ", ") + x;
+        }
+        return s;
+    };
+    if (!missing.empty() || !extra.empty()) {
+        out.push_back("the statement returns (" + joined(explain.fields) +
+                      ") but the lookup table's result columns are (" + joined(columns) +
+                      "); RETURN each declared column by name with AS, and not the key or a "
+                      "metadata column");
+    }
+    for (const auto& [code, description] : explain.notifications) {
+        if (code == "Neo.ClientNotification.Statement.ParameterNotProvided") {
+            out.push_back("the statement uses parameters other than $key (" + description + ")");
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> scan_operators(const Reply& explain) {
+    std::vector<std::string> out;
+    for (const auto& op : explain.plan_operators) {
+        if (op == "AllNodesScan" || op.find("ByLabelScan") != std::string::npos ||
+            op.find("ByTypeScan") != std::string::npos ||
+            op.find("RelationshipTypeScan") != std::string::npos) {
+            out.push_back(op);
+        }
+    }
+    return out;
 }
 
 std::vector<std::string> statement_problems(const Reply& explain) {

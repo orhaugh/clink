@@ -106,6 +106,16 @@ public:
     // tears the operator down. Mirrors AsyncMapOperator::flush.
     void flush(Emitter<Out>& out) override { wait_for_all_(out); }
 
+    // Advances every in-flight lookup once and emits what has finished
+    // (ordered: the finished head only). Never blocks, so an operator
+    // that wraps this one can call it between inputs, when the runner
+    // wakes it, instead of holding finished results until the next
+    // marker or until max_in_flight is reached.
+    void poll(Emitter<Out>& out) {
+        nudge_in_flight_();
+        drain_(out);
+    }
+
     std::string name() const override { return name_; }
 
     // Test/diagnostic accessors. Not part of the public Operator

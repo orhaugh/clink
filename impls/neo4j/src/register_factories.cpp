@@ -8,6 +8,7 @@
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
+#include "lookup.hpp"
 #include "neo4j_sink.hpp"
 #include "options.hpp"
 
@@ -39,7 +40,8 @@ clink::connectors::ConnectorCapabilities record() {
         .timeout_options = {"connect_timeout_ms",
                             "request_timeout_ms",
                             "retry_window_ms",
-                            "flush_interval_ms"},
+                            "flush_interval_ms",
+                            "server_timeout_s"},
         .available_in_sql = true,
         .limitations =
             {"at-least-once: a batch whose reply is lost, or that a restart replays, can be "
@@ -52,7 +54,16 @@ clink::connectors::ConnectorCapabilities record() {
              "one implicit transaction per batch, sent in order from each subtask; subtasks "
              "write concurrently",
              "must be the only sink on its chain: Dag::add_sink refuses another sink beside it",
-             "tested against single-instance Neo4j Community; clusters and Aura are not"},
+             "tested against single-instance Neo4j Community; clusters and Aura are not",
+             "the lookup (connector='lookup', function='neo4j') reads the graph as it is when "
+             "each lookup runs: a replay can enrich a row differently, and nothing is cached or "
+             "read from a snapshot",
+             "a lookup returns zero or one row of scalar columns for each key; more rows, a "
+             "value outside its declared type, or an unreachable server fail the task, never a "
+             "no-match",
+             "lookup requests carry accessMode READ, which the tested server enforces, and the "
+             "open check refuses writes, schema changes, procedure calls, LOAD CSV and IN "
+             "TRANSACTIONS; Community Edition has no roles, so no read-only user can back it"},
     };
 }
 
@@ -71,6 +82,13 @@ void install(clink::plugin::PluginRegistry& reg) {
         [](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Sink<clink::sql::Row>> {
             return std::make_shared<Neo4jSink>(
                 parse_options(ctx.params, ctx.subtask_idx, ctx.parallelism));
+        });
+    reg.register_operator<clink::sql::Row, clink::sql::Row>(
+        "neo4j_lookup_join_row",
+        [](const clink::plugin::BuildContext& ctx)
+            -> std::shared_ptr<Operator<clink::sql::Row, clink::sql::Row>> {
+            return std::make_shared<Neo4jLookupJoin>(
+                parse_lookup_options(ctx.params, ctx.subtask_idx, ctx.parallelism));
         });
     clink::connectors::declare_connector(record());
 }

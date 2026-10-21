@@ -459,6 +459,7 @@ include/clink/sql/install.hpp
 include/clink/sql/join_reorder.hpp
 include/clink/sql/json_string_to_row_columnar.hpp
 include/clink/sql/logical_plan.hpp
+include/clink/sql/lookup_join.hpp
 include/clink/sql/materialized_view.hpp
 include/clink/sql/model_provider.hpp
 include/clink/sql/name_suggest.hpp

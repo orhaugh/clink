@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The Neo4j sink's live gate: every Neo4j test against the pinned server of
-# docker/integration-services.yml, then a check that nothing was skipped and
-# that every required suite ran.
+# The Neo4j connector's live gate: every Neo4j sink and lookup test against the
+# pinned server of docker/integration-services.yml, then a check that nothing
+# was skipped and that every required suite ran.
 #
 #   scripts/neo4j-live.sh [build-dir]
 #
@@ -9,11 +9,12 @@
 # same pinned build: neo4j (the Query API over HTTP on host port 17474) and
 # neo4j-tls (over HTTPS only, on 17443, with a CA and a certificate for
 # localhost that scripts/make-neo4j-test-tls.sh generates per run). Then it runs:
-#   - clink_neo4j_tests: the unit suites, the live suite (Neo4jLive.*), whose
-#     outage case stops and starts the neo4j container, and the TLS suite
-#     (Neo4jLiveTls.*);
-#   - clink_neo4j_sql_tests: the SQL-level suites, including an embedded SQL
-#     pipeline into the server (Neo4jSqlLive.*);
+#   - clink_neo4j_tests: the unit suites, the sink's live suite (Neo4jLive.*),
+#     whose outage case stops and starts the neo4j container, the lookup's live
+#     suite (Neo4jLookupLive.*) and the TLS suite (Neo4jLiveTls.*);
+#   - clink_neo4j_sql_tests: the SQL-level suites, including embedded SQL
+#     pipelines into and enriched from the server (Neo4jSqlLive.*,
+#     Neo4jSqlLookupLive.*);
 #   - clink_integration_tests' Neo4jRecovery.* cells when that binary is built
 #     (NEO4J_LIVE_RECOVERY=0 leaves them out): a coordinator and two workers
 #     running a SQL job from Kafka into the server, a worker killed at the
@@ -118,15 +119,22 @@ run neo4j "${UNIT_BIN}"
 run neo4j-sql "${SQL_BIN}"
 reports=("${REPORT_DIR}/neo4j.json" "${REPORT_DIR}/neo4j-sql.json")
 expect=(
-    --expect 'Neo4jFactory.*=4'
+    --expect 'Neo4jFactory.*=5'
     --expect 'Neo4jOptions.*=12'
     --expect 'Neo4jTypes.*=8'
     --expect 'Neo4jReply.*=7'
     --expect 'Neo4jSink.*=16'
     --expect 'Neo4jLive.*=15'
-    --expect 'Neo4jLiveTls.*=3'
+    --expect 'Neo4jLiveTls.*=4'
+    --expect 'Neo4jLookupOptions.*=9'
+    --expect 'Neo4jLookupTypes.*=5'
+    --expect 'Neo4jLookupReply.*=5'
+    --expect 'Neo4jLookup.*=18'
+    --expect 'Neo4jLookupLive.*=7'
     --expect 'Neo4jSql.*=4'
     --expect 'Neo4jSqlLive.*=1'
+    --expect 'Neo4jSqlLookup.*=3'
+    --expect 'Neo4jSqlLookupLive.*=1'
 )
 if [ "${NEO4J_LIVE_RECOVERY}" = "1" ]; then
     run recovery "${IT_BIN}" --gtest_filter='Neo4jRecovery.*'

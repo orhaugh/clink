@@ -44,6 +44,8 @@
 #include "clink/sql/row.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
+#include "live_oracle.hpp"
+#include "lookup.hpp"
 #include "neo4j_sink.hpp"
 #include "options.hpp"
 #include "tests/integration/docker_command.hpp"
@@ -53,99 +55,18 @@ using clink::config::JsonArray;
 using clink::config::JsonObject;
 using clink::config::JsonValue;
 using clink::itest::TcpFaultProxy;
+using clink::neo4j::Neo4jError;
 using clink::neo4j::Neo4jSink;
-using clink::neo4j::Neo4jSinkError;
 using clink::neo4j::parse_options;
+using clink::neo4j::testing::env;
+using clink::neo4j::testing::host_port;
+using clink::neo4j::testing::Oracle;
+using clink::neo4j::testing::text;
 using clink::sql::Row;
 using namespace std::chrono_literals;
 namespace code = clink::neo4j::code;
 
 namespace {
-
-std::string env(const char* name) {
-    const char* v = std::getenv(name);
-    return v == nullptr ? std::string{} : std::string{v};
-}
-
-// host:port of an http(s)://host:port endpoint.
-std::pair<std::string, int> host_port(const std::string& endpoint) {
-    const auto scheme_end = endpoint.find("://");
-    const auto rest = endpoint.substr(scheme_end + 3);
-    const auto colon = rest.rfind(':');
-    return {rest.substr(0, colon), std::stoi(rest.substr(colon + 1))};
-}
-
-// A Cypher client of the case's own, over the Query API with plain JSON
-// parameters and typed results: independent of the sink's batching and
-// encoding.
-class Oracle {
-public:
-    Oracle(std::string endpoint, std::string password, std::string ca_file = {})
-        : endpoint_(std::move(endpoint)),
-          password_(std::move(password)),
-          ca_file_(std::move(ca_file)) {}
-
-    // The typed rows of `statement` against `database`; throws on any error.
-    std::vector<JsonArray> rows(const std::string& statement,
-                                const std::string& params_json = "{}",
-                                const std::string& database = "neo4j") const {
-        httplib::Client cli(endpoint_);
-        if (!ca_file_.empty()) {
-            cli.set_ca_cert_path(ca_file_);
-        }
-        cli.set_basic_auth("neo4j", password_);
-        cli.set_read_timeout(std::chrono::seconds{60});
-        std::string body = "{\"statement\":";
-        JsonValue{statement}.serialize_into(body);
-        body += ",\"parameters\":" + params_json + "}";
-        const auto res = cli.Post("/db/" + database + "/query/v2",
-                                  httplib::Headers{{"Accept", "application/vnd.neo4j.query"}},
-                                  body,
-                                  "application/json");
-        if (!res) {
-            throw std::runtime_error("oracle: " + httplib::to_string(res.error()));
-        }
-        const JsonValue reply = clink::config::parse(res->body);
-        if (reply.contains("errors")) {
-            throw std::runtime_error("oracle: " + res->body);
-        }
-        std::vector<JsonArray> out;
-        for (const auto& r : reply.at("data").at("values").as_array()) {
-            out.push_back(r.as_array());
-        }
-        return out;
-    }
-
-    void run(const std::string& statement,
-             const std::string& params_json = "{}",
-             const std::string& database = "neo4j") const {
-        (void)rows(statement, params_json, database);
-    }
-
-    std::int64_t count(const std::string& statement) const {
-        const auto r = rows(statement);
-        return std::stoll(r.at(0).at(0).at("_value").as_string());
-    }
-
-    bool reachable() const {
-        try {
-            run("RETURN 1");
-            return true;
-        } catch (const std::exception&) {
-            return false;
-        }
-    }
-
-private:
-    std::string endpoint_;
-    std::string password_;
-    std::string ca_file_;
-};
-
-std::string text(const JsonValue& typed) {
-    const auto& v = typed.at("_value");
-    return v.is_string() ? v.as_string() : v.serialize(0);
-}
 
 Row row_of(std::vector<std::pair<std::string, JsonValue>> cells) {
     JsonObject obj;
@@ -193,7 +114,7 @@ struct LiveSink {
 std::string refusal_code(const std::function<void()>& f, std::string* message = nullptr) {
     try {
         f();
-    } catch (const Neo4jSinkError& e) {
+    } catch (const Neo4jError& e) {
         if (message != nullptr) {
             *message = e.what();
         }
@@ -1054,4 +975,48 @@ TEST_F(Neo4jLiveTls, AHostTheCertificateDoesNotNameIsRefusedBeforeAnythingIsSent
     std::string m;
     EXPECT_EQ(refusal_code([&] { s.sink->open(); }, &m), code::kTlsVerify) << m;
     EXPECT_GE(proxy.accepted(), 1U) << "the connection was not even attempted";
+}
+
+TEST_F(Neo4jLiveTls, TheLookupReachesTheServerOnTheSinksTlsSettings) {
+    const auto lookup_params = [&](const std::string& ca) {
+        return std::map<std::string, std::string>{
+            {"probe_alias", "s"},
+            {"dim_alias", "d"},
+            {"probe_columns", "key"},
+            {"dim_columns", "key,echo"},
+            {"join_type", "inner"},
+            {"probe_key_column", "key"},
+            {"probe_key_type", "VARCHAR"},
+            {"dim_key_column", "key"},
+            {"dim_column_types", "key:VARCHAR;echo:VARCHAR"},
+            {"neo4j.endpoint", tls_endpoint_},
+            {"neo4j.username", "neo4j"},
+            {"neo4j.password", password_},
+            {"neo4j.tls_ca_file", ca},
+            {"neo4j.statement", "RETURN $key AS echo"},
+        };
+    };
+    clink::neo4j::Neo4jLookupJoin lookup(
+        clink::neo4j::parse_lookup_options(lookup_params(ca_), 0, 1));
+    lookup.open();
+    std::vector<Row> got;
+    clink::Emitter<Row> out{[&](clink::StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& r : e.as_data()) {
+                got.push_back(r.value());
+            }
+        }
+        return true;
+    }};
+    clink::Batch<Row> b;
+    b.emplace(row_of({{"key", JsonValue{"over-tls"}}}));
+    lookup.process(clink::StreamElement<Row>::data(std::move(b)), out);
+    lookup.flush(out);
+    lookup.close();
+    ASSERT_EQ(got.size(), 1U);
+    EXPECT_EQ(got[0].values.at("d_echo").as_string(), "over-tls");
+
+    clink::neo4j::Neo4jLookupJoin wrong(
+        clink::neo4j::parse_lookup_options(lookup_params(wrong_ca_), 0, 1));
+    EXPECT_EQ(refusal_code([&] { wrong.open(); }), code::kTlsVerify);
 }

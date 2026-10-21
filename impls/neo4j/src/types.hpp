@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 
+#include "clink/config/json.hpp"
 #include "clink/sql/row.hpp"
 
 namespace clink::neo4j {
@@ -46,7 +47,7 @@ struct Column {
     SqlType type;
 };
 
-// "name:SPELLING;name:SPELLING". Throws Neo4jSinkError(option_invalid) on a
+// "name:SPELLING;name:SPELLING". Throws Neo4jError(option_invalid) on a
 // malformed list; an unknown spelling parses as Kind::Unsupported.
 [[nodiscard]] std::vector<Column> parse_column_types(const std::string& spec);
 
@@ -56,9 +57,28 @@ struct Column {
 
 // Appends one row as a typed JSON Map, {"$type":"Map","_value":{...}}, keyed by
 // the declared column names. A column the row does not carry is Null. Throws
-// Neo4jSinkError(value_invalid) naming the column and the kind it holds, never
+// Neo4jError(value_invalid) naming the column and the kind it holds, never
 // the value, when a value does not fit its declared type.
 void encode_row(const std::vector<Column>& columns, const clink::sql::Row& row, std::string& out);
+
+// Appends one value as a typed JSON value of the declared type, by the rules
+// encode_row applies to a column; `name` names it in a refusal.
+void encode_value_as(const SqlType& type,
+                     const clink::config::JsonValue& value,
+                     const std::string& name,
+                     std::string& out);
+
+// Reads one typed JSON value of a reply ({"$type": ..., "_value": ...}) into
+// the Row value of a declared result column, refusing anything that would be
+// lost or guessed: Null is SQL NULL; an Integer fills TINYINT to BIGINT when
+// it is in the type's range, and DOUBLE when a double holds it exactly; a
+// Float fills DOUBLE (NaN and the infinities included); a Boolean fills
+// BOOLEAN; a String fills VARCHAR. Every other pairing, and every other Neo4j
+// type (a node, relationship, path, list, map, temporal or spatial value),
+// throws Neo4jError(value_invalid) naming the column, its declared type and
+// the Neo4j type, never the value.
+[[nodiscard]] clink::config::JsonValue decode_result(const Column& column,
+                                                     const clink::config::JsonValue& typed);
 
 // Days since 1970-01-01 as YYYY-MM-DD, and epoch milliseconds as
 // YYYY-MM-DDTHH:MM:SS.mmm, for years 1 to 9999; false outside them.

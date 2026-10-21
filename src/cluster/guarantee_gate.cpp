@@ -186,6 +186,15 @@ connectors::PipelineFacts pipeline_facts_from_graph(const JobGraphSpec& graph,
                 "async lookup" + (fn == op.params.end() ? std::string{} : " '" + fn->second + "'") +
                 " reads an external system whose answers can change between runs");
         }
+        if (op.type == "neo4j_lookup_join_row") {
+            // Current-state enrichment: each lookup reads the graph as it is
+            // when the query runs, so a replay can enrich a row differently.
+            det.calls_external_service = true;
+            det.sources_of_nondeterminism.push_back(
+                "Neo4j lookup '" + op.id +
+                "' reads the graph as it is when each lookup runs, so a replay can enrich a row "
+                "differently");
+        }
     }
     for (const auto& u : graph.udfs) {
         // LANGUAGE SQL bodies are composed of built-ins the binder already

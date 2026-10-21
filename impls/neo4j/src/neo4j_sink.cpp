@@ -2,10 +2,8 @@
 
 #include <algorithm>
 #include <optional>
-#include <random>
 #include <utility>
 
-#include "clink/core/base64.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/metrics/metrics_registry.hpp"
@@ -25,140 +23,9 @@ using clink::http_connector::BoundedResponse;
 using clink::http_connector::HttpRequest;
 
 constexpr std::string_view kLog = "sink.neo4j";
-constexpr char kTypedJson[] = "application/vnd.neo4j.query";
 constexpr std::string_view kBodySuffix = "]}}}";
 
-std::string tagged(const char* metric, std::uint64_t op) {
-    return std::string(metric) + "{op_id=\"" + std::to_string(op) + "\"}";
-}
-
-std::string tagged(const char* metric,
-                   std::uint64_t op,
-                   std::string_view key,
-                   std::string_view value) {
-    std::string out(metric);
-    out += "{op_id=\"" + std::to_string(op) + "\",";
-    out += key;
-    out += "=\"";
-    out += value;
-    out += "\"}";
-    return out;
-}
-
-// Full jitter: the nth wait is uniform in [0, min(5 s, 100 ms * 2^n)].
-class Backoff {
-public:
-    std::chrono::milliseconds next() {
-        const std::int64_t cap = std::min<std::int64_t>(5000, 100LL << std::min(n_, 10U));
-        ++n_;
-        std::uniform_int_distribution<std::int64_t> pick(0, cap);
-        return std::chrono::milliseconds{pick(rng_)};
-    }
-
-private:
-    std::mt19937_64 rng_ = std::mt19937_64(std::random_device{}());
-    unsigned n_{0};
-};
-
-// Waits `d` in slices, returning false as soon as the task is cancelled.
-bool cancellable_wait(std::chrono::milliseconds d, const CancelSignal& cancel) {
-    const auto until = Clock::now() + d;
-    while (true) {
-        if (cancel.requested()) {
-            return false;
-        }
-        const auto now = Clock::now();
-        if (now >= until) {
-            return true;
-        }
-        std::this_thread::sleep_for(
-            std::min<Clock::duration>(until - now, std::chrono::milliseconds{50}));
-    }
-}
-
-const char* error_code_for(ErrorClass c) {
-    switch (c) {
-        case ErrorClass::Authentication:
-            return code::kAuthentication;
-        case ErrorClass::Authorisation:
-            return code::kAuthorisation;
-        case ErrorClass::Statement:
-            return code::kStatementRefused;
-        default:
-            return code::kServerRefused;
-    }
-}
-
 }  // namespace
-
-// ---- RequestWatch -----------------------------------------------------------
-
-RequestWatch::RequestWatch(HttpRequest& http) : http_(http), thread_([this] { run(); }) {}
-
-RequestWatch::~RequestWatch() {
-    stop();
-}
-
-void RequestWatch::arm(Clock::time_point deadline, CancelSignal cancel) {
-    {
-        const std::lock_guard<std::mutex> lock(mu_);
-        armed_ = true;
-        deadline_ = deadline;
-        cancel_ = std::move(cancel);
-        why_ = Why::None;
-    }
-    cv_.notify_all();
-}
-
-RequestWatch::Why RequestWatch::disarm() {
-    const std::lock_guard<std::mutex> lock(mu_);
-    armed_ = false;
-    return why_;
-}
-
-void RequestWatch::stop() {
-    {
-        const std::lock_guard<std::mutex> lock(mu_);
-        stop_ = true;
-    }
-    cv_.notify_all();
-    if (thread_.joinable()) {
-        thread_.join();
-    }
-}
-
-void RequestWatch::run() {
-    std::unique_lock<std::mutex> lock(mu_);
-    while (!stop_) {
-        if (!armed_) {
-            cv_.wait(lock, [this] { return stop_ || armed_; });
-            continue;
-        }
-        cv_.wait_for(lock, std::chrono::milliseconds{20});
-        if (stop_ || !armed_) {
-            continue;
-        }
-        Why why = Why::None;
-        if (cancel_.requested()) {
-            why = Why::Cancelled;
-        } else if (Clock::now() >= deadline_) {
-            why = Why::Deadline;
-        }
-        if (why == Why::None) {
-            continue;
-        }
-        if (why_ == Why::None) {
-            why_ = why;
-        }
-        // Outside the lock: a connect under way holds the client until it
-        // finishes or times out, and arm/disarm must not wait on it. While
-        // still armed, the next tick interrupts again, in case this one
-        // landed between two of the client's own steps.
-        lock.unlock();
-        http_.interrupt();
-        lock.lock();
-    }
-}
 
 // ---- Neo4jSink --------------------------------------------------------------
 
@@ -183,28 +50,14 @@ std::string Neo4jSink::where_() const {
 
 void Neo4jSink::fail_(const char* code, const std::string& message) {
     clink::metrics::connector::error_inc(metric::kConnector);
-    throw Neo4jSinkError(code, "neo4j sink: " + where_() + ": " + message);
+    throw Neo4jError(code, "neo4j sink: " + where_() + ": " + message);
 }
 
 void Neo4jSink::open() {
     if (runtime() != nullptr) {
         cancel_ = runtime()->cancel_signal();
     }
-    HttpRequest::Options h;
-    h.base_url = opts_.endpoint;
-    h.connect_timeout_ms = static_cast<int>(opts_.connect_timeout_ms);
-    h.rw_timeout_ms =
-        static_cast<int>(std::min<std::uint64_t>(opts_.request_timeout_ms, 3'600'000));
-    h.verify_tls = true;
-    h.ca_cert_path = opts_.tls_ca_file;
-    h.verify_hostname = true;
-    if (!opts_.username.empty()) {
-        h.headers["Authorization"] =
-            "Basic " + clink::base64_encode(opts_.username + ":" + opts_.password);
-    } else if (!opts_.bearer_token.empty()) {
-        h.headers["Authorization"] = "Bearer " + opts_.bearer_token;
-    }
-    http_ = std::make_unique<HttpRequest>(std::move(h));
+    http_ = make_client(opts_);
     watch_ = std::make_unique<RequestWatch>(*http_);
     check_statement_();
     opened_ = true;

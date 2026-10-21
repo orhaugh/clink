@@ -1608,9 +1608,10 @@ std::string compile_node(const LogicalPlan& node,
         // Lookup (enrichment) join: drive the probe stream through the
         // async_lookup_join_row operator, which calls the dim table's
         // registered Row -> Task<Row> function and merges aliased probe
-        // + dim columns. INNER drops misses (null dim columns) with a
-        // trailing IS NOT NULL filter on the dim key output column;
-        // LEFT keeps every probe row.
+        // + dim columns; function='neo4j' selects the Neo4j connector's
+        // own lookup operator instead. INNER drops misses (null dim
+        // columns) with a trailing IS NOT NULL filter on the dim key
+        // output column; LEFT keeps every probe row.
         const auto& lj = static_cast<const LogicalLookupJoin&>(node);
         if (ch != Channel::Row) {
             unsupported("lookup join requires format='json' Row channel");
@@ -1638,6 +1639,30 @@ std::string compile_node(const LogicalPlan& node,
         op.params["probe_columns"] = join_csv(lj.probe_columns());
         op.params["dim_columns"] = join_csv(lj.dim_columns());
         op.params["join_type"] = lj.outer() ? "left_outer" : "inner";
+        if (lj.function_name() == "neo4j") {
+            // The Neo4j lookup is the connector's own operator, configured by
+            // the lookup table: its declared columns and types, which probe
+            // column is the key, and its options, prefixed so none can be
+            // mistaken for a join parameter.
+            const TableDef* dim = lj.dim_table();
+            const auto probe_schema = lj.input().schema();
+            const auto key_field = probe_schema != nullptr
+                                       ? probe_schema->GetFieldByName(lj.probe_key_column())
+                                       : nullptr;
+            if (dim == nullptr || key_field == nullptr) {
+                unsupported("the Neo4j lookup join needs its probe key column and lookup table");
+            }
+            op.type = "neo4j_lookup_join_row";
+            op.params["probe_key_column"] = lj.probe_key_column();
+            op.params["probe_key_type"] = arrow_to_sql_type_string(*key_field->type());
+            op.params["dim_key_column"] = lj.dim_key_column();
+            op.params["dim_column_types"] = render_sql_column_types(*dim);
+            for (const auto& [key, value] : dim->properties) {
+                if (key != "connector" && key != "function") {
+                    op.params["neo4j." + key] = value;
+                }
+            }
+        }
         std::string last_id = op.id;
         spec.ops.push_back(std::move(op));
 
