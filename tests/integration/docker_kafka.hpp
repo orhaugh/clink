@@ -7,6 +7,8 @@
 #include <string>
 #include <thread>
 
+#include "docker_command.hpp"
+
 namespace clink::test {
 
 // RAII wrapper that spins up a single-node Redpanda broker via the Docker CLI
@@ -65,9 +67,10 @@ public:
             " --mode dev-container --smp 1"
             " --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092"
             " --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:" +
-            std::to_string(port_) + sasl_flags + registry_flags + " > /dev/null 2>&1";
-        if (std::system(cmd.c_str()) != 0) {
-            throw std::runtime_error("DockerKafka: docker run failed");
+            std::to_string(port_) + sasl_flags + registry_flags;
+        if (const auto started = run_docker_command(cmd); started.status != 0) {
+            throw std::runtime_error("DockerKafka: docker run failed (exit " +
+                                     std::to_string(started.status) + "): " + started.out);
         }
         if (options_.sasl) {
             // The superuser must exist before the Kafka-API readiness probes

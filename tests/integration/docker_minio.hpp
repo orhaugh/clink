@@ -27,6 +27,8 @@
 #include <string_view>
 #include <thread>
 
+#include "docker_command.hpp"
+
 namespace clink::test {
 
 class DockerMinio {
@@ -43,10 +45,10 @@ public:
             ":9000 -e MINIO_ROOT_USER=" + std::string{kAccessKey} +
             " -e MINIO_ROOT_PASSWORD=" + std::string{kSecretKey} + " " +
             (trace ? std::string{"-e MINIO_HTTP_TRACE=/dev/stderr "} : std::string{}) + "--name " +
-            container_name_ +
-            " minio/minio:RELEASE.2025-09-07T16-13-09Z server /data > /dev/null 2>&1";
-        if (std::system(cmd.c_str()) != 0) {
-            throw std::runtime_error("DockerMinio: docker run failed");
+            container_name_ + " minio/minio:RELEASE.2025-09-07T16-13-09Z server /data";
+        if (const auto started = run_docker_command(cmd); started.status != 0) {
+            throw std::runtime_error("DockerMinio: docker run failed (exit " +
+                                     std::to_string(started.status) + "): " + started.out);
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
         const std::string probe = "curl -fsS http://127.0.0.1:" + std::to_string(port_) +

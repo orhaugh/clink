@@ -12,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+#include "docker_command.hpp"
+
 namespace clink::test {
 
 // RAII wrapper that spins up a Postgres container via the Docker CLI for
@@ -64,10 +66,9 @@ public:
             cmd += " ";
             cmd += a;
         }
-        cmd += " > /tmp/clink_docker_id.txt 2>&1";
-        const int rc = std::system(cmd.c_str());
-        if (rc != 0) {
-            throw std::runtime_error("docker run failed (rc=" + std::to_string(rc) + ")");
+        if (const auto started = run_docker_command(cmd); started.status != 0) {
+            throw std::runtime_error("DockerPostgres: docker run failed (exit " +
+                                     std::to_string(started.status) + "): " + started.out);
         }
 
         // Poll libpq until the server accepts connections or we time out.
