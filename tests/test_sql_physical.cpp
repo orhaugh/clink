@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/job_graph.hpp"
 #include "clink/config/json.hpp"
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
@@ -3180,6 +3181,40 @@ TEST(SqlPhysical, InAndNotInEmitSemiJoinRow) {
         ASSERT_NE(op, nullptr);
         EXPECT_EQ(op->params.at("anti"), "1");
         EXPECT_EQ(op->params.at(std::string{cluster::kForcedSingletonParam}), "true");
+    }
+}
+
+// The Delta and Iceberg sinks write from subtask 0 alone, so the plan keeps
+// them on one subtask whatever parallelism the job is fanned out to, with the
+// operators in front fanning in. They used to fan out with the job, and every
+// subtask beside the writer took its share of the rows and dropped it.
+TEST(SqlPhysical, SingleWriterTableSinksStayOnOneSubtask) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE clicks (user_id BIGINT, url TEXT) "
+        "WITH (connector='file', format='json', path='/tmp/clicks.ndjson');"
+        "CREATE TABLE lake (user_id BIGINT, url TEXT) "
+        "WITH (connector='delta', format='json', path='/tmp/lake');"
+        "CREATE TABLE ice (user_id BIGINT, url TEXT) "
+        "WITH (connector='iceberg', format='json', warehouse='/tmp/wh', table='ice')");
+    for (std::size_t i = 0; i < 3; ++i) {
+        cat.register_table(std::get<ast::CreateTableStmt>(s.statements[i]));
+    }
+    PhysicalPlanner pp;
+    for (const auto& [target, sink_type] :
+         {std::pair{"lake", "delta_row_sink"}, std::pair{"ice", "iceberg_row_sink"}}) {
+        const std::string sql = std::string{"INSERT INTO "} + target +
+                                " SELECT user_id, url FROM clicks WHERE user_id > 0";
+        auto plan = bind_insert(cat, sql.c_str());
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        cluster::apply_job_parallelism(spec, 4);
+        const auto* sink = find_op(spec, sink_type);
+        ASSERT_NE(sink, nullptr) << sink_type;
+        EXPECT_TRUE(cluster::is_forced_singleton(*sink)) << sink_type;
+        EXPECT_EQ(sink->parallelism, 1u) << sink_type;
+        const auto* source = find_op(spec, "file_json_source");
+        ASSERT_NE(source, nullptr);
+        EXPECT_EQ(source->parallelism, 4u) << "the rest of the plan still fans out";
     }
 }
 

@@ -12968,6 +12968,13 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (path.empty()) {
                 throw std::runtime_error("delta_row_sink: 'path' (the table root) is required");
             }
+            if (ctx.parallelism > 1) {
+                // Only subtask 0 writes; the others would drop their rows.
+                throw std::runtime_error(
+                    "delta_row_sink: a single-writer table sink, so it requires parallelism 1 "
+                    "(a subtask beside the writer would drop its share of the rows); give the "
+                    "sink operator parallelism 1, as SQL plans it");
+            }
             DeltaRowSinkOptions o;
             o.table_root = path;
             o.batcher =

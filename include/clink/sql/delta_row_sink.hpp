@@ -48,6 +48,7 @@
 #include "clink/connectors/arrow_s3_lifecycle.hpp"
 #include "clink/connectors/delta_log.hpp"
 #include "clink/core/arrow_batcher.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/sql/row.hpp"
 
@@ -106,11 +107,11 @@ public:
     }
 
     void on_barrier(CheckpointBarrier /*b*/) override { commit_current_(); }
-
     // The interval's log version must be committed before the checkpoint is
     // acknowledged, which follows this hook only while the sink owns its chain's
     // checkpoint, so Dag::add_sink refuses another sink beside it.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+
     void close() override {
         if (!dormant_) {
             commit_current_();  // flush the tail interval
@@ -246,11 +247,27 @@ private:
         body += clink::delta::commit_info_action_json(ts, "WRITE") + "\n";
         body += clink::delta::add_action_json(cur_data_rel_, size, ts, cur_records_) + "\n";
 
-        const std::string log_path = log_dir_() + "/" + clink::delta::version_filename(version_);
-        auto log_out = value_or_throw_(fs_->OpenOutputStream(log_path), "open log file");
-        ensure_ok_(log_out->Write(body.data(), static_cast<std::int64_t>(body.size())),
-                   "write log");
+        // The version is the appearance of <N>.json, so the entry must never be
+        // seen half written: a reader, and the next open's version count, would
+        // both take an empty or torn file as the commit. An object store
+        // publishes an object only when its upload completes; on a local disk
+        // the entry is written beside it under a hidden name and renamed into
+        // place, which a Delta reader's listing ignores until then.
+        const std::string log_name = clink::delta::version_filename(version_);
+        const std::string log_path = log_dir_() + "/" + log_name;
+        const bool local = fs_->type_name() == "local";
+        const std::string write_path = local ? log_dir_() + "/." + log_name + ".tmp" : log_path;
+        auto log_out = value_or_throw_(fs_->OpenOutputStream(write_path), "open log file");
+        const auto fault = CLINK_FAULT_POINT(clink::fault::points::kDeltaLogWrite);
+        const std::size_t to_write = fault.truncate_to(body.size());
+        ensure_ok_(log_out->Write(body.data(), static_cast<std::int64_t>(to_write)), "write log");
+        if (fault.is_truncate()) {
+            throw std::runtime_error(opts_.name + ": injected torn write of " + write_path);
+        }
         ensure_ok_(log_out->Close(), "close log");
+        if (local) {
+            ensure_ok_(fs_->Move(write_path, log_path), "publish log");
+        }
 
         ++version_;
         cur_data_rel_.clear();

@@ -22,6 +22,7 @@
 #include "clink/connectors/delta_log.hpp"
 #include "clink/connectors/parquet_source.hpp"
 #include "clink/core/record.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/sql/delta_row_sink.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
@@ -122,6 +123,64 @@ TEST(DeltaLog, ProtocolAndMetadataActions) {
 }
 
 // ---- Local round-trip through DeltaRowSink ----
+
+// A log entry torn by a death mid-write is never taken as a version. The
+// entry used to be written straight to _delta_log/<N>.json, so a process
+// killed between creating the file and finishing it left an empty or partial
+// <N>.json: a Delta reader failed on it, and the next run took it as version N
+// and committed after it. It is now written under a hidden name and renamed
+// into place.
+TEST(DeltaSink, ATornLogEntryIsNeverAVersion) {
+#if !CLINK_FAULT_ENABLED
+    GTEST_SKIP() << "needs a build with fault injection";
+#else
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_delta_torn_" + std::to_string(static_cast<long>(::getpid())));
+    std::filesystem::remove_all(root);
+    const auto make_sink = [&] {
+        DeltaRowSinkOptions o;
+        o.table_root = root.string();
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return std::make_unique<DeltaRowSink>(std::move(o));
+    };
+    {
+        auto sink = make_sink();
+        sink->open();
+        Batch<Row> b;
+        b.emplace(make_row(1, "a"));
+        sink->on_data(b);
+        const clink::fault::ScopedFault torn(
+            clink::fault::Rule{.point = clink::fault::points::kDeltaLogWrite,
+                               .ordinal = 1,
+                               .action = clink::fault::Action::Truncate,
+                               .arg = 5});
+        EXPECT_THROW(sink->on_barrier(CheckpointBarrier{CheckpointId{1}}), std::runtime_error);
+    }
+    // The next run commits version 0, and every version parses.
+    {
+        auto sink = make_sink();
+        sink->open();
+        Batch<Row> b;
+        b.emplace(make_row(1, "a"));
+        sink->on_data(b);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink->close();
+    }
+    std::vector<std::filesystem::path> versions;
+    for (const auto& e : std::filesystem::directory_iterator(root / "_delta_log")) {
+        const auto name = e.path().filename().string();
+        if (name.size() == 25 && name.compare(20, 5, ".json") == 0) {
+            versions.push_back(e.path());
+        }
+    }
+    ASSERT_EQ(versions.size(), 1u) << "the torn entry became a version";
+    EXPECT_EQ(versions[0].filename().string(), "00000000000000000000.json");
+    for (const auto& line : read_lines(versions[0])) {
+        EXPECT_NO_THROW((void)cfg::parse(line)) << line;
+    }
+    std::filesystem::remove_all(root);
+#endif
+}
 
 TEST(DeltaSink, WritesValidDeltaTableWithTwoCommits) {
     // CLINK_DELTA_KEEP_DIR lets an external reader (delta-rs / DuckDB) validate the

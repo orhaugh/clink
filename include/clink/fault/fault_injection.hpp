@@ -390,6 +390,11 @@ inline constexpr char kSinkAfterTeardown[] = "sink.after_teardown";
 // transaction lands, or does not; a death here leaves the marker, and the
 // next open settles again.
 inline constexpr char kSinkOrphanDescribed[] = "sink.orphan_described";
+// The Delta sink is writing an interval's log entry, _delta_log/<N>.json, whose
+// appearance is the commit. Truncate writes only `arg` bytes of it and then
+// throws, standing for a process killed mid-write; the entry must not then be
+// visible as version N.
+inline constexpr char kDeltaLogWrite[] = "delta.log_write";
 
 // Sharded keyed stage: a shard whose operator threw, between closing its
 // input queue and delivering its failure for the control round in flight.

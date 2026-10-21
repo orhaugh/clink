@@ -2606,6 +2606,14 @@ std::string compile_node(const LogicalPlan& node,
             for (const auto& [k, v] : binding.extra_params) {
                 op.params[k] = v;  // binding-forced params override passed-through WITH-options
             }
+            if (op.type == "delta_row_sink" || op.type == "iceberg_row_sink") {
+                // A single-writer table sink: only subtask 0 commits to the
+                // table, and a subtask beside it would drop its share of the
+                // rows. Kept on one subtask whatever the job's parallelism, with
+                // the operators in front fanning in to it.
+                op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+                op.parallelism = 1;
+            }
             // #56: tell the sink which columns are DECIMAL(p,s) so it quantises
             // the value to the column scale on assignment and renders clean.
             std::string dec_csv;

@@ -20574,6 +20574,28 @@ TEST(SqlRuntime, DeadLetterPayloadWritesNonFiniteAsNull) {
     EXPECT_TRUE(clink::config::parse(recs[0].payload).at("amt").is_null());
 }
 
+// The Delta sink writes from subtask 0 alone, so its factory refuses a
+// parallelism above 1, and SQL plans it as a singleton
+// (SqlPhysical.SingleWriterTableSinksStayOnOneSubtask). A subtask beside the
+// writer used to take its share of the rows and drop it.
+TEST(SqlRuntime, TheDeltaSinkRefusesAParallelismAbove1) {
+    ensure_sql_installed_once();
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_sink(
+        "delta_row_sink", cluster::ChannelType{"row"});
+    ASSERT_NE(factory, nullptr);
+    cluster::OperatorBuildContext ctx;
+    ctx.params = {{"path", "/nonexistent/clink-delta-refusal"}};
+    ctx.parallelism = 2;
+    ctx.subtask_idx = 1;
+    try {
+        (void)factory->build(ctx);
+        ADD_FAILURE() << "built at parallelism 2";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("requires parallelism 1"), std::string::npos)
+            << e.what();
+    }
+}
+
 // The SQL sinks that keep their output across a restore by write-through state
 // or by appending files must own their chain's checkpoint, and the partitioned
 // file sink writes out at every barrier: its lines used to wait in each

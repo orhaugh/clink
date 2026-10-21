@@ -123,6 +123,13 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   schema_columns (required for the typed columns)
     reg.register_sink<Row>(
         "iceberg_row_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<Row>> {
+            if (ctx.parallelism > 1) {
+                // Only subtask 0 writes; the others would drop their rows.
+                throw std::runtime_error(
+                    "iceberg_row_sink: a single-writer table sink, so it requires parallelism 1 "
+                    "(a subtask beside the writer would drop its share of the rows); give the "
+                    "sink operator parallelism 1, as SQL plans it");
+            }
             IcebergRowSinkOptions o;
             o.warehouse = ctx.param_or("warehouse", "");
             if (o.warehouse.empty()) {

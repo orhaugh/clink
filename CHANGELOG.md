@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**The Delta and Iceberg sinks stay on one subtask, and a Delta log entry is
+never torn.** Both write from subtask 0 alone, and SQL fanned them out with the
+job's parallelism, so every subtask beside the writer took its share of the
+rows and dropped it. SQL now plans them as singletons, the operators in front
+fanning in, and their factories refuse a parallelism above 1; a job graph saved
+with either sink above parallelism 1 is refused at deploy and has to be planned
+again. The Delta sink wrote each log entry, `_delta_log/<N>.json`, in place on
+a local disk, so a process killed while writing it left an empty or partial
+entry that a reader failed on and the next run took as version N; it now writes
+the entry under a hidden name and renames it into place.
+
 **Integers past 2^53 reach every sink exactly.** Several sinks read a JSON
 integer through a double, which holds integers only up to 2^53, so
 9007199254740993 was written as 9007199254740992: the MySQL and PostgreSQL
