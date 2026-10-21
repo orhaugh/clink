@@ -216,6 +216,7 @@ The factories are also reachable through the registry on the `string` channel as
 
 ## Limitations
 
+- Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - The cursor source uses the MySQL text protocol, so every cell is delivered as a string; numeric and date typing depends on the downstream Row bridge coercing to declared column types.
 - A VARCHAR `cursor_column` orders lexically (so `'10' < '9'`); choose a numeric or zero-padded key.
 - A non-unique `cursor_column` can drop rows at a page boundary unless `id_column` is set as a unique tie-breaker.

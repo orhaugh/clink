@@ -144,6 +144,7 @@ The source reports `is_bounded() == true`: it reads a single Parquet object to i
 
 ## Limitations
 
+- The 2PC sink must be the only sink on its chain: at every checkpoint barrier it prepares the interval's transaction and stages its handle in the checkpoint, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - The source reads one Parquet file with `path`, or every matching file under `prefix` (an HDFS directory), or under `path` when `path` names a directory (the factory checks with `GETFILESTATUS` when it builds the source). With `prefix`, `WebHdfsMultiObjectParquetSource` enumerates the directory via a `LISTSTATUS` call, sorts the files, and shards them round-robin across subtasks (file `i` is read by subtask `i % parallelism`), reading each through the single-object source. Optional param: `suffix` (default `.parquet`). The directory listing is non-recursive (`LISTSTATUS` direct children only) and there is no cross-file replay.
 - WebHDFS has no incremental upload, so a part is buffered in memory until it closes: one checkpoint interval's output per subtask (a job without checkpointing buffers its whole output).
 - The default sink (`path`, a directory of part files) is at-least-once; the `prefix` 2PC sink is exactly-once (atomic HDFS RENAME on checkpoint commit).

@@ -54,7 +54,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {},
         .available_in_sql = true,
         .limitations = {"publish has no producer dedup: a replayed tail is re-published",
-                        "a consumer whose durable is deleted loses its redelivery state"},
+                        "a consumer whose durable is deleted loses its redelivery state",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

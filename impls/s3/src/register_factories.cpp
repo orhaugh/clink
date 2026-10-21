@@ -81,7 +81,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .available_in_sql = true,
         .limitations = {"an abandoned multipart upload keeps consuming storage until an "
                         "expiry lifecycle rule removes it - configure one",
-                        "S3 requires every part except the last to be at least 5 MiB"},
+                        "S3 requires every part except the last to be at least 5 MiB",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
         .required_options_for_exactly_once = {"bucket"},
     });
 

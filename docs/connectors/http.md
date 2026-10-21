@@ -276,6 +276,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 
 ## Limitations
 
+- Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - All connectors carry records as `std::string` only; there is no int64 or typed-Arrow channel. On the SQL path rows are serialised to JSON strings.
 - No two-phase commit on any sink; exactly-once delivery is not offered. The SQL planner rejects `exactly_once` and `upsert` modes on these sinks.
 - HTTPS works only if cpp-httplib was built with OpenSSL; otherwise an `https://` URL is rejected at construction.

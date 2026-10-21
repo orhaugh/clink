@@ -284,7 +284,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"a crash can leave orphaned staging objects; expire <prefix>/staging"},
+        .limitations = {"a crash can leave orphaned staging objects; expire <prefix>/staging",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
         .required_options_for_exactly_once = {"bucket", "prefix"},
     });
 

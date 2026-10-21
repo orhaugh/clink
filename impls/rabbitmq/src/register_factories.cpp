@@ -55,9 +55,10 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations =
-            {"publish has no producer dedup: a replayed tail is re-published",
-             "redelivery order after a crash is queue order, not original consume order"},
+        .limitations = {"publish has no producer dedup: a replayed tail is re-published",
+                        "redelivery order after a crash is queue order, not original consume order",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

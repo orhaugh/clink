@@ -154,6 +154,7 @@ src.open();
 
 ## Limitations
 
+- The `file` text sink, the `parquet` rolling sink and both 2PC sinks must each be the only sink on their chain: at every checkpoint barrier the first two write out what they received before the barrier and the 2PC sinks prepare the interval, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - The `parquet` source's multi-object directory read (`prefix`) shards by object across same-parallelism subtasks; cross-parallelism rescale of the assignment is not coordinated.
 - No Hive-partition pruning or column projection on the Parquet read path; the whole file is read.
 - The `file` text sink truncates on open unless the run restores from a checkpoint, and the partitioning sink is append-only.

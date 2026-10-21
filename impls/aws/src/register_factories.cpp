@@ -67,7 +67,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {"poll_interval_ms"},
         .available_in_sql = true,
-        .limitations = {"resharding while a job is running is not rebalanced until restart"},
+        .limitations = {"resharding while a job is running is not rebalanced until restart",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "firehose",
@@ -89,8 +91,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations =
-            {"no producer dedup: a replayed batch is re-appended to the delivery stream"},
+        .limitations = {"no producer dedup: a replayed batch is re-appended to the delivery stream",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "dynamodb",
@@ -115,7 +118,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"UnprocessedItems are retried max_retries times, then the flush fails"},
+        .limitations = {"UnprocessedItems are retried max_retries times, then the flush fails",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

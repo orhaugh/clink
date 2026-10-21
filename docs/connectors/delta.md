@@ -75,6 +75,7 @@ The sink carries no capability record, so it does not appear in `clink --capabil
 
 ## Limitations
 
+- The sink must be the only sink on its chain: at every checkpoint barrier it commits the interval's log version, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - Append-only: no `UPDATE`, `DELETE`, `MERGE` or compaction (these need deletion vectors or a Delta kernel), and `mode='upsert'` is refused.
 - At-least-once only: `delivery_guarantee='exactly_once'` is refused.
 - Unpartitioned tables only; `partition_by` is not honoured.

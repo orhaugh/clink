@@ -107,6 +107,10 @@ public:
 
     void on_barrier(CheckpointBarrier /*b*/) override { commit_current_(); }
 
+    // The interval's log version must be committed before the checkpoint is
+    // acknowledged, which follows this hook only while the sink owns its chain's
+    // checkpoint, so Dag::add_sink refuses another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
     void close() override {
         if (!dormant_) {
             commit_current_();  // flush the tail interval

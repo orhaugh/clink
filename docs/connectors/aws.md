@@ -183,6 +183,7 @@ None of the sinks offer two-phase-commit exactly-once. On exhausted retries each
 
 ## Limitations
 
+- Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - Module only configures when the kinesis, firehose and dynamodb SDK components are present; the prebuilt `clink-build:latest` image ships only the s3 component, so the module is not built there.
 - String channel only; every record is a string (JSON object string on the SQL path). No int64 channel, no Arrow/Parquet encoding on this path.
 - Firehose, DynamoDB and the Kinesis source/sink are the four registered factories; there is no Kinesis Firehose source and no DynamoDB source.

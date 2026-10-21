@@ -171,6 +171,7 @@ Honest caveat (stated in `redis_source.hpp`): `XACK` is an external side effect 
 
 ## Limitations
 
+- Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - String channel only; record type is fixed to `std::string` for both factories.
 - Sink is append-only at-least-once with no two-phase commit and no producer dedup; `mode='upsert'` is rejected on the SQL path.
 - A source entry round-trips verbatim only when it carries the single configured `field` (default `v`); any other entry is rendered as a JSON object of all field/value pairs, with all values string-typed (Redis bulk strings).

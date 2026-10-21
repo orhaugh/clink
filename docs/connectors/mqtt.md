@@ -147,6 +147,7 @@ Sink. End-to-end the sink is at-least-once regardless of QoS. `flush()` (called 
 
 ## Limitations
 
+- The sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - String channel only: payloads are opaque `std::string` values, published and emitted verbatim. There is no Arrow or Parquet encoding and no typed (for example int64) channel.
 - The sink publishes to a single fixed `topic`; there is no per-record topic routing.
 - `include_topic=true` assumes UTF-8 text payloads; for binary payloads use the default verbatim mode.

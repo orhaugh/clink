@@ -74,7 +74,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {"ack_timeout_ms"},
         .available_in_sql = false,  // no connector='mqtt' binding in the SQL planner
         .limitations = {"qos=0 is fire-and-forget (at-most-once) on both sides",
-                        "a clean session discards the redelivery state recovery depends on"},
+                        "a clean session discards the redelivery state recovery depends on",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

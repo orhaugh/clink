@@ -142,6 +142,7 @@ The source reads a single Parquet object to its last row group and reports `is_b
 
 ## Limitations
 
+- The `gcs_parquet_2pc` sink must be the only sink on its chain: at every checkpoint barrier it prepares the interval's transaction and stages its handle in the checkpoint, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - The source reads one object with `key`, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). There is no Hive-partition pruning or column projection on either path.
 - Channels are limited to `int64` and `string`; there are no other typed factories.
 - The factory sink rolls parts at checkpoint barriers only (no size-based rollover) and is at-least-once. For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages and atomically promotes one file per checkpoint.

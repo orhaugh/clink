@@ -152,6 +152,7 @@ A data file staged before a crash whose checkpoint never completed is an orphan 
 
 ## Limitations
 
+- The sink must be the only sink on its chain: at every checkpoint barrier it prepares the interval's transaction and stages its handle in the checkpoint, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - Sink only; there is no Iceberg source.
 - Single-writer: only subtask 0 writes; other subtasks are dormant and produce no files. The `clink.checkpoint-id` idempotency marker protects against this writer's own redelivery or replay only. It is a precondition, not enforced, that no other job writes the same table concurrently; a foreign concurrent writer could defeat the idempotency scan.
 - Partitioning is identity only, on INT/LONG/BOOL/STRING columns; bucket, truncate and temporal transforms are not supported, nor are float/double partition columns. Partition values must be present and non-null. A high-cardinality partition column produces many open writers and small files per interval, so prefer bounded-cardinality keys and run Iceberg compaction.

@@ -101,7 +101,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"XADD has no dedup: a replayed tail is re-appended to the stream"},
+        .limitations = {"XADD has no dedup: a replayed tail is re-appended to the stream",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "redis_upsert",
@@ -124,7 +126,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"changelog contract: deletes are DEL by key"},
+        .limitations = {"changelog contract: deletes are DEL by key",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

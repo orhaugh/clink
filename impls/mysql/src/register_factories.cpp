@@ -92,7 +92,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .available_in_sql = true,
         .limitations =
             {"the plain sink has no transaction tied to the checkpoint; XA is not implemented",
-             "query source re-reads from the start on restart"},
+             "query source re-reads from the start on restart",
+             "the sink must be the only sink on its chain: Dag::add_sink refuses another sink "
+             "beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "mysql_upsert",
@@ -115,7 +117,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"requires a PRIMARY KEY or UNIQUE index matching key_columns"},
+        .limitations = {"requires a PRIMARY KEY or UNIQUE index matching key_columns",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

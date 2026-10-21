@@ -137,6 +137,7 @@ The source reads a single object to its last row group and reports itself as bou
 
 ## Limitations
 
+- The factory sink and the 2PC sink must each be the only sink on their chain: at every checkpoint barrier the factory sink completes the interval's part and the 2PC sink prepares the interval, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - The factory sink writes part objects under one prefix; there is no Hive-partitioned write. The programmatic `ParquetS3Sink<T>` writes one object at `bucket/key` (or one per distinct `bucket_assigner` key). The source reads one object with `key` or every object under `prefix` (sharded across subtasks), but neither side performs Hive-partition pruning or column projection.
 - Channel types are limited to `int64` and `string` (the four registered factories); other record types are not registered.
 - The SQL frontend exposes only the `string` factories under `connector='s3_parquet'`; `int64` is programmatic-only.

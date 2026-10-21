@@ -484,6 +484,7 @@ SELECT source: the cursor is the row index into the materialised result set. A r
 
 ## Limitations
 
+- Each sink must be the only sink on its chain: at every checkpoint barrier the at-least-once and upsert sinks write out what they received before the barrier, and the exactly-once sink prepares its transaction and stages its handle in the checkpoint, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - The default sink (`postgres_sink`) writes one batched multi-row INSERT per flush and is at-least-once. Exactly-once needs `delivery_guarantee='exactly_once'` (the `postgres_2pc_sink` variant) and a server with `max_prepared_transactions > 0`.
 - `mode='upsert'` requires a PRIMARY KEY (the conflict target + delete key) and is effectively-once, not two-phase commit. `mode='upsert'` combined with `delivery_guarantee='exactly_once'` is rejected (pick one). For a plain append stream, `on_conflict='update'` on the default sink is the lighter idempotent-by-key option.
 - The SELECT source is snapshot mode only: it runs the query once at `open()` and closes when the result set is exhausted. There is no incremental polling or `refresh_interval` behaviour (the field is reserved and ignored).

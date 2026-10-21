@@ -149,6 +149,7 @@ Both directions are at-least-once.
 
 ## Limitations
 
+- The sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - String record type only; there is no int64 or Arrow channel for this connector.
 - Sink requires a pre-existing JetStream stream bound to the target subject; stream provisioning is not performed by the connector.
 - No producer dedup key (`Nats-Msg-Id`) is set, so exactly-once and upsert are unsupported (enforced by the SQL planner).

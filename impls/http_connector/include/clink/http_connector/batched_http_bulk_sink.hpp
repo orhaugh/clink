@@ -129,6 +129,13 @@ public:
         // and only the transient failures stay active for the next attempt - the
         // succeeded records are never re-sent.
         std::vector<std::size_t> active(n);
+    // With the barrier flush on, as every factory sets it, the barrier writes
+    // out everything received before it, which is the at-least-once guarantee
+    // only while the sink owns its chain's checkpoint, so Dag::add_sink refuses
+    // another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override {
+        return opts_.flush_on_barrier;
+    }
         for (std::size_t i = 0; i < n; ++i) {
             active[i] = i;
         }

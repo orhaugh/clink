@@ -254,6 +254,11 @@ public:
 
     // The rows received before this barrier become one complete part.
     void on_barrier(CheckpointBarrier /*b*/) override { finish_part_(); }
+    // A restore keeps the parts written before its checkpoint and replays the
+    // rest, so the part must be complete before the checkpoint is acknowledged,
+    // which follows this hook only while the sink owns its chain's checkpoint.
+    // Dag::add_sink therefore refuses another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
 
     // End of input: the rows after the last barrier become the final part.
     void flush() override { finish_part_(); }

@@ -156,6 +156,10 @@ public:
         // Emit in chunks of <= batch_records; pending_ is already key-deduped so
         // no chunk carries two items with the same primary key.
         std::vector<Aws::DynamoDB::Model::WriteRequest> chunk;
+    // Its barrier hook writes out everything it received before the barrier,
+    // which is its guarantee only while it owns its chain's checkpoint, so
+    // Dag::add_sink refuses another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
         chunk.reserve(opts_.batch_records);
         try {
             for (auto& [key, item] : pending_) {

@@ -41,7 +41,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {},
         .available_in_sql = false,  // no connector='mongo' binding in the SQL planner
         .limitations = {"effectively-once only with on_duplicate='replace' and a stable key_field",
-                        "a resume token older than the oplog window cannot resume"},
+                        "a resume token older than the oplog window cannot resume",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

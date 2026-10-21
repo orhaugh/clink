@@ -300,6 +300,13 @@ public:
         aborts_.push_back(checkpoint_id);
     }
 
+    // Its barrier hook stages the epoch that checkpoint's commit publishes, so
+    // the checkpoint must not complete first: a commit that arrived before the
+    // stage would find nothing, and the epoch would stay pending for good. The
+    // acknowledgement follows this hook only while the sink owns its chain's
+    // checkpoint, so Dag::add_sink refuses another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+
     std::string name() const override { return "transactional-test-sink"; }
 
     // ---- Inspection (locked copies) ----

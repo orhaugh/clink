@@ -495,6 +495,21 @@ jobs:
         # no toolchain: it must run on every push regardless.
         run: ./scripts/check-qualification-status.py
 
+  sink-ownership:
+    name: Every shipped sink is classified for checkpoint ownership
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sink classes and scripts/sink-ownership.txt agree
+        # A sink whose guarantee needs the checkpoint's acknowledgement to
+        # follow its own barrier hook declares it, and Dag::add_sink then
+        # refuses another sink beside it. A sink that forgets loses that
+        # refusal without a sound, so every sink class in shipped code is
+        # listed as owning its chain's checkpoint or as free with the reason,
+        # and each entry must match what the class declares. No build, no
+        # toolchain: it runs on every push.
+        run: ./scripts/check-sink-ownership.py
+
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04

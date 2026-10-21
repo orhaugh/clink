@@ -105,6 +105,7 @@ To obtain the sink from the plugin registry, look it up by the factory name `cas
 
 ## Limitations
 
+- Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - Sink only. There is no source; Cassandra is a serving store, not an unbounded streaming log.
 - Single record channel: `std::string`, where each record must be a JSON object string. There is no typed or Arrow channel.
 - Rows are written with `INSERT ... JSON`, so column mapping is by JSON field name and Cassandra's own type coercion. The schema must already exist.

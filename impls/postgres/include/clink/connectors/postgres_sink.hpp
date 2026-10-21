@@ -49,6 +49,12 @@ public:
 
     void open() override;
     void on_data(const Batch<std::vector<std::string>>& batch) override;
+    // A checkpoint barrier commits what is buffered, so no row the checkpoint
+    // covers is still waiting for a size or time trigger. That is the sink's
+    // guarantee only while it owns its chain's checkpoint, so Dag::add_sink
+    // refuses another sink beside it.
+    void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
     void flush() override;
     void close() override;
 

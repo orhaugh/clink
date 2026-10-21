@@ -44,7 +44,9 @@ void declare_builtin_capabilities() {
         .available_in_sql = true,
         .limitations = {"the plain sink appends as it goes, so a restart re-emits "
                         "post-checkpoint records; use file_2pc for exactly-once output",
-                        "one file per subtask - parallelism > 1 suffixes the path"},
+                        "one file per subtask - parallelism > 1 suffixes the path",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     // ---- file_2pc -------------------------------------------------------
@@ -76,7 +78,9 @@ void declare_builtin_capabilities() {
         .limitations = {"a staging file for a checkpoint that never completed is left in "
                         "staging/ for manual cleanup - recovery will not auto-abort it, "
                         "because a half-written file cannot be told apart from a "
-                        "commit that failed"},
+                        "commit that failed",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
         // dir OR path: the C++ factory takes `dir`, the SQL DDL supplies
         // `path`. Naming only one spelling would reject valid SQL jobs.
         .required_options_for_exactly_once = {"dir|path"},
@@ -120,7 +124,9 @@ void declare_builtin_capabilities() {
         .available_in_sql = true,
         .limitations = {"offset granularity is the record batch: a restore resumes at the "
                         "next unread batch",
-                        "use parquet_2pc for checkpoint-tied output"},
+                        "use parquet_2pc for checkpoint-tied output",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     // ---- parquet_2pc ----------------------------------------------------
@@ -145,7 +151,9 @@ void declare_builtin_capabilities() {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"same staging-file cleanup caveat as file_2pc"},
+        .limitations = {"same staging-file cleanup caveat as file_2pc",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
         // dir OR path: the C++ factory takes `dir`, the SQL DDL supplies
         // `path`. Naming only one spelling would reject valid SQL jobs.
         .required_options_for_exactly_once = {"dir|path"},

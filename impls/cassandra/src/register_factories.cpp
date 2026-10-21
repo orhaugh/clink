@@ -65,7 +65,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {"connect_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"effectively-once only when the table's PRIMARY KEY identifies the record"},
+        .limitations = {"effectively-once only when the table's PRIMARY KEY identifies the record",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "cassandra_upsert",
@@ -88,7 +90,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {"connect_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"changelog contract: deletes are DELETE by key, not tombstone-managed"},
+        .limitations = {"changelog contract: deletes are DELETE by key, not tombstone-managed",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

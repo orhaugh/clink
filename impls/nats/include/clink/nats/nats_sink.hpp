@@ -38,6 +38,10 @@ public:
     void on_data(const Batch<std::string>& batch) override;
     void on_barrier(CheckpointBarrier b) override;
     void flush() override;
+    // Its barrier hook writes out everything it received before the barrier,
+    // which is its guarantee only while it owns its chain's checkpoint, so
+    // Dag::add_sink refuses another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
     void close() override;
     [[nodiscard]] std::string name() const override;
 

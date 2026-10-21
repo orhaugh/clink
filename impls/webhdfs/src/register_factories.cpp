@@ -215,7 +215,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .available_in_sql = true,
         .limitations =
             {"path= (a directory of part files) is at-least-once; exactly-once needs prefix=",
-             "a crash can leave orphaned files under <prefix>/staging"},
+             "a crash can leave orphaned files under <prefix>/staging",
+             "the sink must be the only sink on its chain: Dag::add_sink refuses another sink "
+             "beside it"},
         .required_options_for_exactly_once = {"prefix"},
     });
 

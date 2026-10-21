@@ -96,7 +96,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {"poll_interval_ms"},
         .available_in_sql = true,
         .limitations = {"records between the last poll and a crash can be delivered twice or "
-                        "missed depending on the endpoint's own semantics"},
+                        "missed depending on the endpoint's own semantics",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "elasticsearch",
@@ -121,7 +123,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {},
         .available_in_sql = true,
         .limitations = {"effectively-once only when document_id is set; without it replays "
-                        "index duplicate documents"},
+                        "index duplicate documents",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "opensearch",
@@ -146,7 +150,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {},
         .available_in_sql = true,
         .limitations = {"effectively-once only when document_id is set; without it replays "
-                        "index duplicate documents"},
+                        "index duplicate documents",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "influxdb",
@@ -170,7 +176,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"effectively-once only when timestamp_field is set"},
+        .limitations = {"effectively-once only when timestamp_field is set",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "prometheus",
@@ -195,7 +203,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"pushgateway keeps only the last push per group"},
+        .limitations = {"pushgateway keeps only the last push per group",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "splunk_hec",
@@ -217,7 +227,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"no dedup key: a replayed batch is re-indexed"},
+        .limitations = {"no dedup key: a replayed batch is re-indexed",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "pubsub",
@@ -241,7 +253,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"publish has no dedup key: a replay re-publishes"},
+        .limitations = {"publish has no dedup key: a replay re-publishes",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

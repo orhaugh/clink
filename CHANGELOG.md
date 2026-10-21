@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**Every connector sink that writes at the barrier declares it, and a gate keeps
+every shipped sink classified.** The AWS, Cassandra, HTTP family, Prometheus,
+MongoDB, MQTT, MySQL, NATS, PostgreSQL (all three, the legacy C++ sink now
+flushing at the barrier too), Pulsar, RabbitMQ, Redis, rolling Parquet and Delta
+sinks, and the public testing framework's `TransactionalTestSink`, declare that
+they gate the checkpoint's acknowledgement, so `Dag::add_sink` refuses another
+sink beside them; every two-phase-commit sink already declared it through
+`CommittingSink`. Their capability records and connector pages say so.
+`scripts/check-sink-ownership.py`, run by the pre-commit hook and CI, fails when
+a sink class in shipped code is not listed in `scripts/sink-ownership.txt` as
+owning its chain's checkpoint or as free with the reason, or when a listing
+disagrees with what the class declares.
+
 **The file sinks write out at every barrier, check their writes and keep their
 files in a restored run.** `FileSink` (`file_text_sink`, `file_json_sink`) kept
 lines in its stream's buffer until it filled or the input ended, so a

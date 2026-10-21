@@ -46,6 +46,10 @@ public:
 
 private:
     struct Impl;
+    // Its barrier hook writes out everything it received before the barrier,
+    // which is its guarantee only while it owns its chain's checkpoint, so
+    // Dag::add_sink refuses another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
     std::unique_ptr<Impl> impl_;
 };
 

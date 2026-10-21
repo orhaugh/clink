@@ -55,7 +55,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {},
         .available_in_sql = true,
         .limitations = {"publish has no producer dedup: a replayed tail is re-published",
-                        "a Shared subscription does not preserve per-key order across consumers"},
+                        "a Shared subscription does not preserve per-key order across consumers",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;

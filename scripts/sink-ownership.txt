@@ -1,0 +1,90 @@
+# Which shipped sinks must own their chain's checkpoint, checked by
+# scripts/check-sink-ownership.py against every class in include/, src/ and
+# impls/ that derives from Sink<...> or CommittingSink<...>.
+#
+#   <path>:<Class> owns
+#       The sink declares Sink::gates_checkpoint_ack() (it writes out at the
+#       barrier what it received before it) or Sink::stages_state_at_barrier()
+#       (a two-phase-commit sink; every CommittingSink). Its guarantee holds
+#       only while the checkpoint's acknowledgement follows its barrier hook,
+#       so Dag::add_sink refuses another sink beside it.
+#
+#   <path>:<Class> free <reason>
+#       The sink declares neither, and the reason says why its output needs no
+#       acknowledgement ordering: it writes nothing outside the job, the
+#       barrier travels on to a subtask that acknowledges for it, or it claims
+#       nothing a checkpoint could cover.
+#
+# A new sink class fails the check until it is listed here.
+
+# Two-phase-commit framework and its sinks
+include/clink/connectors/committing_sink.hpp:CommittingSink owns
+include/clink/connectors/file_2pc_sink.hpp:FileSink2PC owns
+include/clink/connectors/parquet_2pc_sink.hpp:ParquetSink2PC owns
+include/clink/connectors/parquet_fs_2pc_sink.hpp:ParquetFsSink2PC owns
+impls/postgres/include/clink/connectors/postgres_json_sink_2pc.hpp:PostgresJsonSink2PC owns
+impls/s3/include/clink/connectors/s3_sink_2pc.hpp:S3Sink2PC owns
+impls/webhdfs/include/clink/connectors/webhdfs_parquet_sink.hpp:WebHdfsParquetSink2PC owns
+impls/iceberg/src/iceberg_row_sink.cpp:IcebergRowSink owns
+impls/kafka/src/register_factories.cpp:TwoPhaseCommitStringKafkaSink owns
+
+# At-least-once sinks that write out at the barrier
+include/clink/connectors/file_sink.hpp:FileSink owns
+include/clink/connectors/parquet_rolling_sink.hpp:ParquetRollingSink owns
+include/clink/sql/delta_row_sink.hpp:DeltaRowSink owns
+src/cluster/built_in_file_sinks.hpp:FileLineSink owns
+src/cluster/built_in_file_sinks.hpp:FileInt64Sink owns
+impls/aws/include/clink/aws/dynamodb_sink.hpp:DynamoDbSink owns
+impls/aws/include/clink/aws/firehose_sink.hpp:FirehoseSink owns
+impls/aws/include/clink/aws/kinesis_sink.hpp:KinesisSink owns
+impls/cassandra/include/clink/cassandra/cassandra_sink.hpp:CassandraSink owns
+impls/cassandra/include/clink/cassandra/cassandra_upsert_sink.hpp:CassandraUpsertSink owns
+impls/clickhouse/include/clink/clickhouse/native_sink.hpp:NativeSinkOf owns
+impls/clickhouse/include/clink/connectors/clickhouse_sink.hpp:ClickHouseSink owns
+impls/clickhouse/src/native/native_sink.hpp:NativeSink owns
+impls/http_connector/include/clink/http_connector/batched_http_bulk_sink.hpp:BatchedHttpBulkSink owns
+impls/http_connector/include/clink/http_connector/prometheus_push_sink.hpp:PrometheusPushSink owns
+impls/kafka/include/clink/connectors/kafka_sink.hpp:KafkaSink owns
+impls/kafka/src/register_factories.cpp:StringKafkaSink owns
+impls/kafka/src/register_factories.cpp:UpsertKafkaSink owns
+impls/mongodb/src/mongo_sink.cpp:MongoSink owns
+impls/mqtt/include/clink/mqtt/mqtt_sink.hpp:MqttSink owns
+impls/mysql/include/clink/mysql/mysql_json_upsert_sink.hpp:MysqlJsonUpsertSink owns
+impls/mysql/include/clink/mysql/mysql_sink.hpp:MysqlSink owns
+impls/nats/include/clink/nats/nats_sink.hpp:NatsSink owns
+impls/postgres/include/clink/connectors/postgres_json_sink.hpp:PostgresJsonSink owns
+impls/postgres/include/clink/connectors/postgres_json_upsert_sink.hpp:PostgresJsonUpsertSink owns
+impls/postgres/include/clink/connectors/postgres_sink.hpp:PostgresSink owns
+impls/pulsar/include/clink/pulsar/pulsar_sink.hpp:PulsarSink owns
+impls/rabbitmq/include/clink/rabbitmq/rabbitmq_sink.hpp:RabbitMqSink owns
+impls/redis/include/clink/redis/redis_sink.hpp:RedisSink owns
+impls/redis/include/clink/redis/redis_upsert_sink.hpp:RedisUpsertSink owns
+include/clink/test/sources_and_sinks.hpp:TransactionalTestSink owns
+src/sql/install.cpp:FileJsonUpsertSink owns
+src/sql/install.cpp:ChangelogNetSink owns
+src/sql/install.cpp:PartitionedJsonSink owns
+src/sql/install.cpp:PartitionOverwriteSink owns
+
+# Sinks that write once, at the end of input, from what they held in memory,
+# with no checkpoint state: no checkpoint covers any of their output, so
+# acknowledgement ordering changes nothing. Their pages state what a failure
+# leaves behind.
+include/clink/connectors/parquet_sink.hpp:ParquetSink free writes one file at the end of input; a checkpoint covers none of its output
+impls/s3/include/clink/connectors/parquet_s3_sink.hpp:ParquetS3Sink free writes one object at the end of input; a checkpoint covers none of its output
+impls/gcs/include/clink/connectors/parquet_gcs_sink.hpp:ParquetGcsSink free writes one object at the end of input; a checkpoint covers none of its output
+impls/azure/include/clink/connectors/parquet_azure_sink.hpp:ParquetAzureSink free writes one object at the end of input; a checkpoint covers none of its output
+impls/webhdfs/include/clink/connectors/webhdfs_parquet_sink.hpp:WebHdfsParquetSink free writes one file at the end of input; a checkpoint covers none of its output
+impls/s3/include/clink/connectors/s3_sink.hpp:S3Sink free at-most-once by its record: puts parts by size and at the end of input, never at a barrier
+
+# In-process sinks: nothing leaves the job
+include/clink/operators/sink_operator.hpp:CollectingSink free keeps records in memory for the caller
+include/clink/operators/sink_operator.hpp:FunctionSink free hands each record to a callback and claims no delivery guarantee
+include/clink/sql/blackhole_row_sink.hpp:BlackholeRowSink free discards every record
+include/clink/test/sources_and_sinks.hpp:CollectSink free keeps records in memory for a test
+include/clink/test/sources_and_sinks.hpp:FailingSink free keeps records in memory for a test and fails on cue
+src/embed/collect_hub.cpp:CollectSink free hands rows to an in-process reader of the embedded engine
+
+# The barrier travels on: the downstream subtask acknowledges only after the
+# records ahead of the barrier have reached it
+include/clink/runtime/network/network_bridge.hpp:NetworkBridgeSink free forwards the barrier in band to the subtask that acknowledges for it
+include/clink/runtime/network/network_bridge.hpp:SwappableBridgeSink free forwards the barrier in band to the subtask that acknowledges for it

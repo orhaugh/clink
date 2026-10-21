@@ -718,7 +718,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "truncating one partition publishes nothing",
                         "a CDC snapshot interrupted by a failure is taken again and converges; "
                         "it does not resume",
-                        "the plain sink is at-least-once - use postgres_2pc or the upsert sink"},
+                        "the plain sink is at-least-once - use postgres_2pc or the upsert sink",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
@@ -747,7 +749,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "transaction that is never resolved holds locks and pins WAL "
                         "indefinitely",
                         "the prepared-transaction id must be unique per subtask and stable "
-                        "across restarts for recovery to find it"},
+                        "across restarts for recovery to find it",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
         .required_options_for_exactly_once = {"table"},
     });
 
@@ -775,7 +779,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {"connect_timeout", "statement_timeout"},
         .available_in_sql = true,
         .limitations = {"duplicates collapse only if primary_key really is unique for the row; "
-                        "clink cannot verify the target schema"},
+                        "clink cannot verify the target schema",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;
