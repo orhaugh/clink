@@ -14,7 +14,12 @@ QoS, which QoS 0 is not, and named the wrong client library; the RabbitMQ
 record listed a token authentication that does not exist. The HTTP page says
 that a Pushgateway push replaces every series of its metric in the group, and
 the MongoDB page that a plain insert of a record carrying its own `_id` fails
-on replay, and the job with it, until that record is removed.
+on replay, and the job with it, until that record is removed. The pages of the
+programmatic single-object Parquet sinks (`ParquetSink`, `ParquetS3Sink`,
+`ParquetGcsSink`, `ParquetAzureSink` and `WebHdfsParquetSink`) say that they
+keep no checkpoint state and finish their output only at close, so a cancelled
+task's output reads as complete and a run restored from a checkpoint writes
+only the rows after the restore point.
 
 **Sinks no longer report delivery over a record that went nowhere.** NATS
 JetStream reports a refused publish (a negative PubAck, or no stream bound to

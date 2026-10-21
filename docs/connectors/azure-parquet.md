@@ -152,6 +152,7 @@ The source reads a single Parquet object to its last row group and reports `is_b
 - Record channels are limited to `int64` and `string`. Only those four factories are registered.
 - The source enforces an exact schema match (excluding metadata) against the batcher and throws otherwise.
 - `compression` and `bucket_assigner` on the sink are reachable only through the programmatic API; the factory parameter parsing does not expose them.
+- The programmatic `ParquetAzureSink<T>` keeps no checkpoint state and finishes each blob only at close. Azure creates a blob when its stream opens, so one being written when the process fails is left empty or incomplete; a cancelled task closes its blobs with the rows they held, so they read as complete; and a run restored from a checkpoint writes only the rows after the restore point, so those before it are lost. Use it where a failure re-reads the input from the start; the factory sinks keep their output across a restore.
 - Writes do not auto-create the container; it must exist beforehand (see the live test, which creates it via `AzureFileSystem::CreateDir`).
 
 ## Testing

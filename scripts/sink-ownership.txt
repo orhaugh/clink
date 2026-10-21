@@ -65,15 +65,19 @@ src/sql/install.cpp:ChangelogNetSink owns
 src/sql/install.cpp:PartitionedJsonSink owns
 src/sql/install.cpp:PartitionOverwriteSink owns
 
-# Sinks that write once, at the end of input, from what they held in memory,
-# with no checkpoint state: no checkpoint covers any of their output, so
-# acknowledgement ordering changes nothing. Their pages state what a failure
-# leaves behind.
-include/clink/connectors/parquet_sink.hpp:ParquetSink free writes one file at the end of input; a checkpoint covers none of its output
-impls/s3/include/clink/connectors/parquet_s3_sink.hpp:ParquetS3Sink free writes one object at the end of input; a checkpoint covers none of its output
-impls/gcs/include/clink/connectors/parquet_gcs_sink.hpp:ParquetGcsSink free writes one object at the end of input; a checkpoint covers none of its output
-impls/azure/include/clink/connectors/parquet_azure_sink.hpp:ParquetAzureSink free writes one object at the end of input; a checkpoint covers none of its output
-impls/webhdfs/include/clink/connectors/webhdfs_parquet_sink.hpp:WebHdfsParquetSink free writes one file at the end of input; a checkpoint covers none of its output
+# Sinks that finish their output only at close (a cancelled task's close
+# included) and keep no checkpoint state: no checkpoint covers any of their
+# output, so acknowledgement ordering changes nothing. Their pages state what
+# a failure, a cancel and a restore leave behind.
+include/clink/connectors/parquet_sink.hpp:ParquetSink free finishes its file only at close; a checkpoint covers none of its output
+impls/s3/include/clink/connectors/parquet_s3_sink.hpp:ParquetS3Sink free finishes its objects only at close; a checkpoint covers none of its output
+impls/gcs/include/clink/connectors/parquet_gcs_sink.hpp:ParquetGcsSink free finishes its objects only at close; a checkpoint covers none of its output
+impls/azure/include/clink/connectors/parquet_azure_sink.hpp:ParquetAzureSink free finishes its blobs only at close; a checkpoint covers none of its output
+impls/webhdfs/include/clink/connectors/webhdfs_parquet_sink.hpp:WebHdfsParquetSink free uploads its file only at close; a checkpoint covers none of its output
+
+# A sink that writes by size and at the end of input, never at a barrier, and
+# declares that records can be lost on failure: no acknowledgement ordering
+# would change what it promises.
 impls/s3/include/clink/connectors/s3_sink.hpp:S3Sink free at-most-once by its record: puts parts by size and at the end of input, never at a barrier
 
 # In-process sinks: nothing leaves the job
