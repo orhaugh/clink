@@ -25,6 +25,12 @@
 // next bytes after any reply from the server are its data blocks. Data
 // blocks themselves are compressed, so they do not match by accident.
 //
+// For a protocol whose request is a single message, such as HTTP,
+// set_request_marker() replaces that detection: a request is client bytes
+// carrying the marker (say "POST /db/"), and drop_at_upload / hold_at_upload
+// act on the request itself. A dropped request is reset before a byte of it
+// reaches the server; a held one is forwarded whole and its reply withheld.
+//
 // Threads: one acceptor, and one pump per connection. Only a pump closes its
 // own sockets; every other call sets a flag the pump acts on within one poll
 // interval, and the calls that promise a reset wait for it.
@@ -120,6 +126,14 @@ public:
     // While on, nothing is forwarded in either direction. Connections stay
     // open and resume when it ends, unless their client gave up meanwhile.
     void set_blackhole(bool on) { blackhole_.store(on); }
+
+    // Switch to request mode (see the top of the file). Set before any
+    // connection carries a request.
+    void set_request_marker(std::string marker) {
+        const std::lock_guard<std::mutex> lock(mu_);
+        request_marker_ = std::move(marker);
+        request_mode_.store(true);
+    }
 
     // Cut the next `n` INSERT uploads before a byte of them is forwarded.
     void drop_at_upload(std::size_t n) { drop_uploads_.fetch_add(n); }
@@ -333,12 +347,15 @@ private:
         }
     }
 
-    // Whether these client bytes complete an "INSERT INTO" statement.
-    static bool carries_insert(Conn& c, const char* data, std::size_t n) {
+    // Whether these client bytes complete an "INSERT INTO" statement, or in
+    // request mode the marker.
+    bool carries_insert(Conn& c, const char* data, std::size_t n) const {
+        const std::string_view needle =
+            request_mode_.load() ? std::string_view(request_marker_) : kInsert;
         std::string window = c.tail;
         window.append(data, n);
-        const bool found = window.find(kInsert) != std::string::npos;
-        const std::size_t keep = std::min(window.size(), kInsert.size() - 1);
+        const bool found = window.find(needle) != std::string::npos;
+        const std::size_t keep = std::min(window.size(), needle.size() - 1);
         c.tail = window.substr(window.size() - keep);
         return found;
     }
@@ -379,7 +396,20 @@ private:
                 }
                 c.last_client_bytes.store(Clock::now().time_since_epoch().count());
                 const auto len = static_cast<std::size_t>(n);
-                if (carries_insert(c, buf, len)) {
+                if (request_mode_.load()) {
+                    if (carries_insert(c, buf, len)) {
+                        inserts_.fetch_add(1);
+                        if (take_one(drop_uploads_)) {
+                            dropped_uploads_.fetch_add(1);
+                            reset = true;
+                            break;
+                        }
+                        if (take_one(hold_uploads_)) {
+                            held_uploads_.fetch_add(1);
+                            c.held.store(true);
+                        }
+                    }
+                } else if (carries_insert(c, buf, len)) {
                     c.statement_seen = true;
                     c.reply_seen = false;
                     inserts_.fetch_add(1);
@@ -469,6 +499,8 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> refusing_{false};
     std::atomic<bool> blackhole_{false};
+    std::atomic<bool> request_mode_{false};
+    std::string request_marker_;
     std::atomic<std::size_t> drop_uploads_{0};
     std::atomic<std::size_t> hold_uploads_{0};
     std::atomic<std::size_t> accepted_{0};
