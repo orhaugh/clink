@@ -34,6 +34,21 @@ LocalExecutor::LocalExecutor(Dag dag, JobConfig config)
             "barrier. Build the Dag without the declaration, with each such sink alone on its "
             "chain.");
     }
+    // Parallel stages take no part in a checkpoint (Dag::has_parallel_stages):
+    // with an acknowledgement callback their checkpoints would never complete,
+    // or a completion rule counting the other runners' acknowledgements would
+    // declare one complete over state nothing captured.
+    if (dag_.has_parallel_stages() && config_.on_checkpoint_ack) {
+        throw std::logic_error(
+            "LocalExecutor: the Dag has parallel stages (add_parallel_operator, "
+            "add_parallel_sink or fork_parallel; LocalSubmitter builds them for an operator "
+            "whose parallelism is above 1), whose subtasks take no part in a checkpoint: they "
+            "neither snapshot their state nor acknowledge, so no checkpoint can cover them, but "
+            "the JobConfig sets on_checkpoint_ack. Run the Dag without an acknowledgement "
+            "callback, where each sink commits at the end of the input, or run the job on a "
+            "cluster or the embedded engine, which plan each parallel subtask as a task of its "
+            "own and complete its checkpoints.");
+    }
     if (config_.memory_budget && config_.memory_limit_bytes != 0)
         throw std::invalid_argument("set memory_budget or memory_limit_bytes, not both");
     if (!config_.memory_budget) {

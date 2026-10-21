@@ -3738,6 +3738,17 @@ public:
     //
     // Operators must be supplied as factories - each subtask gets its own
     // instance so per-subtask state stays isolated.
+    //
+    // Parallel stages take no part in a checkpoint. A barrier passes through
+    // them, aligned across each subtask's inputs, but their operator and sink
+    // subtasks snapshot nothing and acknowledge nothing, and a parallel source
+    // records its offsets but leaves the success acknowledgement to the stage
+    // at the end of its chain. Only the end-of-input barrier means anything
+    // here: each sink subtask commits it locally. LocalExecutor therefore
+    // refuses a Dag with parallel stages an acknowledgement callback (see
+    // has_parallel_stages). A cluster and the embedded engine plan each
+    // parallel subtask as a task of its own, which is where checkpoints
+    // complete.
     template <typename T>
     struct ParallelStageHandle {
         std::size_t parallelism{1};
@@ -3821,10 +3832,9 @@ public:
                         // send after persist(), and sending it here - after an
                         // in-memory put - published COMPLETED markers for
                         // checkpoints whose snapshots were not yet durable
-                        // (item 51). This is the runner a PARALLEL source
-                        // uses, so it is the one a distributed job goes
-                        // through - fixing only the other path would leave the
-                        // defect exactly where it matters most.
+                        // (item 51). A parallel source holds to the same
+                        // rule; its stage never sends the success ack at all
+                        // (see "Parallel stages").
                         const bool delivered = typed_emitter.emit_barrier(*b);
                         if (!delivered && ack_cb) {
                             ack_cb(b->id(),
@@ -4017,6 +4027,7 @@ public:
             throw std::invalid_argument(
                 "add_parallel_sink: parallelism must equal upstream or be 1 (fan-in)");
         }
+        has_parallel_stages_ = true;
         const std::size_t N = upstream.parallelism;
         const std::size_t M = parallelism;
 
@@ -4257,6 +4268,7 @@ public:
                 "Dag::fork_parallel: upstream ParallelStageHandle is malformed "
                 "(parallelism vs emitter count mismatch).");
         }
+        has_parallel_stages_ = true;
 
         // Per upstream subtask: a single forward channel that upstream
         // writes into. The fork-subtask runner drains this channel.
@@ -4815,6 +4827,15 @@ public:
         return checkpoints_can_complete_;
     }
 
+    // True once the Dag holds a parallel stage: add_parallel_operator,
+    // add_parallel_operator_shuffled, add_parallel_sink or fork_parallel. Such
+    // stages take no part in a checkpoint (see "Parallel stages" above), so no
+    // checkpoint can complete over them, and LocalExecutor refuses to run the
+    // Dag with an acknowledgement callback rather than let the checkpoints
+    // never complete, or let a completion rule counting the other runners'
+    // acknowledgements declare one complete over state nothing captured.
+    [[nodiscard]] bool has_parallel_stages() const noexcept { return has_parallel_stages_; }
+
 private:
     // Shared body of add_parallel_operator and ..._shuffled. Allocates the
     // edge channels (forward = N channels diagonal, shuffle = N×M),
@@ -4829,6 +4850,7 @@ private:
         std::function<std::size_t(const In&)> partitioner) {
         const std::size_t N = upstream.parallelism;
         const std::size_t M = parallelism;
+        has_parallel_stages_ = true;
 
         // Allocate channels.
         ParallelChannelGrid<In> channels;
@@ -5153,6 +5175,8 @@ private:
     // False once run_without_checkpoint_completion() declares this Dag will
     // run where no checkpoint can complete; see there.
     bool checkpoints_can_complete_{true};
+    // True once a parallel stage is added; see has_parallel_stages().
+    bool has_parallel_stages_{false};
     std::vector<BarrierInjector> source_injectors_;
     std::vector<OperatorId> source_ids_;
     // Boundedness recorded at registration, parallel to source_ids_ (BATCH-1).

@@ -204,6 +204,35 @@ TEST(LocalSubmitter, ParallelUniformChainSubmitsWithoutThrowing) {
     std::filesystem::remove(out_path);
 }
 
+// A pipeline above parallelism 1 runs on parallel stages, which take no part in
+// a checkpoint, so LocalExecutor refuses it an acknowledgement callback rather
+// than run checkpoints that can never complete over them. Without the callback
+// it runs, as above.
+TEST(LocalSubmitter, AParallelPipelineIsRefusedAnAcknowledgementCallback) {
+    cluster::ensure_built_ins_registered();
+    const auto out_path = std::filesystem::temp_directory_path() /
+                          ("clink_local_submitter_parallel_ack_" + std::to_string(::getpid()));
+    std::filesystem::remove(out_path);
+
+    auto env = Pipeline::create();
+    env.source<std::int64_t>(IntRangeSource::builder().count(2).start(1).build())
+        .map<std::int64_t>([](const std::int64_t& v) { return v * 10; })
+        .sink(FileInt64Sink::builder().path(out_path.string()).build());
+    auto& mutable_graph = const_cast<cluster::JobGraphSpec&>(env.graph());  // NOLINT(*-const-cast)
+    for (auto& op : mutable_graph.ops) {
+        op.parallelism = 2;
+    }
+    JobConfig config;
+    config.on_checkpoint_ack = [](CheckpointId /*id*/, bool /*ok*/, std::string /*error*/) {};
+    try {
+        cluster::LocalSubmitter::submit(env, std::move(config));
+        ADD_FAILURE() << "ran a parallel pipeline with an acknowledgement callback";
+    } catch (const std::logic_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("parallel stages"), std::string::npos) << e.what();
+    }
+    std::filesystem::remove(out_path);
+}
+
 TEST(LocalSubmitter, MixedParallelismRejected) {
     // Uniform parallelism is supported; mixing values across an edge
     // requires hash-shuffle or rebalance which are follow-ups.

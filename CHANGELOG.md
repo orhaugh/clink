@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A Dag with parallel stages is refused an acknowledgement callback.** The Dag's
+parallel stages (`add_parallel_operator`, `add_parallel_sink`, `fork_parallel`,
+which `LocalSubmitter` builds above parallelism 1) take no part in a
+checkpoint: their operator and sink subtasks snapshot and acknowledge nothing.
+`LocalExecutor` ran such a Dag with `on_checkpoint_ack` all the same, so its
+checkpoints never completed, or completed under a rule that counted the other
+runners' acknowledgements over state nothing had captured. It now refuses the
+callback, naming the parallel stages; without it, each sink still commits at
+the end of the input. Checkpoints complete on a cluster and in the embedded
+engine, which plan each parallel subtask as a task of its own.
+
 **Capability records and pages match the code.** The SQL row Parquet
 two-phase-commit sink, `parquet_row_2pc_sink`, resolved to the at-least-once
 `parquet` record, and the S3 Parquet sinks to the at-most-once `s3` record, so a

@@ -98,6 +98,8 @@ Parallelism is correct only because each subtask is independent. In `include/cli
 - `add_parallel_operator_shuffled(upstream, factory, parallelism, partitioner)`: hash-shuffle layout. Allocates an `N x M` channel grid; each upstream subtask attaches all M outputs to its `SubtaskEmitter` with the partitioner, and each downstream subtask reads from N inputs and aligns watermarks and barriers across them via `MultiInputAlignment`. Pass `make_key_group_partitioner` here to get key-consistent routing.
 - `add_parallel_sink(upstream, factory, parallelism)`: forward (`M == N`) or fan-in (`M == 1`) only. Fan-in has the single sink subtask read from all N upstream channels and align over them.
 
+These in-process stages take no part in a checkpoint, and `LocalExecutor` refuses a Dag with them an acknowledgement callback (see [checkpointing](checkpointing.md#guarantees-and-caveats)); a cluster deploys each parallel subtask as a task with a Dag of its own.
+
 `wire_stage_` is the shared body of the two operator variants: it allocates the edge channels (N for forward, `N x M` for shuffle), attaches the upstream emitters, and builds the per-subtask runners with their input channels and a fresh `SubtaskEmitter` for the next stage to wire onto.
 
 `OperatorId` derivation matters for state survival. With a uid set (`derive_id_from_uid_`), the id is a hash of `"uid/" + uid`, stable across topology edits so keyed state restores even when ops are renamed or reordered. Without a uid the legacy path hashes `"stage<idx>/<name>"`, which changes when upstream ops change, silently abandoning stale state. A uid is strongly recommended for any stateful op; duplicate uids within a `Dag` throw.

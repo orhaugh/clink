@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -413,8 +414,60 @@ TEST(SinkChainOwnership, AParallelSinkStageCommitsItsLastIntervalAtTheEndOfTheIn
     }
 }
 
-// Sinks that need no ownership still share a chain: refusing every multi-sink
-// chain would break fan-out that is safe.
+// Parallel stages take no part in a checkpoint: their operator and sink
+// subtasks snapshot nothing and acknowledge nothing. LocalExecutor ran such a
+// Dag with an acknowledgement callback all the same, so its checkpoints never
+// completed, or completed under a rule that counted the other runners'
+// acknowledgements over state nothing had captured. It now refuses the
+// callback, for a parallel sink and for a parallel operator, and still runs
+// the same Dags without one.
+TEST(SinkChainOwnership, ADagWithParallelStagesIsRefusedAnAcknowledgementCallback) {
+    const auto source = [](std::size_t subtask) -> std::shared_ptr<clink::Source<int>> {
+        const int base = static_cast<int>(subtask) * 100;
+        return std::make_shared<OwnershipScriptSource>(
+            std::vector<OwnershipStep>{ownership_rows(base, base + 10)});
+    };
+    const auto sink = [](std::size_t) -> std::shared_ptr<clink::Sink<int>> {
+        return std::make_shared<OwnershipPlainSink>();
+    };
+    const std::vector<std::pair<std::string, std::function<clink::Dag()>>> dags{
+        {"a parallel sink",
+         [&] {
+             clink::Dag dag;
+             dag.add_parallel_sink<int>(dag.add_parallel_source<int>(source, 2), sink, 1);
+             return dag;
+         }},
+        {"a parallel operator",
+         [&] {
+             clink::Dag dag;
+             auto op = dag.add_parallel_operator<int, int>(
+                 dag.add_parallel_source<int>(source, 2),
+                 [](std::size_t) -> std::shared_ptr<clink::Operator<int, int>> {
+                     return ownership_identity();
+                 },
+                 2);
+             dag.add_parallel_sink<int>(op, sink, 2);
+             return dag;
+         }},
+    };
+    for (const auto& [what, build] : dags) {
+        clink::JobConfig acknowledged;
+        acknowledged.state_backend = std::make_shared<clink::InMemoryStateBackend>();
+        acknowledged.on_checkpoint_ack = [](clink::CheckpointId, bool, std::string) {};
+        try {
+            clink::LocalExecutor refused(build(), acknowledged);
+            ADD_FAILURE() << "ran a Dag with " << what << " with an acknowledgement callback";
+        } catch (const std::logic_error& e) {
+            EXPECT_NE(std::string{e.what()}.find("parallel stages"), std::string::npos) << e.what();
+        }
+        clink::JobConfig quiet;
+        quiet.state_backend = std::make_shared<clink::InMemoryStateBackend>();
+        clink::LocalExecutor runs(build(), quiet);
+        runs.run();
+        EXPECT_TRUE(runs.operator_errors().empty()) << what;
+    }
+}
+
 // A two-phase-commit sink refuses a run without a state backend before it
 // takes a record. It used to open and take every record: with no backend its
 // prepared handles had nowhere to go and no end-of-input checkpoint came, so
@@ -470,6 +523,8 @@ TEST(SinkChainOwnership, ADagThatCompletesNoCheckpointMayShareItsChainButNotWith
     }
 }
 
+// Sinks that need no ownership still share a chain: refusing every multi-sink
+// chain would break fan-out that is safe.
 TEST(SinkChainOwnership, SinksThatNeedNoOwnershipStillShareAChain) {
     clink::Dag dag;
     auto src =

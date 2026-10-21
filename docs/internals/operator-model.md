@@ -132,6 +132,8 @@ Fan-in (N to 1) is a degenerate shuffle with M = 1: a single downstream aligns N
 
 `add_parallel_operator` requires `parallelism == upstream.parallelism` and installs the forward layout. A cross-parallelism edge requires `add_parallel_operator_shuffled` with a partitioner, which allocates the N×M channel grid; each upstream subtask's emitter is attached with the partitioner to choose the destination, and each downstream subtask reads from N inputs through `MultiInputAlignment`.
 
+Parallel stages take no part in a checkpoint: their operator and sink subtasks snapshot and acknowledge nothing, so `LocalExecutor` refuses a Dag with them an acknowledgement callback (`Dag::has_parallel_stages`; see [checkpointing](checkpointing.md#guarantees-and-caveats)). A cluster plans each parallel subtask as a task of its own instead.
+
 ### OperatorId and stable identity
 
 `OperatorId` is a `StrongId` over `std::uint64_t` (`include/clink/core/types.hpp`), a non-convertible wrapper that prevents id types being mixed up. The DAG derives ids two ways (`derive_id_with_uid_`):

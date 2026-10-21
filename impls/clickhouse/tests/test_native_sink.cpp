@@ -421,7 +421,11 @@ struct NsRig {
             h,
             [s = sink](std::size_t /*subtask*/) -> std::shared_ptr<Sink<sql::Row>> { return s; },
             1);
-        exec = std::make_unique<LocalExecutor>(std::move(dag), config);
+        // Parallel stages take no part in a checkpoint, so LocalExecutor
+        // refuses them an acknowledgement callback; no fan-in case needs one.
+        JobConfig fan_in_config = config;
+        fan_in_config.on_checkpoint_ack = nullptr;
+        exec = std::make_unique<LocalExecutor>(std::move(dag), std::move(fan_in_config));
         exec->start();
     }
 
