@@ -44,6 +44,11 @@ namespace clink::kafka {
 //
 // Stage types: kafka_source, kafka_sink, map, filter, split.
 // `input` references another stage by `name` or `name.<branch>`.
+//
+// Each kafka_sink must own its chain's checkpoint, so a pipeline with two of
+// them, as above, loads only into a Dag declared to run where no checkpoint
+// completes (Dag::run_without_checkpoint_completion); otherwise Dag::add_sink
+// refuses the second.
 class KafkaPipelineLoader {
 public:
     using MapFn = std::function<KafkaMessage(const KafkaMessage&)>;

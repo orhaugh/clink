@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -391,7 +392,9 @@ TEST(Kafka, SinkRecordsDeliveryFailureViaMetricsAndAccessors) {
     Batch<KafkaMessage> batch;
     batch.emplace(KafkaMessage{"will-fail"});
     sink_h.sink->on_data(batch);
-    sink_h.sink->flush();
+    // The record is lost, so the end of input fails rather than finishing the
+    // job over it (see ABarrierFailsWhenARecordWasNotDelivered).
+    EXPECT_THROW(sink_h.sink->flush(), std::runtime_error);
 
     EXPECT_EQ(sink_h.sink->delivered_count(), 0u);
     EXPECT_GE(sink_h.sink->delivery_error_count(), 1u);
@@ -405,6 +408,161 @@ TEST(Kafka, SinkRecordsDeliveryFailureViaMetricsAndAccessors) {
         }
     }
     EXPECT_TRUE(saw_err);
+}
+
+// The barrier waits for the brokers to acknowledge every record produced
+// before it. It used to return at once, with the records still in the
+// producer's queue, so a checkpoint could complete over records the topic did
+// not hold, and a process that died then lost them for good: the restore
+// resumed the source after them.
+TEST(Kafka, ABarrierWaitsForTheBrokersToAcknowledgeEveryRecord) {
+    MockCluster mock;
+    const std::string topic = "barrier-flush";
+    mock.create_topic(topic);
+
+    KafkaSink::Options sink_opts;
+    sink_opts.brokers = mock.brokers();
+    sink_opts.topic = topic;
+    sink_opts.metric_prefix = "barrier";
+    // Long enough that nothing but a flush sends the records during the test.
+    sink_opts.linger_ms = 10000ms;
+    SinkHarness sink_h(sink_opts);
+
+    Batch<KafkaMessage> batch;
+    for (int i = 0; i < 10; ++i) {
+        batch.emplace(KafkaMessage{"payload-" + std::to_string(i)});
+    }
+    sink_h.sink->on_data(batch);
+    sink_h.sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+
+    EXPECT_EQ(sink_h.sink->delivered_count(), 10u);
+    EXPECT_TRUE(sink_h.sink->gates_checkpoint_ack());
+}
+
+// A record the brokers refused, or never acknowledged within its timeout,
+// fails the barrier, so the checkpoint fails and the job restores and
+// replays it. Delivery failures used to be counted and nothing else.
+TEST(Kafka, ABarrierFailsWhenARecordWasNotDelivered) {
+    KafkaSink::Options sink_opts;
+    sink_opts.brokers = "127.0.0.1:1";
+    sink_opts.topic = "undeliverable";
+    sink_opts.metric_prefix = "undeliverable";
+    sink_opts.produce_timeout = 200ms;
+    sink_opts.flush_timeout = 5000ms;
+    SinkHarness sink_h(sink_opts);
+
+    Batch<KafkaMessage> batch;
+    batch.emplace(KafkaMessage{"will-fail"});
+    sink_h.sink->on_data(batch);
+    try {
+        sink_h.sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        ADD_FAILURE() << "the barrier passed over a record that was never delivered";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("1 record(s) were not delivered"), std::string::npos)
+            << e.what();
+    }
+}
+
+// Records still in flight when flush_timeout runs out fail the barrier too.
+TEST(Kafka, ABarrierFailsWhenTheBrokersDoNotAnswerWithinFlushTimeout) {
+    KafkaSink::Options sink_opts;
+    sink_opts.brokers = "127.0.0.1:1";
+    sink_opts.topic = "unanswered";
+    sink_opts.metric_prefix = "unanswered";
+    sink_opts.produce_timeout = 30000ms;
+    sink_opts.flush_timeout = 300ms;
+    SinkHarness sink_h(sink_opts);
+
+    Batch<KafkaMessage> batch;
+    batch.emplace(KafkaMessage{"in-flight"});
+    sink_h.sink->on_data(batch);
+    try {
+        sink_h.sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        ADD_FAILURE() << "the barrier passed over a record still awaiting the brokers";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("still unacknowledged"), std::string::npos)
+            << e.what();
+    }
+}
+
+namespace {
+
+// The values of the first `expected` records of `topic`, read raw so that a
+// NULL value (nullopt) is told apart from an empty one; KafkaSource maps both
+// to an empty payload.
+std::vector<std::optional<std::string>> raw_values(const std::string& brokers,
+                                                   const std::string& topic,
+                                                   std::size_t expected) {
+    char err[512] = {};
+    rd_kafka_conf_t* conf = rd_kafka_conf_new();
+    rd_kafka_conf_set(conf, "bootstrap.servers", brokers.c_str(), err, sizeof(err));
+    rd_kafka_conf_set(conf, "group.id", ("raw-" + topic).c_str(), err, sizeof(err));
+    rd_kafka_conf_set(conf, "auto.offset.reset", "earliest", err, sizeof(err));
+    rd_kafka_conf_set(conf, "enable.auto.commit", "false", err, sizeof(err));
+    rd_kafka_conf_set(conf, "log_level", "0", err, sizeof(err));
+    rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err, sizeof(err));
+    if (rk == nullptr) {
+        ADD_FAILURE() << "consumer: " << err;
+        return {};
+    }
+    rd_kafka_poll_set_consumer(rk);
+    rd_kafka_topic_partition_list_t* parts = rd_kafka_topic_partition_list_new(1);
+    rd_kafka_topic_partition_list_add(parts, topic.c_str(), RD_KAFKA_PARTITION_UA);
+    rd_kafka_subscribe(rk, parts);
+    rd_kafka_topic_partition_list_destroy(parts);
+    std::vector<std::optional<std::string>> out;
+    const auto end = std::chrono::steady_clock::now() + 10s;
+    while (out.size() < expected && std::chrono::steady_clock::now() < end) {
+        rd_kafka_message_t* m = rd_kafka_consumer_poll(rk, 200);
+        if (m == nullptr) {
+            continue;
+        }
+        if (m->err == RD_KAFKA_RESP_ERR_NO_ERROR) {
+            if (m->payload == nullptr) {
+                out.emplace_back(std::nullopt);
+            } else {
+                out.emplace_back(std::string(static_cast<const char*>(m->payload), m->len));
+            }
+        }
+        rd_kafka_message_destroy(m);
+    }
+    rd_kafka_consumer_close(rk);
+    rd_kafka_destroy(rk);
+    return out;
+}
+
+}  // namespace
+
+// An upsert delete is a tombstone, a record whose value is NULL. It used to
+// carry an empty value, which log compaction keeps like any other, so a
+// deleted key never left a compacted topic and a reader saw an empty value
+// where the key should have been gone.
+TEST(Kafka, AnUpsertDeleteIsProducedWithANullValue) {
+    MockCluster mock;
+    const std::string topic = "upsert-tombstone";
+    mock.create_topic(topic);
+
+    const auto* factory = clink::cluster::OperatorRegistry::default_instance().find_sink(
+        "kafka_upsert_sink_string", clink::cluster::ChannelType{"string"});
+    ASSERT_NE(factory, nullptr);
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"brokers", mock.brokers()}, {"topic", topic}, {"primary_key", "id"}};
+    auto sink = std::static_pointer_cast<clink::Sink<std::string>>(factory->build(ctx));
+    EXPECT_TRUE(sink->gates_checkpoint_ack());
+    sink->open();
+    Batch<std::string> rows;
+    rows.emplace(R"({"id":1,"v":"a"})");
+    rows.emplace(R"({"id":1,"__row_kind":"delete"})");
+    sink->on_data(rows);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    sink->close();
+
+    const auto values = raw_values(mock.brokers(), topic, 2);
+    ASSERT_EQ(values.size(), 2u);
+    ASSERT_TRUE(values[0].has_value());
+    EXPECT_EQ(*values[0], R"({"id":1,"v":"a"})");
+    EXPECT_FALSE(values[1].has_value())
+        << "the delete carried a non-NULL value: '" << values[1].value_or("") << "'";
 }
 
 TEST(Kafka, SourceCounterIncrementsPerConsumedMessage) {

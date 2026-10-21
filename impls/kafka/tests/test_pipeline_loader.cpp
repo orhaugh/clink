@@ -175,8 +175,13 @@ TEST(PipelineLoader, AcceptsLinearKafkaPipeline) {
     EXPECT_NO_THROW(loader.load(cfg, dag));
 }
 
+// A split into two Kafka sinks builds a Dag with two sinks that must each own
+// their chain's checkpoint, which a Dag that runs where no checkpoint completes
+// can hold once it declares so; RefusesABranchingPipelineWhereACheckpointCanComplete
+// is the same pipeline without the declaration.
 TEST(PipelineLoader, AcceptsBranchingPipelineWithSplit) {
     Dag dag;
+    dag.run_without_checkpoint_completion();
     KafkaPipelineLoader loader;
     loader.register_selector_fn("by_key",
                                 [](const KafkaMessage& m) { return m.key.has_value() ? 0 : 1; });
@@ -196,4 +201,35 @@ TEST(PipelineLoader, AcceptsBranchingPipelineWithSplit) {
         }
     })");
     EXPECT_NO_THROW(loader.load(cfg, dag));
+}
+
+// Without that declaration the second Kafka sink is refused: a checkpoint could
+// complete before either had written what preceded its barrier.
+TEST(PipelineLoader, RefusesABranchingPipelineWhereACheckpointCanComplete) {
+    Dag dag;
+    KafkaPipelineLoader loader;
+    loader.register_selector_fn("by_key",
+                                [](const KafkaMessage& m) { return m.key.has_value() ? 0 : 1; });
+    const auto cfg = parse(R"({
+        "pipeline": {
+            "stages": [
+                {"name": "src", "type": "kafka_source",
+                 "params": {"brokers": "h:9092", "topic": "in"}},
+                {"name": "router", "type": "split", "input": "src",
+                 "params": {"fn": "by_key", "branches": 2}},
+                {"name": "main", "type": "kafka_sink", "input": "router.0",
+                 "params": {"brokers": "h:9092", "topic": "main"}},
+                {"name": "errs", "type": "kafka_sink", "input": "router.1",
+                 "params": {"brokers": "h:9092", "topic": "errs"}}
+            ]
+        }
+    })");
+    try {
+        loader.load(cfg, dag);
+        ADD_FAILURE() << "two Kafka sinks shared a chain whose checkpoints can complete";
+    } catch (const std::logic_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("kafka_sink must be the only sink on its chain"),
+                  std::string::npos)
+            << e.what();
+    }
 }

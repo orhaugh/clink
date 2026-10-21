@@ -420,6 +420,13 @@ void KafkaSink::on_data(const Batch<KafkaMessage>& batch) {
             }
         }
 
+        // A NULL value is a tombstone; a non-NULL pointer with no bytes is an
+        // empty value, which log compaction keeps.
+        char* payload_ptr = const_cast<char*>(m.payload.data());
+        if (m.payload.empty() && impl_->opts.empty_payload_is_tombstone) {
+            payload_ptr = nullptr;
+        }
+
         const void* key_ptr = nullptr;
         std::size_t key_len = 0;
         if (m.key.has_value()) {
@@ -435,7 +442,7 @@ void KafkaSink::on_data(const Batch<KafkaMessage>& batch) {
             const auto rc = impl_->producer->produce(impl_->opts.topic,
                                                      partition,
                                                      RdKafka::Producer::RK_MSG_COPY,
-                                                     const_cast<char*>(m.payload.data()),
+                                                     payload_ptr,
                                                      m.payload.size(),
                                                      key_ptr,
                                                      key_len,
@@ -473,9 +480,37 @@ void KafkaSink::on_data(const Batch<KafkaMessage>& batch) {
     clink::metrics::connector::bytes_out_inc("kafka", bytes_written);
 }
 
+void KafkaSink::on_barrier(CheckpointBarrier /*b*/) {
+    await_delivery_("checkpoint barrier");
+}
+
 void KafkaSink::flush() {
-    if (impl_ && impl_->producer) {
-        impl_->producer->flush(static_cast<int>(impl_->opts.flush_timeout.count()));
+    await_delivery_("end of input");
+}
+
+void KafkaSink::await_delivery_(const char* at) {
+    if (!impl_ || !impl_->producer) {
+        return;
+    }
+    const auto rc = impl_->producer->flush(static_cast<int>(impl_->opts.flush_timeout.count()));
+    if (!impl_->opts.transactional_id.empty()) {
+        return;  // commit_transaction() fails the transaction for either case below
+    }
+    // The delivery report runs on this thread, inside flush(), so the count is
+    // complete for every record flush() resolved.
+    if (const auto errors = impl_->delivery_errors.load(std::memory_order_relaxed); errors > 0) {
+        throw std::runtime_error("KafkaSink: " + std::to_string(errors) +
+                                 " record(s) were not delivered to topic '" + impl_->opts.topic +
+                                 "' (last error: " + last_error() + "); failing at the " + at +
+                                 " so the job restores from its last checkpoint and replays them");
+    }
+    if (rc != RdKafka::ERR_NO_ERROR) {
+        throw std::runtime_error(
+            "KafkaSink: " + std::to_string(impl_->producer->outq_len()) +
+            " record(s) still unacknowledged by the brokers of topic '" + impl_->opts.topic +
+            "' after flush_timeout (" + std::to_string(impl_->opts.flush_timeout.count()) +
+            " ms) at the " + at + " (" + RdKafka::err2str(rc) +
+            "); failing so the job restores from its last checkpoint and replays them");
     }
 }
 
@@ -531,6 +566,8 @@ KafkaSink::KafkaSink(Options /*opts*/) {
 KafkaSink::~KafkaSink() = default;
 void KafkaSink::open() {}
 void KafkaSink::on_data(const Batch<KafkaMessage>& /*batch*/) {}
+void KafkaSink::on_barrier(CheckpointBarrier /*b*/) {}
+void KafkaSink::await_delivery_(const char* /*at*/) {}
 void KafkaSink::flush() {}
 void KafkaSink::close() {}
 void KafkaSink::commit_transaction() {}

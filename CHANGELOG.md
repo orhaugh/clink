@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**The Kafka sinks wait for the brokers at every checkpoint barrier, fail on a
+lost record, and write deletes as tombstones.** The plain, string, upsert and
+message sinks had no barrier hook, so a checkpoint completed while the records
+before it were still in the producer's queue, and a process that died then lost
+them for good: the restore resumed the sources after them. A record the brokers
+refused, or that ran out of retries, only incremented `delivery_errors`. Each
+barrier and the end of input now wait up to `flush_timeout` for every record to
+be acknowledged, and throw when one was not delivered or the wait ran out,
+naming the topic and the last error, so the checkpoint fails and the job replays
+it. The sinks declare that they gate the acknowledgement, so `Dag::add_sink`
+refuses another sink beside them. The upsert sink produced a delete with an
+empty value, which log compaction keeps; it now produces a NULL value, the
+tombstone compaction removes. The transactional sink is unchanged: its commit
+already failed a transaction that lost a record. A JSON-configured Kafka
+pipeline (`KafkaPipelineLoader`) that splits into two Kafka sinks loads only into
+a Dag declared to run without checkpoint completion.
+
 **A sink that must own its chain's checkpoint is refused beside any other
 sink.** Two kinds of sink hold their guarantee only while the checkpoint's
 acknowledgement follows their own barrier hook: an at-least-once sink that

@@ -301,7 +301,11 @@ TEST(PipelineConfig, JsonConfiguredKafkaPipelineWithSideOutputs) {
     loader.register_map_fn("enrich_with_tier", enrich_with_tier);
     loader.register_selector_fn("classify_valid_or_reject", classify);
 
+    // Two Kafka sinks in one Dag: each must own its chain's checkpoint, which
+    // this run never completes (no acknowledgement callback), so the Dag
+    // declares that first, as Dag::add_sink would otherwise refuse the second.
     Dag dag;
+    dag.run_without_checkpoint_completion();
     loader.load(parse(cfg.str()), dag);
 
     // Run the pipeline in a thread; cancel after a deadline since

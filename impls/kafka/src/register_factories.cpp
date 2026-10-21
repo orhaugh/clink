@@ -357,6 +357,10 @@ public:
     }
     void on_watermark(Watermark wm) override { inner_.on_watermark(wm); }
     void on_barrier(CheckpointBarrier b) override { inner_.on_barrier(b); }
+    // The inner sink's barrier flush is this sink's guarantee: see KafkaSink.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override {
+        return inner_.gates_checkpoint_ack();
+    }
     void flush() override { inner_.flush(); }
     void close() override { inner_.close(); }
     std::string name() const override { return "kafka_text_sink"; }
@@ -1380,8 +1384,8 @@ private:
 // Upsert-shaped Kafka sink. Takes JSON rows (each row is
 // a complete JSON object) and emits Kafka records keyed by the
 // configured primary_key columns. Rows tagged with
-// `__row_kind == "delete"` are emitted with an empty payload, the
-// log-compaction tombstone convention. Inserts (default kind) emit
+// `__row_kind == "delete"` are emitted with a NULL value, the
+// log-compaction tombstone. Inserts (default kind) emit
 // the row JSON minus the privileged `__row_kind` field as the
 // payload. Watermarks / barriers / flush / close pass through to
 // the inner KafkaSink unchanged.
@@ -1390,7 +1394,7 @@ public:
     UpsertKafkaSink(KafkaSink::Options opts,
                     std::vector<std::string> primary_key,
                     ValueEncoderPtr encoder = nullptr)
-        : inner_(std::move(opts)),
+        : inner_(tombstoning_(std::move(opts))),
           primary_key_(std::move(primary_key)),
           encoder_(std::move(encoder)) {
         if (primary_key_.empty()) {
@@ -1413,11 +1417,20 @@ public:
     }
     void on_watermark(Watermark wm) override { inner_.on_watermark(wm); }
     void on_barrier(CheckpointBarrier b) override { inner_.on_barrier(b); }
+    // The inner sink's barrier flush is this sink's guarantee: see KafkaSink.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override {
+        return inner_.gates_checkpoint_ack();
+    }
     void flush() override { inner_.flush(); }
     void close() override { inner_.close(); }
     std::string name() const override { return "kafka_upsert_sink_string"; }
 
 private:
+    static KafkaSink::Options tombstoning_(KafkaSink::Options opts) {
+        opts.empty_payload_is_tombstone = true;
+        return opts;
+    }
+
     std::optional<KafkaMessage> build_message_(const std::string& row_json) {
         clink::config::JsonValue parsed;
         try {
@@ -1439,7 +1452,7 @@ private:
             }
         }
         // Row kinds:
-        //   delete         -> tombstone (empty payload)
+        //   delete         -> tombstone (no payload, produced as a NULL value)
         //   update_before  -> drop on the floor; the matching
         //                     update_after will overwrite by key
         //                     and Kafka log compaction handles the
@@ -1619,7 +1632,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options = {"poll_timeout_ms"},
         .available_in_sql = true,
         .limitations = {"the plain sink is at-least-once; use the kafka_2pc connector for "
-                        "transactional output"},
+                        "transactional output",
+                        "at-least-once needs acks=all, the default: with acks=1 or 0 a record "
+                        "the brokers acknowledged can still be lost",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
     });
 
     // The transactional sink is a DISTINCT connector for capability
@@ -1662,7 +1679,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "interval; HA recovery additionally resumes orphaned prepared "
                         "transactions over the wire (in-doubt resolution), best-effort - a "
                         "SASL-only listener or an unsupported broker version falls back to "
-                        "the bounded contract"},
+                        "the bounded contract",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
         .required_options_for_exactly_once = {"transactional_id"},
     });
 

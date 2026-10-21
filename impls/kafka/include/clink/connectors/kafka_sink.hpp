@@ -25,6 +25,16 @@ namespace clink {
 //     increments and the last error message is captured (recoverable
 //     via last_error()).
 //
+// At-least-once (a producer without transactional_id): on_barrier() and
+// flush() wait up to flush_timeout for the brokers to acknowledge every
+// record produced so far, and throw when one was refused or the wait ran
+// out, so the checkpoint the barrier starts, or the clean end of input,
+// never covers a record the topic does not hold. The acknowledgement
+// follows on_barrier() only while the sink owns its chain's checkpoint, so
+// Dag::add_sink refuses another sink beside it. A transactional producer
+// leaves both checks to commit_transaction(), which fails the transaction
+// for either.
+//
 // Backpressure:
 //   * If the local producer queue is full, on_data() polls and retries
 //     until the queue drains or `produce_timeout` elapses, then throws.
@@ -75,6 +85,12 @@ public:
         // through the new public methods below.
         std::string transactional_id;
 
+        // Produce a record with an empty payload as a NULL value, the
+        // log-compaction tombstone, instead of as an empty value, which
+        // compaction keeps. The upsert sink sets it: a delete is the only
+        // record it produces without a payload.
+        bool empty_payload_is_tombstone = false;
+
         // Extra librdkafka config properties applied verbatim after the fields
         // above, e.g. {"security.protocol":"sasl_ssl", "sasl.mechanism":"PLAIN",
         // "sasl.username":"u", "sasl.password":"p", "ssl.ca.location":"/ca.pem"}.
@@ -92,6 +108,8 @@ public:
 
     void open() override;
     void on_data(const Batch<KafkaMessage>& batch) override;
+    void on_barrier(CheckpointBarrier b) override;
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
     void flush() override;
     void close() override;
 
@@ -143,6 +161,11 @@ public:
     static bool is_real_implementation();
 
 private:
+    // Waits for the brokers to acknowledge every record produced so far, and
+    // for a producer without transactions throws when one was refused or the
+    // wait ran out. `at` names the point for the message.
+    void await_delivery_(const char* at);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
