@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -32,13 +33,13 @@ inline std::string es_id_to_string(const clink::config::JsonValue& v) {
     if (v.is_bool()) {
         return v.as_bool() ? "true" : "false";
     }
-    if (v.is_number()) {
     if (v.is_integral_number()) {
         // Exact: as_number() would round an id past 2^53, so two records with
         // neighbouring ids would share a document and one would overwrite the
         // other.
         return std::to_string(v.as_int());
     }
+    if (v.is_number()) {
         const double d = v.as_number();
         // Integral AND within int64 range -> plain integer. The range guard is
         // load-bearing: the float->int64 cast is UB outside int64, and on
@@ -79,8 +80,11 @@ inline int es_item_status(const clink::config::JsonValue& item) {
 
 // Parse an Elasticsearch _bulk response into a per-record verdict. `count` is the
 // number of records POSTed (== items[] length). Each item's status: 2xx success,
-// 429/5xx transient (resend that item), other 4xx (400 mapping / 409 version)
-// permanent (DLQ that item). A non-2xx HTTP status, a parse failure, or an
+// a status that refuses the record (400 mapping, 409 version, 422; see
+// status_rejects_records) permanent (DLQ that item), anything else transient
+// (resend that item): 429 and 5xx, and the item failures that are about the
+// index rather than the document, such as 403 for an index set read-only or 404
+// for one that does not exist. A non-2xx HTTP status, a parse failure, or an
 // items[] whose length does not match the batch falls back to whole-batch
 // classification so the whole batch is retried/DLQ'd rather than mis-attributed.
 inline BulkResult es_bulk_result(const HttpResponse& res, std::size_t count) {
@@ -114,10 +118,10 @@ inline BulkResult es_bulk_result(const HttpResponse& res, std::size_t count) {
         if (st >= 200 && st < 300) {
             continue;  // this item indexed
         }
-        if (st == 429 || st >= 500) {
-            br.failed_transient.push_back(i);
-        } else {
+        if (status_rejects_records(st)) {
             br.failed_permanent.push_back(i);  // 400 mapping / 409 version: poison
+        } else {
+            br.failed_transient.push_back(i);
         }
     }
     br.ok = br.failed_transient.empty() && br.failed_permanent.empty();
@@ -176,21 +180,33 @@ inline std::shared_ptr<Sink<std::string>> make_es_bulk_sink(EsBulkOptions o) {
         return es_bulk_result(r, count);
     };
 
-    auto render = [index = o.index, id_field = o.document_id](std::string& out,
-                                                              const std::string& rec) {
+    auto render = [index = o.index, id_field = o.document_id, name = o.name](
+                      std::string& out, const std::string& rec) {
         clink::config::JsonObject meta;
         meta["_index"] = clink::config::JsonValue{index};
         if (!id_field.empty()) {
+            // document_id promises that a replay overwrites the same document.
+            // A record without a usable id would get a generated _id, and its
+            // replay a second one, so it is refused instead.
+            std::optional<std::string> id;
             try {
                 auto j = clink::config::parse(rec);
                 if (j.is_object()) {
                     const auto& obj = j.as_object();
                     if (auto it = obj.find(id_field); it != obj.end() && !it->second.is_null()) {
-                        meta["_id"] = clink::config::JsonValue{es_id_to_string(it->second)};
+                        id = es_id_to_string(it->second);
                     }
                 }
-            } catch (...) {
+            } catch (const std::exception&) {
             }
+            if (!id.has_value()) {
+                throw UnrenderableRecord(
+                    name + ": a record has no '" + id_field +
+                    "' field (or it is null, or the record is not a JSON object), so it would be "
+                    "indexed under a generated _id that a replay duplicates; document_id needs it "
+                    "in every record");
+            }
+            meta["_id"] = clink::config::JsonValue{std::move(*id)};
         }
         clink::config::JsonObject action;
         action["index"] = clink::config::JsonValue{std::move(meta)};

@@ -105,6 +105,31 @@ TEST(PostgresJsonSinkLogic, OnConflictUpdateColumnsSubsetLimitsSetList) {
               "SET \"b\"=EXCLUDED.\"b\"");
 }
 
+// Rows of one flush that share a conflict key become one row: what applying
+// them in order leaves, the first row's values with each SET column from the
+// last row, a column a later row leaves out becoming NULL as EXCLUDED would
+// make it. PostgreSQL refuses an ON CONFLICT DO UPDATE that touches one key
+// twice, so the flush used to fail, and its replay failed the same way.
+TEST(PostgresJsonSinkLogic, OnConflictUpdateMergesRowsThatShareAKey) {
+    EXPECT_EQ(build_insert_sql("t",
+                               {"a", "b", "c"},
+                               "update",
+                               {"a"},
+                               {"b"},
+                               {R"({"a":1,"b":2,"c":3})",
+                                R"({"a":2,"b":5,"c":6})",
+                                R"({"a":1,"b":4,"c":9})",
+                                R"({"a":1,"c":7})"},
+                               esc),
+              "INSERT INTO \"t\" (\"a\",\"b\",\"c\") VALUES (1,NULL,3),(2,5,6) ON CONFLICT "
+              "(\"a\") DO UPDATE SET \"b\"=EXCLUDED.\"b\"");
+    // DO NOTHING takes a key twice as it is; it never needed merging.
+    EXPECT_EQ(
+        build_insert_sql(
+            "t", {"a", "b"}, "nothing", {"a"}, {}, {R"({"a":1,"b":2})", R"({"a":1,"b":3})"}, esc),
+        "INSERT INTO \"t\" (\"a\",\"b\") VALUES (1,2),(1,3) ON CONFLICT (\"a\") DO NOTHING");
+}
+
 TEST(PostgresJsonSinkLogic, NonObjectRowThrows) {
     // A well-formed but non-object JSON row must fail loudly (not silently NULL).
     EXPECT_THROW(build_insert_sql("t", {"a"}, "", {}, {}, {"5"}, esc), std::runtime_error);

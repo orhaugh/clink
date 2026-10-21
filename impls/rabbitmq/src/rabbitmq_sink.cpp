@@ -75,7 +75,7 @@ void RabbitMqSink::on_data(const Batch<std::string>& batch) {
                                           kChannel,
                                           exchange,
                                           routing_key,
-                                          0 /*mandatory*/,
+                                          impl_->opts.mandatory ? 1 : 0,
                                           0 /*immediate*/,
                                           &props,
                                           body);
@@ -109,6 +109,21 @@ void RabbitMqSink::flush() {
         amqp_publisher_confirm_t result;
         struct timeval tv = to_timeval(impl_->opts.confirm_timeout);
         const amqp_rpc_reply_t r = amqp_publisher_confirm_wait(impl_->conn, &tv, &result);
+        if (r.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION &&
+            r.library_error == AMQP_STATUS_UNEXPECTED_STATE) {
+            // A frame that is not a confirm: for a mandatory publish, the
+            // basic.return the broker sends ahead of the ack of a message no
+            // queue is bound to receive.
+            clink::metrics::connector::error_inc(kLabel, "sink");
+            throw std::runtime_error(
+                impl_->opts.name +
+                ": the broker answered a publish with a frame other than a "
+                "confirm, which for a mandatory publish is the return of a message no queue is "
+                "bound to receive (exchange '" +
+                impl_->opts.exchange + "', routing key '" + impl_->opts.routing_key +
+                "'); bind a queue, or set mandatory='false' to let the "
+                "exchange drop such messages");
+        }
         if (r.reply_type != AMQP_RESPONSE_NORMAL) {
             clink::metrics::connector::error_inc(kLabel, "sink");
             throw std::runtime_error(

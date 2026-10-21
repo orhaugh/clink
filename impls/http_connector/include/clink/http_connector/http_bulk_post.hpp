@@ -62,11 +62,24 @@ struct BulkResult {
 // the number of records in the POSTed body so a handler can map item indices.
 using ResponseHandler = std::function<BulkResult(const HttpResponse&, std::size_t record_count)>;
 
+// Whether a 4xx refuses the records themselves, so that a replay would be
+// refused the same way and dlq=drop may dead-letter them: 400 (bad request),
+// 409 (conflict) and 422 (unprocessable). Every other 4xx is about the endpoint
+// rather than the records: credentials (401, 403, 407), a missing path or index
+// (404, 410), a timeout (408), a body the endpoint will not take whole (413),
+// an index set read-only. Dead-lettering under one of those dropped good
+// records while the endpoint was misconfigured or briefly refusing, so they are
+// transient: retried, then the job fails and replays.
+inline bool status_rejects_records(int status) {
+    return status == 400 || status == 409 || status == 422;
+}
+
 // Whole-batch verdict from a bool validator: the batch is all-or-nothing. Used
 // when a sink supplies no per-item ResponseHandler (http_sink, Splunk). A
-// rejected response classifies ALL records the same way by HTTP status: a
-// droppable 4xx (poison) -> failed_permanent; anything else (0/3xx/429/5xx
-// outage, or a 2xx the validator rejected) -> failed_transient (resend/replay).
+// rejected response classifies ALL records the same way by HTTP status: a 4xx
+// that refuses the records (status_rejects_records) -> failed_permanent;
+// anything else (0, 3xx, any other 4xx, 5xx, or a 2xx the validator rejected)
+// -> failed_transient (resend/replay).
 inline BulkResult whole_batch_result(const HttpResponse& res,
                                      std::size_t record_count,
                                      const ResponseValidator& validator) {
@@ -79,8 +92,7 @@ inline BulkResult whole_batch_result(const HttpResponse& res,
         all[i] = i;
     }
     BulkResult br;
-    const bool droppable_client_error = res.status >= 400 && res.status < 500 && res.status != 429;
-    if (droppable_client_error) {
+    if (status_rejects_records(res.status)) {
         br.failed_permanent = std::move(all);
     } else {
         br.failed_transient = std::move(all);

@@ -133,6 +133,35 @@ TEST(PostgresJsonSinkLive, OnConflictUpdateIsIdempotentByKey) {
     run_sql("DROP TABLE IF EXISTS " + tbl);
 }
 
+// One flush that updates a key twice lands the later values. PostgreSQL
+// refuses an ON CONFLICT DO UPDATE whose rows touch one key twice ("command
+// cannot affect row a second time"), so this flush used to fail, and its
+// replay failed the same way, for good; the sink now merges such rows first.
+TEST(PostgresJsonSinkLive, OnConflictUpdateTakesAKeyTwiceInOneFlush) {
+    if (!pg_configured()) {
+        GTEST_SKIP() << "set CLINK_POSTGRES_CDC_TEST_DSN";
+    }
+    const std::string tbl = "pjs_twice_" + uniq();
+    run_sql("DROP TABLE IF EXISTS " + tbl);
+    run_sql("CREATE TABLE " + tbl + " (id bigint primary key, val text)");
+
+    PostgresJsonSinkOptions o = opts(tbl);
+    o.on_conflict = "update";
+    o.conflict_columns = {"id"};
+    EXPECT_NO_THROW(sink_write(o,
+                               {R"({"id":1,"val":"first"})",
+                                R"({"id":2,"val":"other"})",
+                                R"({"id":1,"val":"second"})",
+                                R"({"id":9007199254740993,"val":"big"})"}));
+
+    EXPECT_EQ(scalar("SELECT COUNT(*) FROM " + tbl), "3");
+    EXPECT_EQ(scalar("SELECT val FROM " + tbl + " WHERE id=1"), "second");
+    EXPECT_EQ(scalar("SELECT val FROM " + tbl + " WHERE id=2"), "other");
+    // An integer past 2^53 is written exactly (it used to round to ...992).
+    EXPECT_EQ(scalar("SELECT val FROM " + tbl + " WHERE id=9007199254740993"), "big");
+    run_sql("DROP TABLE IF EXISTS " + tbl);
+}
+
 // M5b: PostgresSource must populate the per-cell null mask (PQgetisnull) so a SQL
 // NULL is distinguishable from an empty string - the basis for the JSON source
 // emitting JSON null rather than "".

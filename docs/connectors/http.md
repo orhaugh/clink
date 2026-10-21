@@ -60,7 +60,7 @@ These keys are read by every connector unless noted otherwise (defaults and the 
 | `batch_bytes` | No | `4194304` | Flush when the buffered body reaches this many bytes. |
 | `max_retries` | No | `4` | Retry attempts beyond the first; clamped to `[0, 20]`. |
 | `linger_ms` | No | `0` | Flush a partial batch once its oldest record is this old (evaluated on record arrival, not on a timer). `0` disables. |
-| `dlq` | No | `fail` | `drop` routes a permanently-rejected (4xx) batch to the dead-letter path (a `BadRecord` report plus metrics) instead of failing the job. Any other value keeps the fail-and-replay default. |
+| `dlq` | No | `fail` | `drop` routes records the endpoint refuses as records (HTTP 400, 409 or 422) to the dead-letter path (a `BadRecord` report plus metrics) instead of failing the job. A refusal about the endpoint rather than the records, such as 401, 403, 404, 408 or 413, is never dead-lettered: it is retried and then fails the job, which replays. Any other value keeps the fail-and-replay default. |
 
 `http_poll_source` and the Prometheus sink do not use all of these; their connector-specific keys are below.
 
@@ -79,7 +79,7 @@ Identical `_bulk` API; records are framed as NDJSON action+doc pairs.
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `index` | Yes | (none) | Target index for the `_index` action metadata. |
-| `document_id` | No | (empty) | Record field used as the document `_id`; setting it makes re-delivery an idempotent overwrite. |
+| `document_id` | No | (empty) | Record field used as the document `_id`; setting it makes re-delivery an idempotent overwrite. Every record then needs the field: a record without it, or with it null, is refused (dead-lettered under `dlq='drop'`, otherwise the job fails) rather than indexed under a generated `_id` that a replay would duplicate. An integer id is used exactly, past 2^53 included. |
 | `path` | No | `/_bulk` | Bulk endpoint path. |
 
 ### `splunk_hec_sink`
@@ -267,7 +267,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 ## Delivery semantics
 
 - Sinks (`http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, `prometheus_sink`, `pubsub_sink`) are at-least-once. The shared `BatchedHttpBulkSink` flushes on every checkpoint barrier (before the sink acks), on the size and linger thresholds, and at end-of-stream. On permanent failure with retries exhausted it throws rather than dropping, so the job replays from the last checkpoint. There is no two-phase commit, so a replay re-delivers buffered records.
-- `elasticsearch_sink` / `opensearch_sink` upgrade toward effectively-once when `document_id` is set: a replayed document overwrites the same `_id` rather than duplicating. The `_bulk` response is parsed per item, so a transient per-item failure resends only the failed records and a permanent per-item failure is DLQ'd or thrown per the `dlq` policy.
+- `elasticsearch_sink` / `opensearch_sink` upgrade toward effectively-once when `document_id` is set: a replayed document overwrites the same `_id` rather than duplicating, and a record without the field is refused rather than given a generated `_id`. The `_bulk` response is parsed per item, so a failed item is resent alone. An item the index refuses as a document (400 mapping, 409 version, 422) is dead-lettered or thrown per the `dlq` policy; any other item failure, such as 403 for an index with a write block or 404 for one that does not exist, is resent and then fails the job, never dead-lettered.
 - `influxdb_sink` is effectively-once when `timestamp_field` is set, since an identical point is idempotent.
 - `splunk_hec_sink` and `prometheus_sink` are at-least-once with no dedup key; HEC ingestion is append, and the Pushgateway stores the latest value per series (last-write-wins within a push).
 - `pubsub_sink` is at-least-once with no producer dedup; a replay re-publishes.

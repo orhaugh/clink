@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**Sinks no longer report delivery over a record that went nowhere.** NATS
+JetStream reports a refused publish (a negative PubAck, or no stream bound to
+the subject) only to an error handler, which the sink did not install, so a
+flush succeeded over the lost message; the sink now fails the flush. RabbitMQ
+publishes are mandatory by default (`mandatory`, default `true`), so a message
+no queue is bound to receive comes back and fails the flush instead of being
+confirmed and dropped by the exchange; `mandatory='false'` keeps the old
+behaviour. The HTTP sinks' `dlq='drop'` dead-lettered a whole batch for any 4xx
+but 429, so expired credentials, a wrong path, a timeout or an Elasticsearch
+index set read-only dropped every record; only 400, 409 and 422 are now taken
+as the records' fault, and every other refusal is retried and then fails the
+job. With `document_id` set, an Elasticsearch record without the field is
+refused (dead-lettered under `dlq='drop'`) rather than indexed under a
+generated `_id` that a replay duplicates. The PostgreSQL sink's
+`on_conflict='update'` failed any flush that updated a key twice ("command
+cannot affect row a second time"), and its replay failed the same way, for
+good; rows that share a key are now merged into the row applying them in order
+leaves.
+
 **Object-store sinks: a refused S3 part fails the prepare, text-sink parts no
 longer collide, and a two-phase commit publishes whole objects.** The
 exactly-once raw S3 sink aborted a multipart upload whose part the store refused

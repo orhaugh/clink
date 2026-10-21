@@ -465,7 +465,7 @@ clink::postgres::install(env.registry());
 
 ## Delivery semantics
 
-Sink (default, `postgres_sink`): at-least-once. A replay after a failed checkpoint re-runs the buffered INSERT, appending duplicates. With `on_conflict='update'` and `conflict_columns` the INSERT is idempotent by key, which is effectively-once for keyed upserts. On a flush error the connection is dropped, the buffer cleared, and the exception propagated so the job replays from the last checkpoint. The sink flushes on every checkpoint barrier.
+Sink (default, `postgres_sink`): at-least-once. A replay after a failed checkpoint re-runs the buffered INSERT, appending duplicates. With `on_conflict='update'` and `conflict_columns` the INSERT is idempotent by key, which is effectively-once for keyed upserts. Rows of one flush that share a key are merged into the row that applying them in order would leave, because PostgreSQL refuses an `ON CONFLICT DO UPDATE` that touches one key twice; before that merge such a flush failed, and its replay failed the same way, so the job never got past it. Integer values are written exactly, past 2^53 included. On a flush error the connection is dropped, the buffer cleared, and the exception propagated so the job replays from the last checkpoint. The sink flushes on every checkpoint barrier.
 
 Sink (`mode='upsert'`, `postgres_upsert_sink`): effectively-once on the sink table for a stable PRIMARY KEY and a deterministic defining query. Applies the changelog by key (upsert on insert/update_after, DELETE on delete/update_before), netted per key within a flush and applied in one transaction; a replay re-applies keyed idempotent statements. See the changelog upsert sink section above.
 

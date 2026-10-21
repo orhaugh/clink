@@ -61,6 +61,9 @@ public:
                   [](const httplib::Request&, httplib::Response& res) { res.status = 400; });
         svr_.Post("/redirect",  // 3xx: operator-fixable misconfig, must NOT be dropped
                   [](const httplib::Request&, httplib::Response& res) { res.status = 301; });
+        svr_.Post(R"(/status/(\d+))", [](const httplib::Request& req, httplib::Response& res) {
+            res.status = std::stoi(req.matches[1]);
+        });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         thread_ = std::thread([this] { svr_.listen_after_bind(); });
         while (!svr_.is_running()) {
@@ -319,6 +322,36 @@ TEST(HttpDlq, DropPolicyDoesNotDrop3xxRedirect) {
     b.emplace(std::string{R"({"a":1})"});
     sink.on_data(b);
     EXPECT_THROW(sink.flush(), std::runtime_error);  // surfaces, not silently dropped
+}
+
+// A refusal about the endpoint rather than the records is never dead-lettered:
+// expired or wrong credentials, a wrong path, a timeout, a body too large for
+// the endpoint. dlq=drop used to drop every record of the batch for any 4xx
+// but 429, so a misconfigured or briefly refusing endpoint lost all of them.
+// The records the endpoint refuses (400, 409, 422) are still dead-lettered.
+TEST(HttpDlq, DropPolicyDoesNotDropARefusalAboutTheEndpoint) {
+    StubServer srv;
+    for (const int status : {401, 403, 404, 405, 408, 410, 413, 415}) {
+        auto opts = base_opts(srv.url(), 100);
+        opts.path = "/status/" + std::to_string(status);
+        opts.max_retries = 0;
+        opts.dlq_policy = DlqPolicy::Drop;
+        opts.name = "dlq_endpoint_sink";
+        BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+        sink.open();
+        sink.on_data(batch_of({R"({"a":1})"}));
+        EXPECT_THROW(sink.flush(), std::runtime_error) << status << " was dead-lettered";
+    }
+    for (const int status : {400, 409, 422}) {
+        auto opts = base_opts(srv.url(), 100);
+        opts.path = "/status/" + std::to_string(status);
+        opts.max_retries = 0;
+        opts.dlq_policy = DlqPolicy::Drop;
+        BatchedHttpBulkSink<std::string> sink(opts, verbatim());
+        sink.open();
+        sink.on_data(batch_of({R"({"a":1})"}));
+        EXPECT_NO_THROW(sink.flush()) << status << " was not dead-lettered";
+    }
 }
 
 TEST(HttpDlq, DefaultFailPolicyThrowsOnPermanent) {

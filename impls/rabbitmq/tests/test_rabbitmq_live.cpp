@@ -108,3 +108,52 @@ TEST(RabbitMqLive, PublishThenConsumeRoundTrip) {
     sink.close();
     src.close();
 }
+
+// A message no queue is bound to receive has to fail the barrier flush. The
+// sink used to publish with mandatory unset, so the exchange dropped such a
+// message and the broker confirmed it anyway: the flush succeeded and the
+// message was in no queue. Mandatory publishes come back as a basic.return,
+// and the flush fails.
+TEST(RabbitMqLive, ABarrierFlushFailsForAMessageNoQueueReceives) {
+    if (!rmq_configured()) {
+        GTEST_SKIP() << "set CLINK_RABBITMQ_TEST_ENDPOINT (+ _PORT/_USER/_PASSWORD)";
+    }
+    // The default exchange routes by queue name, and no queue has this one.
+    RabbitMqSink::Options ko;
+    ko.conn = conn_from_env();
+    ko.routing_key = unique_queue() + "_unbound";
+    ko.confirm_timeout = std::chrono::milliseconds{5000};
+    RabbitMqSink sink(std::move(ko));
+    sink.open();
+
+    Batch<std::string> out;
+    out.emplace(R"({"id":1,"v":"a"})");
+    sink.on_data(out);
+    try {
+        sink.on_barrier(clink::CheckpointBarrier{clink::CheckpointId{1}});
+        ADD_FAILURE() << "the barrier flush succeeded, though no queue received the message";
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string{e.what()}.find("no queue is bound"), std::string::npos) << e.what();
+    }
+}
+
+// mandatory='false' keeps the exchange's own behaviour, for a topology that
+// publishes where nothing may be listening: the message is dropped, and the
+// flush succeeds.
+TEST(RabbitMqLive, WithoutMandatoryAnUnroutableMessageIsDroppedQuietly) {
+    if (!rmq_configured()) {
+        GTEST_SKIP() << "set CLINK_RABBITMQ_TEST_ENDPOINT (+ _PORT/_USER/_PASSWORD)";
+    }
+    RabbitMqSink::Options ko;
+    ko.conn = conn_from_env();
+    ko.routing_key = unique_queue() + "_unbound";
+    ko.mandatory = false;
+    RabbitMqSink sink(std::move(ko));
+    sink.open();
+
+    Batch<std::string> out;
+    out.emplace(R"({"id":1,"v":"a"})");
+    sink.on_data(out);
+    EXPECT_NO_THROW(sink.on_barrier(clink::CheckpointBarrier{clink::CheckpointId{1}}));
+    sink.close();
+}

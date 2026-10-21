@@ -88,7 +88,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     // rabbitmq_sink_string: basic.publish each string to an exchange with a routing key.
     // At-least-once (persistent + publisher confirms; flush waits for broker acks on each barrier).
     // Params: host/port/vhost/user/password (as above), exchange (default ""), routing_key
-    //   (required), persistent (true), content_type (application/json), confirm_timeout_ms (30000).
+    //   (required), persistent (true), mandatory (true: an unroutable message fails the flush),
+    //   content_type (application/json), confirm_timeout_ms (30000).
     reg.register_sink<std::string>(
         "rabbitmq_sink_string", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
             RabbitMqSink::Options o;
@@ -96,6 +97,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.exchange = ctx.param_or("exchange", "");
             o.routing_key = ctx.param_or("routing_key");
             o.persistent = ctx.param_or("persistent", "true") != "false";
+            o.mandatory = ctx.param_or("mandatory", "true") != "false";
             o.content_type = ctx.param_or("content_type", "application/json");
             o.confirm_timeout =
                 std::chrono::milliseconds{ctx.param_int64_or("confirm_timeout_ms", 30000)};

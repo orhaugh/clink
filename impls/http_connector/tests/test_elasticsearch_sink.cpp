@@ -164,6 +164,43 @@ TEST(ElasticsearchSink, DocumentIdGoesIntoActionLine) {
     EXPECT_TRUE(contains(got[0], R"({"id":"k1","a":1})")) << got[0];  // source doc verbatim
 }
 
+// With document_id set, a record without the field is refused rather than
+// indexed under a generated _id, which a replay would index again beside it.
+// Under dlq=drop it is dead-lettered and the others are written. It used to be
+// indexed without an _id, so the overwrite document_id promises did not hold
+// for it.
+TEST(ElasticsearchSink, ARecordWithoutItsDocumentIdIsRefused) {
+    {
+        EsStub srv;
+        EsBulkOptions o;
+        o.url = srv.url();
+        o.index = "logs";
+        o.document_id = "id";
+        o.batch_records = 100;
+        auto sink = make_es_bulk_sink(o);
+        sink->open();
+        EXPECT_THROW(sink->on_data(batch_of({R"({"a":1})"})), std::runtime_error);
+        EXPECT_THROW(sink->on_data(batch_of({R"({"id":null,"a":2})"})), std::runtime_error);
+    }
+    {
+        EsStub srv;
+        EsBulkOptions o;
+        o.url = srv.url();
+        o.index = "logs";
+        o.document_id = "id";
+        o.batch_records = 100;
+        o.dlq_policy = clink::http_connector::DlqPolicy::Drop;
+        auto sink = make_es_bulk_sink(o);
+        sink->open();
+        sink->on_data(batch_of({R"({"a":1})", R"({"id":"k2","a":2})"}));
+        sink->flush();
+        auto got = srv.bodies();
+        ASSERT_EQ(got.size(), 1u);
+        EXPECT_TRUE(contains(got[0], R"("_id":"k2")")) << got[0];
+        EXPECT_FALSE(contains(got[0], R"({"a":1})")) << got[0];
+    }
+}
+
 TEST(ElasticsearchSink, LargeNumericDocumentIdDoesNotCollapseOrTrapUb) {
     // A numeric document_id beyond int64 range must NOT be cast to int64 (UB,
     // and on saturation every such id would collapse onto INT64_MAX, silently
@@ -188,6 +225,27 @@ TEST(ElasticsearchSink, LargeNumericDocumentIdDoesNotCollapseOrTrapUb) {
     const auto second = got[0].find(R"("_id":)", first + 1);
     ASSERT_NE(second, std::string::npos) << got[0];
     EXPECT_NE(got[0].substr(first, 30), got[0].substr(second, 30)) << got[0];
+}
+
+// An integer id past 2^53 becomes its exact _id. It used to pass through a
+// double, which rounded 9007199254740993 to 9007199254740992, so two records
+// with neighbouring ids shared one document and the second overwrote the first.
+TEST(ElasticsearchSink, AnIntegerDocumentIdPast2To53IsWrittenExactly) {
+    EsStub srv;
+    EsBulkOptions o;
+    o.url = srv.url();
+    o.index = "logs";
+    o.document_id = "id";
+    o.batch_records = 100;
+    auto sink = make_es_bulk_sink(o);
+    sink->open();
+    sink->on_data(
+        batch_of({R"({"id":9007199254740992,"a":1})", R"({"id":9007199254740993,"a":2})"}));
+    sink->flush();
+    auto got = srv.bodies();
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_TRUE(contains(got[0], R"("_id":"9007199254740992")")) << got[0];
+    EXPECT_TRUE(contains(got[0], R"("_id":"9007199254740993")")) << got[0];
 }
 
 TEST(ElasticsearchSink, ErrorsFalseResponseSucceeds) {
@@ -227,27 +285,6 @@ TEST(ElasticsearchSink, ResendsOnlyTheFailedItemNotTheWholeBatch) {
     EsStub srv;
     EsBulkOptions o;
     o.url = srv.url();
-// An integer id past 2^53 becomes its exact _id. It used to pass through a
-// double, which rounded 9007199254740993 to 9007199254740992, so two records
-// with neighbouring ids shared one document and the second overwrote the first.
-TEST(ElasticsearchSink, AnIntegerDocumentIdPast2To53IsWrittenExactly) {
-    EsStub srv;
-    EsBulkOptions o;
-    o.url = srv.url();
-    o.index = "logs";
-    o.document_id = "id";
-    o.batch_records = 100;
-    auto sink = make_es_bulk_sink(o);
-    sink->open();
-    sink->on_data(
-        batch_of({R"({"id":9007199254740992,"a":1})", R"({"id":9007199254740993,"a":2})"}));
-    sink->flush();
-    auto got = srv.bodies();
-    ASSERT_EQ(got.size(), 1u);
-    EXPECT_TRUE(contains(got[0], R"("_id":"9007199254740992")")) << got[0];
-    EXPECT_TRUE(contains(got[0], R"("_id":"9007199254740993")")) << got[0];
-}
-
     o.index = "logs";
     o.path = "/_bulk_resend";
     o.batch_records = 100;
@@ -329,6 +366,23 @@ TEST(EsBulkResult, PerItemTransientVsPermanent) {
     EXPECT_EQ(r.failed_transient[0], 1u);
     ASSERT_EQ(r.failed_permanent.size(), 1u);
     EXPECT_EQ(r.failed_permanent[0], 2u);
+}
+
+// An item failure about the index rather than the document is resent, not
+// dead-lettered: 403 for a write to an index with a write block, 404 for an
+// index that does not exist. Every 4xx but 429 used to count as a poison
+// document, so dlq=drop dropped every record written while an index refused
+// writes.
+TEST(EsBulkResult, AnItemRefusedForItsIndexIsResentNotDeadLettered) {
+    const std::string body =
+        R"({"errors":true,"items":[)"
+        R"({"index":{"status":403,"error":{"type":"cluster_block_exception"}}},)"
+        R"({"index":{"status":404,"error":{"type":"index_not_found_exception"}}},)"
+        R"({"index":{"status":409,"error":{"type":"version_conflict_engine_exception"}}}]})";
+    auto r = es_bulk_result(resp(200, body), 3);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.failed_transient, (std::vector<std::size_t>{0, 1}));
+    EXPECT_EQ(r.failed_permanent, (std::vector<std::size_t>{2}));
 }
 
 TEST(EsBulkResult, NonTwoXxFallsBackToWholeBatch) {

@@ -11,8 +11,9 @@ namespace clink::nats {
 
 // NATS JetStream sink: publishes each std::string record to a subject. Delivery is
 // AT-LEAST-ONCE. Messages are published asynchronously (js_PublishAsync) for throughput;
-// flush()/on_barrier() calls js_PublishAsyncComplete to block until the server has acked every
-// pending publish, and THROWS on timeout so the job replays from the last checkpoint rather than
+// flush()/on_barrier() calls js_PublishAsyncComplete to block until the server has answered every
+// pending publish, and THROWS on timeout, or when the server refused a publish (a negative PubAck,
+// or no stream bound to the subject), so the job replays from the last checkpoint rather than
 // dropping data. JetStream de-dups within a publish window only via Nats-Msg-Id (not set here),
 // so re-delivery on replay can duplicate (at-least-once); the SQL planner rejects exactly_once.
 //
@@ -37,11 +38,11 @@ public:
     void open() override;
     void on_data(const Batch<std::string>& batch) override;
     void on_barrier(CheckpointBarrier b) override;
-    void flush() override;
     // Its barrier hook writes out everything it received before the barrier,
     // which is its guarantee only while it owns its chain's checkpoint, so
     // Dag::add_sink refuses another sink beside it.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+    void flush() override;
     void close() override;
     [[nodiscard]] std::string name() const override;
 

@@ -7,10 +7,13 @@
 // ON CONFLICT clause. Pure (escaping injected as a callback) so it unit-tests
 // without a server.
 
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "clink/config/json.hpp"
 #include "clink/connectors/sql_json_builder.hpp"
 
 namespace clink::pgsql {
@@ -52,6 +55,70 @@ inline bool in_set(const std::vector<std::string>& set, const std::string& c) {
     return false;
 }
 
+// Rows that share a conflict key, merged into one row per key, in the order
+// each key first appears. PostgreSQL refuses an ON CONFLICT DO UPDATE whose
+// rows touch one key twice ("command cannot affect row a second time"), and a
+// stream updates a key more than once in an interval as a matter of course, so
+// the flush failed, and its replay failed the same way, for good. The merged
+// row is what applying the rows one at a time leaves: the first row's values,
+// with each SET column taken from the last row (a column a later row leaves out
+// becomes NULL, as EXCLUDED would make it). A row that is not a JSON object is
+// left as it is for build_insert_head_values to refuse.
+inline std::vector<std::string> merge_rows_by_key(const std::vector<std::string>& json_rows,
+                                                  const std::vector<std::string>& conflict_columns,
+                                                  const std::vector<std::string>& set_cols) {
+    // One entry per output row: a row passed through as it came, or a merged one.
+    struct Entry {
+        bool merged{false};
+        std::string raw;
+        std::size_t slot{0};
+    };
+    std::vector<Entry> entries;
+    std::vector<config::JsonObject> merged;
+    std::map<std::string, std::size_t> slot_of_key;
+    for (const auto& row : json_rows) {
+        config::JsonValue v;
+        try {
+            v = config::parse(row);
+        } catch (const std::exception&) {
+            entries.push_back(Entry{.raw = row});
+            continue;
+        }
+        if (!v.is_object()) {
+            entries.push_back(Entry{.raw = row});
+            continue;
+        }
+        const auto& obj = v.as_object();
+        std::string key;
+        for (const auto& c : conflict_columns) {
+            const auto it = obj.find(c);
+            if (it == obj.end()) {
+                key += "null";
+            } else {
+                it->second.serialize_into(key);
+            }
+            key += '\x1f';
+        }
+        const auto [at, fresh] = slot_of_key.try_emplace(key, merged.size());
+        if (fresh) {
+            merged.push_back(obj);
+            entries.push_back(Entry{.merged = true, .slot = at->second});
+            continue;
+        }
+        auto& into = merged[at->second];
+        for (const auto& c : set_cols) {
+            const auto it = obj.find(c);
+            into[c] = it == obj.end() ? config::JsonValue{} : it->second;
+        }
+    }
+    std::vector<std::string> out;
+    out.reserve(entries.size());
+    for (auto& e : entries) {
+        out.push_back(e.merged ? config::JsonValue{merged[e.slot]}.serialize(0) : std::move(e.raw));
+    }
+    return out;
+}
+
 // Build one multi-row INSERT for a batch of JSON-object rows. on_conflict: ""
 // (plain INSERT), "update" (ON CONFLICT (...) DO UPDATE), or "nothing" (ON
 // CONFLICT (...) DO NOTHING). When non-empty, conflict_columns (the unique/PK
@@ -76,8 +143,28 @@ inline std::string build_insert_sql(const std::string& table,
             "postgres: on_conflict requires conflict_columns (the unique/primary-key target)");
     }
 
-    std::string sql =
-        sqljson::build_insert_head_values(table, columns, json_rows, esc, sqljson::kPostgres);
+    // The SET list for "update": the requested columns, defaulting to all
+    // non-conflict columns.
+    std::vector<std::string> set_cols;
+    if (on_conflict == "update") {
+        if (!update_columns.empty()) {
+            set_cols = update_columns;
+        } else {
+            for (const auto& c : columns) {
+                if (!in_set(conflict_columns, c)) {
+                    set_cols.push_back(c);
+                }
+            }
+        }
+    }
+    std::string sql = sqljson::build_insert_head_values(
+        table,
+        columns,
+        on_conflict == "update" && !set_cols.empty()
+            ? merge_rows_by_key(json_rows, conflict_columns, set_cols)
+            : json_rows,
+        esc,
+        sqljson::kPostgres);
     if (!has_conflict) {
         return sql;
     }
@@ -92,17 +179,6 @@ inline std::string build_insert_sql(const std::string& table,
     if (on_conflict == "nothing") {
         sql += " DO NOTHING";
         return sql;
-    }
-    // "update": SET the requested columns, defaulting to all non-conflict columns.
-    std::vector<std::string> set_cols;
-    if (!update_columns.empty()) {
-        set_cols = update_columns;
-    } else {
-        for (const auto& c : columns) {
-            if (!in_set(conflict_columns, c)) {
-                set_cols.push_back(c);
-            }
-        }
     }
     if (set_cols.empty()) {
         sql += " DO NOTHING";  // nothing left to update (all columns are the key)

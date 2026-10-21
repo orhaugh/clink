@@ -1,7 +1,9 @@
 #include "clink/nats/nats_sink.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,7 +23,29 @@ struct NatsSink::Impl {
     natsConnection* conn{nullptr};
     jsCtx* js{nullptr};
     std::uint64_t pending{0};  // async publishes since the last flush (acks awaited at flush)
+    // Publishes the server refused since the last flush: a negative PubAck, or
+    // no stream bound to the subject. nats.c reports those only to the
+    // context's error handler, on its own thread, and without one it drops
+    // the message and counts the publish as complete.
+    std::atomic<std::uint64_t> refused{0};
+    std::mutex refusal_mu;
+    std::string last_refusal;
     explicit Impl(Options o) : opts(std::move(o)) {}
+
+    // nats.c calls this before it counts the publish as complete, so a
+    // js_PublishAsyncComplete that returns has seen every refusal. The
+    // library destroys the message once this returns.
+    static void on_refused(jsCtx* /*js*/, jsPubAckErr* pae, void* closure) {
+        auto* self = static_cast<Impl*>(closure);
+        std::string why = pae->ErrText != nullptr && pae->ErrText[0] != '\0'
+                              ? std::string{pae->ErrText}
+                              : std::string{natsStatus_GetText(pae->Err)};
+        {
+            const std::lock_guard<std::mutex> lock(self->refusal_mu);
+            self->last_refusal = std::move(why);
+        }
+        self->refused.fetch_add(1, std::memory_order_acq_rel);
+    }
 };
 
 NatsSink::NatsSink(Options opts) : impl_(std::make_unique<Impl>(std::move(opts))) {
@@ -40,6 +64,9 @@ void NatsSink::open() {
     jsOptions jsOpts;
     detail::check(jsOptions_Init(&jsOpts), impl_->opts.name + ": jsOptions_Init");
     jsOpts.PublishAsync.MaxPending = impl_->opts.max_pending;  // backpressure on in-flight acks
+    jsOpts.PublishAsync.ErrHandler = &Impl::on_refused;
+    jsOpts.PublishAsync.ErrHandlerClosure = impl_.get();
+    impl_->refused.store(0, std::memory_order_relaxed);
     detail::check(natsConnection_JetStream(&impl_->js, impl_->conn, &jsOpts),
                   impl_->opts.name + ": JetStream ctx");
     impl_->pending = 0;
@@ -92,6 +119,21 @@ void NatsSink::flush() {
         clink::metrics::connector::error_inc(kLabel, "sink");
         throw std::runtime_error(impl_->opts.name +
                                  ": js_PublishAsyncComplete: " + natsStatus_GetText(s));
+    }
+    // Every publish is answered, but an answer can be a refusal, which leaves
+    // the message in no stream. Failing here makes the job restore from its
+    // last checkpoint and publish it again.
+    if (const auto refused = impl_->refused.exchange(0, std::memory_order_acq_rel); refused > 0) {
+        clink::metrics::connector::error_inc(kLabel, "sink");
+        std::string last;
+        {
+            const std::lock_guard<std::mutex> lock(impl_->refusal_mu);
+            last = impl_->last_refusal;
+        }
+        throw std::runtime_error(impl_->opts.name + ": the server refused " +
+                                 std::to_string(refused) + " publish(es) to '" +
+                                 impl_->opts.subject + "' (last: " + last +
+                                 "); is a JetStream stream bound to the subject?");
     }
     impl_->pending = 0;
     const auto dt =

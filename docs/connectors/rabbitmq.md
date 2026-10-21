@@ -70,6 +70,7 @@ Sink options (`rabbitmq_sink_string`, parsed in `register_factories.cpp`; struct
 | `exchange` | No | `""` | Target exchange. Empty means the default direct exchange. |
 | `routing_key` | Yes | none | Routing key. On the default exchange this is the queue name. Construction throws if empty. |
 | `persistent` | No | `true` | Publish with delivery mode 2 (survives broker restart). Set `false` for delivery mode 1. |
+| `mandatory` | No | `true` | Publish mandatory, so a message no queue is bound to receive is returned and fails the flush. Set `false` to let the exchange drop such messages without an error. |
 | `content_type` | No | `application/json` | AMQP `content-type` property set on each published message. |
 | `confirm_timeout_ms` | No | `30000` | Time to wait for broker publisher confirms before failing, in milliseconds. |
 
@@ -154,12 +155,12 @@ Both ends are at-least-once.
 
 Source: messages are consumed with manual ack (`no_ack=false`). The ack is deferred to checkpoint COMMIT, not the barrier. `snapshot_offset()` records the highest delivery tag emitted before each barrier against that checkpoint id; `notify_checkpoint_complete()` (driven from the cluster's `CommitCheckpoint` dispatch) advances a safe-to-ack watermark, and the next `produce()` turn issues one `basic.ack(multiple=true)` up to it - so a message is confirmed to the broker only after the checkpoint that captured it is globally durable. `notify_checkpoint_aborted()` drops the pending record without acking, so an aborted checkpoint (or a crash before commit) leaves those messages for redelivery. All AMQP calls stay on the `produce()` thread (the connection is not thread-safe); the commit notification only advances an atomic watermark that `produce()` drains. AMQP has no seekable offset, so recovery relies on broker redelivery rather than offset replay.
 
-Sink: messages are published persistent (delivery mode 2 by default) on a channel in publisher-confirm mode (`confirm.select`). `flush()` / `on_barrier()` block until the broker has confirmed every outstanding publish, and throw on a nack or timeout so the job replays from the last checkpoint rather than dropping data. Replay can duplicate messages. RabbitMQ has no producer dedup key, so exactly-once is rejected by the SQL planner.
+Sink: messages are published persistent (delivery mode 2 by default) on a channel in publisher-confirm mode (`confirm.select`). `flush()` / `on_barrier()` block until the broker has confirmed every outstanding publish, and throw on a nack or timeout so the job replays from the last checkpoint rather than dropping data. Publishes are mandatory by default (`mandatory`, default `true`): a message that no queue is bound to receive comes back to the sink as a `basic.return`, and the flush fails with the exchange and routing key named, because a confirm alone does not mean the message reached a queue. With `mandatory='false'` the exchange drops such a message and still confirms it, so it is lost without an error; use that only where publishing to nowhere is intended. Before `mandatory` existed the sink always published that way. Replay can duplicate messages. RabbitMQ has no producer dedup key, so exactly-once is rejected by the SQL planner.
 
 ## Limitations
 
-- String channel only; no int64 or Arrow-columnar channel.
 - The sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
+- String channel only; no int64 or Arrow-columnar channel.
 - Plain TCP only; no TLS in this version.
 - Authentication is SASL PLAIN (`user` / `password`); no other mechanisms.
 - At-least-once on both ends; the sink does not support exactly-once (`delivery_guarantee='exactly_once'`) or `mode='upsert'` (rejected at SQL bind time).

@@ -21,6 +21,8 @@
 #include "clink/operators/operator_base.hpp"
 
 using clink::Batch;
+using clink::CheckpointBarrier;
+using clink::CheckpointId;
 using clink::Emitter;
 using clink::StreamElement;
 using clink::nats::NatsSink;
@@ -121,4 +123,32 @@ TEST(NatsLive, PublishThenConsumeRoundTrip) {
 
     sink.close();
     src.close();
+}
+
+// A publish the server refuses, here one to a subject no stream is bound to,
+// has to fail the barrier flush: the message is in no stream, and only a
+// failed checkpoint makes the job publish it again. nats.c reports a refusal
+// only to an error handler; before the sink installed one, the flush
+// succeeded and the message was gone.
+TEST(NatsLive, ABarrierFlushFailsWhenTheServerRefusesAPublish) {
+    if (!nats_configured()) {
+        GTEST_SKIP() << "set CLINK_NATS_TEST_ENDPOINT (e.g. nats://localhost:4222)";
+    }
+    NatsSink::Options ko;
+    ko.conn.url = nats_url();
+    ko.subject = "clink.it.unbound." + unique_name("s");
+    ko.publish_timeout = std::chrono::milliseconds{5000};
+    NatsSink sink(std::move(ko));
+    sink.open();
+
+    Batch<std::string> out;
+    out.emplace(R"({"id":1,"v":"a"})");
+    sink.on_data(out);
+    try {
+        sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+        ADD_FAILURE() << "the barrier flush succeeded, though no stream holds the message";
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string{e.what()}.find("refused 1 publish"), std::string::npos) << e.what();
+    }
+    sink.close();
 }

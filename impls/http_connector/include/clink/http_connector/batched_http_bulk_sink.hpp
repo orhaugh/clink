@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,16 @@
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::http_connector {
+
+// Thrown by a renderer for a record it cannot write the way the sink promises,
+// such as an Elasticsearch record without the field document_id names, which
+// would be indexed under a generated _id that a replay then duplicates. The
+// record would be refused the same way on every replay, so it is poison: under
+// dlq=drop it is dead-lettered like a record the endpoint refused, and
+// otherwise the sink fails.
+struct UnrenderableRecord : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // How a batch of rendered records is framed into one request body.
 enum class BulkFraming {
@@ -118,6 +129,13 @@ public:
             flush();
         }
     }
+    // With the barrier flush on, as every factory sets it, the barrier writes
+    // out everything received before it, which is the at-least-once guarantee
+    // only while the sink owns its chain's checkpoint, so Dag::add_sink refuses
+    // another sink beside it.
+    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override {
+        return opts_.flush_on_barrier;
+    }
 
     void flush() override {
         if (fragments_.empty()) {
@@ -129,13 +147,6 @@ public:
         // and only the transient failures stay active for the next attempt - the
         // succeeded records are never re-sent.
         std::vector<std::size_t> active(n);
-    // With the barrier flush on, as every factory sets it, the barrier writes
-    // out everything received before it, which is the at-least-once guarantee
-    // only while the sink owns its chain's checkpoint, so Dag::add_sink refuses
-    // another sink beside it.
-    [[nodiscard]] bool gates_checkpoint_ack() const noexcept override {
-        return opts_.flush_on_barrier;
-    }
         for (std::size_t i = 0; i < n; ++i) {
             active[i] = i;
         }
@@ -228,7 +239,28 @@ private:
             first_buffered_at_ = std::chrono::steady_clock::now();  // age clock for linger
         }
         std::string frag;
-        render_(frag, rec);
+        try {
+            render_(frag, rec);
+        } catch (const UnrenderableRecord& e) {
+            clink::metrics::connector::error_inc(opts_.name, "sink");
+            if (opts_.dlq_policy != DlqPolicy::Drop) {
+                throw;
+            }
+            if (auto* rt = this->runtime(); rt != nullptr) {
+                std::string payload;
+                if constexpr (std::is_same_v<In, std::string>) {
+                    payload = rec;
+                }
+                rt->report_bad_record(
+                    clink::BadRecord{.payload = std::move(payload),
+                                     .error = e.what(),
+                                     .connector = opts_.name,
+                                     .direction = "sink",
+                                     .location = opts_.http.base_url + opts_.path});
+            }
+            clink::metrics::connector::dropped_records_inc(opts_.name, 1);
+            return;
+        }
         pending_bytes_ += frag.size();
         fragments_.push_back(std::move(frag));
     }
