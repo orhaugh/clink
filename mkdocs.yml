@@ -161,6 +161,7 @@ nav:
       - connectors/mqtt.md
       - connectors/mysql.md
       - connectors/nats.md
+      - connectors/neo4j.md
       - connectors/postgres.md
       - connectors/pulsar.md
       - connectors/rabbitmq.md

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**A Neo4j sink.** `connector='neo4j'` writes a SQL table's rows to Neo4j
+through the Query API: each batch runs the table's Cypher statement once, in
+one implicit transaction, with the rows as a typed `$rows` parameter, so 64-bit
+integers stay exact and NaN and the infinities are stored as floats. It
+delivers at least once: a checkpoint barrier returns only after the server
+reported every earlier batch committed, judged from the whole reply and not its
+status, and a reply lost after the request was sent counts as an unknown
+outcome and is retried, which a statement keyed by stable ids under uniqueness
+constraints absorbs and a `CREATE` does not. When it opens, the sink runs
+`EXPLAIN` on the statement and refuses one that returns rows, uses
+`CALL { ... } IN TRANSACTIONS`, only reads, changes the schema, or needs a
+parameter other than `$rows`. Exactly-once, `mode='upsert'` and
+`changelog='true'` are refused. It is tested against Neo4j 2026.09.0 Community,
+pinned by digest, by a live gate (`scripts/neo4j-live.sh`, the `neo4j`
+workflow) that fails on any skip and includes recovery cells with killed
+workers; `examples/kafka-to-neo4j` runs synthetic transfers into a graph with a
+windowed fan-in indicator. The shared HTTP client gained a bounded reply, an
+interrupt from another thread, a CA file and hostname verification.
+
 **A MongoDB insert job whose records carry their `_id` recovers from a
 failure.** A restore replays the records after the last checkpoint, and a plain
 insert of one that carries its own `_id` met the document the sink had already

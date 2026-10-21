@@ -52,6 +52,7 @@ is reachable through the programmatic API only.
 | [MySQL / MariaDB](mysql.md) | source + sink | mariadb-connector-c | system pkg | `mysql` |
 | [ClickHouse](clickhouse.md) | source + sink (`clickhouse_sink`, the SQL default; `clickhouse_native_sink` via `insert_format='native'`, recommended for a new table) | clickhouse-cpp | `2.6.2` (from source, Release) | `clickhouse` |
 | [Cassandra / ScyllaDB](cassandra.md) | sink | DataStax cpp-driver | `2.17.1` | `cassandra` |
+| [Neo4j](neo4j.md) | sink (Cypher statement per batch, Query API) | clink::http_connector (vendored httplib) | Neo4j 2026.09.0 tested | `neo4j` |
 | [MongoDB](mongodb.md) | source + sink | mongo-cxx-driver | system pkg | - |
 | [Redis](redis.md) | source + sink | hiredis | system pkg | `redis` |
 
@@ -144,7 +145,7 @@ table option `json_non_finite` chooses the form:
 value is refused at `CREATE TABLE`, and again when the job is planned, naming
 the accepted values; a sink factory built outside SQL refuses it too. The
 option is refused on a sink that writes no JSON (`parquet`, `delta`, `iceberg`,
-ClickHouse `insert_format='native'`, `collect`, `blackhole`, or a single-TEXT
+ClickHouse `insert_format='native'`, `neo4j`, `collect`, `blackhole`, or a single-TEXT
 column table, which writes each record as it is): a typed sink holds NaN and
 the infinities as they are. So does Kafka with the registry format
 `format='avro'` or `'protobuf'`, which refuses the option too: its encoder

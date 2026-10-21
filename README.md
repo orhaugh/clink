@@ -258,7 +258,7 @@ Everything below is published at
 - [Connectors](https://orhaugh.github.io/clink/connectors/): twenty-plus
   sources and sinks (Kafka, Postgres incl. CDC, ClickHouse, S3/GCS/Azure
   Parquet, Iceberg, Delta Lake, MQTT, NATS, Pulsar, RabbitMQ, Redis, MongoDB,
-  Cassandra, HTTP, Avro, WebSocket and more), each with dependencies,
+  Cassandra, Neo4j, HTTP, Avro, WebSocket and more), each with dependencies,
   options and delivery semantics; Kafka speaks the Confluent Schema Registry
   wire format (Avro, Protobuf, JSON Schema), and a new ClickHouse table should
   use the typed native sink, `insert_format='native'`.
@@ -273,6 +273,9 @@ Everything below is published at
   Kafka to clink to ClickHouse on your machine, with a deliberate Worker
   kill and independent verification
   ([examples/kafka-to-clickhouse](examples/kafka-to-clickhouse/)).
+- [Kafka to Neo4j example](examples/kafka-to-neo4j/): synthetic transfers
+  into a graph through the Neo4j sink, with a windowed fan-in indicator, a
+  Worker kill and an independent check of the graph.
 - [Runnable examples](docs/consumer-examples/): every core feature as a
   standalone buildable program, from hello-pipeline to the testing
   framework and state-as-data workflows.
