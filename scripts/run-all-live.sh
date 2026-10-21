@@ -75,7 +75,7 @@ CONNECTORS=(
   "mongodb@@mongodb@@clink_mongodb_tests@@MongoLive"
   "nats@@nats@@clink_nats_tests@@NatsLive"
   "mqtt@@mqtt@@clink_mqtt_tests@@MqttLive"
-  "postgres@@postgres-cdc@@clink_postgres_tests@@PostgresCdcLive|PostgresCdcContractLive|PostgresJsonSinkLive|PostgresSink2PCLive|PostgresUpsertSinkLive|SinkContractSuite|UpsertContractSuite"
+  "postgres@@postgres-cdc@@clink_postgres_tests@@PostgresCdcLive|PostgresCdcContractLive|PostgresJsonSinkLive|PostgresSinkLive|PostgresSink2PCLive|PostgresUpsertSinkLive|SinkContractSuite|UpsertContractSuite"
   "postgres-sql@@postgres-cdc@@clink_postgres_sql_tests@@PostgresCdcSql"
   "mysql@@mysql@@clink_mysql_tests@@MysqlLive|MysqlCdcLive|MysqlUpsertSinkLive|UpsertContractSuite"
   "s3@@localstack@@clink_s3_tests@@S3Sink2PCLive|S3TextSinkLive|SinkContractSuite|S3MaterializationStore.RoundTripAgainstLiveEndpoint|StateParquetExportS3.PartitionedExportReadableBackFromS3|S3SnapshotStore.CheckpointDirRoundTripAgainstLiveEndpoint|S3SnapshotStore.CacheServesImmutableSstOnSecondFetch|S3CasSnapshotStore|S3RemotePool"
