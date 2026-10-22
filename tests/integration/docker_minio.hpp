@@ -21,7 +21,11 @@
 //   ... use s3.endpoint() with AWS_ACCESS_KEY_ID/SECRET set to
 //   s3.access_key() / s3.secret_key() ...
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,10 +40,6 @@ namespace clink::test {
 class DockerMinio {
 public:
     DockerMinio() {
-        // CLINK_TEST_S3_TRACE=1 turns on MinIO's per-request HTTP trace so
-        // `docker logs` shows every S3 API call - the forensic view when an
-        // exactly-once verdict needs the store's side of the story.
-        const bool trace = std::getenv("CLINK_TEST_S3_TRACE") != nullptr;
         const auto started = start_on_free_ports(
             "DockerMinio",
             1,
@@ -47,9 +47,8 @@ public:
             [&](const std::vector<std::uint16_t>& ports, const std::string& name) {
                 return "docker run -d --rm -p " + std::to_string(ports[0]) +
                        ":9000 -e MINIO_ROOT_USER=" + std::string{kAccessKey} +
-                       " -e MINIO_ROOT_PASSWORD=" + std::string{kSecretKey} + " " +
-                       (trace ? std::string{"-e MINIO_HTTP_TRACE=/dev/stderr "} : std::string{}) +
-                       "--name " + name + " " + std::string{kImage} + " server /data";
+                       " -e MINIO_ROOT_PASSWORD=" + std::string{kSecretKey} + " --name " + name +
+                       " " + std::string{kImage} + " server /data";
             });
         port_ = started.ports[0];
         container_name_ = started.name;
@@ -62,6 +61,12 @@ public:
                 throw std::runtime_error("DockerMinio: never became healthy");
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        // CLINK_TEST_S3_TRACE=1 records every S3 call the store serves - the
+        // forensic view when an exactly-once verdict needs the store's side
+        // of the story.
+        if (std::getenv("CLINK_TEST_S3_TRACE") != nullptr) {
+            start_trace();
         }
     }
 
@@ -107,6 +112,43 @@ public:
     }
 
 private:
+    // MinIO dropped MINIO_HTTP_TRACE, which named a file to trace to, in
+    // 2019; the server streams its call trace to an admin client instead.
+    // One runs inside the container, where the image ships mcli, and writes
+    // a line per call to a host file named on stderr. The file outlives the
+    // container, so the trace is still there after teardown; the client
+    // ends with the server.
+    void start_trace() {
+        trace_file_ =
+            (std::filesystem::temp_directory_path() / (container_name_ + ".s3trace")).string();
+        const std::string client = "docker exec " + container_name_ +
+                                   " /bin/sh -c 'mcli alias set local http://127.0.0.1:9000 " +
+                                   std::string{kAccessKey} + " " + std::string{kSecretKey} +
+                                   " > /dev/null && exec mcli admin trace --no-color "
+                                   "--disable-pager local' > '" +
+                                   trace_file_ + "' 2>&1 &";
+        (void)std::system(client.c_str());
+        // Live once it shows a call made after it started.
+        const std::string probe = "curl -s -o /dev/null http://127.0.0.1:" + std::to_string(port_) +
+                                  "/" + std::string{kTraceProbe};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        for (;;) {
+            (void)std::system(probe.c_str());
+            std::ifstream in(trace_file_);
+            const std::string seen{std::istreambuf_iterator<char>(in),
+                                   std::istreambuf_iterator<char>()};
+            if (seen.find(kTraceProbe) != std::string::npos) {
+                std::fprintf(stderr, "DockerMinio: S3 calls traced to %s\n", trace_file_.c_str());
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                stop();
+                throw std::runtime_error("DockerMinio: the S3 trace did not start: " + seen);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    }
+
     void stop() noexcept {
         if (!container_name_.empty()) {
             // Unpause first: a test dying mid-outage strands a paused
@@ -135,9 +177,12 @@ private:
         "@sha256:2636fc4155d9a7e41ff58cdb65ddd13ba9304e67184e13c25bc5cb34016269d7";
     static constexpr std::string_view kAccessKey = "clink-minio-test";
     static constexpr std::string_view kSecretKey = "clink-minio-test-secret";
+    // A bucket nothing creates: the trace's first line, never a test's.
+    static constexpr std::string_view kTraceProbe = "clink-trace-probe";
 
     int port_ = 0;
     std::string container_name_;
+    std::string trace_file_;
 };
 
 }  // namespace clink::test
