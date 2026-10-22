@@ -735,6 +735,16 @@ TEST_F(KafkaWindowRecoveryTest, RepeatedCompletedMarkerCoordinatorCrashesKeepOne
         feed = produce_json_until(
             kafka_->brokers(), input_topic_, open_start, kKeys, stop_feed, produced);
     });
+    struct FeedGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~FeedGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } feed_guard{stop_feed, feeder};
     ASSERT_TRUE(
         clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s))
         << "the sustained feed did not start before the armed marker crash";
@@ -905,6 +915,16 @@ TEST_F(KafkaWindowRecoveryTest, CascadingWorkerLossAcrossACommitWindowStaysExact
         feed = produce_json_until(
             kafka_->brokers(), input_topic_, open_start, kKeys, stop_feed, produced);
     });
+    struct FeedGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~FeedGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } feed_guard{stop_feed, feeder};
     ASSERT_TRUE(
         clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s));
 
@@ -1048,6 +1068,16 @@ TEST_F(KafkaWindowRecoveryTest, AFencedPartialCommitFallsBackWithoutDuplicates) 
         feed_windows = produce_json_advancing(
             kafka_->brokers(), input_topic_, advance_base, kKeys, stop_feed, produced);
     });
+    struct FeedGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~FeedGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } feed_guard{stop_feed, feeder};
     ASSERT_TRUE(
         clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s));
 
@@ -2580,6 +2610,16 @@ TEST_F(KafkaWindowRecoveryTest, AFailedCheckpointRewindsInsteadOfLosingItsInterv
         feed = produce_json_until(
             kafka_->brokers(), input_topic_, open_start, kKeys, stop_feed, produced);
     });
+    struct FeedGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~FeedGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } feed_guard{stop_feed, feeder};
     ASSERT_TRUE(
         clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s));
 
@@ -2924,6 +2964,16 @@ TEST_P(KafkaTwopcFaultMatrixTest, DiesAtThePointRecoversAndMatchesTheOracle) {
         feed = produce_json_until(
             kafka_->brokers(), input_topic_, open_start, kKeys, stop_feed, produced);
     });
+    struct FeedGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~FeedGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } feed_guard{stop_feed, feeder};
     ASSERT_TRUE(
         clink::itest::await([&] { return produced.load(std::memory_order_acquire) >= 200; }, 15s));
 
