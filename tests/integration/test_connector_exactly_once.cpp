@@ -1101,6 +1101,50 @@ protected:
         return submit_job(c, s3_2pc_job(), max_restarts);
     }
 
+    // A worker dies in this suite only by exiting at an armed
+    // sink.before_commit point, never by a kill at a random moment: a worker
+    // killed while its CompleteMultipartUpload is in flight can leave the
+    // upload unable to complete on this store (docker_minio.hpp), and a
+    // verdict must be about the engine. Exit code 72 proves the point fired
+    // there - not a death some other way, and not the job's one sink placed
+    // on the other worker.
+    // The job starts on worker 0 alone, armed with `fault`, so both its
+    // subtasks - the source and the one sink - are there; worker 1, armed
+    // with `worker_1_fault`, joins once the job is running, as the failover
+    // target, and counts commits only from the moment it takes over.
+    // Placement across two workers from the start is not stable, and an
+    // armed point on a worker without the sink never fires.
+    static std::unique_ptr<Process> submit_on_worker_0(Cluster& c,
+                                                       const std::string& fault,
+                                                       int max_restarts,
+                                                       const std::string& worker_1_fault = "") {
+        if (!c.start_coordinator() || !c.start_worker(0, {.fault = fault}) ||
+            !c.await_workers_registered(1)) {
+            ADD_FAILURE() << "the coordinator or worker 0 did not start";
+            return nullptr;
+        }
+        auto sub = submit(c, max_restarts);
+        if (sub == nullptr ||
+            !clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s)) {
+            ADD_FAILURE() << "the job did not start running on worker 0";
+            return nullptr;
+        }
+        if (!c.start_worker(1, {.fault = worker_1_fault}) || !c.await_workers_registered(2)) {
+            ADD_FAILURE() << "worker 1 did not join";
+            return nullptr;
+        }
+        return sub;
+    }
+
+    static void expect_armed_exit(Cluster& c, std::size_t worker) {
+        ASSERT_TRUE(clink::itest::await([&] { return !c.worker(worker).running(); }, 60s))
+            << "worker " << worker << " never reached its armed sink.before_commit point";
+        const auto code = c.worker(worker).poll_exit();
+        ASSERT_TRUE(code.has_value());
+        ASSERT_EQ(*code, 72) << "worker " << worker
+                             << " died for a reason other than its armed commit point";
+    }
+
     static clink::test::DockerMinio* s3_;
     std::string bucket_;
 };
@@ -1140,16 +1184,12 @@ TEST_F(S3ExactlyOnceTest, EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill) {
 
     Cluster c(two_worker_spec());
     ScopedDiagnostics diag(c);
-    ASSERT_TRUE(c.start_coordinator());
-    ASSERT_TRUE(c.start_worker(0));
-    ASSERT_TRUE(c.start_worker(1));
-    ASSERT_TRUE(c.await_workers_registered(2));
-    auto sub = submit(c, /*max_restarts=*/2);
+    // The worker holding the sink dies at its fifth commit, before that
+    // commit's complete.
+    auto sub = submit_on_worker_0(c, "sink.before_commit=exit:72@5", /*max_restarts=*/2);
     ASSERT_NE(sub, nullptr);
 
-    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
-    c.worker(0).kill_hard();
-    ASSERT_TRUE(c.await_process_gone(0));
+    ASSERT_NO_FATAL_FAILURE(expect_armed_exit(c, 0));
 
     const auto code = sub->await_exit(120s);
     ASSERT_TRUE(code.has_value()) << "submitter never exited";
@@ -1164,7 +1204,10 @@ TEST_F(S3ExactlyOnceTest, EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill) {
 // The commit window, held open and provable: the checkpoint's object is
 // STAGED (visible in ListMultipartUploads, invisible in the object listing)
 // while the armed delay holds the commit; the kill lands inside that window;
-// recovery re-completes the persisted handle idempotently.
+// recovery re-completes the persisted handle idempotently. The hold outlasts
+// anything the test waits for, so the kill always lands while the commit is
+// held at sink.before_commit and never on a complete in flight (see
+// expect_armed_exit).
 TEST_F(S3ExactlyOnceTest, AWorkerKilledInsideTheCommitWindowStaysExactlyOnce) {
     constexpr int kTotal = 40;
     ::setenv("CLINK_2PC_TOTAL", "40", 1);
@@ -1172,15 +1215,9 @@ TEST_F(S3ExactlyOnceTest, AWorkerKilledInsideTheCommitWindowStaysExactlyOnce) {
 
     Cluster c(two_worker_spec());
     ScopedDiagnostics diag(c);
-    ASSERT_TRUE(c.start_coordinator());
-    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=delay:4000@1"}));
-    ASSERT_TRUE(c.start_worker(1, {.fault = "sink.before_commit=delay:4000@1"}));
-    ASSERT_TRUE(c.await_workers_registered(2));
-
-    auto sub = submit(c, /*max_restarts=*/2);
+    auto sub = submit_on_worker_0(c, "sink.before_commit=delay:60000@1", /*max_restarts=*/2);
     ASSERT_NE(sub, nullptr);
 
-    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
     // The witness: staged output exists while nothing is visible yet.
     ASSERT_TRUE(clink::itest::await([&] { return pending_multiparts() > 0; }, 30s))
         << "no multipart upload appeared; the commit window never opened";
@@ -1242,10 +1279,12 @@ TEST_F(S3ExactlyOnceTest, TheFinalPanesCommitIsWaitedForAtEndOfStream) {
 // The decisive composition, transposed to object storage: the store goes
 // down while a worker-loss recovery needs it. A worker dies inside a held
 // commit window (parts uploaded, the multipart handle staged, its
-// CompleteMultipartUpload outstanding), the store is then PAUSED, and the
-// restarted framework must complete the restored handle against a frozen
-// endpoint - retrying through the restart cycle, resolving nothing blind,
-// and converging on the heal with every record exactly once. The
+// CompleteMultipartUpload outstanding) with the store already STOPPED, and
+// the restarted framework must complete the restored handle against an
+// endpoint that refuses it - retrying through the restart cycle, resolving
+// nothing blind, and converging on the heal with every record exactly once.
+// Stopped, not paused: a paused store runs the completes its clients gave
+// up on once it resumes, which can break the upload (docker_minio.hpp). The
 // PostgreSQL twin of this gate (APostgresOutageDuringRecovery...) is what
 // QUAL-02's campaign leaned on; QUAL-03 gets the same floor before it
 // spends anything.
@@ -1256,24 +1295,37 @@ TEST_F(S3ExactlyOnceTest, AnS3OutageDuringRecoveryStaysExactlyOnce) {
 
     Cluster c(two_worker_spec());
     ScopedDiagnostics diag(c);
-    ASSERT_TRUE(c.start_coordinator());
-    ASSERT_TRUE(c.start_worker(0, {.fault = "sink.before_commit=delay:4000@1"}));
-    ASSERT_TRUE(c.start_worker(1, {.fault = "sink.before_commit=delay:4000@1"}));
-    ASSERT_TRUE(c.await_workers_registered(2));
-
-    auto sub = submit(c, /*max_restarts=*/6);
+    // Held at its first commit for longer than the test waits, so the store
+    // goes down and the worker dies while the complete is still unsent.
+    // Every restart during the outage fails at once against the refused
+    // endpoint, so the budget covers a fast restart cycle, not a slow one.
+    auto sub = submit_on_worker_0(c, "sink.before_commit=delay:60000@1", /*max_restarts=*/30);
     ASSERT_NE(sub, nullptr);
 
-    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
     // Vacuity guard: the kill must land on a provably open commit window.
     ASSERT_TRUE(clink::itest::await([&] { return pending_multiparts() > 0; }, 30s))
         << "no multipart upload appeared; the commit window never opened";
 
+    // The store comes back on every way out, a failed assertion included:
+    // the suite's cases share it, and the next one must find it up.
+    struct StoreOutage {
+        clink::test::DockerMinio& s3;
+        bool down{false};
+        ~StoreOutage() {
+            if (down) {
+                try {
+                    s3.start();
+                } catch (const std::exception& e) {
+                    ADD_FAILURE() << "the store did not come back: " << e.what();
+                }
+            }
+        }
+    } outage{*s3_};
+    s3_->stop();
+    outage.down = true;
     c.worker(0).kill_hard();
     ASSERT_TRUE(c.await_process_gone(0));
-    // Freeze the store BEFORE the recovery can complete the staged upload,
-    // and return the worker (the campaign's supervisor would).
-    s3_->pause();
+    // Return the worker, as the campaign's supervisor would.
     ASSERT_TRUE(c.start_worker(0, {}));
     ASSERT_TRUE(clink::itest::await(
         [&] {
@@ -1281,17 +1333,18 @@ TEST_F(S3ExactlyOnceTest, AnS3OutageDuringRecoveryStaysExactlyOnce) {
                    c.count_in_coordinator_log("restart waiting for capacity") > 0;
         },
         60s))
-        << "the recovery never engaged while the store was frozen";
-    // Non-vacuity: a frozen store must stall the pipeline - the sink
+        << "the recovery never engaged while the store was down";
+    // Non-vacuity: a stopped store must stall the pipeline - the sink
     // cannot upload parts at the barrier, so no checkpoint may complete.
-    // A broken pause() sails through this window and reds here rather
-    // than passing the gate vacuously. Doubles as composition dwell.
+    // A broken stop() sails through this window and reds here rather than
+    // passing the gate vacuously. Doubles as composition dwell.
     const auto stalled_at = latest_completed(c.checkpoint_dir());
     EXPECT_FALSE(
         clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > stalled_at; }, 8s))
-        << "a checkpoint completed against a frozen store; the outage never composed";
+        << "a checkpoint completed against a stopped store; the outage never composed";
 
-    s3_->unpause();
+    s3_->start();
+    outage.down = false;
 
     const auto code = sub->await_exit(180s);
     ASSERT_TRUE(code.has_value()) << "submitter never exited";
@@ -1308,7 +1361,9 @@ TEST_F(S3ExactlyOnceTest, AnS3OutageDuringRecoveryStaysExactlyOnce) {
 
 // The longer-horizon arm: thirty times the records, two separated worker
 // losses, strict verdict - S3 commits are recoverable, so unlike Kafka there
-// is no tolerated loss window.
+// is no tolerated loss window. Worker 0 dies at its fifth commit; the job
+// moves to worker 1, which dies at its eighth, after progress of its own;
+// worker 0 has come back by then, unarmed, and the job finishes there.
 TEST_F(S3ExactlyOnceTest, StaysExactlyOnceAcrossTwoSeparatedKillsOnALongerRun) {
     constexpr int kTotal = 1200;
     ::setenv("CLINK_2PC_TOTAL", "1200", 1);
@@ -1316,26 +1371,21 @@ TEST_F(S3ExactlyOnceTest, StaysExactlyOnceAcrossTwoSeparatedKillsOnALongerRun) {
 
     Cluster c(two_worker_spec());
     ScopedDiagnostics diag(c);
-    ASSERT_TRUE(c.start_coordinator());
-    ASSERT_TRUE(c.start_worker(0));
-    ASSERT_TRUE(c.start_worker(1));
-    ASSERT_TRUE(c.await_workers_registered(2));
-    auto sub = submit(c, /*max_restarts=*/3);
+    auto sub = submit_on_worker_0(c,
+                                  "sink.before_commit=exit:72@5",
+                                  /*max_restarts=*/3,
+                                  "sink.before_commit=exit:72@8");
     ASSERT_NE(sub, nullptr);
 
-    ASSERT_TRUE(clink::itest::await([&] { return latest_completed(c.checkpoint_dir()) > 0; }, 45s));
-
-    c.worker(0).kill_hard();
-    ASSERT_TRUE(c.await_process_gone(0));
+    ASSERT_NO_FATAL_FAILURE(expect_armed_exit(c, 0));
 
     const auto before_second = latest_completed(c.checkpoint_dir());
     ASSERT_TRUE(clink::itest::await(
         [&] { return latest_completed(c.checkpoint_dir()) > before_second; }, 60s))
-        << "no checkpoint progress after the first kill; the restart never drained";
+        << "no checkpoint progress after the first death; the restart never drained";
     ASSERT_TRUE(c.restart_worker(0));
 
-    c.worker(1).kill_hard();
-    ASSERT_TRUE(c.await_process_gone(1));
+    ASSERT_NO_FATAL_FAILURE(expect_armed_exit(c, 1));
 
     const auto code = sub->await_exit(180s);
     ASSERT_TRUE(code.has_value()) << "submitter never exited";

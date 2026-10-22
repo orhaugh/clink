@@ -10,7 +10,12 @@ now SILO, Pigsty's maintained fork of the MinIO server, pinned by digest and
 measured before the switch on what the suite depends on: a duplicate complete
 of a multipart upload gets `NoSuchUpload`, and completes racing on one upload
 leave one success and the object intact. The QUAL-03 and QUAL-04 rigs pin the
-same release. A Docker-backed suite whose container cannot start now fails its
+same release. MinIO and SILO alike can leave an upload unable to complete when
+its client disconnects partway through `CompleteMultipartUpload`, whether its
+worker died or it gave up on a stalled store, and the job then fails rather
+than guess; the S3 page now says so, and the S3 suite kills a worker only at a
+fault point outside the complete and stops its store for the outage instead of
+pausing it. A Docker-backed suite whose container cannot start now fails its
 tests with Docker's own message instead of skipping them; eleven suites
 started their container in `SetUpTestSuite`, where a throw makes googletest
 skip the whole suite. The `docker-suites` workflow runs every suite that
@@ -23,7 +28,10 @@ PostgreSQL pipeline, sink and transport suites. Its script,
 only skipped in CI, which ran them without Docker. `CLINK_TEST_S3_TRACE=1` now
 records every S3 call the store serves, through the server's admin trace; the
 MinIO setting it used to pass was removed in 2019, so until now it recorded
-nothing.
+nothing. A cluster test that fails now writes each node's thread stacks beside
+its logs (gdb on Linux, sample on macOS), and the Kafka transactional sink
+logs when `init_transactions` starts and when the producer is ready, so a
+stall in CI shows where it waits.
 
 **A read-only Neo4j lookup for SQL joins.** A lookup table declared with
 `connector='lookup'` and `function='neo4j'` enriches each row of a stream, on
