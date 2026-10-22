@@ -280,8 +280,13 @@ void KafkaSink::open() {
         // Real failures (fenced producer, auth, bad config) are not
         // retriable and still throw immediately; the retriable case is
         // bounded by the same overall budget rather than retried for ever.
-        const auto init_deadline =
-            std::chrono::steady_clock::now() + 3 * impl_->opts.produce_timeout;
+        const auto init_started = std::chrono::steady_clock::now();
+        const auto init_deadline = init_started + 3 * impl_->opts.produce_timeout;
+        // Logged before and after, so a stall here shows as a start with no
+        // ready line rather than as silence.
+        clink::log::info(
+            "kafka.sink",
+            "transactional id '" + impl_->opts.transactional_id + "': init_transactions started");
         for (;;) {
             auto err_init = impl_->producer->init_transactions(timeout_ms);
             if (!err_init) {
@@ -298,6 +303,12 @@ void KafkaSink::open() {
         if (err_begin) {
             throw std::runtime_error("KafkaSink: begin_transaction failed: " + err_begin->str());
         }
+        const auto init_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - init_started)
+                                 .count();
+        clink::log::info("kafka.sink",
+                         "transactional id '" + impl_->opts.transactional_id + "': ready after " +
+                             std::to_string(init_ms) + " ms");
         // Capture the producer identity (pid/epoch) BEFORE the first record:
         // it only surfaces through the stats callback, which fires on poll()
         // at statistics.interval.ms. Left to chance, a checkpoint barrier
