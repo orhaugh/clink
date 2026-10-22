@@ -1,14 +1,15 @@
-name: connector-exactly-once
+name: docker-suites
 
-# The connector exactly-once gate (scripts/connector-exactly-once-live.sh): the
-# exactly-once suites of the Kafka, PostgreSQL and S3 sinks, the Kafka
-# window-recovery suite and the Kafka two-phase-commit fault matrix. Each runs a
-# job in a cluster of a coordinator and workers against a real server it starts
-# in Docker, kills processes or takes the server away at the points it names,
-# and checks the output exactly. The suites need Docker, which the ci
-# workflow's integration step runs without, so they skip there, and gtest
-# counts a skip as a pass; this gate fails on any skip and on a suite that ran
-# fewer cases than it has.
+# The Docker suites gate (scripts/docker-suites-live.sh): every test suite
+# that starts its own servers in Docker, apart from those with a gate of their
+# own (postgres-cdc, neo4j and the nightly ClickHouse recovery matrix). That
+# is the exactly-once suites of the Kafka, PostgreSQL and S3 sinks, the Kafka
+# window-recovery suite and two-phase-commit fault matrix, the Kafka
+# connector's live suites, the embedded resume, the Kafka source's ownership,
+# and the PostgreSQL pipeline, sink and transport suites. They need Docker,
+# which the ci workflow's integration step runs without, so they skip there,
+# and gtest counts a skip as a pass; this gate fails on any skip and on a
+# suite that ran fewer cases than it has.
 #
 # Plain runner steps that `docker run` the toolchain image, as the
 # postgres-cdc workflow does: the suites reach their servers on the runner's
@@ -27,7 +28,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: connector-exactly-once-${{ github.ref }}
+  group: docker-suites-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -36,7 +37,7 @@ env:
 
 jobs:
   live:
-    name: Kafka, PostgreSQL and S3 stay exactly once against real servers
+    name: Every suite that starts its own servers passes against them
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     env:
@@ -57,10 +58,12 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-connector-exactly-once-${{ github.run_id }}
-          restore-keys: ccache-connector-exactly-once-
-      - name: Build the integration tests, the node binaries and the 2PC job plugins
-        # Debug without DWARF and stripped, as the build job builds.
+          key: ccache-docker-suites-${{ github.run_id }}
+          restore-keys: ccache-docker-suites-
+      - name: Build the test binaries, the node binaries, the CLI and the 2PC job plugins
+        # Debug without DWARF and stripped, as the build job builds. Avro and
+        # Protobuf are required rather than detected, so the registry-format
+        # cases cannot drop out of the build unnoticed.
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ccache"
@@ -74,18 +77,19 @@ jobs:
               git config --global --add safe.directory "*"
               apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
               cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
-                -DCLINK_INTEGRATION_TESTS=ON -DCMAKE_C_FLAGS_DEBUG=-g0 -DCMAKE_CXX_FLAGS_DEBUG=-g0 \
+                -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_AVRO=ON -DCLINK_WITH_PROTOBUF=ON \
+                -DCMAKE_C_FLAGS_DEBUG=-g0 -DCMAKE_CXX_FLAGS_DEBUG=-g0 \
                 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
-              cmake --build build --target clink_integration_tests clink_node clink_submit_job \
-                clink_submit_sql clink_kafka_2pc_job clink_postgres_2pc_job clink_s3_2pc_job \
-                -j "$(( $(nproc) / 2 + 1 ))"
+              cmake --build build --target clink_integration_tests clink_kafka_tests clink_node \
+                clink_submit_job clink_submit_sql clink clink_kafka_2pc_job clink_postgres_2pc_job \
+                clink_s3_2pc_job -j "$(( $(nproc) / 2 + 1 ))"
               ccache -s | tail -3'
       - name: Save compiler cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-connector-exactly-once-${{ github.run_id }}
+          key: ccache-docker-suites-${{ github.run_id }}
       - name: Fetch the pinned Docker CLI
         # The toolchain image carries no Docker client; the suites drive the
         # runner's daemon with this one, verified against its pin.
@@ -103,18 +107,18 @@ jobs:
             -v "${RUNNER_TEMP}/docker/docker:/usr/local/bin/docker:ro" \
             -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
             -v /tmp:/tmp -v "${RUNNER_TEMP}:${RUNNER_TEMP}" \
-            -e REPORT_DIR="${RUNNER_TEMP}/connector-exactly-once-reports" \
+            -e REPORT_DIR="${RUNNER_TEMP}/docker-suites-reports" \
             -e CLINK_TEST_S3_TRACE=1 \
-            "${TOOLCHAIN}" scripts/connector-exactly-once-live.sh build 2>&1 \
-            | tee "${RUNNER_TEMP}/connector-exactly-once-gate.log"
+            "${TOOLCHAIN}" scripts/docker-suites-live.sh build 2>&1 \
+            | tee "${RUNNER_TEMP}/docker-suites-gate.log"
       - name: Keep the reports and the S3 store's trace
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: connector-exactly-once-gate
+          name: docker-suites-gate
           path: |
-            ${{ runner.temp }}/connector-exactly-once-reports/**
-            ${{ runner.temp }}/connector-exactly-once-gate.log
+            ${{ runner.temp }}/docker-suites-reports/**
+            ${{ runner.temp }}/docker-suites-gate.log
             /tmp/clink_test_minio_*.s3trace
           if-no-files-found: warn
           retention-days: 14
@@ -124,7 +128,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: connector-exactly-once-harness-logs
+          name: docker-suites-harness-logs
           path: /tmp/clink_it_*/logs/**
           if-no-files-found: ignore
           retention-days: 14
