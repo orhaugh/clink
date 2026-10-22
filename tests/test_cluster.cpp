@@ -2097,6 +2097,46 @@ clink::cluster::JobGraphSpec clink_cancel_test_graph() {
 
 }  // namespace
 
+// The read API carries the delivery guarantee the submit-time analyser
+// computed, on the summary and the detail alike. Before this the verdict
+// lived only in a log line at submit, so "is this job exactly-once?" meant
+// finding that line. A job with no checkpoint directory has no recovery
+// guarantee at all, and the analyser names why.
+TEST(Cluster, JobSnapshotsCarryTheDeliveryGuarantee) {
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-guarantee"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-guarantee", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto job_id =
+        coordinator.submit_job(clink_cancel_test_graph(), OperatorRegistry::default_instance());
+
+    const auto detail = coordinator.snapshot_job(job_id);
+    ASSERT_TRUE(detail.has_value());
+    EXPECT_EQ(detail->delivery_guarantee, "NO_RECOVERY_GUARANTEE");
+    EXPECT_EQ(detail->guarantee_limiting_factor, "checkpointing disabled");
+    EXPECT_FALSE(detail->guarantee_reasons.empty());
+
+    bool listed = false;
+    for (const auto& s : coordinator.snapshot_jobs()) {
+        if (s.id == job_id) {
+            listed = true;
+            EXPECT_EQ(s.delivery_guarantee, detail->delivery_guarantee);
+            EXPECT_EQ(s.guarantee_limiting_factor, detail->guarantee_limiting_factor);
+        }
+    }
+    EXPECT_TRUE(listed);
+
+    (void)coordinator.cancel_job(job_id);
+    EXPECT_TRUE(coordinator.await_job_completion(job_id, 5s));
+}
+
 // A cancelled job's threads are JOINED, not leaked - asserted against the
 // process's live thread count rather than inferred from jthread semantics.
 // The first job doubles as the warm-up that spins any lazily-created

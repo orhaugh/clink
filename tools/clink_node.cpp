@@ -34,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <poll.h>
 #include <sstream>
 #include <stdexcept>
@@ -67,6 +68,7 @@
 #include "clink/cluster/submit_query_config.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/cluster/worker_supervisor.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/lineage/lineage_listener.hpp"
 #ifdef CLINK_HAS_HTTP
 #include "clink/cluster/snapshots.hpp"
@@ -406,6 +408,8 @@ void write_job_summary(clink::http::JsonWriter& w, const clink::cluster::JobSumm
     w.kv("cancel_requested", j.cancel_requested);
     w.kv("error_count", j.error_count);
     w.kv("status", j.status);
+    w.kv("delivery_guarantee", j.delivery_guarantee);
+    w.kv("guarantee_limiting_factor", j.guarantee_limiting_factor);
     w.end_object();
 }
 
@@ -455,6 +459,22 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
     w.kv("unaligned_checkpoints", j.unaligned_checkpoints);
     w.kv("adaptive_barrier_mode", j.adaptive_barrier_mode);
     w.kv("status", j.status);
+    // The delivery guarantee the analyser computed at submit, and why. The
+    // level is the one the submit log line carries; a console shows it
+    // beside the recovery configuration so an operator sees what the job
+    // promises without reading logs.
+    w.kv("delivery_guarantee", j.delivery_guarantee);
+    w.kv("guarantee_limiting_factor", j.guarantee_limiting_factor);
+    w.key("guarantee_reasons").begin_array();
+    for (const auto& r : j.guarantee_reasons) {
+        w.string_value(r);
+    }
+    w.end_array();
+    w.key("guarantee_warnings").begin_array();
+    for (const auto& wn : j.guarantee_warnings) {
+        w.string_value(wn);
+    }
+    w.end_array();
     w.key("pending_checkpoint_ids").begin_array();
     for (auto id : j.pending_checkpoint_ids) {
         w.uint_value(id);
@@ -1269,6 +1289,28 @@ clink::http::HttpResponse handle_connectors(const clink::http::HttpRequest&) {
     };
     // clang-format on
 
+    // The capability records this binary declares, grouped under the
+    // vocabulary entry they belong to by the same longest-prefix rule the
+    // delivery-guarantee gate uses (kafka_2pc belongs to kafka, s3_parquet_2pc
+    // to s3_parquet rather than s3). A connector's declared guarantees are
+    // what a console needs beside the name: whether a sink can be exactly-once,
+    // whether a source replays from a recorded position, whether TLS exists.
+    const auto records = clink::connectors::CapabilityRegistry::instance().all();
+    const auto owner_of = [&](std::string_view record_name) -> std::string_view {
+        std::string_view best;
+        for (const auto& c : kConnectors) {
+            const std::string_view n = c.name;
+            const bool exact = record_name == n;
+            const bool prefixed = record_name.size() > n.size() &&
+                                  record_name.substr(0, n.size()) == n &&
+                                  record_name[n.size()] == '_';
+            if ((exact || prefixed) && n.size() > best.size()) {
+                best = n;
+            }
+        }
+        return best;
+    };
+
     clink::http::JsonWriter w;
     w.begin_object();
     w.kv("ok", true);
@@ -1286,6 +1328,48 @@ clink::http::HttpResponse handle_connectors(const clink::http::HttpRequest&) {
         // this endpoint before a deploy must see the truth of the
         // running cluster.
         w.kv("available", clink::cluster::connector_declared_available(c.name));
+        // The strongest sink guarantee any of its records declares, whether
+        // any source record replays, whether any record has TLS; then the
+        // records themselves, so a console can show a variant table.
+        std::optional<clink::connectors::DeliveryGuarantee> strongest;
+        bool replayable = false;
+        bool tls = false;
+        std::vector<const clink::connectors::ConnectorCapabilities*> mine;
+        for (const auto& r : records) {
+            if (owner_of(r.name) != std::string_view{c.name}) {
+                continue;
+            }
+            mine.push_back(&r);
+            if (r.is_sink &&
+                (!strongest.has_value() || clink::connectors::strength(r.delivery) >
+                                               clink::connectors::strength(*strongest))) {
+                strongest = r.delivery;
+            }
+            replayable = replayable || (r.is_source && r.replayable);
+            tls = tls || r.tls;
+        }
+        if (strongest.has_value()) {
+            w.kv("sink_delivery", clink::connectors::to_string(*strongest));
+        }
+        w.kv("source_replayable", replayable);
+        w.kv("tls", tls);
+        w.key("variants").begin_array();
+        for (const auto* r : mine) {
+            w.begin_object();
+            w.kv("name", r->name);
+            w.kv("source", r->is_source);
+            w.kv("sink", r->is_sink);
+            w.kv("delivery", clink::connectors::to_string(r->delivery));
+            w.kv("transactional", r->transactional);
+            w.kv("commit_recoverable", r->commit_recoverable);
+            w.kv("replayable", r->replayable);
+            w.kv("offset_model", clink::connectors::to_string(r->offset_model));
+            w.kv("checkpoint_integrated", r->checkpoint_integrated);
+            w.kv("tls", r->tls);
+            w.kv("available_in_sql", r->available_in_sql);
+            w.end_object();
+        }
+        w.end_array();
         w.end_object();
     }
     w.end_array();

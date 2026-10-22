@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**The read API says what a job promises and what a connector declares.**
+`GET /api/v1/jobs` and `GET /api/v1/jobs/:id` carry the delivery guarantee the
+submission-time analyser computed for the job (`delivery_guarantee`, one of
+the `EndToEndGuarantee` levels, and `guarantee_limiting_factor`, the sink or
+property that caps it), and the detail adds the analyser's `guarantee_reasons`
+and `guarantee_warnings`. Until now the verdict lived in a log line at submit,
+so an operator asking "is this job exactly-once?" had to find it there; the
+console now shows it beside the recovery configuration. `GET /api/v1/connectors`
+adds, per vocabulary entry, the capability records this binary declares
+(`variants`: name, source or sink, delivery, transactional, commit-recoverable,
+replayable, offset model, checkpoint integration, TLS, SQL availability),
+grouped under the entry by the same longest-prefix rule the guarantee gate
+uses, plus the strongest sink delivery (`sink_delivery`), `source_replayable`
+and `tls` rolled up. A recovered job is resubmitted through the same path, so
+it carries the fields too.
+
 **The exactly-once specification covers an interval a sink found empty.** A
 two-phase sink of the recoverable family (Postgres, files, objects) that
 received nothing between two barriers seals no transaction, persists no

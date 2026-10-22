@@ -1626,6 +1626,17 @@ private:
         // can identify the job by name, not just id.
         std::string name;
 
+        // The delivery guarantee the submission-time analyser computed for
+        // this job (guarantee_gate.hpp): its level, what limits it, and the
+        // reasons and warnings behind it. Kept so GET /api/v1/jobs and
+        // /jobs/:id can say what a running job actually promises; until
+        // now the verdict lived only in a log line at submit, and an
+        // operator asking "is this job exactly-once?" had to find it there.
+        std::string delivery_guarantee;
+        std::string guarantee_limiting_factor;
+        std::vector<std::string> guarantee_reasons;
+        std::vector<std::string> guarantee_warnings;
+
         // Distributed-checkpointing config carried from SubmitJob. The
         // coordinator uses checkpoint_dir to address per-job snapshot storage,
         // and interval_ms to drive its periodic trigger thread.

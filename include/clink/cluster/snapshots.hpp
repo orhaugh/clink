@@ -56,6 +56,13 @@ struct JobSummary {
     // the obvious field name - silently never fired, so it applied zero
     // faults for a whole campaign.
     std::string status;
+    // The end-to-end delivery guarantee the submission-time analyser computed
+    // for the job (connectors::EndToEndGuarantee as text, e.g.
+    // END_TO_END_EXACTLY_ONCE) and what limits it ("sink 'file_text_sink'",
+    // "checkpointing disabled"; empty when nothing does). Empty strings on a
+    // job the coordinator has not analysed.
+    std::string delivery_guarantee;
+    std::string guarantee_limiting_factor;
 };
 
 struct JobTaskRecord {
@@ -117,6 +124,12 @@ struct JobDetail {
     bool adaptive_barrier_mode{false};
     // Same value and precedence as JobSummary::status.
     std::string status;
+    // As JobSummary, plus the analyser's reasons and warnings, so the read API
+    // carries the whole verdict the submit log line summarised.
+    std::string delivery_guarantee;
+    std::string guarantee_limiting_factor;
+    std::vector<std::string> guarantee_reasons;
+    std::vector<std::string> guarantee_warnings;
 };
 
 // --- Job DAG (GET /api/v1/jobs/:id/graph) ----------------------------------

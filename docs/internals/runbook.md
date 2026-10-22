@@ -447,7 +447,11 @@ when no other job completed checkpoint N there), or run the coordinator with
 checkpoint configuration the job is running with - directory, interval, state backend,
 restore source, restart budget and alignment. Check it before assuming a job that is
 not checkpointing is broken: an interval of 0, or an empty checkpoint_dir, means it was
-never asked to.
+never asked to. The same response (and each row of `/api/v1/jobs`) carries
+`delivery_guarantee`, the end-to-end level the submit gate computed, with
+`guarantee_limiting_factor` naming what caps it and, on the detail, the gate's
+`guarantee_reasons` and `guarantee_warnings`; so "is this job exactly-once?" is a
+read, not a search of the submit log.
 
 **Is the recovery point moving?** `clink_ckpt_last_completed_unix_seconds` advancing
 is the single best signal that a job is healthy. A job that is running, consuming and

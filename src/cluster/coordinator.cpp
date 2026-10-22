@@ -2730,6 +2730,8 @@ std::vector<JobSummary> Coordinator::snapshot_jobs() const {
         s.error_count = job->errors.size();
         s.status = job_status_string(
             job->completion_signalled, job->cancel_requested, !job->errors.empty());
+        s.delivery_guarantee = job->delivery_guarantee;
+        s.guarantee_limiting_factor = job->guarantee_limiting_factor;
         out.push_back(std::move(s));
     }
     return out;
@@ -2776,6 +2778,10 @@ std::optional<JobDetail> Coordinator::snapshot_job(JobId job_id) const {
     d.adaptive_barrier_mode = job.checkpoint.alignment == CheckpointAlignment::Adaptive;
     d.status =
         job_status_string(job.completion_signalled, job.cancel_requested, !job.errors.empty());
+    d.delivery_guarantee = job.delivery_guarantee;
+    d.guarantee_limiting_factor = job.guarantee_limiting_factor;
+    d.guarantee_reasons = job.guarantee_reasons;
+    d.guarantee_warnings = job.guarantee_warnings;
     return d;
 }
 
@@ -5131,7 +5137,8 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
             throw std::runtime_error(reject);
         }
     }
-    if (auto reject = check_delivery_guarantee(graph, checkpoint, /*out_report=*/nullptr);
+    connectors::GuaranteeReport guarantee_report;
+    if (auto reject = check_delivery_guarantee(graph, checkpoint, &guarantee_report);
         !reject.empty()) {
         throw std::runtime_error(reject);
     }
@@ -5270,11 +5277,18 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
     // coordinator's request_rescale will reject them as
     // not-scalable; cleaner than skipping at register time because
     // status() then surfaces them as Idle for dashboards).
+    //
+    // The same lock stashes the guarantee verdict for the read API
+    // (JobState's comment says why it is kept).
     {
         std::lock_guard lock(mu_);
         auto it = jobs_.find(job_id);
         if (it != jobs_.end()) {
             auto& job = *it->second;
+            job.delivery_guarantee = std::string(connectors::to_string(guarantee_report.level));
+            job.guarantee_limiting_factor = guarantee_report.limiting_factor;
+            job.guarantee_reasons = guarantee_report.reasons;
+            job.guarantee_warnings = guarantee_report.warnings;
             if (!job.rescale_coordinator) {
                 job.rescale_coordinator = std::make_unique<RescaleCoordinator>();
             }
