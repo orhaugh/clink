@@ -524,3 +524,5 @@ CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres password=pos
 ```
 
 The convenience script `scripts/sanitize_connectors.sh` networks a PostgreSQL instance against the `clink-build:latest` image and sets the DSN automatically.
+
+The two-phase-commit sink's exactly-once suite (`PostgresExactlyOnceTest.*` in `clink_integration_tests`) runs the sink in a cluster, a coordinator and workers, against a PostgreSQL container it starts itself, and requires every record exactly once: a clean run, a worker killed, a worker killed inside the commit window, a PostgreSQL outage during recovery, and two kills on a longer run. `scripts/connector-exactly-once-live.sh` runs it with the Kafka and S3 exactly-once suites and fails on any skipped case; the `connector-exactly-once` workflow runs it on every push and pull request.

@@ -1,0 +1,130 @@
+name: connector-exactly-once
+
+# The connector exactly-once gate (scripts/connector-exactly-once-live.sh): the
+# exactly-once suites of the Kafka, PostgreSQL and S3 sinks, the Kafka
+# window-recovery suite and the Kafka two-phase-commit fault matrix. Each runs a
+# job in a cluster of a coordinator and workers against a real server it starts
+# in Docker, kills processes or takes the server away at the points it names,
+# and checks the output exactly. The suites need Docker, which the ci
+# workflow's integration step runs without, so they skip there, and gtest
+# counts a skip as a pass; this gate fails on any skip and on a suite that ran
+# fewer cases than it has.
+#
+# Plain runner steps that `docker run` the toolchain image, as the
+# postgres-cdc workflow does: the suites reach their servers on the runner's
+# loopback and drive the runner's Docker daemon through its socket with a
+# pinned static CLI. The S3 store's trace of every call is kept with the
+# reports, the store's side of any verdict.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: connector-exactly-once-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOCKER_CLI_VERSION: 29.8.2
+  DOCKER_CLI_SHA256: 995d1ef289677f74fd58d8d2c35727b6a4ee389c69db8638a3e42d0487aa5b0f
+
+jobs:
+  live:
+    name: Kafka, PostgreSQL and S3 stay exactly once against real servers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      TOOLCHAIN: ghcr.io/${{ github.repository_owner }}/clink-build:main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report what is under test
+        run: |
+          echo "commit under test: $(git rev-parse HEAD)"
+          docker pull -q "${TOOLCHAIN}"
+          df -h /
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-connector-exactly-once-${{ github.run_id }}
+          restore-keys: ccache-connector-exactly-once-
+      - name: Build the integration tests, the node binaries and the 2PC job plugins
+        # Debug without DWARF and stripped, as the build job builds.
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ccache"
+          docker run --rm --user root \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
+            -v "${RUNNER_TEMP}/ccache:/root/.ccache" \
+            -e CLINK_DEPS_PREFIX=/usr/local -e CCACHE_DIR=/root/.ccache -e CCACHE_MAXSIZE=1500M \
+            -e CMAKE_C_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "${TOOLCHAIN}" bash -c '
+              set -euo pipefail
+              git config --global --add safe.directory "*"
+              apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
+                -DCLINK_INTEGRATION_TESTS=ON -DCMAKE_C_FLAGS_DEBUG=-g0 -DCMAKE_CXX_FLAGS_DEBUG=-g0 \
+                -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
+              cmake --build build --target clink_integration_tests clink_node clink_submit_job \
+                clink_submit_sql clink_kafka_2pc_job clink_postgres_2pc_job clink_s3_2pc_job \
+                -j "$(( $(nproc) / 2 + 1 ))"
+              ccache -s | tail -3'
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-connector-exactly-once-${{ github.run_id }}
+      - name: Fetch the pinned Docker CLI
+        # The toolchain image carries no Docker client; the suites drive the
+        # runner's daemon with this one, verified against its pin.
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/docker.tgz" \
+            "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz"
+          echo "${DOCKER_CLI_SHA256}  ${RUNNER_TEMP}/docker.tgz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/docker.tgz" -C "${RUNNER_TEMP}" docker/docker
+      - name: Run the gate
+        run: |
+          set -euo pipefail
+          docker run --rm --user root --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${RUNNER_TEMP}/docker/docker:/usr/local/bin/docker:ro" \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
+            -v /tmp:/tmp -v "${RUNNER_TEMP}:${RUNNER_TEMP}" \
+            -e REPORT_DIR="${RUNNER_TEMP}/connector-exactly-once-reports" \
+            -e CLINK_TEST_S3_TRACE=1 \
+            "${TOOLCHAIN}" scripts/connector-exactly-once-live.sh build 2>&1 \
+            | tee "${RUNNER_TEMP}/connector-exactly-once-gate.log"
+      - name: Keep the reports and the S3 store's trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-exactly-once-gate
+          path: |
+            ${{ runner.temp }}/connector-exactly-once-reports/**
+            ${{ runner.temp }}/connector-exactly-once-gate.log
+            /tmp/clink_test_minio_*.s3trace
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload the harness logs on failure
+        # The harness keeps its scratch tree, with every Coordinator and Worker
+        # log, when a case fails.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-exactly-once-harness-logs
+          path: /tmp/clink_it_*/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
