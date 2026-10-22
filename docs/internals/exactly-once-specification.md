@@ -66,6 +66,18 @@ suppression. The staged-artifact and XA family (file, Parquet, S3,
 Postgres) re-commits its persisted handles idempotently at open and
 restores from the newest completed checkpoint.
 
+A sink of that family may find an interval empty: nothing of the position
+reached it, so it seals no transaction for the checkpoint, persists no
+handle, acks the capture and later declines the commit and the abort
+(`SinkPrepareEmpty`; the ghost `emptyAt` records the positions a sink found
+empty, and the invariants ask nothing of it there). The answer is the
+input's, so a position found empty stays empty across a replay. The Kafka
+sink seals a transaction every barrier, records or none. The model was
+extended to the empty interval after a fraud-detection job recorded against
+it showed the shape: nine alerts in ninety days leave almost every interval
+empty for a Postgres sink, and the first commit such a sink declined was the
+first step the trace module could not explain.
+
 ### The steps
 
 The atomic steps are chosen so that every named fault point in
@@ -158,6 +170,7 @@ anything can race it, as the engine's open now does (see What the model found).
 | `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts; a lost worker may still be running | 19.0M distinct states, depth 54, all invariants hold |
 | `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault; a lost worker is a dead one | invariants and `EventuallySettled` hold, 7.4M distinct states |
 | `MC_KafkaLostWorker` | Kafka | as `MC_KafkaLiveness`, safety only, and a lost worker may still be running | 15.7M distinct states, depth 63, all invariants hold |
+| `MC_RecoverableSparse` | recoverable | 2 sinks, 2 checkpoints, 1 in flight, worker and coordinator death, snapshot failure, up to two empty (sink, position) pairs | 1.6M distinct states, depth 41, all invariants hold |
 
 A lost worker left running about doubles a search, so it is in the models a
 CI job can afford: `MC_KafkaTwoInFlight` (from 101,698 states),
@@ -204,7 +217,7 @@ specification, or a stutter the trace module recognises.
 |---|---|---|---|
 | `Trigger` | coordinator: the trigger loop, a savepoint (`savepoint`), a hot rescale's cut checkpoint (`cutover`, in a run outside the specification's scope), or a source's end-of-input final id (`final`) | `job`, `ckpt`, `epoch` | `Trigger` (or `ZombieTrigger` from a superseded coordinator); diverges when another coordinator that can still reach a worker has triggered the same id |
 | `DeliverBarrier` | worker, on `TriggerCheckpoint` | `job`, `ckpt`, `epoch`, `worker`, `fenced` | `DeliverBarrier`; on a worker declared lost and still running, `LostDeliverBarrier` |
-| `SinkPrepare` | the two-phase sink, transaction sealed | `sub`, `ckpt`, `family`, `staged` | `SinkPrepare` or `SinkPrepareFails`; the ack decides which. An old incarnation's is `LostSinkPrepare` |
+| `SinkPrepare` | the two-phase sink, transaction sealed, or nothing to seal | `sub`, `ckpt`, `family`, `staged` | `SinkPrepare` or `SinkPrepareFails`; the ack decides which. An old incarnation's is `LostSinkPrepare`. With `staged` false, a recoverable sink that received nothing of the interval: `SinkPrepareEmpty` or `SinkPrepareEmptyFails`, an old incarnation's `LostSinkPrepareEmpty` |
 | `SubtaskAck` | worker, as `SubtaskCheckpointed` is sent (the subtask's own step, so it precedes the subtask's next prepare in the merged trace) | `job`, `sub`, `ckpt`, `ok` | `SinkAck` (a non-sink subtask's ack is a stutter). An ack for a checkpoint an earlier incarnation of the sink sealed is a stutter: it comes from a lost worker's process, whose frames the coordinator drops |
 | `CoordComplete` | coordinator, last ack in | `job`, `ckpt`, `outcome` = `completed`, `failed`, `discarded`, `epoch` | `CoordComplete`. From a superseded coordinator's epoch, a `completed` decision on acks sent before the supersession is a stutter: the supersession turned that checkpoint's put stale (`DecidedLate`). A late `failed` or `discarded` decision diverges, as does one on an ack sent after the supersession by a worker not yet re-registered |
 | `WriteCompleted` | coordinator, in the hold after the marker fsync that advances the completed restore point, before the `after_completed_marker` fault point; not emitted when the job redeployed while the put was out, and the advance is skipped while the restart is held for in-doubt resolution | `job`, `ckpt`, `epoch` | `WriteCompleted` for the leader. From a superseded coordinator's epoch, the stale put landing (`StaleCompletedLands`), or a stutter when the takeover already read the marker; before the takeover's line, a stutter with the put left stale |

@@ -264,3 +264,17 @@ control frames is the known upgrade if it proves too loose.
    catalogue row, the README, the changelog: shipped. Still to land: a
    validated rig trace alongside a campaign page, which needs a rig run with
    `CLINK_PROTOCOL_TRACE_DIR` set.
+6. **Empty intervals.** A consumer job traced against the specification (a
+   fraud-detection rail with five Postgres two-phase sinks behind five
+   detectors, nine alerts in ninety days) diverged at the first commit a
+   sink declined because it had staged nothing in that interval, a shape
+   the engine's own traced workloads never produce. The specification now
+   takes the empty prepare (`SinkPrepareEmpty` and its forms), with the
+   ghost `emptyAt` fixing a position's answer across a replay and the
+   invariants asking nothing of a sink there; `MaxEmptyIntervals` keeps
+   every existing search unchanged, `MC_RecoverableSparse` checks the
+   extension's invariants, and the consumer run is recorded under
+   `formal/traces/recoverable-sparse-sinks`. Shipped. The same run showed
+   the module's other edge: it takes one sink family per job, and a job
+   with both Kafka and Postgres sinks is validated as the Kafka family. Not
+   yet modelled.

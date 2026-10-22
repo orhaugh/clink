@@ -151,15 +151,26 @@ StepDeliverBarrier ==
 \* The engine learns whether the capture failed only from the ack, so the
 \* prepare step is either action; the ack's `ok` picks the branch. An old
 \* incarnation's prepare (LostSinkPrepare) seals the next barrier in its own
-\* queue.
+\* queue. A line whose `staged` is false is a recoverable sink that received
+\* nothing of the interval (CommittingSink::on_barrier with no committable):
+\* the empty prepare, live or an old incarnation's. The Kafka sink's line
+\* always says staged; a line without the field is an engine from before it.
+Unstaged == Has(E, "staged") /\ ~E.staged
+
 StepSinkPrepare ==
     /\ Is("SinkPrepare")
     /\ IF ForSink
-       THEN \/ /\ CanPrepare(E.sub) /\ Min(barriers[E.sub]) = E.ckpt
-               /\ SinkPrepare(E.sub) \/ SinkPrepareFails(E.sub)
-            \/ /\ lost[E.sub].st # "down" /\ lost[E.sub].barriers # {}
-               /\ Min(lost[E.sub].barriers) = E.ckpt
-               /\ LostSinkPrepare(E.sub)
+       THEN IF Unstaged
+            THEN \/ /\ CanPrepare(E.sub) /\ Min(barriers[E.sub]) = E.ckpt
+                    /\ SinkPrepareEmpty(E.sub) \/ SinkPrepareEmptyFails(E.sub)
+                 \/ /\ lost[E.sub].st # "down" /\ lost[E.sub].barriers # {}
+                    /\ Min(lost[E.sub].barriers) = E.ckpt
+                    /\ LostSinkPrepareEmpty(E.sub)
+            ELSE \/ /\ CanPrepare(E.sub) /\ Min(barriers[E.sub]) = E.ckpt
+                    /\ SinkPrepare(E.sub) \/ SinkPrepareFails(E.sub)
+                 \/ /\ lost[E.sub].st # "down" /\ lost[E.sub].barriers # {}
+                    /\ Min(lost[E.sub].barriers) = E.ckpt
+                    /\ LostSinkPrepare(E.sub)
        ELSE Skip
 
 \* A checkpoint an earlier incarnation of the sink sealed, which the live one

@@ -117,6 +117,10 @@ def write_constants(events: list[dict], out: str) -> None:
         # A trace carries no restart budget; size it so a recorded failure always
         # rewinds, as the run did (a job failing out of budget is not recorded).
         f"TraceMaxJobRestarts == {sum(1 for e in of('SubtaskAck') if not e.get('ok', True))}",
+        # Each prepare a recoverable sink reports unstaged is an interval it found
+        # empty; the model counts distinct (sink, position) pairs, never more
+        # than these lines.
+        f"TraceMaxEmptyIntervals == {sum(1 for e in of('SinkPrepare') if e.get('staged', True) is False)}",
         f"TraceFirstEpoch == {first_epoch}   \\* the engine's epochs need not start at 1; the model's do",
         "====",
     ]

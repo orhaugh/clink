@@ -83,6 +83,24 @@ what replay suppression swallowed at emission. The invariants are then:
 | `Fenced` | No worker acted on a frame from a superseded coordinator |
 | `EventuallySettled` (liveness) | With bounded faults and fair progress the run quiesces with every vouched-for position published once |
 
+A sink of the recoverable family may find an interval **empty**: nothing of
+that position reached it, so it seals no transaction for the checkpoint,
+persists no handle, acks the capture, and later declines the commit and the
+abort for it (`SinkPrepareEmpty`, `SinkPrepareEmptyFails`,
+`LostSinkPrepareEmpty`). The ghost `emptyAt` records each position a sink
+found empty; it is the input's property, not the attempt's, so a position
+once sealed full is never found empty and one found empty is never sealed
+full, and a replay after a restore meets the same answer. `NoLoss`,
+`FrontierCovered` and `Settled` ask nothing of a sink at a position it found
+empty. `MaxEmptyIntervals` bounds how many (sink, position) pairs a search
+may find empty, zero in every configuration but `MC_RecoverableSparse`, so
+the other searches are unchanged; the trace validator counts them off the
+run. The Kafka sink seals a transaction every barrier, records or none, and
+never takes the step. A fraud-detection job recorded against the
+specification found the gap: nine alerts in ninety days leave almost every
+interval empty for a Postgres sink, and the first commit such a sink
+declined was the first step the module could not explain.
+
 Two connector families share the module through the `Recoverable`
 constant: the Kafka family (a broker transaction dies with its producer
 unless resolved with the saved identity, so the job runs the
@@ -176,10 +194,23 @@ go from a step in a counterexample to the code.
 | `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall` with no restart budget and no error restarts; a lost worker may run on | A failed checkpoint that cannot rewind fails the job rather than completing above itself; an old incarnation's commit racing the re-commit at open |
 | `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault; no lost worker left running | Checks `EventuallySettled` as well as the invariants |
 | `MC_KafkaLostWorker` | Kafka | as `MC_KafkaLiveness`, safety only, with the lost worker running on | An old incarnation executing the frames on its wire alongside the drain, the walk, the redeploy and the reopening sinks |
+| `MC_RecoverableSparse` | recoverable | 2 sinks, 2 checkpoints, 1 in flight, worker and coordinator death, snapshot failure, up to 2 empty (sink, position) pairs | A sink that seals nothing for an interval and declines its commit, across a restore and the re-commit at open |
 
 Bounds are small on purpose: a push gate has minutes, and within its bounds
 TLC is exhaustive. Larger bounds are for a deliberate longer run, not for
 the gate.
+
+Liveness is checked for the Kafka family only. For the recoverable family
+`EventuallySettled` fails at these bounds for a reason the bounds create,
+with or without empty intervals: `Settled` vouches on the newest `COMPLETED`
+marker, and a marker whose put was still out when the job restored from
+below it lands afterwards and vouches for a cut the run then has no
+checkpoint id left to re-cover (a bounded `MaxCkpt`, or a takeover's
+renumbering past a superseded coordinator's claims). The Kafka family
+vouches on `CONFIRMED` markers, which only follow executed commits, and does
+not meet it. The property, not the protocol, is what stops there; `NoLoss`
+holds through those runs, with the positions held in prepared transactions
+of a completed checkpoint.
 
 `MaxLostRunning` is 1 in `MC_KafkaTwoInFlight`, `MC_RecoverableNoBudget` and
 `MC_KafkaLostWorker`, and 0 in the other three. A lost worker left running about
@@ -451,6 +482,17 @@ the takeover's walk left open, as `RestartProceeds` requires
 re-registers keeps whatever was placed on its new session when the old one is
 retired, and a new session lost while still retiring the old one leaves the
 old session's subtasks to that retirement.
+
+A `SinkPrepare` line whose `staged` is false is a recoverable sink that
+received nothing of the interval, and the module takes the empty prepare
+(`SinkPrepareEmpty`, or the failing capture's and the old incarnation's
+forms); the `DeliverCommit` and `DeliverAbort` it later declines are the
+steps that find no handle. The Kafka sink's line always says staged.
+`traces/recoverable-sparse-sinks` is a run of card-sentry's payment rail
+(five Postgres two-phase sinks behind five fraud detectors over a Kafka
+feed, a worker killed mid-flight, a batch re-sent by its producer): 4,281
+events, 455 prepares of which 9 staged, and it diverged at the first
+declined commit before the empty prepare existed.
 
 A `WorkerDies` line is the coordinator's declaration, and the module takes it
 either way: the process gone, or still running (`WorkerLost` with `running`

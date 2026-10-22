@@ -21,6 +21,12 @@
 (* committed transactions carry, less what replay suppression swallowed at    *)
 (* emission. Exactly-once is then two statements about that multiset, made    *)
 (* precise in the INVARIANTS section.                                         *)
+(* A sink of the recoverable family may find an interval EMPTY: nothing of it *)
+(* reached the sink, so it seals no transaction for that checkpoint, persists *)
+(* no handle, acks, and later declines the commit. It owes nothing at that    *)
+(* position (emptyAt), and the answer is the input's, not the attempt's: a    *)
+(* position found empty stays empty across a replay. The Kafka sink seals a   *)
+(* transaction every barrier, records or none, and never finds one empty.     *)
 (*                                                                            *)
 (* Granularity. The atomic steps are chosen so that every named fault point   *)
 (* in include/clink/fault/fault_injection.hpp is a distinct state between two *)
@@ -67,6 +73,8 @@ CONSTANTS
     MaxWalkCancels,    \* resolution walks cancelled by the watchdog deadline
     MaxErrorRestarts,  \* whole-job restarts begun for a subtask error or a transport failure
     MaxJobRestarts,    \* the job's restart budget, as spent by failed-checkpoint rewinds
+    MaxEmptyIntervals, \* (sink, position) pairs a recoverable sink may find empty: nothing
+                       \* of the interval reached it, so it stages no transaction
     Bug                \* "none" or a mutant name (see Mutants below)
 
 Mutants == {
@@ -100,6 +108,7 @@ ASSUME Bug \in Mutants
 ASSUME MaxCkpt \in Nat /\ MaxCkpt >= 1
 ASSUME MaxInFlight \in Nat /\ MaxInFlight >= 1
 ASSUME MaxLostRunning \in Nat
+ASSUME MaxEmptyIntervals \in Nat
 
 None == 0
 Ckpts == 1..MaxCkpt
@@ -192,6 +201,9 @@ VARIABLES
     frontier,       \* cut of the current restore point; nothing at or below re-emits
     restorePoint,   \* id restored from (0 = fresh)
     cutOf,          \* [Ckpts -> Nat]: the cut each allocated id took (ghost)
+    emptyAt,        \* [Sinks -> SUBSET Positions]: positions a recoverable sink found
+                    \* empty (nothing of the interval reached it). The input's property,
+                    \* recorded as the run meets it: once found, a position stays empty
 
     \* Output and ghosts for the invariants.
     published,      \* [Sinks -> [Positions -> Nat]]: times each position is visible
@@ -211,7 +223,7 @@ vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles, receipts,
            unresolvedMk, txn, brokerUp, sinkGen, sink, pendingHandles, barriers,
            boundEpoch, msgs, lost, lostCommits, lostAborts, lostTriggers, lostSrc,
-           srcPos, frontier, restorePoint, cutOf, published, restoreSound,
+           srcPos, frontier, restorePoint, cutOf, emptyAt, published, restoreSound,
            staleAccepted, workerDeaths, coordDeaths, expiries, snapFails,
            brokerOutages, walkCancels, errorRestarts, ckptRewinds, lostRunning >>
 
@@ -230,7 +242,7 @@ diskVars   == << completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles,
 \* too: an action that leaves the sinks alone leaves them alone as well.
 lostVars   == << lost, lostCommits, lostAborts, lostTriggers, lostSrc >>
 sinkVars   == << sink, pendingHandles, barriers, lostVars >>
-jobVars    == << srcPos, frontier, restorePoint, cutOf >>
+jobVars    == << srcPos, frontier, restorePoint, cutOf, emptyAt >>
 ghostVars  == << published, restoreSound, staleAccepted >>
 budgetVars == << workerDeaths, coordDeaths, expiries, snapFails, brokerOutages,
                  walkCancels, errorRestarts, ckptRewinds, lostRunning >>
@@ -297,6 +309,27 @@ Publish(s, c) == IF txn[s][c].has
                  THEN [published EXCEPT ![s][cutOf[c]] = @ + 1]
                  ELSE published
 
+\* An empty interval: nothing of position p reached sink s, so it has nothing
+\* to seal for the checkpoint that cuts there (CommittingSink::on_barrier
+\* returns no committable from prepare_commit, persists no handle, and
+\* finalise_ later finds none for the commit or the abort and declines it).
+\* Whether a sink has records at a position is the input's property, not the
+\* attempt's: a position once sealed full (a transaction of any state names
+\* it) is never found empty, and one found empty is never sealed full, so a
+\* replay after a restore meets the same answer. MaxEmptyIntervals bounds how
+\* many (sink, position) pairs a search may find empty; the trace validator
+\* counts them off the run. The Kafka sink seals a transaction every barrier,
+\* records or none, and never takes the empty step.
+EmptyPairs == {<<s, p>> \in Sinks \X Positions : p \in emptyAt[s]}
+PreparedFull(s, p) == \E c \in Ckpts : cutOf[c] = p /\ txn[s][c].st # "none"
+CanBeEmpty(s, p) ==
+    /\ Recoverable /\ ~PreparedFull(s, p)
+    /\ p \in emptyAt[s] \/ Cardinality(EmptyPairs) < MaxEmptyIntervals
+FoundEmpty(s, p) == [emptyAt EXCEPT ![s] = @ \cup {p}]
+
+\* A sink owes a position unless it found the interval empty.
+Owes(s, p) == p \notin emptyAt[s]
+
 --------------------------------------------------------------------------------
 (* INITIAL STATE: the job is deployed and running, nothing checkpointed. *)
 
@@ -327,6 +360,7 @@ Init ==
     /\ lostCommits = {} /\ lostAborts = {} /\ lostTriggers = {} /\ lostSrc = FALSE
     /\ srcPos = 0 /\ frontier = 0 /\ restorePoint = 0
     /\ cutOf = [c \in Ckpts |-> 0]
+    /\ emptyAt = [s \in Sinks |-> {}]
     /\ published = [s \in Sinks |-> [p \in Positions |-> 0]]
     /\ restoreSound = TRUE /\ staleAccepted = FALSE
     /\ workerDeaths = 0 /\ coordDeaths = 0 /\ expiries = 0 /\ snapFails = 0
@@ -408,7 +442,7 @@ DeliverBarrier ==
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, sinkCut,
                     sinkHandles, receipts, unresolvedMk, txn, brokerUp, sinkGen, sink,
                     pendingHandles, boundEpoch, lostCommits, lostAborts, lostTriggers, lostSrc,
-                    frontier, restorePoint, published, restoreSound, budgetVars >>
+                    frontier, restorePoint, emptyAt, published, restoreSound, budgetVars >>
 
 \* Sink::on_barrier: the prepare. The Kafka sink flushes the open transaction,
 \* stages its resume handle inside this checkpoint and will not seal another
@@ -443,7 +477,8 @@ SinkPrepare(s) ==
     /\ LET c == Min(barriers[s])
            has == cutOf[c] > sink[s].suppress
            handles == pendingHandles[s] \cup {c}
-       IN /\ barriers' = [barriers EXCEPT ![s] = @ \ {c}]
+       IN /\ cutOf[c] \notin emptyAt[s]
+          /\ barriers' = [barriers EXCEPT ![s] = @ \ {c}]
           /\ txn' = [txn EXCEPT ![s][c] = [st |-> "prepared", owner |-> sinkGen[s],
                                           desc |-> FALSE, has |-> has]]
           /\ sinkCut' = [sinkCut EXCEPT ![s][c] = cutOf[c]]
@@ -463,7 +498,8 @@ SinkPrepareFails(s) ==
     /\ CanPrepare(s)
     /\ LET c == Min(barriers[s])
            has == cutOf[c] > sink[s].suppress
-       IN /\ barriers' = [barriers EXCEPT ![s] = @ \ {c}]
+       IN /\ cutOf[c] \notin emptyAt[s]
+          /\ barriers' = [barriers EXCEPT ![s] = @ \ {c}]
           /\ txn' = [txn EXCEPT ![s][c] = [st |-> "prepared", owner |-> sinkGen[s],
                                           desc |-> FALSE, has |-> has]]
           /\ pendingHandles' = [pendingHandles EXCEPT ![s] = @ \cup {c}]
@@ -473,6 +509,45 @@ SinkPrepareFails(s) ==
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, boundEpoch, msgs,
                     lostVars, jobVars, ghostVars, workerDeaths, coordDeaths, expiries,
                     brokerOutages, walkCancels, errorRestarts, ckptRewinds, lostRunning >>
+
+\* Sink::on_barrier for an interval nothing of which reached the sink
+\* (CommittingSink: prepare_commit returns no committable). No transaction
+\* is sealed and no handle persisted; the snapshot is captured and acked all
+\* the same, with the sink's cut and the handles it still holds from earlier
+\* checkpoints, and the sink owes nothing at the position. The commit and
+\* the abort for the checkpoint find no handle and decline (DeliverCommit,
+\* DeliverAbort leave the sink as it is). Fault points as for SinkPrepare.
+SinkPrepareEmpty(s) ==
+    /\ CanPrepare(s)
+    /\ LET c == Min(barriers[s])
+           p == cutOf[c]
+       IN /\ CanBeEmpty(s, p)
+          /\ barriers' = [barriers EXCEPT ![s] = @ \ {c}]
+          /\ sinkCut' = [sinkCut EXCEPT ![s][c] = p]
+          /\ sinkHandles' = [sinkHandles EXCEPT ![s][c] = pendingHandles[s]]
+          /\ sink' = [sink EXCEPT ![s].ackDue = Append(@, [c |-> c, ok |-> TRUE])]
+          /\ emptyAt' = FoundEmpty(s, p)
+    /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, receipts,
+                    unresolvedMk, txn, brokerUp, sinkGen, pendingHandles, boundEpoch, msgs,
+                    lostVars, srcPos, frontier, restorePoint, cutOf, ghostVars, budgetVars >>
+
+\* The capture fails on an empty interval: the ack says so, nothing of the id
+\* reaches disk for the sink, and there is no transaction for the abort to
+\* discard.
+SinkPrepareEmptyFails(s) ==
+    /\ snapFails < MaxSnapFails
+    /\ CanPrepare(s)
+    /\ LET c == Min(barriers[s])
+           p == cutOf[c]
+       IN /\ CanBeEmpty(s, p)
+          /\ barriers' = [barriers EXCEPT ![s] = @ \ {c}]
+          /\ sink' = [sink EXCEPT ![s].ackDue = Append(@, [c |-> c, ok |-> FALSE])]
+          /\ emptyAt' = FoundEmpty(s, p)
+    /\ snapFails' = snapFails + 1
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, txn, brokerUp, sinkGen, pendingHandles,
+                    boundEpoch, msgs, lostVars, srcPos, frontier, restorePoint, cutOf,
+                    ghostVars, workerDeaths, coordDeaths, expiries, brokerOutages, walkCancels,
+                    errorRestarts, ckptRewinds, lostRunning >>
 
 \* SubtaskCheckpointed reaches the coordinator (handle_subtask_checkpointed_).
 \* An ack for an id the coordinator no longer tracks is ignored; an ack to a
@@ -1195,7 +1270,7 @@ LostDeliverBarrier ==
                     freshLeader, rewindFloor, walkVars, confirming, staleCompleted, lateBatch,
                     completedDisk, confirmedDisk, sinkCut, sinkHandles, receipts, unresolvedMk,
                     txn, brokerUp, sinkGen, sink, pendingHandles, boundEpoch, msgs, lostCommits,
-                    lostAborts, frontier, restorePoint, ghostVars, budgetVars >>
+                    lostAborts, frontier, restorePoint, emptyAt, ghostVars, budgetVars >>
 
 \* The old incarnations after an old incarnation's own step: the frames on its
 \* wire as given, nothing else moved.
@@ -1217,6 +1292,7 @@ LostSinkPrepare(s) ==
     /\ Kafka => /\ lost[s].stage = "idle" /\ lost[s].openTxn = None
                 /\ sinkGen[s] = lost[s].gen
     /\ LET c == Min(lost[s].barriers) IN
+       /\ cutOf[c] \notin emptyAt[s]
        /\ txn' = [txn EXCEPT ![s][c] = [st |-> "prepared", owner |-> lost[s].gen,
                                         desc |-> FALSE, has |-> TRUE]]
        /\ lost' = LostAfter([lost EXCEPT ![s].barriers = @ \ {c},
@@ -1225,6 +1301,20 @@ LostSinkPrepare(s) ==
     /\ UNCHANGED << leaderVars, coordVars, diskVars, brokerUp, sinkGen, sink, pendingHandles,
                     barriers, boundEpoch, msgs, lostCommits, lostAborts, lostTriggers, lostSrc,
                     jobVars, ghostVars, budgetVars >>
+
+\* An old incarnation meets an empty interval: it seals nothing, as a live
+\* sink would (SinkPrepareEmpty). Its ack is dropped like any of its acks.
+LostSinkPrepareEmpty(s) ==
+    /\ lost[s].st # "down" /\ lost[s].barriers # {}
+    /\ LET c == Min(lost[s].barriers)
+           p == cutOf[c]
+       IN /\ CanBeEmpty(s, p)
+          /\ emptyAt' = FoundEmpty(s, p)
+          /\ lost' = LostAfter([lost EXCEPT ![s].barriers = @ \ {c}], lostCommits, lostAborts)
+    /\ UNCHANGED << leaderVars, coordVars, diskVars, txn, brokerUp, sinkGen, sink,
+                    pendingHandles, barriers, boundEpoch, msgs, lostCommits, lostAborts,
+                    lostTriggers, lostSrc, srcPos, frontier, restorePoint, cutOf, ghostVars,
+                    budgetVars >>
 
 \* The next CommitCheckpoint on the wire to an old incarnation, in the order
 \* sent (one FIFO dispatch per worker), once its dispatch is free.
@@ -1605,8 +1695,8 @@ Redeploy ==
     /\ coordUp /\ phase = "deploying"
     /\ RedeployEffects
     /\ UNCHANGED << leaderVars, memCompleted, memConfirmed, drainSet, walkVars, diskVars,
-                    txn, brokerUp, sinkGen, boundEpoch, cutOf, published, staleAccepted,
-                    budgetVars >>
+                    txn, brokerUp, sinkGen, boundEpoch, cutOf, emptyAt, published,
+                    staleAccepted, budgetVars >>
 
 \* The drain is covered. A tracked job with a completed-but-unconfirmed gap
 \* holds its redeploy for in-doubt resolution
@@ -1623,11 +1713,12 @@ RestartProceeds ==
             /\ walkVerdict' = [s \in Sinks |-> "none"] /\ walkRetries' = 0
             /\ UNCHANGED << nextCkpt, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
                             markerDue, broadcastIds, unconfirmed, confirming, staleCompleted, lateBatch, freshLeader, rewindFloor,
-                            sinkVars, msgs, srcPos, frontier, restorePoint, restoreSound >>
+                            sinkVars, msgs, srcPos, frontier, restorePoint, emptyAt,
+                            restoreSound >>
        ELSE /\ RedeployEffects
             /\ UNCHANGED walkVars
     /\ UNCHANGED << leaderVars, memCompleted, memConfirmed, drainSet, diskVars, txn, brokerUp,
-                    sinkGen, boundEpoch, cutOf, published, staleAccepted, budgetVars >>
+                    sinkGen, boundEpoch, cutOf, emptyAt, published, staleAccepted, budgetVars >>
 
 \* The leader's claim on its next id is refused: the record already holds
 \* that id or a higher one (renumber_above_held_ids_locked_ in
@@ -1788,15 +1879,16 @@ JobFailed == phase = "failed" /\ UNCHANGED vars
 
 Next ==
     \/ Trigger \/ ZombieTrigger \/ DeliverBarrier
-    \/ \E s \in Sinks : SinkPrepare(s) \/ SinkPrepareFails(s) \/ SinkAck(s)
+    \/ \E s \in Sinks : SinkPrepare(s) \/ SinkPrepareFails(s) \/ SinkPrepareEmpty(s)
+                        \/ SinkPrepareEmptyFails(s) \/ SinkAck(s)
     \/ CoordComplete \/ WriteCompleted \/ WriteStaleCompleted \/ Broadcast
     \/ DeliverCommit \/ DeliverAbort
     \/ \E s \in Sinks : SinkCommit(s) \/ SinkReceipt(s) \/ SinkFinish(s) \/ SinkConfirm(s)
     \/ WriteConfirmed \/ AdvanceConfirmed
     \/ \E w \in Workers : WorkerDies(w) \/ WorkerLostRunning(w)
     \/ LostDeliverBarrier \/ LostDeliverAbort \/ LostSourceStops
-    \/ \E s \in Sinks : LostSinkPrepare(s) \/ LostSinkCommit(s) \/ LostSinkReceipt(s)
-                        \/ LostSinkStops(s)
+    \/ \E s \in Sinks : LostSinkPrepare(s) \/ LostSinkPrepareEmpty(s) \/ LostSinkCommit(s)
+                        \/ LostSinkReceipt(s) \/ LostSinkStops(s)
     \/ RestartOnError
     \/ \E s \in Sinks : SinkDrains(s)
     \/ CoordDies \/ CoordSuperseded \/ ZombieStops \/ CoordRecovers
@@ -1813,7 +1905,8 @@ Next ==
 \* weakly fair, which is what the liveness property assumes.
 Fairness ==
     /\ WF_vars(Trigger) /\ WF_vars(DeliverBarrier)
-    /\ \A s \in Sinks : WF_vars(SinkPrepare(s)) /\ WF_vars(SinkAck(s))
+    /\ \A s \in Sinks : WF_vars(SinkPrepare(s)) /\ WF_vars(SinkPrepareEmpty(s))
+                        /\ WF_vars(SinkAck(s))
                         /\ WF_vars(SinkCommit(s)) /\ WF_vars(SinkReceipt(s))
                         /\ WF_vars(SinkFinish(s)) /\ WF_vars(SinkConfirm(s))
                         /\ WF_vars(SinkDrains(s))
@@ -1854,6 +1947,9 @@ TypeOK ==
     /\ \A p \in lostCommits \cup lostAborts : lost[p[1]].st # "down"
     /\ lostTriggers \subseteq Ckpts /\ (lostSrc <=> lostTriggers # {})
     /\ lostRunning <= MaxLostRunning
+    /\ emptyAt \in [Sinks -> SUBSET Positions]
+    /\ Cardinality(EmptyPairs) <= MaxEmptyIntervals
+    /\ Kafka => \A s \in Sinks : emptyAt[s] = {}
 
 \* No sink publishes any position more than once.
 NoDuplicate ==
@@ -1861,8 +1957,9 @@ NoDuplicate ==
 
 \* The cut of the newest confirmed checkpoint (completed, for the recoverable
 \* family) is a frontier the protocol vouches for: every position at or below
-\* it is published exactly once at every sink, or is held prepared for a
-\* completed checkpoint whose commit the recoverable family will re-execute.
+\* it is published exactly once at every sink that owes it, or is held
+\* prepared for a completed checkpoint whose commit the recoverable family
+\* will re-execute. A sink that found the interval empty owes nothing there.
 VouchedFor == IF Tracked THEN Max(confirmedDisk) ELSE Max(completedDisk)
 
 VouchedCut == IF VouchedFor = None THEN 0 ELSE cutOf[VouchedFor]
@@ -1876,12 +1973,12 @@ Held(s, p) == Recoverable /\ \E c \in Ckpts :
 
 NoLoss ==
     \A s \in Sinks, p \in 1..VouchedCut :
-        published[s][p] = 1 \/ (published[s][p] = 0 /\ Held(s, p))
+        ~Owes(s, p) \/ published[s][p] = 1 \/ (published[s][p] = 0 /\ Held(s, p))
 
 \* Positions the source can no longer re-emit are published or held.
 FrontierCovered ==
     \A s \in Sinks, p \in 1..frontier :
-        published[s][p] = 1 \/ (published[s][p] = 0 /\ Held(s, p))
+        ~Owes(s, p) \/ published[s][p] = 1 \/ (published[s][p] = 0 /\ Held(s, p))
 
 \* A restore never read participant snapshots of mixed vintage.
 RestoreSound == restoreSound
@@ -1911,7 +2008,7 @@ Safety == NoDuplicate /\ NoLoss /\ FrontierCovered /\ RestoreSound /\ ConfirmedM
 
 Settled ==
     /\ Quiescent
-    /\ \A s \in Sinks, p \in 1..VouchedCut : published[s][p] = 1
+    /\ \A s \in Sinks, p \in 1..VouchedCut : ~Owes(s, p) \/ published[s][p] = 1
 
 EventuallySettled == <>[]Settled
 

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**The exactly-once specification covers an interval a sink found empty.** A
+two-phase sink of the recoverable family (Postgres, files, objects) that
+received nothing between two barriers seals no transaction, persists no
+handle, acks the capture and later declines the commit and the abort for
+that checkpoint. The specification modelled every prepare as staging a
+transaction, so the trace module could not explain the first commit such a
+sink declined; clink's own traced workloads carry records in every interval
+and never produced the step. A fraud-detection job recorded against the
+specification did, in almost every interval: nine alerts in ninety days.
+The model now takes the empty prepare (`SinkPrepareEmpty`, its failing
+capture and its old-incarnation forms), the ghost `emptyAt` fixes a
+position's answer across a replay, and the invariants ask nothing of a sink
+at a position it found empty. `MaxEmptyIntervals` bounds the search and is
+zero in every existing configuration, which are unchanged; the new
+`MC_RecoverableSparse` checks the invariants with empty intervals, and
+`formal/traces/recoverable-sparse-sinks`, that fraud job's run with a worker
+killed mid-flight (4,281 events, 455 prepares of which 9 staged), is
+validated on every push. The trace validator counts
+the empty prepares off the run; the trace module reads the `staged` field
+the engine has always emitted.
+
 **The Docker-backed suites all run in CI, and the S3 suite runs again.** MinIO
 no longer publishes images: the `minio/minio` repository is gone from Docker
 Hub and quay.io refuses anonymous pulls, so the S3 suite's store could not
