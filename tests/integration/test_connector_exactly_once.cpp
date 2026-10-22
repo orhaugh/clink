@@ -168,18 +168,6 @@ std::uint64_t latest_confirmed(const std::filesystem::path& ckpt_root) {
 
 class PostgresExactlyOnceTest : public ::testing::Test {
 protected:
-    // One container for the whole suite (startup is seconds); one TABLE per
-    // test, so scenarios stay isolated without paying the container again.
-    static void SetUpTestSuite() {
-        if (!clink::test::DockerPostgres::docker_available()) {
-            return;  // per-test SetUp skips
-        }
-        clink::test::DockerPostgresOptions opts;
-        // 2PC is refused outright at the default max_prepared_transactions=0.
-        opts.postgres_args = {"-c", "max_prepared_transactions=64"};
-        pg_ = new clink::test::DockerPostgres(opts);
-    }
-
     static void TearDownTestSuite() {
         delete pg_;
         pg_ = nullptr;
@@ -193,7 +181,16 @@ protected:
             !std::filesystem::exists(postgres_2pc_job())) {
             GTEST_SKIP() << "cluster binaries or the postgres 2PC job plugin are not built";
         }
-        ASSERT_NE(pg_, nullptr);
+        // One container for the whole suite (startup is seconds); one TABLE
+        // per test, so scenarios stay isolated without paying the container
+        // again. Started by the first test, not in SetUpTestSuite: a throw
+        // there makes gtest skip every test, which ctest counts as passing.
+        if (pg_ == nullptr) {
+            clink::test::DockerPostgresOptions opts;
+            // 2PC is refused outright at the default max_prepared_transactions=0.
+            opts.postgres_args = {"-c", "max_prepared_transactions=64"};
+            pg_ = new clink::test::DockerPostgres(opts);
+        }
         // Lowercased: the sink quotes the identifier, so a mixed-case name
         // here would name a DIFFERENT relation than the unquoted CREATE.
         table_ = std::string{"clink_xo_"} +
@@ -523,13 +520,6 @@ void expect_exactly_once_modulo_commit_window(const std::vector<std::string>& re
 // last stable offset, so it surfaces as missing tail records.
 class KafkaExactlyOnceTest : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (!clink::test::DockerKafka::docker_available()) {
-            return;  // per-test SetUp skips
-        }
-        kafka_ = new clink::test::DockerKafka();
-    }
-
     static void TearDownTestSuite() {
         delete kafka_;
         kafka_ = nullptr;
@@ -543,7 +533,11 @@ protected:
             !std::filesystem::exists(kafka_2pc_job())) {
             GTEST_SKIP() << "cluster binaries or the kafka 2PC job plugin are not built";
         }
-        ASSERT_NE(kafka_, nullptr);
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (kafka_ == nullptr) {
+            kafka_ = new clink::test::DockerKafka();
+        }
         topic_ = std::string{"clink_xo_"} +
                  ::testing::UnitTest::GetInstance()->current_test_info()->name();
         kafka_->create_topic(topic_);
@@ -1063,13 +1057,6 @@ const auto* const kClinkS3Lifecycle =
 // only the clean run asserts the pending set is empty.
 class S3ExactlyOnceTest : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (!clink::test::DockerMinio::docker_available()) {
-            return;  // per-test SetUp skips
-        }
-        s3_ = new clink::test::DockerMinio();
-    }
-
     static void TearDownTestSuite() {
         delete s3_;
         s3_ = nullptr;
@@ -1083,7 +1070,11 @@ protected:
             !std::filesystem::exists(s3_2pc_job())) {
             GTEST_SKIP() << "cluster binaries or the s3 2PC job plugin are not built";
         }
-        ASSERT_NE(s3_, nullptr);
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (s3_ == nullptr) {
+            s3_ = new clink::test::DockerMinio();
+        }
         // One bucket per test; S3 bucket names must be lowercase.
         bucket_ = std::string{"clink-xo-"} +
                   ::testing::UnitTest::GetInstance()->current_test_info()->name();

@@ -55,16 +55,16 @@ std::unique_ptr<clink::test::DockerKafka> broker_;
 
 class TxnResumeLive : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (clink::test::DockerKafka::docker_available()) {
-            broker_ = std::make_unique<clink::test::DockerKafka>();
-        }
-    }
     static void TearDownTestSuite() { broker_.reset(); }
 
     void SetUp() override {
-        if (broker_ == nullptr) {
+        if (!clink::test::DockerKafka::docker_available()) {
             GTEST_SKIP() << "Docker not available";
+        }
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (broker_ == nullptr) {
+            broker_ = std::make_unique<clink::test::DockerKafka>();
         }
         topic_ = std::string{"clink_resume_"} +
                  ::testing::UnitTest::GetInstance()->current_test_info()->name();
@@ -224,18 +224,18 @@ TEST_F(TxnResumeLive, AFencedIdentityIsRefusedAndTheOrphanStaysAborted) {
 // and stays that way until SCRAM ships or the broker pin gains PLAIN.
 class TxnResumeSaslLive : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (clink::test::DockerKafka::docker_available()) {
-            clink::test::DockerKafkaOptions opts;
-            opts.sasl = true;
-            sasl_broker_ = std::make_unique<clink::test::DockerKafka>(opts);
-        }
-    }
     static void TearDownTestSuite() { sasl_broker_.reset(); }
 
     void SetUp() override {
-        if (sasl_broker_ == nullptr) {
+        if (!clink::test::DockerKafka::docker_available()) {
             GTEST_SKIP() << "Docker not available";
+        }
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (sasl_broker_ == nullptr) {
+            clink::test::DockerKafkaOptions opts;
+            opts.sasl = true;
+            sasl_broker_ = std::make_unique<clink::test::DockerKafka>(opts);
         }
     }
 

@@ -441,19 +441,19 @@ SustainedFeed produce_json_until(const std::string& brokers,
 
 class KafkaWindowRecoveryTest : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (clink::test::DockerKafka::docker_available()) {
-            kafka_ = std::make_unique<clink::test::DockerKafka>();
-        }
-    }
     static void TearDownTestSuite() { kafka_.reset(); }
 
     void SetUp() override {
-        if (kafka_ == nullptr) {
+        if (!clink::test::DockerKafka::docker_available()) {
             GTEST_SKIP() << "Docker not available; skipping Kafka window recovery gate";
         }
         if (!std::filesystem::exists(node_binary()) || !std::filesystem::exists(sql_binary())) {
             GTEST_SKIP() << "cluster node or SQL submit binary is not built";
+        }
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (kafka_ == nullptr) {
+            kafka_ = std::make_unique<clink::test::DockerKafka>();
         }
         const auto suffix =
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
@@ -2815,19 +2815,19 @@ std::ostream& operator<<(std::ostream& os, const TwopcFaultCase& c) {
 
 class KafkaTwopcFaultMatrixTest : public ::testing::TestWithParam<TwopcFaultCase> {
 protected:
-    static void SetUpTestSuite() {
-        if (clink::test::DockerKafka::docker_available()) {
-            kafka_ = std::make_unique<clink::test::DockerKafka>();
-        }
-    }
     static void TearDownTestSuite() { kafka_.reset(); }
 
     void SetUp() override {
-        if (kafka_ == nullptr) {
+        if (!clink::test::DockerKafka::docker_available()) {
             GTEST_SKIP() << "Docker not available; skipping 2PC fault matrix";
         }
         if (!std::filesystem::exists(node_binary()) || !std::filesystem::exists(sql_binary())) {
             GTEST_SKIP() << "cluster node or SQL submit binary is not built";
+        }
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (kafka_ == nullptr) {
+            kafka_ = std::make_unique<clink::test::DockerKafka>();
         }
         const auto suffix =
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());

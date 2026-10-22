@@ -82,16 +82,16 @@ std::vector<std::pair<std::int32_t, std::string>> drain_quiet(clink::KafkaSource
 
 class KafkaSourceOwnershipTest : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (clink::test::DockerKafka::docker_available()) {
-            kafka_ = std::make_unique<clink::test::DockerKafka>();
-        }
-    }
     static void TearDownTestSuite() { kafka_.reset(); }
 
     void SetUp() override {
-        if (kafka_ == nullptr) {
+        if (!clink::test::DockerKafka::docker_available()) {
             GTEST_SKIP() << "Docker not available; skipping Kafka source ownership gate";
+        }
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (kafka_ == nullptr) {
+            kafka_ = std::make_unique<clink::test::DockerKafka>();
         }
         topic_ = "clink_source_ownership_" +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());

@@ -32,17 +32,17 @@ std::unique_ptr<clink::test::DockerKafka> live_broker_;
 
 class KafkaRegistryFormatsLive : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (clink::test::DockerKafka::docker_available()) {
+    static void TearDownTestSuite() { live_broker_.reset(); }
+    void SetUp() override {
+        if (!clink::test::DockerKafka::docker_available()) {
+            GTEST_SKIP() << "Docker not available";
+        }
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (live_broker_ == nullptr) {
             clink::test::DockerKafkaOptions opts;
             opts.schema_registry = true;
             live_broker_ = std::make_unique<clink::test::DockerKafka>(opts);
-        }
-    }
-    static void TearDownTestSuite() { live_broker_.reset(); }
-    void SetUp() override {
-        if (live_broker_ == nullptr) {
-            GTEST_SKIP() << "Docker not available";
         }
     }
 

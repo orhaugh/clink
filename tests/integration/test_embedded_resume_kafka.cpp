@@ -171,19 +171,19 @@ std::string pipeline_sql(const std::string& brokers,
 
 class EmbeddedResumeKafka : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (clink::test::DockerKafka::docker_available()) {
-            broker_ = std::make_unique<clink::test::DockerKafka>();
-        }
-    }
     static void TearDownTestSuite() { broker_.reset(); }
 
     void SetUp() override {
-        if (broker_ == nullptr) {
+        if (!clink::test::DockerKafka::docker_available()) {
             GTEST_SKIP() << "Docker not available";
         }
         if (cli_binary().empty() || !fs::exists(cli_binary())) {
             GTEST_SKIP() << "clink CLI not built";
+        }
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (broker_ == nullptr) {
+            broker_ = std::make_unique<clink::test::DockerKafka>();
         }
         root_ = fs::temp_directory_path() /
                 ("clink_it_embedded_resume_" + std::to_string(::getpid()) + "_" +

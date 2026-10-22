@@ -50,16 +50,16 @@ std::unique_ptr<clink::test::DockerKafka> eoi_broker_;
 
 class KafkaTxnEndOfInputLive : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        if (clink::test::DockerKafka::docker_available()) {
-            eoi_broker_ = std::make_unique<clink::test::DockerKafka>();
-        }
-    }
     static void TearDownTestSuite() { eoi_broker_.reset(); }
 
     void SetUp() override {
-        if (eoi_broker_ == nullptr) {
+        if (!clink::test::DockerKafka::docker_available()) {
             GTEST_SKIP() << "Docker not available";
+        }
+        // Started by the first test, not in SetUpTestSuite: a throw there
+        // makes gtest skip every test, which ctest counts as passing.
+        if (eoi_broker_ == nullptr) {
+            eoi_broker_ = std::make_unique<clink::test::DockerKafka>();
         }
         name_ = ::testing::UnitTest::GetInstance()->current_test_info()->name();
         topic_ = "clink_eoi_" + name_;
