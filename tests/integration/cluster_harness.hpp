@@ -893,6 +893,47 @@ public:
         }
     }
 
+    // Every live process's threads, each into <log dir>/<label>.stacks.txt,
+    // so a failure that is a stall shows where each thread waits. gdb where
+    // it is installed (attaching needs ptrace permission, which a container
+    // gets with --cap-add=SYS_PTRACE), sample on macOS, nothing otherwise.
+    // Each dump is bounded, so a debugger that cannot attach never holds
+    // the teardown.
+    void dump_stacks() {
+        const bool gdb = std::system("command -v gdb > /dev/null 2>&1") == 0;
+        const bool sample = !gdb && std::system("command -v sample > /dev/null 2>&1") == 0;
+        if (!gdb && !sample) {
+            return;
+        }
+        const auto dump = [&](Process& p) {
+            if (!p.running()) {
+                return;
+            }
+            const auto out = (log_dir() / (p.label() + ".stacks.txt")).string();
+            const std::string pid = std::to_string(p.pid());
+            const std::string cmd =
+                gdb ? "timeout 60 gdb -p " + pid +
+                          " -batch -nx -q -ex 'set pagination off' -ex 'thread apply all bt' > '" +
+                          out + "' 2>&1"
+                    : "sample " + pid + " 1 -file '" + out + "' > /dev/null 2>&1";
+            (void)std::system(cmd.c_str());
+            std::cerr << "[harness] stacks of " << p.label() << " written to " << out << "\n";
+        };
+        if (coordinator_) {
+            dump(*coordinator_);
+        }
+        for (auto& c : ha_coordinators_) {
+            if (c) {
+                dump(*c);
+            }
+        }
+        for (auto& w : workers_) {
+            if (w) {
+                dump(*w);
+            }
+        }
+    }
+
 private:
     ClusterSpec spec_;
     std::unique_ptr<Process> coordinator_;
@@ -913,6 +954,9 @@ public:
     ScopedDiagnostics& operator=(const ScopedDiagnostics&) = delete;
     ~ScopedDiagnostics() {
         if (::testing::Test::HasFailure()) {
+            // Stacks first, while every process is still where the failure
+            // found it.
+            cluster_.dump_stacks();
             cluster_.dump_logs();
             cluster_.keep_artifacts();
             std::cerr << "\n[harness] artifacts kept at " << cluster_.root().string() << "\n";
