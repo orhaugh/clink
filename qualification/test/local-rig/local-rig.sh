@@ -186,7 +186,7 @@ seed() {  # host-container, image
 docker image inspect postgres:16 >/dev/null 2>&1 || docker pull -q postgres:16 >/dev/null
 docker image inspect docker.redpanda.com/redpandadata/redpanda:v24.2.7 >/dev/null 2>&1 || \
     docker pull -q docker.redpanda.com/redpandadata/redpanda:v24.2.7 >/dev/null
-MINIO_IMAGE="minio/minio:RELEASE.2025-09-07T16-13-09Z"   # qual03's store, pinned with minio.yml
+MINIO_IMAGE="pgsty/silo:RELEASE.2026-10-18T00-00-00Z"   # qual03's store, pinned by tag with minio.yml
 docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1 || docker pull -q "$MINIO_IMAGE" >/dev/null
 seed "$PREFIX-coordinator" "$RUNTIME_IMAGE" & p1=$!
 seed "$PREFIX-worker1" "$RUNTIME_IMAGE" & p2=$!

@@ -49,7 +49,7 @@ public:
                        ":9000 -e MINIO_ROOT_USER=" + std::string{kAccessKey} +
                        " -e MINIO_ROOT_PASSWORD=" + std::string{kSecretKey} + " " +
                        (trace ? std::string{"-e MINIO_HTTP_TRACE=/dev/stderr "} : std::string{}) +
-                       "--name " + name + " minio/minio:RELEASE.2025-09-07T16-13-09Z server /data";
+                       "--name " + name + " " + std::string{kImage} + " server /data";
             });
         port_ = started.ports[0];
         container_name_ = started.name;
@@ -121,6 +121,18 @@ private:
         }
     }
 
+    // MinIO no longer publishes images: the minio/minio repository is gone
+    // from Docker Hub and quay.io refuses anonymous pulls. This is SILO,
+    // Pigsty's fork of the MinIO server under a new name, which keeps the S3
+    // API, the MINIO_* settings, the /minio/health routes and `server /data`.
+    // It completes uploads as described above: measured on this release,
+    // eight completes of one upload in flight together gave one success and
+    // seven NoSuchUpload, with the object intact, in each of 100 rounds.
+    // Pinned by digest, so a re-pushed tag cannot change the store under the
+    // suite; the qualification rigs pin the same release by tag.
+    static constexpr std::string_view kImage =
+        "pgsty/silo:RELEASE.2026-10-18T00-00-00Z"
+        "@sha256:2636fc4155d9a7e41ff58cdb65ddd13ba9304e67184e13c25bc5cb34016269d7";
     static constexpr std::string_view kAccessKey = "clink-minio-test";
     static constexpr std::string_view kSecretKey = "clink-minio-test-secret";
 
