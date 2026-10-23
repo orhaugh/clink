@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.12.1 (October 2026)
+
+A fix for exactly-once into PostgreSQL: a takeover could restore from a
+checkpoint whose transactions the job had already rolled back, and lose that
+checkpoint's interval. There are no state-format, API or wire-protocol changes,
+and the plugin ABI fingerprint is unchanged, so job modules built against
+v0.12.0 load as they are. Coordinators now write one more small record per job
+beside its checkpoint markers (see the entry).
 
 **A takeover no longer restores from a checkpoint whose marker landed after the
 job had restored from below it.** A `COMPLETED` marker whose write was still out
