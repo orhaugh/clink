@@ -576,6 +576,31 @@ public:
                (!spec_.http || await([this] { return port_accepting(http_port_); }));
     }
 
+    // One more HA coordinator on the port and HA directory the first ones use,
+    // with options of its own: a standby that takes over clean while the
+    // leader runs with a fault armed (start_ha_coordinators arms every one of
+    // its processes alike). Not for a cluster serving HTTP, whose standbys
+    // cannot share the HTTP port.
+    [[nodiscard]] bool start_ha_standby(const ProcOptions& opts = {}) {
+        if (!spec_.ha || spec_.http || ha_coordinators_.empty()) {
+            return false;
+        }
+        const auto i = ha_coordinators_.size();
+        std::vector<std::string> argv{spec_.node_binary.string(),
+                                      "--role=coordinator",
+                                      "--bind-host=127.0.0.1",
+                                      "--advertise-host=127.0.0.1",
+                                      "--port=" + std::to_string(coordinator_port_),
+                                      "--ha-dir=" + ha_dir().string()};
+        argv.insert(argv.end(), opts.extra_args.begin(), opts.extra_args.end());
+        ha_coordinators_.push_back(std::make_unique<Process>());
+        return ha_coordinators_.back()->spawn("coordinator-" + std::to_string(i),
+                                              spec_.node_binary,
+                                              std::move(argv),
+                                              log_dir(),
+                                              opts);
+    }
+
     // Index of the process currently holding leadership, by its own log.
     // A coordinator that has been superseded keeps its old "became leader"
     // line, so liveness is checked too.

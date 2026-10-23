@@ -494,6 +494,104 @@ TEST_F(PostgresExactlyOnceTest, StaysExactlyOnceAcrossTwoSeparatedKillsOnALonger
         << "the longer run completed with a prepared transaction still pending";
 }
 
+// A takeover must not restore from a checkpoint whose COMPLETED marker landed
+// after the job had restored from below it. Checkpoint 2's marker write is
+// held; a worker dies, and the restart restores from checkpoint 1, so the
+// sinks that reopen roll checkpoint 2's prepared transactions back (they are
+// not in the restored state). The held write then lands. Every later marker
+// write is held for good, so the restarted run completes nothing, and the
+// leader dies. Before the job's RESTORED record, the standby's takeover read
+// COMPLETED-2 as the newest marker and restored from it: its open committed
+// nothing for checkpoint 2, whose transactions were gone, and its source
+// resumed past them, so checkpoint 2's records were in no store. The
+// exactly-once specification found the shape (mutant restore_from_superseded).
+TEST_F(PostgresExactlyOnceTest, ATakeoverPassesOverAMarkerThatLandedAfterTheJobRestoredBelowIt) {
+    constexpr int kTotal = 400;
+    ::setenv("CLINK_2PC_TOTAL", "400", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "20", 1);
+
+    ClusterSpec ha = spec();
+    ha.ha = true;
+    Cluster c(ha);
+    ScopedDiagnostics diag(c);
+    // The leader holds checkpoint 2's marker write past the worker's loss
+    // (declared at its heartbeat timeout) and the restart, and every later
+    // one for good. One worker runs the whole job: the write runs on the
+    // dispatch thread of the worker whose ack completed the checkpoint, and a
+    // survivor's drain report queued behind it would hold the restart until
+    // the write landed, and the restart would restore from checkpoint 2.
+    ASSERT_TRUE(
+        c.start_ha_coordinators(1,
+                                {.fault = "coordinator.before_completed_marker=block:20000@2,"
+                                          "coordinator.before_completed_marker=block:600000@3"}))
+        << "the leader did not come up";
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.await_workers_registered(1));
+    auto sub = submit(c, /*max_restarts=*/2);
+    ASSERT_NE(sub, nullptr);
+
+    const auto leader_log = [&] { return c.ha_coordinator(0).read_log(); };
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            const auto log = leader_log();
+            return log.find("fired: coordinator.before_completed_marker action=3 ordinal=2") !=
+                   std::string::npos;
+        },
+        45s))
+        << "checkpoint 2's marker write was never held";
+    // Not vacuous: checkpoint 2 sealed rows, so there is something to lose.
+    const auto prepared_for_2 = [&] {
+        return std::stol(
+            pg_->scalar("SELECT count(*) FROM pg_prepared_xacts WHERE gid ~ '_sub[0-9]+_2$'"));
+    };
+    ASSERT_GT(prepared_for_2(), 0) << "checkpoint 2 sealed no rows; the scenario loses nothing";
+
+    // A spare, registered once the job runs, takes the restart with nothing
+    // to drain. The worker dies with the write held; the restart restores
+    // from 1, and the reopened sinks roll checkpoint 2 back.
+    ASSERT_TRUE(c.start_ha_worker(1));
+    ASSERT_TRUE(c.await_workers_registered(2));
+    c.worker(0).kill_hard();
+    ASSERT_TRUE(c.await_process_gone(0));
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return leader_log().find("restore point: checkpoint 1 ") != std::string::npos; },
+        30s))
+        << "the restart did not restore from checkpoint 1";
+    ASSERT_TRUE(clink::itest::await([&] { return prepared_for_2() == 0; }, 30s))
+        << "the reopened sinks did not roll checkpoint 2's transactions back";
+
+    // The held write lands for the run before the restart.
+    const auto marker_2 = c.checkpoint_dir() / "_jobs" / "1" / "COMPLETED-2";
+    ASSERT_TRUE(clink::itest::await([&] { return std::filesystem::exists(marker_2); }, 45s))
+        << "checkpoint 2's marker never landed";
+
+    // The leader dies before the restarted run completes anything; a clean
+    // standby takes over.
+    ASSERT_TRUE(c.start_ha_standby()) << "the standby did not start";
+    ASSERT_TRUE(
+        clink::itest::await([&] { return c.ha_coordinator(1).log_contains("standby"); }, 15s));
+    ASSERT_TRUE(c.kill_leader_and_await_failover().has_value())
+        << "no standby took over after the leader was killed: " << c.describe_coordinator_exits();
+    ASSERT_TRUE(c.await_coordinator_ready()) << "the new leader never opened the control port";
+    ASSERT_TRUE(c.restart_worker_ha(0)) << "the killed worker did not come back";
+
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return c.ha_coordinator(1).log_contains("recovered job_id=1 "); }, 30s))
+        << "the new leader never recovered the job";
+    EXPECT_TRUE(c.ha_coordinator(1).log_contains("recovered job_id=1 restore_from_ckpt=1"))
+        << "the takeover did not restore from checkpoint 1, below COMPLETED-2, whose "
+           "transactions the restarted run had rolled back";
+
+    // Judged by the data: the submitter's connection died with the leader.
+    clink::itest::await([&] { return committed_count() >= kTotal; }, 90s);
+    const auto v = clink::itest::verify_exactly_once_records(rows(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a takeover after a marker landed late broke Postgres "
+                              "exactly-once: "
+                           << clink::itest::describe(v);
+    EXPECT_EQ(prepared_count(), 0) << "the recovered run left a prepared transaction behind";
+    (void)sub;
+}
+
 #ifdef CLINK_HAS_KAFKA
 
 // The verdict for the transactional Kafka sink under PROCESS LOSS, on the

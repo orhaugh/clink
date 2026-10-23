@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -93,6 +94,46 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 // parse. A record from before the claimant line (the id alone) reads the same.
 [[nodiscard]] std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir,
                                                         JobId job_id);
+
+// <checkpoint_dir>/_jobs/<job_id>/RESTORED: where the job's newest deploy
+// restored from and the first checkpoint id its run numbers, put before any of
+// that deploy's frames leave. A COMPLETED marker strictly between the two is a
+// put that was still out when the job restored: a restart redeployed while it
+// was in flight, or a superseded coordinator's put landed after the takeover
+// read the disk. The run that restored below it has rolled its transactions
+// back at open (the Postgres two-phase sink rolls back every prepared
+// transaction its restore does not hold), so a restore that chose it would
+// re-commit transactions that are gone and resume the source past their
+// interval. A job that restores from its newest completed checkpoint passes
+// such a marker over (latest_completed_id_on_disk in coordinator.cpp). Records
+// only rise: a later deploy restores from at least what an earlier one could
+// choose and numbers above every id ever allocated, so the newest record
+// excludes all an older one did that a restore could still reach.
+struct RestoredRecord {
+    std::uint64_t restore{0};  // the checkpoint the deploy restored from (0: nothing)
+    std::uint64_t next{0};     // the first id its run numbers
+    // Whether a COMPLETED marker for `id` is one this record passes over.
+    [[nodiscard]] bool passes_over(std::uint64_t id) const noexcept {
+        return restore < id && id < next;
+    }
+};
+
+[[nodiscard]] std::string restored_record_key(JobId job_id);
+
+// Put the record, fenced by the writer's coordinator epoch: it lands over a
+// record of the same or an earlier epoch, and returns false, writing nothing,
+// over a later one (a leader has superseded the writer, which must not
+// deploy). Throws when the record could not be written.
+[[nodiscard]] bool record_restore_point(const std::string& checkpoint_dir,
+                                        JobId job_id,
+                                        std::uint64_t writer_epoch,
+                                        RestoredRecord record);
+
+// The record, or nullopt when the job has none. A body that does not parse
+// throws: passing over nothing could restore from a checkpoint whose
+// transactions are gone, and guessing is not safer.
+[[nodiscard]] std::optional<RestoredRecord> read_restore_point(const std::string& checkpoint_dir,
+                                                               JobId job_id);
 
 // The checkpoint-id floor of a new run of the job (DeployMsg::run_checkpoint_floor):
 // a 2PC sink reads receipts and unresolved markers above the larger of its

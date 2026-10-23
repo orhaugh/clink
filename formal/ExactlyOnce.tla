@@ -98,8 +98,10 @@ Mutants == {
     "advance_before_confirmed_put",   \* found in review: latest_confirmed moved before the CONFIRMED marker was durable
     "orphan_left_to_init",            \* found by this model: a reopening sink left an undecided orphan for its init
                                       \* to abort, and the lost worker still running committed it in between
-    "open_skips_restore_zero"         \* found by this model: a sink reopening at restore point 0 took the restart
+    "open_skips_restore_zero",        \* found by this model: a sink reopening at restore point 0 took the restart
                                       \* for a fresh start, and neither settled its orphan nor armed suppression
+    "restore_from_superseded"         \* found by this model: a takeover restored from a COMPLETED marker that
+                                      \* landed after the job had restored from below it, its transactions gone
 }
 
 ASSUME Host \in [Sinks -> Workers]
@@ -165,6 +167,8 @@ VARIABLES
     sinkHandles,    \* [Sinks -> [Ckpts -> SUBSET Ckpts]]: staged handles per snapshot
     receipts,       \* SUBSET (Sinks \X Ckpts): commit receipts sub<K>-<N>
     unresolvedMk,   \* SUBSET (Sinks \X Ckpts): sub<K>-<N>.unresolved markers
+    restoreRec,     \* the newest deploy's RESTORED record: the checkpoint it restored
+                    \* from and the first id its run numbers (see RedeployEffects)
 
     \* The broker (the external transaction coordinator).
     txn,            \* [Sinks -> [Ckpts -> record]]: st, owner, desc, has
@@ -221,7 +225,7 @@ vars == << leaderEpoch, coordUp, zombie, zombieEpoch, zombieNext,
            markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed, drainSet,
            freshLeader, rewindFloor, walkC, walkVerdict, walkRetries,
            completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles, receipts,
-           unresolvedMk, txn, brokerUp, sinkGen, sink, pendingHandles, barriers,
+           unresolvedMk, restoreRec, txn, brokerUp, sinkGen, sink, pendingHandles, barriers,
            boundEpoch, msgs, lost, lostCommits, lostAborts, lostTriggers, lostSrc,
            srcPos, frontier, restorePoint, cutOf, emptyAt, published, restoreSound,
            staleAccepted, workerDeaths, coordDeaths, expiries, snapFails,
@@ -236,8 +240,10 @@ coordMem   == << phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                  walkRetries >>
 coordVars  == << coordMem, confirming, staleCompleted, lateBatch >>
 walkVars   == << walkC, walkVerdict, walkRetries >>
-diskVars   == << completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles,
-                 receipts, unresolvedMk >>
+\* Everything durable but the RESTORED record, which only a redeploy writes.
+diskButRecord == << completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles,
+                    receipts, unresolvedMk >>
+diskVars   == << diskButRecord, restoreRec >>
 \* The old incarnations a lost worker's process still runs are sink processes
 \* too: an action that leaves the sinks alone leaves them alone as well.
 lostVars   == << lost, lostCommits, lostAborts, lostTriggers, lostSrc >>
@@ -349,6 +355,7 @@ Init ==
     /\ sinkCut = [s \in Sinks |-> [c \in Ckpts |-> 0]]
     /\ sinkHandles = [s \in Sinks |-> [c \in Ckpts |-> {}]]
     /\ receipts = {} /\ unresolvedMk = {}
+    /\ restoreRec = [from |-> 0, next |-> 1]
     /\ txn = [s \in Sinks |-> [c \in Ckpts |-> NoTxn]]
     /\ brokerUp = TRUE /\ sinkGen = [s \in Sinks |-> 1]
     /\ sink = [s \in Sinks |-> [DownSink EXCEPT !.up = TRUE]]
@@ -433,7 +440,7 @@ DeliverBarrier ==
         /\ LET c == m.c
                fenced == m.epoch < boundEpoch[SrcWorker] /\ Bug # "no_fencing"
            IN IF fenced
-              THEN UNCHANGED << srcPos, srcCut, cutOf, barriers, lost, staleAccepted >>
+              THEN UNCHANGED << srcPos, srcCut, cutOf, barriers, lost, staleAccepted, restoreRec >>
               ELSE /\ staleAccepted' = (staleAccepted \/ m.epoch < leaderEpoch)
                    /\ srcPos' = srcPos + 1
                    /\ srcCut' = [srcCut EXCEPT ![c] = srcPos + 1]
@@ -442,7 +449,7 @@ DeliverBarrier ==
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, sinkCut,
                     sinkHandles, receipts, unresolvedMk, txn, brokerUp, sinkGen, sink,
                     pendingHandles, boundEpoch, lostCommits, lostAborts, lostTriggers, lostSrc,
-                    frontier, restorePoint, emptyAt, published, restoreSound, budgetVars >>
+                    frontier, restorePoint, emptyAt, published, restoreSound, budgetVars, restoreRec >>
 
 \* Sink::on_barrier: the prepare. The Kafka sink flushes the open transaction,
 \* stages its resume handle inside this checkpoint and will not seal another
@@ -488,7 +495,7 @@ SinkPrepare(s) ==
                                   ![s].ackDue = Append(@, [c |-> c, ok |-> TRUE])]
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, receipts,
                     unresolvedMk, brokerUp, sinkGen, boundEpoch, msgs, lostVars, jobVars,
-                    ghostVars, budgetVars >>
+                    ghostVars, budgetVars, restoreRec >>
 
 \* The runner's capture for this checkpoint fails (a transient disk error): the
 \* ack goes back ok = FALSE and nothing of this id reaches disk for the sink.
@@ -529,7 +536,7 @@ SinkPrepareEmpty(s) ==
           /\ emptyAt' = FoundEmpty(s, p)
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, receipts,
                     unresolvedMk, txn, brokerUp, sinkGen, pendingHandles, boundEpoch, msgs,
-                    lostVars, srcPos, frontier, restorePoint, cutOf, ghostVars, budgetVars >>
+                    lostVars, srcPos, frontier, restorePoint, cutOf, ghostVars, budgetVars, restoreRec >>
 
 \* The capture fails on an empty interval: the ack says so, nothing of the id
 \* reaches disk for the sink, and there is no transaction for the abort to
@@ -670,7 +677,7 @@ WriteCompleted ==
                     broadcastIds, unconfirmed, drainSet, freshLeader, rewindFloor, walkVars,
                     confirmedDisk, srcCut, sinkCut, sinkHandles, receipts, unresolvedMk,
                     txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars,
-                    budgetVars >>
+                    budgetVars, restoreRec >>
 
 \* The puts still out once nothing will advance the leader's memory or reach a
 \* sink of the leader's run for them: the job redeployed (the second hold sees
@@ -704,10 +711,12 @@ DecidedLate == {c \in Decidable : \A d \in Decidable :
 \* participant acked the checkpoint), and nothing else moves. For a redeployed
 \* run the engine emits no line; a superseded coordinator emits its
 \* WriteCompleted, stamped with its own epoch, and trace validation reads that
-\* line as this step. What reads the disk afterwards sees it: a takeover
-\* reseeds its completed point from the newest marker, and the in-doubt walk
-\* probes the handles of every marker in its range, so a superseded run's
-\* marker can be restored from or walked over. A dead coordinator's own put
+\* line as this step. What reads the disk afterwards sees it: the in-doubt
+\* walk probes the handles of every marker in its range, so a superseded
+\* run's marker can be walked over, and a takeover that read the disk before
+\* the job's next redeploy can restore from it. Once that redeploy's
+\* RESTORED record is on disk, a recoverable job's takeover passes it over
+\* (RestorableCompleted). A dead coordinator's own put
 \* landed before its death or never will; the stale ones of a coordinator
 \* that dies are kept, as ConfirmingAfterDeath keeps stale confirmations.
 StaleCompletedLands(c) ==
@@ -717,7 +726,7 @@ StaleCompletedLands(c) ==
     /\ lateBatch' = lateBatch \ {c}
     /\ UNCHANGED << leaderVars, coordMem, confirming, confirmedDisk, srcCut, sinkCut, sinkHandles,
                     receipts, unresolvedMk, txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
-                    jobVars, ghostVars, budgetVars >>
+                    jobVars, ghostVars, budgetVars, restoreRec >>
 
 WriteStaleCompleted == \E c \in staleCompleted : StaleCompletedLands(c)
 
@@ -834,7 +843,7 @@ SinkReceipt(s) ==
        /\ sink' = [sink EXCEPT ![s].stage = "receipted"]
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, sinkCut,
                     sinkHandles, unresolvedMk, txn, brokerUp, sinkGen, pendingHandles, barriers,
-                    boundEpoch, msgs, lostVars, jobVars, ghostVars, budgetVars >>
+                    boundEpoch, msgs, lostVars, jobVars, ghostVars, budgetVars, restoreRec >>
 
 \* The Kafka sink's own part of the commit ends (the tail of on_commit in the
 \* 2PC sink): the staged handle is erased (erase_resume_handle_), the open
@@ -922,7 +931,7 @@ ConfirmedStep(c, write, advance) ==
                     toBroadcast, markerDue, memCompleted, staleCompleted, lateBatch, broadcastIds, unconfirmed, drainSet,
                     freshLeader, rewindFloor, walkVars, completedDisk, srcCut, sinkCut, sinkHandles,
                     receipts, unresolvedMk, txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
-                    jobVars, ghostVars, budgetVars >>
+                    jobVars, ghostVars, budgetVars, restoreRec >>
 
 WriteConfirmed ==
     \E c \in Ckpts :
@@ -1180,6 +1189,31 @@ ZombieStops ==
     /\ UNCHANGED << leaderEpoch, coordUp, zombieEpoch, zombieNext, coordVars, diskVars, txn,
                     brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars, budgetVars >>
 
+\* The COMPLETED markers a restore may choose. A marker the newest redeploy
+\* restored below, for a checkpoint numbered before that redeploy's run
+\* began, is not among them: it is a put that was still out when the job
+\* restored (a Redeploy while the put was out, or a superseded coordinator's
+\* put landing after the takeover read the disk), and the run that restored
+\* below it has rolled its transactions back at open, as the recoverable
+\* family does with every prepared transaction its restore does not hold
+\* (SinkOpensWith). The redeploy's RESTORED record is durable before any of
+\* its frames leave, so no open can roll back a transaction such a marker
+\* names before the record that excludes it is on disk. Records are
+\* monotone: a later deploy restores from at least the newest marker an
+\* earlier one could choose and numbers above every id ever allocated, so
+\* the newest record excludes everything an older one did that a restore
+\* could still reach. Found by this model: a takeover used to restore from
+\* the newest marker whatever the run had done since (mutant
+\* restore_from_superseded), and recover_all_ then re-committed a
+\* transaction the Postgres sink had rolled back, past an interval nothing
+\* would publish. The Kafka family restores from CONFIRMED markers and its
+\* in-doubt walk reads every COMPLETED one; both are as before.
+Superseded(c) == restoreRec.from < c /\ c < restoreRec.next
+
+RestorableCompleted ==
+    IF Kafka \/ Bug = "restore_from_superseded" THEN completedDisk
+    ELSE {c \in completedDisk : ~Superseded(c)}
+
 \* A new leader takes over (recover_persisted_jobs). Memory is reseeded from
 \* the durable markers; every worker re-registers and binds the new epoch; the
 \* job is recovered through the same drain-resolve-redeploy path a worker loss
@@ -1196,7 +1230,7 @@ CoordRecovers ==
     /\ phase' = "draining" /\ drainSet' = {}
     /\ inFlight' = {} /\ completeDue' = None /\ toBroadcast' = None /\ markerDue' = None
     /\ ackedOk' = [c \in Ckpts |-> {}] /\ ackedFail' = [c \in Ckpts |-> {}]
-    /\ memCompleted' = Max(completedDisk)
+    /\ memCompleted' = Max(RestorableCompleted)
     \* Whatever CONFIRMED markers are on disk, wherever their writers got to:
     \* a put that landed before the previous coordinator's advance counts. A
     \* superseded coordinator's put still in flight (stale) may land after
@@ -1270,7 +1304,7 @@ LostDeliverBarrier ==
                     freshLeader, rewindFloor, walkVars, confirming, staleCompleted, lateBatch,
                     completedDisk, confirmedDisk, sinkCut, sinkHandles, receipts, unresolvedMk,
                     txn, brokerUp, sinkGen, sink, pendingHandles, boundEpoch, msgs, lostCommits,
-                    lostAborts, frontier, restorePoint, emptyAt, ghostVars, budgetVars >>
+                    lostAborts, frontier, restorePoint, emptyAt, ghostVars, budgetVars, restoreRec >>
 
 \* The old incarnations after an old incarnation's own step: the frames on its
 \* wire as given, nothing else moved.
@@ -1374,7 +1408,7 @@ LostSinkReceipt(s) ==
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, sinkCut,
                     sinkHandles, unresolvedMk, brokerUp, sinkGen, sink, pendingHandles, barriers,
                     boundEpoch, msgs, lostCommits, lostAborts, lostTriggers, lostSrc, jobVars,
-                    ghostVars, budgetVars >>
+                    ghostVars, budgetVars, restoreRec >>
 
 \* An AbortCheckpoint on the wire to an old incarnation: run on its reader, as
 \* for a live sink (DeliverAbort), accepted on what it holds, and refused while
@@ -1499,13 +1533,13 @@ WalkProbes(s) ==
                               ELSE receipts \cup {<<s, c>>}
                /\ walkVerdict' = [walkVerdict EXCEPT ![s] = "committed"]
           ELSE /\ walkVerdict' = [walkVerdict EXCEPT ![s] = "refused"]
-               /\ UNCHANGED << txn, published, receipts >>
+               /\ UNCHANGED << txn, published, receipts, restoreRec >>
     /\ UNCHANGED << leaderVars, phase, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                     toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, drainSet, freshLeader, rewindFloor, walkC, walkRetries, completedDisk,
                     confirmedDisk, srcCut, sinkCut, sinkHandles, unresolvedMk, brokerUp, sinkGen,
                     sinkVars, boundEpoch, msgs, jobVars, restoreSound, staleAccepted,
-                    budgetVars >>
+                    budgetVars, restoreRec >>
 
 \* The broker is unreachable: transport-inconclusive, retried in place with a
 \* bounded budget.
@@ -1529,7 +1563,7 @@ EndUnresolved ==
                     toBroadcast, markerDue, memCompleted, memConfirmed, confirming, staleCompleted, lateBatch, broadcastIds,
                     unconfirmed, drainSet, freshLeader, rewindFloor, walkVerdict, walkRetries,
                     completedDisk, confirmedDisk, srcCut, sinkCut, sinkHandles, receipts,
-                    txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars >>
+                    txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs, jobVars, ghostVars, restoreRec >>
 
 WalkExhausted ==
     /\ Walking /\ ~brokerUp /\ Unsettled # {} /\ walkRetries >= 2
@@ -1559,16 +1593,16 @@ WalkDecides ==
        THEN /\ confirmedDisk' = confirmedDisk \cup {walkC}
             /\ memConfirmed' = IF walkC > memConfirmed THEN walkC ELSE memConfirmed
             /\ NextId
-            /\ UNCHANGED << phase, unresolvedMk >>
+            /\ UNCHANGED << phase, unresolvedMk, restoreRec >>
        ELSE /\ phase' = "deploying" /\ walkC' = None
             /\ unresolvedMk' = unresolvedMk \cup {<<s, walkC>> : s \in Unsettled}
                                             \cup LaterUnreceipted(walkC)
-            /\ UNCHANGED << confirmedDisk, memConfirmed, walkVerdict, walkRetries >>
+            /\ UNCHANGED << confirmedDisk, memConfirmed, walkVerdict, walkRetries, restoreRec >>
     /\ UNCHANGED << leaderVars, nextCkpt, inFlight, ackedOk, ackedFail, completeDue,
                     toBroadcast, markerDue, memCompleted, confirming, staleCompleted, lateBatch, broadcastIds, unconfirmed,
                     drainSet, freshLeader, rewindFloor, completedDisk, srcCut, sinkCut, sinkHandles,
                     receipts, txn, brokerUp, sinkGen, sinkVars, boundEpoch, msgs,
-                    jobVars, ghostVars, budgetVars >>
+                    jobVars, ghostVars, budgetVars, restoreRec >>
 
 WalkFinishes ==
     /\ coordUp /\ phase = "resolving" /\ walkC # None /\ walkC > memCompleted
@@ -1664,6 +1698,16 @@ RedeployEffects ==
           /\ nextCkpt' \in IF ~freshLeader THEN {nextCkpt}
                            ELSE IF Bug = "id_reuse" THEN {r + 1}
                            ELSE FreshIds(r)
+          \* The RESTORED record, put before the deploy frames are built
+          \* (record_restore_point in restart_job_locked_ and deploy_internal_):
+          \* durable before any sink of the new run opens. A death between the
+          \* put and the frames leaves a record whose run never started, which
+          \* excludes the markers its run would have, as the restart decided.
+          \* The engine puts it for every job; the Kafka family restores from
+          \* CONFIRMED markers and reads it nowhere, so the model keeps it for
+          \* the recoverable family alone and the Kafka searches are unchanged.
+          /\ restoreRec' = IF Recoverable THEN [from |-> r, next |-> nextCkpt']
+                           ELSE restoreRec
     /\ phase' = "running" /\ freshLeader' = FALSE /\ rewindFloor' = None
     /\ inFlight' = {} /\ completeDue' = None /\ toBroadcast' = None /\ markerDue' = None
     /\ ackedOk' = [c \in Ckpts |-> {}] /\ ackedFail' = [c \in Ckpts |-> {}]
@@ -1694,7 +1738,7 @@ RedeployEffects ==
 Redeploy ==
     /\ coordUp /\ phase = "deploying"
     /\ RedeployEffects
-    /\ UNCHANGED << leaderVars, memCompleted, memConfirmed, drainSet, walkVars, diskVars,
+    /\ UNCHANGED << leaderVars, memCompleted, memConfirmed, drainSet, walkVars, diskButRecord,
                     txn, brokerUp, sinkGen, boundEpoch, cutOf, emptyAt, published,
                     staleAccepted, budgetVars >>
 
@@ -1714,10 +1758,10 @@ RestartProceeds ==
             /\ UNCHANGED << nextCkpt, inFlight, ackedOk, ackedFail, completeDue, toBroadcast,
                             markerDue, broadcastIds, unconfirmed, confirming, staleCompleted, lateBatch, freshLeader, rewindFloor,
                             sinkVars, msgs, srcPos, frontier, restorePoint, emptyAt,
-                            restoreSound >>
+                            restoreSound, restoreRec >>
        ELSE /\ RedeployEffects
             /\ UNCHANGED walkVars
-    /\ UNCHANGED << leaderVars, memCompleted, memConfirmed, drainSet, diskVars, txn, brokerUp,
+    /\ UNCHANGED << leaderVars, memCompleted, memConfirmed, drainSet, diskButRecord, txn, brokerUp,
                     sinkGen, boundEpoch, cutOf, emptyAt, published, staleAccepted, budgetVars >>
 
 \* The leader's claim on its next id is refused: the record already holds
@@ -1760,7 +1804,15 @@ ZombieRenumber ==
 \* suppression arms from the receipts newer than the restore point:
 \* re-emissions at or below the receipted horizon are swallowed. Recoverable
 \* family (CommittingSink::open): recover_all_ re-commits every handle the
-\* restored snapshot holds; commit is idempotent.
+\* restored snapshot holds; commit is idempotent. Every other prepared
+\* transaction of the sink, sealed by an earlier incarnation for a checkpoint
+\* above the snapshot it left or for one that failed, is rolled back: the
+\* Postgres sink lists them in pg_prepared_xacts (reconcile_orphans_), and a
+\* staging sink that leaves them in place leaves what no restore will
+\* commit, which is the same. A restore never chooses such a checkpoint
+\* again: those at or below the restore point are behind its durable marker,
+\* and those above it behind the RESTORED record the redeploy put before this
+\* open (RestorableCompleted).
 \*
 \* Settling an undecided orphan before the init matters once its producer
 \* may still be running (WorkerLost). The old incarnation's commit of the
@@ -1826,6 +1878,8 @@ SinkOpensWith(s, z) ==
                         THEN [mid[c] EXCEPT !.desc = FALSE]
                         ELSE IF c \in recoverSet
                         THEN [mid[c] EXCEPT !.st = "committed"]
+                        ELSE IF Recoverable /\ mid[c].st = "prepared"
+                        THEN [mid[c] EXCEPT !.st = "aborted"]
                         ELSE mid[c]]
            recovered == {p \in Positions : \E c \in recoverSet : cutOf[c] = p /\ txn[s][c].has}
            horizon == IF skips THEN 0
@@ -1853,7 +1907,7 @@ SinkOpensWith(s, z) ==
     /\ UNCHANGED << leaderVars, coordVars, completedDisk, confirmedDisk, srcCut, sinkCut,
                     sinkHandles, brokerUp, pendingHandles, barriers, boundEpoch, msgs,
                     lostAborts, lostTriggers, lostSrc, jobVars, restoreSound, staleAccepted,
-                    budgetVars >>
+                    budgetVars, restoreRec >>
 
 SinkOpens(s) == \E z \in {None} \cup OpenWindowCommits(s) : SinkOpensWith(s, z)
 
@@ -1931,6 +1985,7 @@ TypeOK ==
     /\ nextCkpt \in 1..(MaxCkpt + 1)
     /\ inFlight \subseteq Ckpts
     /\ completedDisk \subseteq Ckpts /\ confirmedDisk \subseteq Ckpts
+    /\ restoreRec \in [from : 0..MaxCkpt, next : 1..(MaxCkpt + 1)]
     /\ receipts \subseteq Sinks \X Ckpts /\ unresolvedMk \subseteq Sinks \X Ckpts
     /\ \A s \in Sinks, c \in Ckpts :
          txn[s][c].st \in {"none", "prepared", "committed", "aborted"}
@@ -1956,11 +2011,12 @@ NoDuplicate ==
     \A s \in Sinks, p \in Positions : published[s][p] <= 1
 
 \* The cut of the newest confirmed checkpoint (completed, for the recoverable
-\* family) is a frontier the protocol vouches for: every position at or below
+\* family, among the markers a restore may choose) is a frontier the protocol
+\* vouches for: every position at or below
 \* it is published exactly once at every sink that owes it, or is held
 \* prepared for a completed checkpoint whose commit the recoverable family
 \* will re-execute. A sink that found the interval empty owes nothing there.
-VouchedFor == IF Tracked THEN Max(confirmedDisk) ELSE Max(completedDisk)
+VouchedFor == IF Tracked THEN Max(confirmedDisk) ELSE Max(RestorableCompleted)
 
 VouchedCut == IF VouchedFor = None THEN 0 ELSE cutOf[VouchedFor]
 

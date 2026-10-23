@@ -278,3 +278,15 @@ control frames is the known upgrade if it proves too loose.
    the module's other edge: it takes one sink family per job, and a job
    with both Kafka and Postgres sinks is validated as the Kafka family. Not
    yet modelled.
+7. **The recoverable open as the engine runs it.** The specification's
+   recoverable open left every prepared transaction its restore did not hold
+   as it was, where the Postgres sink rolls them back. Written as the sink
+   runs it, the open let TLC find a loss: a `COMPLETED` put still out when
+   the job restored from below it lands afterwards, and a later takeover
+   restores from it past an interval whose transactions are gone. Fixing it
+   at the sink would wedge a keyed table, so the coordinator records every
+   deploy's restore point and first id (`RESTORED`) before its frames leave,
+   and a recoverable job's takeover passes over a marker between the two;
+   the mutant `restore_from_superseded` keeps the old choice, and
+   `formal/traces/superseded-marker-passed-over` pins the new one in trace
+   validation. Shipped.

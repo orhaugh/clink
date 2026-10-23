@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+**A takeover no longer restores from a checkpoint whose marker landed after the
+job had restored from below it.** A `COMPLETED` marker whose write was still out
+when a job restored from an earlier checkpoint, because a restart redeployed
+while it was in flight or because a superseded coordinator's write landed after
+the takeover had read the disk, still landed, and a later takeover chose it as
+the newest. The PostgreSQL two-phase sink rolls back, when it opens, every
+prepared transaction of its own that the restore does not hold, so the run that
+had restored below that checkpoint had already rolled its transactions back: the
+takeover's restore re-committed transactions that were gone, which the sink
+takes as already committed, and resumed the source past their interval, which no
+store then held; the integration test that reproduces it committed 394 of its 400
+records before the fix. Every deploy that continues a run (each restart, a restore, a
+takeover's own deploy) now puts `_jobs/<job id>/RESTORED` in the checkpoint
+directory before any of its frames leave, naming the checkpoint it restored from
+and the first id its run numbers, and a takeover or an embedded resume of a job
+that restores from its newest completed checkpoint passes over a marker between
+the two. The record is fenced by the coordinator's epoch. A restart that cannot
+write it waits as one without capacity does, retried at every watchdog tick, and
+fails the job only at the restart's capacity deadline. Jobs with a Kafka sink
+restore from `CONFIRMED` markers and are unchanged. The exactly-once
+specification found the case once the sink's rollback was modelled; the mutant
+`restore_from_superseded` keeps the old choice and TLC refutes it, and
+`formal/traces/superseded-marker-passed-over` pins the new one in trace
+validation. A coordinator from an earlier release ignores the record, so a
+cluster mid-upgrade keeps the old choice until every coordinator runs this one.
+
 ## v0.12.0 (October 2026)
 
 Exactly-once is held to account across the sink portfolio: every sink that

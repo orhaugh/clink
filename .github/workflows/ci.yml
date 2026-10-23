@@ -576,7 +576,9 @@ jobs:
     name: The recoverable-small model of the exactly-once specification model-checks
     runs-on: ubuntu-24.04
     # MC_RecoverableSmall on its own runner with every worker, beside the other
-    # models: its search is the largest of the set, 170.2M states, which took
+    # models: its search is the largest of the set, 106.1M states since the
+    # recoverable open rolls back the prepared transactions its restore does
+    # not hold, and 170.2M before, which took
     # 88 of the job's 120 minutes on the runner (145.4M states in about 70
     # minutes before the confirmed marker's write and advance became separate
     # steps). The models took 77 minutes in one job until a coordinator whose

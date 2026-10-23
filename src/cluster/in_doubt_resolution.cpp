@@ -153,6 +153,80 @@ std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir, Job
     return body.has_value() ? triggered_id_of(*body) : 0;
 }
 
+std::string restored_record_key(JobId job_id) {
+    return "_jobs/" + std::to_string(job_id) + "/RESTORED";
+}
+
+namespace {
+
+// The record's body is three lines, `epoch=`, `restore=` and `next=`, each a
+// decimal. The epoch is the fence; a record whose epoch line does not parse
+// fences nothing, and the next writer replaces it.
+std::optional<std::uint64_t> restored_field_of(std::string_view body, std::string_view field) {
+    for (std::size_t at = 0; at < body.size();) {
+        auto end = body.find('\n', at);
+        if (end == std::string_view::npos) {
+            end = body.size();
+        }
+        auto line = body.substr(at, end - at);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.remove_suffix(1);
+        }
+        if (line.size() > field.size() && line.substr(0, field.size()) == field) {
+            line.remove_prefix(field.size());
+            std::uint64_t value = 0;
+            const auto [last, ec] = std::from_chars(line.data(), line.data() + line.size(), value);
+            if (ec == std::errc{} && last == line.data() + line.size()) {
+                return value;
+            }
+            return std::nullopt;
+        }
+        at = end + 1;
+    }
+    return std::nullopt;
+}
+
+std::uint64_t restored_epoch_of(const std::string& body) {
+    return restored_field_of(body, "epoch=").value_or(0);
+}
+
+}  // namespace
+
+bool record_restore_point(const std::string& checkpoint_dir,
+                          JobId job_id,
+                          std::uint64_t writer_epoch,
+                          RestoredRecord record) {
+    if (record.next <= record.restore) {
+        throw std::invalid_argument("a run numbers its checkpoints above the one it restored from");
+    }
+    const std::string body = "epoch=" + std::to_string(writer_epoch) +
+                             "\nrestore=" + std::to_string(record.restore) +
+                             "\nnext=" + std::to_string(record.next) + "\n";
+    return make_coordination_store(checkpoint_dir)
+        ->fenced_put_quietly(restored_record_key(job_id), body, writer_epoch, restored_epoch_of);
+}
+
+std::optional<RestoredRecord> read_restore_point(const std::string& checkpoint_dir, JobId job_id) {
+    if (checkpoint_dir.empty()) {
+        return std::nullopt;
+    }
+    const auto key = restored_record_key(job_id);
+    const auto body = make_coordination_store(checkpoint_dir)->get(key);
+    if (!body.has_value()) {
+        return std::nullopt;
+    }
+    const auto restore = restored_field_of(*body, "restore=");
+    const auto next = restored_field_of(*body, "next=");
+    if (!restore.has_value() || !next.has_value()) {
+        throw std::runtime_error("the restore record " + checkpoint_dir + "/" + key +
+                                 " does not parse ('" + *body +
+                                 "'): it names the checkpoints a restore must pass over, and "
+                                 "choosing without it could restore from one whose "
+                                 "transactions are gone");
+    }
+    return RestoredRecord{.restore = *restore, .next = *next};
+}
+
 std::uint64_t new_run_checkpoint_floor(const std::string& checkpoint_dir,
                                        JobId job_id,
                                        std::uint64_t restore_from_checkpoint_id,

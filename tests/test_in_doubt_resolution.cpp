@@ -623,6 +623,66 @@ TEST_F(ResolutionFixture, AClaimTheRecordAlreadyHoldsIsAnAnswerNotAnError) {
     }
 }
 
+// -- the record of where the job's newest deploy restored from --------------
+//
+// A COMPLETED marker strictly between a deploy's restore point and the first
+// id its run numbers is a put that was still out when the job restored below
+// it, and the sinks that reopened rolled its transactions back. The record
+// names that range so a takeover passes the marker over. It is fenced by the
+// writer's epoch, so a superseded coordinator cannot put an older range over
+// the leader's.
+TEST_F(ResolutionFixture, TheRestoreRecordNamesTheRangeATakeoverPassesOver) {
+    using clink::cluster::read_restore_point;
+    using clink::cluster::record_restore_point;
+    EXPECT_FALSE(read_restore_point(dir, kJob).has_value());
+    EXPECT_FALSE(read_restore_point("", kJob).has_value());
+    ASSERT_TRUE(record_restore_point(dir, kJob, 3, {.restore = 4, .next = 7}));
+    const auto rec = read_restore_point(dir, kJob);
+    ASSERT_TRUE(rec.has_value());
+    EXPECT_EQ(rec->restore, 4u);
+    EXPECT_EQ(rec->next, 7u);
+    // Strictly between: the restore point and the run's own ids are not.
+    EXPECT_FALSE(rec->passes_over(3));
+    EXPECT_FALSE(rec->passes_over(4));
+    EXPECT_TRUE(rec->passes_over(5));
+    EXPECT_TRUE(rec->passes_over(6));
+    EXPECT_FALSE(rec->passes_over(7));
+    // Job-scoped, beside the markers.
+    EXPECT_FALSE(read_restore_point(dir, kJob + 1).has_value());
+    std::ifstream in(completed_marker_dir_for(dir, kJob) / "RESTORED");
+    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(body, "epoch=3\nrestore=4\nnext=7\n");
+    // A run numbers above what it restored from.
+    EXPECT_THROW((void)record_restore_point(dir, kJob, 3, {.restore = 7, .next = 7}),
+                 std::invalid_argument);
+}
+
+TEST_F(ResolutionFixture, ASupersededCoordinatorCannotPutItsRestoreRecordOverTheLeaders) {
+    using clink::cluster::read_restore_point;
+    using clink::cluster::record_restore_point;
+    ASSERT_TRUE(record_restore_point(dir, kJob, 5, {.restore = 6, .next = 9}));
+    EXPECT_FALSE(record_restore_point(dir, kJob, 4, {.restore = 2, .next = 4}))
+        << "a superseded coordinator's record replaced the leader's";
+    EXPECT_EQ(read_restore_point(dir, kJob)->restore, 6u);
+    // The same coordinator's next restart replaces it, as does a later leader.
+    EXPECT_TRUE(record_restore_point(dir, kJob, 5, {.restore = 6, .next = 11}));
+    EXPECT_TRUE(record_restore_point(dir, kJob, 6, {.restore = 10, .next = 12}));
+    EXPECT_EQ(read_restore_point(dir, kJob)->next, 12u);
+}
+
+// An unreadable record is not an empty range: passing over nothing could
+// restore from a checkpoint whose transactions are gone.
+TEST_F(ResolutionFixture, AnUnreadableRestoreRecordIsAnErrorNotAnEmptyRange) {
+    using clink::cluster::read_restore_point;
+    const auto path = completed_marker_dir_for(dir, kJob) / "RESTORED";
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path) << "epoch=1\nrestore=oops\n";
+    EXPECT_THROW((void)read_restore_point(dir, kJob), std::runtime_error);
+    // The next deploy's record replaces it.
+    EXPECT_TRUE(clink::cluster::record_restore_point(dir, kJob, 1, {.restore = 0, .next = 2}));
+    EXPECT_EQ(read_restore_point(dir, kJob)->next, 2u);
+}
+
 // -- cancellation (the rig-night composite's zombie walk) ------------------
 //
 // The coordinator's watchdog cancels a walk that outruns its deadline. A

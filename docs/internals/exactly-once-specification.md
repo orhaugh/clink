@@ -63,8 +63,10 @@ family cannot re-execute a commit after the owning process dies (a broker
 transaction is fenced or expires), so the job runs the commit-confirmed
 restore protocol, commit receipts, in-doubt resolution and replay
 suppression. The staged-artifact and XA family (file, Parquet, S3,
-Postgres) re-commits its persisted handles idempotently at open and
-restores from the newest completed checkpoint.
+Postgres) re-commits its persisted handles idempotently at open, rolls back
+every other prepared transaction it finds there, as the Postgres sink does,
+and restores from the newest completed checkpoint that the job's newest
+deploy did not restore below.
 
 A sink of that family may find an interval empty: nothing of the position
 reached it, so it seals no transaction for the checkpoint, persists no
@@ -152,7 +154,7 @@ anything can race it, as the engine's open now does (see What the model found).
 | Invariant | Statement |
 |---|---|
 | `NoDuplicate` | No sink publishes any position more than once |
-| `NoLoss` | Every position at or below the cut of the newest confirmed checkpoint (completed, for the recoverable family) is published exactly once at every sink, or is held prepared with a handle the recoverable family's open will commit |
+| `NoLoss` | Every position at or below the cut of the newest confirmed checkpoint (completed, for the recoverable family, among the markers a restore may choose) is published exactly once at every sink, or is held prepared with a handle the recoverable family's open will commit |
 | `FrontierCovered` | Every position the source can no longer re-emit is published or held |
 | `RestoreSound` | No restore ever read participant snapshots of mixed vintage |
 | `ConfirmedMeansCommitted` | A `CONFIRMED` marker never outruns the commits it vouches for |
@@ -166,11 +168,11 @@ anything can race it, as the engine's open now does (see What the model found).
 |---|---|---|---|
 | `MC_KafkaSmall` | Kafka | 2 sinks on 2 workers, 3 checkpoints, 1 in flight, one of each fault; a lost worker is a dead one | 78.8M distinct states, depth 86, all invariants hold, no deadlock |
 | `MC_KafkaTwoInFlight` | Kafka | 2 checkpoints in flight, worker loss and snapshot failure only; a lost worker may still be running | 243,269 distinct states, depth 75, all invariants hold |
-| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure; a lost worker is a dead one | 170.2M distinct states, depth 59, all invariants hold |
-| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts; a lost worker may still be running | 19.0M distinct states, depth 54, all invariants hold |
+| `MC_RecoverableSmall` | recoverable | 2 sinks, 3 checkpoints, 2 in flight, worker and coordinator death, snapshot failure; a lost worker is a dead one | 106.1M distinct states, depth 58, all invariants hold |
+| `MC_RecoverableNoBudget` | recoverable | as `MC_RecoverableSmall`, with no restart budget: a failed checkpoint fails the job, and no error restarts; a lost worker may still be running | 18.9M distinct states, depth 54, all invariants hold |
 | `MC_KafkaLiveness` | Kafka | 2 checkpoints, one of each fault; a lost worker is a dead one | invariants and `EventuallySettled` hold, 7.4M distinct states |
 | `MC_KafkaLostWorker` | Kafka | as `MC_KafkaLiveness`, safety only, and a lost worker may still be running | 15.7M distinct states, depth 63, all invariants hold |
-| `MC_RecoverableSparse` | recoverable | 2 sinks, 2 checkpoints, 1 in flight, worker and coordinator death, snapshot failure, up to two empty (sink, position) pairs | 1.6M distinct states, depth 41, all invariants hold |
+| `MC_RecoverableSparse` | recoverable | 2 sinks, 2 checkpoints, 1 in flight, worker and coordinator death, snapshot failure, up to two empty (sink, position) pairs | 1.4M distinct states, depth 39, all invariants hold |
 
 A lost worker left running about doubles a search, so it is in the models a
 CI job can afford: `MC_KafkaTwoInFlight` (from 101,698 states),
@@ -511,9 +513,12 @@ and its `WriteCompleted` as the stale put landing
 at the late `CoordComplete` without that branch). The specification models
 that put: a `Redeploy` or a supersession turns a `COMPLETED` put still out
 stale (`staleCompleted`), and `WriteStaleCompleted` lands it with no advance
-and no broadcast. Whatever reads the disk afterwards sees it, so a takeover
-can restore from a superseded run's checkpoint, and the in-doubt walk can probe
-the handles of one, and TLC checks both against the invariants. The trace
+and no broadcast. Whatever reads the disk afterwards sees it: the in-doubt
+walk can probe the handles of a superseded run's checkpoint, and a takeover
+that read the disk before the job's next redeploy can restore from one, which
+TLC checks against the invariants. Once that redeploy's `RESTORED` record is
+on disk, a recoverable job's takeover passes the marker over (see What the
+model found). The trace
 module takes the landing as a hidden step only when an event witnesses it: a
 takeover whose `completed` names that checkpoint (`LostWriteCompleted`), or a
 walk event other than `WalkSkips` at that checkpoint, since the walk reads the
@@ -522,8 +527,13 @@ marker before it emits any of them (`LostStaleCompletedAtWalk`).
 `completed`, so a marker the model lacks diverges at the takeover.
 `formal/traces/completed-marker-landing-after-redeploy`, a synthetic run in
 which a sink's worker dies with checkpoint 2's put out, the job redeploys from
-1, the put lands and a takeover then restores from 2, is accepted, and
-diverges at the takeover's redeploy without the stale put.
+1 and the put lands, ends with a takeover that passes checkpoint 2's marker
+over and restores from 1, as the redeploy's record says; that landing has no
+line, so the trace does not witness it. `formal/traces/superseded-marker-passed-over`
+is the shape in which it does: a superseded coordinator's `WriteCompleted`
+lands after the next leader read the disk, that leader redeploys from nothing,
+and a third leader's takeover reports nothing completed. It is accepted, and
+diverges at the third takeover when the takeover does not pass the marker over.
 `formal/traces/completed-marker-walked-after-redeploy` is the Kafka family's
 shape, also synthetic: the new run completes 3 and restarts unconfirmed, and
 its walk probes checkpoint 2's handle, which the reopened sink fenced. It is
@@ -633,8 +643,9 @@ against the bug it guards is decorative.
 | `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its `CONFIRMED` marker is durable | review of the per-connection dispatch change | yes, `ConfirmedMemoryOnDisk` |
 | `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan before `init_transactions` | this model, with a lost worker left running | yes, `NoDuplicate` |
 | `open_skips_restore_zero` | A Kafka sink reopening at restore point 0 settles its orphan and arms suppression, as at any other | this model, against the engine's open | yes, `NoDuplicate` |
+| `restore_from_superseded` | A takeover passes over a `COMPLETED` marker that the job's newest deploy restored below | this model, once the recoverable open rolled back what its restore did not hold | yes, `NoLoss` |
 
-Seventeen of the nineteen are refuted. The two that are not are recorded in
+Eighteen of the twenty are refuted. The two that are not are recorded in
 `formal/mutants/expected.txt` rather than deleted, and the check holds that
 record in both directions: each of them disables a rule that a later rule
 now guards as well. The preserved prepared transaction predates commit
@@ -762,6 +773,44 @@ A fifth came from reading the engine's open against the specification's:
    `TxnResumeLive.AResubmitFromACheckpointArmsFromTheReceiptsAboveIt`, and by
    `CheckpointCompletion.EveryDeployOfARunCarriesTheFloorItsFirstSubmitFixed`.
 
+A sixth came from writing the recoverable family's open as the engine's
+PostgreSQL sink runs it:
+
+6. **The marker that landed after the job restored below it.** The Postgres
+   two-phase sink rolls back, at open, every prepared transaction of its own
+   that the restored checkpoint does not hold. The specification kept such
+   transactions prepared, as the staging sinks leave their files, so it had
+   checked the protocol against a sink that discards nothing. With the
+   rollback in, TLC found a loss in 12 states. A coordinator is superseded
+   with checkpoint 1 decided and its marker's put still out; the next leader
+   reads the disk, finds no marker, and redeploys from nothing; the sinks
+   reopen and roll checkpoint 1's transactions back; then the superseded
+   coordinator's put lands. The marker vouches for an interval no store
+   holds, and one more takeover restores from it: the open re-commits
+   transactions that are gone, which the sink takes as already committed,
+   and the source resumes past the interval. A restart that redeploys while
+   its own put is out reaches the same state. The fix is the coordinator's.
+   Keeping the transactions at the sink instead would hold the row locks of a
+   keyed table, and the replay's insert of the same rows would wait on them
+   behind a commit that needs the replay to pass its barrier: a wedge below
+   the model's abstraction, which has positions and no keys. Every deploy
+   that continues a run now puts `_jobs/<job id>/RESTORED` before any of its
+   frames leave, naming the checkpoint it restored from and the first id its
+   run numbers, and a takeover or a resume of a job that restores from its
+   newest completed checkpoint passes over a marker between the two. The
+   record is fenced by the coordinator's epoch, so a superseded coordinator
+   cannot put an older range over the leader's, and the newest record is
+   enough: a later deploy restores from at least what an earlier one could
+   choose and numbers above every id ever allocated. `restore_from_superseded`
+   keeps the old choice as a mutant, which TLC refutes on `NoLoss`, and on
+   `FrontierCovered`, the loss itself, once a second takeover is allowed and
+   `NoLoss` is left out. `formal/traces/superseded-marker-passed-over`,
+   synthetic, pins it in trace validation. Pinned in the engine by
+   `CheckpointCompletion.ATakeoverPassesOverAMarkerThatLandedAfterTheJobRestoredBelowIt`,
+   which holds the put, kills the worker, lands the put after the redeploy
+   and takes the job over, and which restored from that checkpoint before
+   the record.
+
 Two further counterexamples in the first runs were defects in the model,
 not the engine (a producer identity kept in the sink's process record and
 so lost with the process; control frames delivered out of order), and were
@@ -776,7 +825,7 @@ In the honesty categories the qualification pages use:
   reachable interleaving of the modelled protocol steps and faults satisfies
   the invariants, the run never deadlocks, and (in the liveness
   configuration) every run with bounded faults settles with every
-  vouched-for position published exactly once. Seventeen of the nineteen
+  vouched-for position published exactly once. Eighteen of the twenty
   mutants produce a counterexample; the two that do not are recorded as
   guarded by a later rule, and the check fails the day that stops being
   true.

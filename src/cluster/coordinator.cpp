@@ -553,9 +553,11 @@ namespace {
 // <ckpt_dir>/_jobs/<job_id>/" lookup. coordinator's existing
 // latest_completed_checkpoint_id is updated in-memory but NOT in the file
 // system before a crash.
-std::uint64_t latest_marker_id_on_disk(const std::string& checkpoint_dir,
-                                       JobId job_id,
-                                       const std::string& prefix) {
+std::uint64_t latest_marker_id_on_disk(
+    const std::string& checkpoint_dir,
+    JobId job_id,
+    const std::string& prefix,
+    const std::optional<RestoredRecord>& restored = std::nullopt) {
     if (checkpoint_dir.empty())
         return 0;
     std::uint64_t latest = 0;
@@ -579,6 +581,8 @@ std::uint64_t latest_marker_id_on_disk(const std::string& checkpoint_dir,
             continue;
         try {
             const auto id = std::stoull(std::string{digits});
+            if (restored.has_value() && restored->passes_over(id))
+                continue;
             if (id > latest)
                 latest = id;
         } catch (...) {
@@ -587,8 +591,14 @@ std::uint64_t latest_marker_id_on_disk(const std::string& checkpoint_dir,
     return latest;
 }
 
-std::uint64_t latest_completed_id_on_disk(const std::string& checkpoint_dir, JobId job_id) {
-    return latest_marker_id_on_disk(checkpoint_dir, job_id, "COMPLETED-");
+// The newest COMPLETED marker. With the job's RESTORED record, the newest a
+// restore may choose: a marker the record passes over was still being put
+// when the job restored from below it, and its transactions are gone.
+std::uint64_t latest_completed_id_on_disk(
+    const std::string& checkpoint_dir,
+    JobId job_id,
+    const std::optional<RestoredRecord>& restored = std::nullopt) {
+    return latest_marker_id_on_disk(checkpoint_dir, job_id, "COMPLETED-", restored);
 }
 
 // Commit-confirmed restore protocol: the newest checkpoint whose external
@@ -854,7 +864,25 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
             // leader's workers, and restoring past it loses that interval.
             const auto confirmed_on_disk =
                 needs_confirmation ? latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id) : 0;
-            completed_on_disk = latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id);
+            // A job that restores from its newest completed checkpoint passes
+            // over the markers its newest deploy restored below, read before
+            // the markers (the RESTORED record): a put still out when the job
+            // restored lands afterwards, and the run that restored below it
+            // has rolled its transactions back. A tracked job restores from
+            // CONFIRMED markers, and its walk reads every COMPLETED one.
+            std::optional<RestoredRecord> restored;
+            if (!needs_confirmation) {
+                try {
+                    restored = read_restore_point(ckpt.checkpoint_dir, job_id);
+                } catch (const std::exception& e) {
+                    clink::metrics::orch::ha_recovery_failed_inc();
+                    log::error("coordinator.ha",
+                               "recovery failed for job_id=" + std::to_string(job_id) +
+                                   "; the job is NOT running and needs a resubmit: " + e.what());
+                    return;
+                }
+            }
+            completed_on_disk = latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id, restored);
             const auto latest = needs_confirmation ? confirmed_on_disk : completed_on_disk;
             own_restore_point = latest;
             if (latest > 0) {
@@ -5577,7 +5605,18 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     std::uint64_t resumed_run_base = 0;
     if (track_runs && !checkpoint.start_fresh) {
         const auto store = make_coordination_store(checkpoint.checkpoint_dir);
-        const auto completed = latest_completed_id_on_disk(checkpoint.checkpoint_dir, job_id);
+        bool needs_confirmation = false;
+        for (const auto& t : resolved_plan.tasks) {
+            needs_confirmation = needs_confirmation || t.needs_commit_confirmation;
+        }
+        // As a takeover reads them: a job that restores from its newest
+        // completed checkpoint passes over the markers its last deploy
+        // restored below (the RESTORED record).
+        const auto completed = latest_completed_id_on_disk(
+            checkpoint.checkpoint_dir,
+            job_id,
+            needs_confirmation ? std::nullopt
+                               : read_restore_point(checkpoint.checkpoint_dir, job_id));
         std::uint64_t run_base = 0;
         if (const auto recorded = store->get(run_base_key(job_id)); recorded.has_value()) {
             try {
@@ -5609,10 +5648,6 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
                                           : "a job that recorded no graph fingerprint") +
                     ". Restoring them would hand this job another job's state. Use a new "
                     "checkpoint directory, or start this job fresh (clink run --fresh).");
-            }
-            bool needs_confirmation = false;
-            for (const auto& t : resolved_plan.tasks) {
-                needs_confirmation = needs_confirmation || t.needs_commit_confirmation;
             }
             std::uint64_t restore =
                 needs_confirmation ? latest_confirmed_id_on_disk(checkpoint.checkpoint_dir, job_id)
@@ -5817,6 +5852,27 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         }
     }
     job->first_checkpoint_id = job->next_checkpoint_id;
+    // The RESTORED record of a deploy that continues a run (a restore, a
+    // resumed tracked run, a takeover): where it restores from and the first id
+    // it numbers, durable before any of its frames leave, as every restart
+    // puts its own (restart_job_locked_). A takeover's sinks roll back what a
+    // superseded coordinator had prepared, and that coordinator's COMPLETED
+    // put can land after this takeover read the disk; the record keeps the
+    // next takeover from restoring from it. A fresh run has no earlier
+    // incarnation whose put could land, and records nothing.
+    if (id_floored && !checkpoint.checkpoint_dir.empty() &&
+        !record_restore_point(checkpoint.checkpoint_dir,
+                              job_id,
+                              epoch(),
+                              {.restore = checkpoint.restore_from_checkpoint_id,
+                               .next = std::max(job->next_checkpoint_id,
+                                                checkpoint.restore_from_checkpoint_id + 1)})) {
+        throw std::runtime_error("job " + std::to_string(job_id) +
+                                 " not deployed: a later coordinator's restore record is on "
+                                 "disk in " +
+                                 checkpoint.checkpoint_dir +
+                                 ", so this coordinator has been superseded");
+    }
     // The run's checkpoint-id floor (DeployMsg::run_checkpoint_floor): the
     // receipts and unresolved markers above it are this run's to read, its
     // own or those of the run it continues, and every checkpoint of this run
@@ -7851,6 +7907,75 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         }
         return {};
     }
+
+    // The restore point (step 7 says how it is chosen), decided before
+    // anything of this restart is fixed, for the RESTORED record below.
+    const auto own_restore_id = job.confirm_task_keys.empty() ? job.latest_completed_checkpoint_id
+                                                              : job.latest_confirmed_checkpoint_id;
+    const bool resubmit_original_restore =
+        own_restore_id == 0 && !job.checkpoint.restore_from_dir.empty();
+    const std::uint64_t restore_from_checkpoint_id =
+        resubmit_original_restore ? job.checkpoint.restore_from_checkpoint_id : own_restore_id;
+    // The RESTORED record: where this run restores from and the first id it
+    // numbers, durable before any of its frames leave. A COMPLETED put still
+    // out now lands for the run before this one, and the sinks this restart
+    // reopens roll its transactions back (the Postgres two-phase sink rolls
+    // back every prepared transaction its restore does not hold); the record
+    // is what keeps a later takeover from restoring from that marker, past
+    // an interval nothing would publish. Put under the lock, since nothing of
+    // the restart may be fixed before it lands; a restart is rare and the
+    // record is a few bytes. One that cannot be put waits like a restart
+    // without capacity: the watchdog re-fires it every tick, and the job fails
+    // only when the record never lands within the restart's capacity
+    // deadline. A fence that refuses it names a later coordinator's record:
+    // this one has been superseded and deploys nothing.
+    if (!job.checkpoint.checkpoint_dir.empty()) {
+        std::string unrecorded;
+        try {
+            // A run numbers above what it restores from; the bound keeps a
+            // record that could not say so from passing anything over.
+            if (!record_restore_point(
+                    job.checkpoint.checkpoint_dir,
+                    job.id,
+                    epoch(),
+                    {.restore = restore_from_checkpoint_id,
+                     .next = std::max(job.next_checkpoint_id, restore_from_checkpoint_id + 1)})) {
+                log::warn("coordinator.restart",
+                          "job_id=" + std::to_string(job.id) +
+                              " restart not deployed: a later coordinator's restore record is "
+                              "on disk, so this coordinator has been superseded");
+                job.restart_deadline = {};
+                return {};
+            }
+        } catch (const std::exception& e) {
+            unrecorded = e.what();
+        }
+        if (!unrecorded.empty()) {
+            const auto now_tp = std::chrono::steady_clock::now();
+            if (job.restart_capacity_deadline == std::chrono::steady_clock::time_point{}) {
+                job.restart_capacity_deadline = now_tp + cfg_.restart_capacity_timeout;
+                log::warn("coordinator.restart",
+                          "job_id=" + std::to_string(job.id) +
+                              " restart waiting to record its restore point (" + unrecorded +
+                              "); the watchdog retries it");
+            }
+            if (now_tp < job.restart_capacity_deadline) {
+                job.restart_deadline = {};
+                return {};  // awaiting_restart stays set; the next kick retries
+            }
+            job.errors.push_back("restart: could not record its restore point in " +
+                                 job.checkpoint.checkpoint_dir + ": " + unrecorded);
+            job.awaiting_restart = false;
+            job.restart_deadline = {};
+            job.restart_capacity_deadline = {};
+            job.restart_pending.clear();
+            job.restart_drained_keys.clear();
+            job.restart_drain_expected.clear();
+            job.completed_count = job.expected_completion;
+            signal_job_completion_locked_(job);
+            return {};
+        }
+    }
     job.restart_capacity_deadline = {};
 
     // 3. Build new worker_id assignments round-robin across survivors.
@@ -8247,14 +8372,9 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     // into a clean empty run.
     //
     // The restore point is a property of the restart, not of a deploy
-    // frame, so it is decided once here and every frame below carries the
-    // same one.
-    const auto own_restore_id = job.confirm_task_keys.empty() ? job.latest_completed_checkpoint_id
-                                                              : job.latest_confirmed_checkpoint_id;
-    const bool resubmit_original_restore =
-        own_restore_id == 0 && !job.checkpoint.restore_from_dir.empty();
-    const std::uint64_t restore_from_checkpoint_id =
-        resubmit_original_restore ? job.checkpoint.restore_from_checkpoint_id : own_restore_id;
+    // frame: it was decided once, before the RESTORED record (above), and
+    // every frame below carries the same one.
+    //
     // Where that checkpoint's state is. The submitted restore point is read
     // where the submit resolved it, and so is the same checkpoint when it is
     // the job's own restore point (a resumed or taken-over job seeds its

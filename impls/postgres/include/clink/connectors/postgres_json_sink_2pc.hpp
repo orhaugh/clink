@@ -9,7 +9,13 @@
 // transaction survives the session, so a crash between PREPARE and COMMIT does
 // not lose it: on restart the base COMMIT PREPAREs any gid in the restored
 // pending set, and on_open() ROLLBACK PREPAREs any of OUR prepared transactions
-// NOT in that set (their checkpoint never became durable).
+// NOT in that set, since no restore will choose their checkpoint again: one at
+// or below the restore point is behind its durable marker, and one above it
+// behind the job's RESTORED record, which the coordinator puts before this
+// deploy's frames leave and a takeover reads before it picks a marker. Without
+// the record, a COMPLETED marker still being written when the job restored
+// from below it landed afterwards, a takeover restored from it, and the
+// transaction this open had rolled back was gone.
 //
 // Each input record is a JSON-object string (row_to_json_string on the SQL
 // path). `columns` is the authoritative projection; a column absent from / null
@@ -375,9 +381,11 @@ private:
         return out;
     }
 
-    // Roll back any of our prepared transactions whose checkpoint never became
-    // durable (prepared, but the gid is not in the restored pending set - e.g. a
-    // crash between PREPARE and the checkpoint snapshot). The framework's
+    // Roll back any of our prepared transactions the restore does not hold
+    // (prepared, but the gid is not in the restored pending set: a crash
+    // between PREPARE and the checkpoint snapshot, a checkpoint that failed, or
+    // one still completing when the job restored from below it). No restore
+    // chooses their checkpoint again (see the header comment). The framework's
     // recover_all_() commits the ones that ARE in the set.
     void reconcile_orphans_() {
         const auto keep_vec = this->pending_committables();

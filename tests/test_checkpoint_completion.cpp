@@ -3456,6 +3456,126 @@ TEST(CheckpointCompletion, ATakeoverIgnoresAMarkerItsLeaderDiedPublishing) {
     std::filesystem::remove_all(root, ec);
 }
 
+// A restart that redeploys while the previous run's COMPLETED put is out puts
+// where it restored from before its frames leave, and a takeover passes the
+// marker over once it lands. The run that restored below the checkpoint rolled
+// its transactions back at open (the Postgres two-phase sink rolls back every
+// prepared transaction its restore does not hold), so restoring from the
+// marker re-committed transactions that were gone and resumed the source past
+// their interval. The specification found the shape (mutant
+// restore_from_superseded); before the record, this takeover restored from the
+// checkpoint whose marker landed late.
+TEST(CheckpointCompletion, ATakeoverPassesOverAMarkerThatLandedAfterTheJobRestoredBelowIt) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_superseded_marker_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(ckpt_dir);
+    clink::fault::Registry::instance().reset();
+
+    JobId job_id = 0;
+    std::uint64_t first = 0;
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(a.await_registrations(2s));
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 600'000;
+        ckpt.max_restarts_on_worker_loss = 1;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        ASSERT_GT(job_id, 0U);
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value());
+        const auto tasks = decode_deploy(*deploy).tasks;
+        ASSERT_FALSE(tasks.empty());
+        std::uint16_t port_seed = 41200;
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+        }
+        // Registered once the job is placed, so it takes the restart alone.
+        FakeWorker spare(port, "w2");
+        ASSERT_TRUE(spare.valid());
+        ASSERT_TRUE(spare.register_and_ack());
+        auto trigger = w.await_frame(MessageKind::TriggerCheckpoint);
+        ASSERT_TRUE(trigger.has_value());
+        first = decode_trigger_checkpoint(*trigger).checkpoint_id;
+        ASSERT_TRUE(ckpt_await([&] {
+            return clink::cluster::latest_triggered_id_on_disk(ckpt_dir.string(), job_id) >=
+                   first + 1;
+        }));
+
+        clink::fault::ScopedFault hold{clink::fault::Rule{
+            .point = kCompletedMarkerPoint, .ordinal = 1, .action = clink::fault::Action::Block}};
+        clink::fault::Registry::instance().arm(
+            {.point = clink::fault::points::kCoordinatorAfterCompletedMarker,
+             .action = clink::fault::Action::Observe});
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, first, t.role, t.subtask_idx, /*ok=*/true));
+        }
+        ASSERT_TRUE(ckpt_await(
+            [] { return clink::fault::Registry::instance().hits(kCompletedMarkerPoint) >= 1; }));
+
+        // The worker dies with the put out; the restart restores from below
+        // the checkpoint, and its record is on disk before its frames left.
+        w.close();
+        auto redeploy = spare.await_frame(MessageKind::Deploy, 20s);
+        ASSERT_TRUE(redeploy.has_value()) << "the restart never redeployed";
+        const auto restored_from = decode_deploy(*redeploy).restore_from_checkpoint_id;
+        ASSERT_LT(restored_from, first);
+        const auto record = clink::cluster::read_restore_point(ckpt_dir.string(), job_id);
+        ASSERT_TRUE(record.has_value())
+            << "the restart deployed without recording its restore point";
+        EXPECT_EQ(record->restore, restored_from);
+        EXPECT_TRUE(record->passes_over(first))
+            << "the restart's record (restore " << record->restore << ", next " << record->next
+            << ") does not pass over checkpoint " << first << ", whose put was still out";
+
+        // The put lands for the run before this one.
+        EXPECT_EQ(clink::fault::Registry::instance().release(kCompletedMarkerPoint), 1U);
+        ASSERT_TRUE(ckpt_await([] {
+            return clink::fault::Registry::instance().hits(
+                       clink::fault::points::kCoordinatorAfterCompletedMarker) >= 1;
+        })) << "the held put never finished";
+        ASSERT_TRUE(std::filesystem::exists(written_marker_path(ckpt_dir, job_id, first)))
+            << "the marker did not land on disk";
+        spare.close();
+        a.stop();
+    }
+
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(b.await_registrations(2s));
+        b.recover_persisted_jobs();
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value()) << "the recovered job was never deployed";
+        const auto msg = decode_deploy(*deploy);
+        EXPECT_LT(msg.restore_from_checkpoint_id, first)
+            << "the takeover restored from checkpoint " << msg.restore_from_checkpoint_id
+            << ", whose marker landed after the job had restored from below it; the sinks that "
+               "reopened then had rolled its transactions back";
+        w.close();
+        b.stop();
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 // A takeover before the job has completed a checkpoint of its own. The new
 // leader used to take the job's own latest id, 0, as the restore point; the
 // deploy lint refuses a restore directory with id 0, so the recovery threw and

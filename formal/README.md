@@ -35,7 +35,7 @@ refuted mutants four at a time with one worker each. The accepted mutants
 (`formal/mutants/expected.txt`) enumerate their whole state space, over an hour
 each, and run two at a time in the `formal-mutants-accepted` job. One search in
 each set dominates it and runs alone on its own runner with every worker:
-`MC_RecoverableSmall` (about 86 minutes) in the `formal-recoverable-small` job,
+`MC_RecoverableSmall` (about an hour) in the `formal-recoverable-small` job,
 `MC_KafkaSmall` in the `formal-kafka-small` job, and `M_id_reuse`, which allows
 two coordinator deaths, in the `formal-mutant-id-reuse` job.
 
@@ -106,8 +106,10 @@ constant: the Kafka family (a broker transaction dies with its producer
 unless resolved with the saved identity, so the job runs the
 commit-confirmed restore protocol, receipts, in-doubt resolution and replay
 suppression) and the staged-artifact / XA family (file, Parquet, S3,
-Postgres: a persisted handle is re-committed idempotently at open, restores
-select the newest completed checkpoint).
+Postgres: a persisted handle is re-committed idempotently at open, every
+other prepared transaction found there is rolled back, and restores select
+the newest completed checkpoint the job's newest deploy did not restore
+below).
 
 Faults are actions with a budget, so the checker may inject them or not:
 worker death, coordinator death, a superseded coordinator that keeps
@@ -155,7 +157,9 @@ after it, and a takeover seeds `memConfirmed` from whatever is on disk.
 The `COMPLETED` put is outside the lock too, and a `Redeploy` or a
 supersession turns one still out stale (`staleCompleted`):
 `WriteStaleCompleted` lands it with no advance and no broadcast, and a later
-takeover or walk reads it like any other marker.
+walk reads it like any other marker. A recoverable job's takeover passes it
+over once the redeploy's `RESTORED` record (`restoreRec`, put in
+`RedeployEffects`) excludes it.
 
 ### Fault points are states between steps
 
@@ -257,12 +261,13 @@ each and judges the outcome against `mutants/expected.txt`.
 | `advance_before_confirmed_put` | The in-memory confirmed restore point advances only once its CONFIRMED marker is durable | review of the per-connection dispatch change | refuted: ConfirmedMemoryOnDisk |
 | `orphan_left_to_init` | A reopening Kafka sink settles an undecided orphan (abort, or the receipt of the commit that beat the abort) before `init_transactions` | this model, once a lost worker could run on | refuted: NoDuplicate |
 | `open_skips_restore_zero` | A Kafka sink reopening at restore point 0 settles its orphan and arms suppression, as at any other | this model, against the engine's open | refuted: NoDuplicate |
+| `restore_from_superseded` | A takeover passes over a COMPLETED marker that the job's newest deploy restored below (the RESTORED record) | this model, once the recoverable open rolled back what its restore did not hold | refuted: NoLoss (FrontierCovered with a second takeover and NoLoss left out) |
 
 A mutant TLC accepts is recorded in `mutants/expected.txt`, not deleted: it
 means a later rule guards the same defect (defence in depth), and the check
 then holds that record in both directions: the day TLC refutes an
 `accepted` mutant, the other guard has gone and the record is wrong. Two of
-the nineteen are accepted today, both superseded by receipts, in-doubt
+the twenty are accepted today, both superseded by receipts, in-doubt
 resolution and the marker rule the refusal-wall finding added; the withheld
 broadcast left that set when trace validation widened the specification,
 and the check would have failed had it stayed recorded as accepted. The
@@ -371,6 +376,30 @@ A fifth came from comparing the engine's open with the specification's:
    `TxnResumeLive.AResubmitFromACheckpointArmsFromTheReceiptsAboveIt`, and
    `CheckpointCompletion.EveryDeployOfARunCarriesTheFloorItsFirstSubmitFixed`.
 
+A sixth came from writing the recoverable open as the Postgres sink runs it:
+
+6. **The marker that landed after the job restored below it.** The
+   specification's recoverable open re-committed the handles the restore held
+   and left every other prepared transaction as it was; the Postgres sink
+   rolls those back (`reconcile_orphans_`). With the rollback in, TLC refuted
+   the protocol in 12 states: a coordinator superseded with checkpoint 1
+   decided and its marker's put out, a takeover that reads no marker and
+   redeploys from nothing, sinks that reopen and roll checkpoint 1 back, and
+   the superseded put landing after them; a further takeover restores from
+   that marker and resumes the source past an interval no store holds. A
+   restart redeploying while its own put is out reaches the same state.
+   Keeping the transactions at the sink instead wedges a keyed table: the
+   replay's insert of the same row waits on the kept transaction's lock,
+   which only a later commit would release. So the coordinator records every
+   deploy's restore point and first id (`RESTORED`, put in `RedeployEffects`
+   before the sinks open, fenced by epoch in the engine), and a recoverable
+   job's takeover passes over a marker between the two
+   (`RestorableCompleted`, which `VouchedFor` also uses: a marker no restore
+   would choose vouches for nothing). `restore_from_superseded` keeps the old
+   choice. Pinned by
+   `CheckpointCompletion.ATakeoverPassesOverAMarkerThatLandedAfterTheJobRestoredBelowIt`
+   and `traces/superseded-marker-passed-over`.
+
 ## Trace validation
 
 The engine records its protocol steps when `CLINK_PROTOCOL_TRACE_DIR` names
@@ -411,9 +440,10 @@ read exactly that checkpoint off the disk; a stale `COMPLETED` put is also
 admitted just before a walk event at its checkpoint
 (`LostStaleCompletedAtWalk`), since the walk reads the marker before any event
 but `WalkSkips`. `CoordRecovers` pins the reseeded completed restore point to
-the event's `completed` (`traces/completed-marker-landing-after-redeploy` and
-`traces/completed-marker-walked-after-redeploy`, both synthetic, are accepted
-and diverge without the stale put). A
+the event's `completed`: `traces/completed-marker-walked-after-redeploy`,
+synthetic, is accepted and diverges without the stale put, and in
+`traces/completed-marker-landing-after-redeploy` the takeover passes the
+landed marker over, as the redeploy's `RESTORED` record says. A
 `WriteConfirmed` line stands for `WriteConfirmed` and `AdvanceConfirmed` back
 to back, since the engine emits it in the advance's hold, and `CoordRecovers`
 pins the Kafka family's reseeded confirmed restore point to the event's
