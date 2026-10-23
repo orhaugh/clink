@@ -390,6 +390,86 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
     http_post_empty("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
 }
 
+TEST(HttpSubmit, PostJobsHonoursRecoveryParametersOnTheQuery) {
+    // The upload route took no recovery options: a job submitted as a .so over
+    // HTTP ran with the coordinator's defaults, that is no checkpointing, while
+    // /jobs/spec and /jobs/sql read them from the query string. One parser now
+    // serves all three, and the job detail is where the result is observable.
+    const auto job_so = cancel_test_job_path();
+    if (!std::filesystem::exists(job_so)) {
+        GTEST_SKIP() << "cancel_test_job.so not built";
+    }
+    auto c = start_cluster(/*n_workers=*/2);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
+    const auto ckpt_dir = std::filesystem::temp_directory_path() /
+                          ("clink_http_submit_ckpt_" + std::to_string(::getpid()));
+    std::filesystem::create_directories(ckpt_dir);
+
+    const auto bytes = read_file_bytes(job_so);
+    const auto resp = http_post_multipart_file(
+        "127.0.0.1",
+        c->coordinator_http_port,
+        "/api/v1/jobs?checkpoint_dir=" + ckpt_dir.string() +
+            "&checkpoint_interval_ms=250&max_restarts_on_worker_loss=2&alignment=unaligned",
+        "job_so",
+        "cancel_test_job.so",
+        bytes,
+        "job_name",
+        "test-upload-recovery");
+    ASSERT_EQ(resp.status, 200) << "submit body: " << resp.body;
+    ASSERT_NE(resp.body.find("\"ok\":true"), std::string::npos) << "submit body: " << resp.body;
+
+    ASSERT_TRUE(clink::itest::await_condition(
+        [&] {
+            return http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1").status == 200;
+        },
+        std::chrono::seconds(20)))
+        << "the submitted job never appeared at /api/v1/jobs/1";
+    const auto detail = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1");
+    EXPECT_NE(detail.body.find("\"checkpoint_dir\":\"" + ckpt_dir.string() + "\""),
+              std::string::npos)
+        << detail.body;
+    EXPECT_NE(detail.body.find("\"checkpoint_interval_ms\":250"), std::string::npos) << detail.body;
+    EXPECT_NE(detail.body.find("\"max_restarts_on_worker_loss\":2"), std::string::npos)
+        << detail.body;
+    EXPECT_NE(detail.body.find("\"unaligned_checkpoints\":true"), std::string::npos) << detail.body;
+
+    http_post_empty("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
+    // Stop the cluster before removing the directory it checkpoints into.
+    c.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(ckpt_dir, ec);
+}
+
+TEST(HttpSubmit, PostJobsRefusesAMalformedRecoveryParameter) {
+    // A bad value is a 400 before the upload is loaded, as on /jobs/spec:
+    // silently defaulting it would hand the job a recovery configuration
+    // nobody asked for.
+    const auto job_so = cancel_test_job_path();
+    if (!std::filesystem::exists(job_so)) {
+        GTEST_SKIP() << "cancel_test_job.so not built";
+    }
+    auto c = start_cluster(/*n_workers=*/1);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    const auto bytes = read_file_bytes(job_so);
+    const auto resp = http_post_multipart_file("127.0.0.1",
+                                               c->coordinator_http_port,
+                                               "/api/v1/jobs?checkpoint_interval_ms=soon",
+                                               "job_so",
+                                               "cancel_test_job.so",
+                                               bytes);
+    EXPECT_EQ(resp.status, 400) << resp.body;
+    EXPECT_NE(resp.body.find("checkpoint_interval_ms"), std::string::npos) << resp.body;
+    const auto list = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs");
+    EXPECT_NE(list.body.find("\"jobs\":[]"), std::string::npos)
+        << "a refused upload must not leave a job behind: " << list.body;
+}
+
 TEST(HttpSubmit, PostJobsRejectsRequestWithoutFile) {
     auto c = start_cluster(/*n_workers=*/1);
     if (!c.has_value()) {

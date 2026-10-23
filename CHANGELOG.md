@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+**The plugin upload takes the same recovery options as the other submit
+routes.** `POST /api/v1/jobs` (multipart `job_so`) reads `checkpoint_dir`,
+`checkpoint_interval_ms`, `state_backend`, `max_restarts_on_worker_loss`,
+`alignment` and `restore_from_*` from the query string through the same
+`checkpoint_config_from_query` as `/jobs/spec` and `/jobs/sql`, and refuses a
+malformed value with a 400 before the upload is loaded. Until now a job
+submitted as a `.so` over HTTP always ran with an empty checkpoint
+configuration, so a console could not make it recoverable at all; the ops
+console's upload form now carries the same recovery fields as its spec and
+SQL paths.
+
+**Generator sources resume from their position, and the nexmark source says
+so.** `GeneratorSource<T>` snapshots how many records it has emitted at each
+barrier and, on restore, regenerates and discards that many before emitting
+again, so a restarted subtask continues its deterministic stream where the
+checkpoint left it rather than from the start. The nexmark source
+(`connector='nexmark'`, a `GeneratorSource` over the fixed-seed Nexmark
+generator) gains a capability record declaring it replayable and
+checkpoint-integrated. It had none, so the delivery-guarantee gate read every
+nexmark job as at-most-once at the source even when checkpointed, and the
+console showed it so. A restore pays for its position by regenerating
+everything before it, which for a large position is seconds on the restored
+subtask's first produce.
+
 **The read API says what a job promises and what a connector declares.**
 `GET /api/v1/jobs` and `GET /api/v1/jobs/:id` carry the delivery guarantee the
 submission-time analyser computed for the job (`delivery_guarantee`, one of

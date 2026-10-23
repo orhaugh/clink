@@ -181,6 +181,15 @@ private:
 
 // Generator source: callable produces optional<Record<T>>. Returning nullopt
 // signals end of stream.
+//
+// Checkpoint behaviour: the source snapshots how many records it has emitted
+// when a barrier flows through. On restore it regenerates and discards that
+// many before emitting again, so a restart after a checkpoint continues the
+// stream where it left off rather than from the start. That is correct for a
+// generator that is a function of its parameters (a fixed seed and a
+// counter, as the test and benchmark generators are): the regenerated prefix
+// is the one the previous run shipped. The cost of a restore is the position
+// itself, regenerated rather than read.
 template <typename T>
 class GeneratorSource final : public Source<T> {
 public:
@@ -201,23 +210,80 @@ public:
         if (this->cancelled()) {
             return false;
         }
+        // A restore left `pending_skip_` records to regenerate and discard:
+        // the ones the previous run emitted before its last checkpoint. The
+        // generator is re-derived from its parameters, so after that many
+        // calls it stands where the checkpoint left it (see restore_offset).
+        while (pending_skip_ > 0) {
+            if (this->cancelled()) {
+                return false;
+            }
+            if (!gen_().has_value()) {
+                // The stream ended before the restored position: nothing
+                // more to emit.
+                pending_skip_ = 0;
+                out.emit_watermark(Watermark::max());
+                return false;
+            }
+            --pending_skip_;
+        }
         auto maybe = gen_();
         if (!maybe.has_value()) {
             out.emit_watermark(Watermark::max());
             return false;
         }
+        ++emitted_;
         Batch<T> batch;
         batch.push(std::move(*maybe));
         out.emit_data(std::move(batch));
         return true;
     }
 
+    // The offset is the count of records emitted so far, persisted as a u64
+    // LE under a fixed operator-state slot: the same contract as
+    // VectorSource (operator state, not keyed state, so every subtask
+    // restores it whole).
+    void snapshot_offset(StateBackend& backend,
+                         OperatorId op_id,
+                         CheckpointId /*ckpt_id*/) override {
+        std::array<std::byte, 8> bytes{};
+        for (int i = 0; i < 8; ++i) {
+            bytes[static_cast<std::size_t>(i)] =
+                static_cast<std::byte>((emitted_ >> (i * 8)) & 0xFF);
+        }
+        backend.put_operator_state(
+            op_id,
+            StateBackend::KeyView{kOffsetKey_, std::strlen(kOffsetKey_)},
+            StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+    }
+
+    // Restores the count and arranges for produce() to regenerate and
+    // discard that many records before emitting. The cost is the position
+    // itself: a source restored a million records in regenerates a million.
+    bool restore_offset(StateBackend& backend, OperatorId op_id) override {
+        auto v = backend.get_operator_state(
+            op_id, StateBackend::KeyView{kOffsetKey_, std::strlen(kOffsetKey_)});
+        if (!v.has_value() || v->size() < 8) {
+            return false;
+        }
+        std::uint64_t restored = 0;
+        for (int i = 0; i < 8; ++i) {
+            restored |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
+        }
+        emitted_ = restored;
+        pending_skip_ = restored;
+        return true;
+    }
+
     std::string name() const override { return name_; }
 
 private:
+    static constexpr const char* kOffsetKey_ = "__generator_source_offset__";
     Gen gen_;
     std::string name_;
     bool bounded_{false};
+    std::uint64_t emitted_{0};
+    std::uint64_t pending_skip_{0};
 };
 
 }  // namespace clink

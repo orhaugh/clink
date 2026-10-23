@@ -367,6 +367,34 @@ TEST(HttpSse, SseSurfacesWorkerRegistered) {
                      << reader->buf;
 }
 
+TEST(HttpSse, SseSurfacesWorkerLost) {
+    // The console listens for coordinator.worker_lost to refresh its fleet
+    // views the moment a worker goes, rather than on its next poll. Pin that
+    // the loss handler's publish reaches the stream, naming the worker.
+    auto c = start_cluster(/*n_workers=*/2);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    auto reader = open_sse("127.0.0.1", c->coordinator_http_port, "/api/v1/events");
+    ASSERT_TRUE(reader.has_value());
+    ASSERT_TRUE(await_sse_live(*reader)) << "the SSE stream never went live, so any event "
+                                            "published from here would be missed";
+
+    // Kill the second worker outright. The coordinator notices through its
+    // heartbeat timeout (2 s by default) or the torn connection, whichever
+    // reports first; the event is the same either way.
+    const std::string lost_id = c->worker_ids.back();
+    kill_quietly(c->worker_pids.back());
+    c->worker_pids.pop_back();
+
+    const bool saw = drain_until(*reader, 10s, [&](const std::string& s) {
+        return s.find("event: coordinator.worker_lost") != std::string::npos &&
+               s.find("\"worker_id\":\"" + lost_id + "\"") != std::string::npos;
+    });
+    EXPECT_TRUE(saw) << "did not see coordinator.worker_lost for " << lost_id << " in stream:\n"
+                     << reader->buf;
+}
+
 TEST(HttpSse, SseSurfacesJobLifecycleEvents) {
     const auto submit = submit_binary_path();
     const auto job_so = cancel_test_job_path();

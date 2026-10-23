@@ -511,3 +511,56 @@ TEST(SourceReplay, PacedAndUnpacedSourcesShareOneOffsetContract) {
             << "a paced source re-emitted records an unpaced run had already shipped";
     }
 }
+
+TEST(SourceReplay, GeneratorSourceResumesFromItsSnapshottedCount) {
+    // A deterministic generator whose i-th call yields i, ten in all. After
+    // four produce() calls a barrier snapshots the count; a fresh source over
+    // a fresh generator that restores it must continue at 4, having
+    // regenerated and discarded 0..3, and must snapshot the full count after.
+    InMemoryStateBackend backend;
+    const OperatorId op_id{78};
+    auto make_gen = [] {
+        return [i = 0]() mutable -> std::optional<Record<int>> {
+            if (i >= 10) {
+                return std::nullopt;
+            }
+            return Record<int>{i++};
+        };
+    };
+
+    GeneratorSource<int> src(make_gen(), "gen_source", /*bounded=*/true);
+    auto channel = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> emitter(channel.get());
+    for (int k = 0; k < 4; ++k) {
+        ASSERT_TRUE(src.produce(emitter));
+    }
+    EXPECT_EQ(drain_ints(*channel), (std::vector<int>{0, 1, 2, 3}));
+    src.snapshot_offset(backend, op_id, CheckpointId{1});
+
+    GeneratorSource<int> fresh(make_gen(), "gen_source", /*bounded=*/true);
+    ASSERT_TRUE(fresh.restore_offset(backend, op_id));
+    auto channel2 = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> emitter2(channel2.get());
+    while (fresh.produce(emitter2)) {
+    }
+    EXPECT_EQ(drain_ints(*channel2), (std::vector<int>{4, 5, 6, 7, 8, 9}))
+        << "a restored GeneratorSource must continue after the records its prior run shipped";
+
+    // The count the restored source snapshots covers what it skipped too, so
+    // a second restore lands at the end of the stream and emits nothing.
+    fresh.snapshot_offset(backend, op_id, CheckpointId{2});
+    GeneratorSource<int> third(make_gen(), "gen_source", /*bounded=*/true);
+    ASSERT_TRUE(third.restore_offset(backend, op_id));
+    auto channel3 = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> emitter3(channel3.get());
+    EXPECT_FALSE(third.produce(emitter3));
+    EXPECT_TRUE(drain_ints(*channel3).empty());
+}
+
+TEST(SourceReplay, GeneratorSourceRestoreReturnsFalseWhenNoStateSaved) {
+    InMemoryStateBackend backend;
+    GeneratorSource<int> src([]() -> std::optional<Record<int>> { return std::nullopt; },
+                             "gen_source",
+                             /*bounded=*/true);
+    EXPECT_FALSE(src.restore_offset(backend, OperatorId{99}));
+}

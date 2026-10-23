@@ -82,6 +82,31 @@ TEST_F(GuaranteeGateTest, AnUnknownOpTypeResolvesToNothing) {
     EXPECT_TRUE(connector_name_for_op_type("some_third_party_sink").empty());
 }
 
+TEST_F(GuaranteeGateTest, TheNexmarkSourceResolvesToAReplayableRecord) {
+    // Until the nexmark record existed, every nexmark job was at-most-once at
+    // the source even when checkpointed: the gate reads "no record" as
+    // "replayability cannot be established". GeneratorSource now snapshots
+    // its count and restores by regenerating, and the record says so.
+    EXPECT_EQ(connector_name_for_op_type("nexmark_source"), "nexmark");
+    const auto* record = connectors::CapabilityRegistry::instance().find("nexmark");
+    ASSERT_NE(record, nullptr);
+    EXPECT_TRUE(record->is_source);
+    EXPECT_TRUE(record->replayable);
+    EXPECT_TRUE(record->checkpoint_integrated);
+    EXPECT_TRUE(record->available_in_sql);
+}
+
+TEST_F(GuaranteeGateTest, ACheckpointedNexmarkJobIsNoLongerCappedAtItsSource) {
+    JobGraphSpec g;
+    g.ops.push_back(op("nexmark_source", "src", {}, {{"events_num", "1000"}}));
+    g.ops.push_back(op("file_2pc_sink_string", "snk", {"src"}, {{"dir", "/tmp/o"}}));
+    connectors::GuaranteeReport report;
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), &report);
+    EXPECT_TRUE(reject.empty()) << reject;
+    EXPECT_EQ(report.level, connectors::EndToEndGuarantee::EndToEndExactlyOnce)
+        << report.limiting_factor;
+}
+
 // Declares records for one test and puts back whatever the registry held
 // under those names before, so the process-wide registry is left as found.
 class GateScopedRecords {

@@ -615,9 +615,13 @@ void write_worker_recovery_snapshot(clink::http::JsonWriter& w,
 // build_fn under call_once and surfaces errors), extracts the
 // JobGraphSpec via clink_job_build, and calls Coordinator::submit_job
 // with the bytes as a PluginBinary so every worker dlopens the same .so.
+// Durability rides as query parameters, the same set /jobs/spec and
+// /jobs/sql take (see checkpoint_config_from_query); until it did, a job
+// uploaded over HTTP always ran with an empty checkpoint configuration.
 //
 // Returns 200 with {"job_id":N,"name":"...","ok":true} on success,
-// 400 on bad request (missing file), 500 on build/submit failure.
+// 400 on bad request (missing file, malformed recovery parameter), 500 on
+// build/submit failure.
 clink::http::HttpResponse handle_submit_job(clink::cluster::Coordinator& coordinator,
                                             const clink::http::HttpRequest& req) {
     clink::http::HttpResponse resp;
@@ -632,6 +636,15 @@ clink::http::HttpResponse handle_submit_job(clink::cluster::Coordinator& coordin
         return fail(400, "multipart field 'job_so' is required");
     }
     const auto& upload = it->second;
+
+    // A malformed recovery parameter is refused here, before the upload is
+    // written out and loaded: silently defaulting it would hand the job a
+    // recovery configuration nobody asked for.
+    std::string ckpt_error;
+    const auto ckpt = clink::cluster::checkpoint_config_from_query(req.query, &ckpt_error);
+    if (!ckpt_error.empty()) {
+        return fail(400, ckpt_error);
+    }
 
     // Pick a job name: explicit job_name part wins, else uploaded
     // filename minus extension, else "job".
@@ -714,7 +727,7 @@ clink::http::HttpResponse handle_submit_job(clink::cluster::Coordinator& coordin
         job_id = coordinator.submit_job(graph,
                                         clink::cluster::OperatorRegistry::default_instance(),
                                         std::move(plugins),
-                                        clink::cluster::CheckpointConfig{},
+                                        ckpt,
                                         std::move(bundle),
                                         /*notify_client_conn=*/nullptr);
     } catch (const std::exception& e) {
@@ -2687,7 +2700,8 @@ int run_coordinator(int argc, char** argv) {
 
         // POST /api/v1/jobs - multipart upload + submit. Closes the
         // dashboard's loop: the SPA can submit a job .so directly
-        // without dropping to the clink_submit_job CLI.
+        // without dropping to the clink_submit_job CLI. Recovery options
+        // ride the query string, as on /jobs/spec.
         http_srv->post("/api/v1/jobs", [coordinator_ptr](const clink::http::HttpRequest& req) {
             clink::metrics::http::request_seen();
             return handle_submit_job(*coordinator_ptr, req);

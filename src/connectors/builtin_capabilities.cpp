@@ -184,6 +184,39 @@ void declare_builtin_capabilities() {
                         "op params, not read from anywhere"},
     });
 
+    // ---- nexmark --------------------------------------------------------
+    //
+    // include/clink/nexmark/register.hpp: a GeneratorSource<Row> over the
+    // deterministic NexmarkGenerator (fixed seed, monotonic event counter,
+    // one shared stream filtered per type). GeneratorSource snapshots how
+    // many records it has emitted and on restore regenerates and discards
+    // that many before emitting again, so a restored subtask continues the
+    // same stream from the same position. Replayable for the reason the
+    // generator record is: the stream is derived from the parameters.
+    declare_connector(ConnectorCapabilities{
+        .name = "nexmark",
+        .version = "1",
+        .is_source = true,
+        .is_sink = false,
+        .formats = {"row"},
+        // events_num > 0 bounds the stream; 0 leaves it endless.
+        .boundedness = Boundedness::Either,
+        .replayable = true,
+        .offset_model = OffsetModel::FileOffset,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .backpressure = true,
+        // connector='nexmark' binds once the node registers the nexmark
+        // factories (clink_node does; the SQL library alone does not).
+        .available_in_sql = true,
+        .limitations = {"a benchmark source: the stream is derived from seed, tps, base_time_ms "
+                        "and events_num, not read from anywhere",
+                        "a restore regenerates and discards every event before the position, "
+                        "so a large position costs seconds on the restored subtask's first "
+                        "produce"},
+    });
+
     // ---- blackhole / print ----------------------------------------------
     //
     // Discards or prints. There is no external system to be exactly-once

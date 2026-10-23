@@ -146,6 +146,9 @@ TEST(ConnectorAvailability, EveryDeclaredCapabilityResolvesThroughTheVocabulary)
         "parquet",
         "parquet_2pc",
         "changelog",
+        // In-tree like the generator it is built on; clink_node registers
+        // its factory in every build.
+        "nexmark",
     };
     for (const auto& cap : clink::connectors::CapabilityRegistry::instance().all()) {
         bool exempt = false;
