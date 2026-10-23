@@ -551,23 +551,30 @@ TEST_F(Neo4jLive, AServerRestartWithinTheRetryWindowIsRiddenOut) {
 TEST_F(Neo4jLive, AnOutageLongerThanTheRetryWindowFailsTheBarrier) {
     const auto acct = label("Account");
     const auto [host, port] = host_port(endpoint_);
-    TcpFaultProxy proxy(static_cast<std::uint16_t>(port), host == "localhost" ? "127.0.0.1" : host);
+    std::optional<TcpFaultProxy> proxy;
+    proxy.emplace(static_cast<std::uint16_t>(port), host == "localhost" ? "127.0.0.1" : host);
     auto p = params("UNWIND $rows AS row MERGE (a:" + acct + " {id: row.id}) SET a.name = row.name",
                     "id:BIGINT;name:VARCHAR",
                     {{"retry_window_ms", "1500"}});
-    p["endpoint"] = "http://127.0.0.1:" + std::to_string(proxy.port());
+    p["endpoint"] = "http://127.0.0.1:" + std::to_string(proxy->port());
     LiveSink s(p);
     s.sink->open();
     s.send(account_rows(0, 20));
-    proxy.set_refusing(true);
+    // The server goes away for the rest of the test: every connection the sink
+    // holds is reset, and then nothing listens, so every new one is refused at
+    // connect. The proxy's refusing mode accepts a new connection and then
+    // resets it, which races the sink's write of the request: a write that
+    // landed first made that attempt's outcome unknown, the right answer for a
+    // connection that was accepted, and failed the assertion below whenever
+    // the retries outlasted the connections the sink had pooled.
+    proxy->drop_all();
+    proxy.reset();
     const auto start = std::chrono::steady_clock::now();
     EXPECT_EQ(refusal_code([&] { s.barrier(1); }), code::kRetriesExhausted);
     EXPECT_LT(std::chrono::steady_clock::now() - start, 15s);
-    EXPECT_GE(proxy.refused(), 1U) << "the outage did not engage";
-    EXPECT_GE(s.sink->counts().attempts_failed, 2U);
+    EXPECT_GE(s.sink->counts().attempts_failed, 2U) << "the outage did not engage";
     EXPECT_EQ(s.sink->counts().outcome_unknown, 0U)
         << "a refused connection is a request never sent, not an unknown outcome";
-    proxy.set_refusing(false);
     EXPECT_EQ(oracle_->count("MATCH (a:" + acct + ") RETURN count(a)"), 0);
     EXPECT_EQ(s.sink->buffered_rows(), 20U);
 }
