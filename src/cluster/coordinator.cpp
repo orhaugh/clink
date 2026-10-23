@@ -564,8 +564,21 @@ std::uint64_t latest_marker_id_on_disk(const std::string& checkpoint_dir,
         const auto name = std::filesystem::path(key).filename().string();
         if (name.rfind(prefix, 0) != 0)
             continue;
+        // Only a whole marker counts: the prefix, then the id, then nothing.
+        // A marker is published by renaming its temp file
+        // (<marker>.tmp.<pid>.<n>, write_string_fsync_rename) into place, and
+        // a writer killed between the temp's fsync and the rename leaves the
+        // temp behind. std::stoull reads "2.tmp.74715.0" as 2, so a takeover
+        // counted a checkpoint whose completion was never recorded, restored
+        // from it, found no marker for it, and read state from a directory
+        // that holds none: the job failed with every record since the last
+        // real marker unpublished.
+        const auto digits = std::string_view{name}.substr(prefix.size());
+        if (digits.empty() || digits.size() > 20 ||
+            digits.find_first_not_of("0123456789") != std::string_view::npos)
+            continue;
         try {
-            const auto id = std::stoull(name.substr(prefix.size()));
+            const auto id = std::stoull(std::string{digits});
             if (id > latest)
                 latest = id;
         } catch (...) {

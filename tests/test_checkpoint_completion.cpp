@@ -3361,6 +3361,101 @@ TEST(CheckpointCompletion, RecoveryRestoresFromTheLastCompletedCheckpoint) {
     std::filesystem::remove_all(root, ec);
 }
 
+// A leader killed while it publishes a completion marker: the temp file
+// holding the marker's body is written and fsynced, the rename that makes it
+// the marker never happens. That checkpoint never completed, whatever the
+// dead leader had decided in memory; the takeover must restore from the last
+// marker that was published. It counted the temp file as the marker (its name
+// begins with the marker's, and std::stoull reads the id off the front),
+// restored from a checkpoint that has no marker, and the restore then read
+// state from the job's marker directory, where there is none: every subtask
+// refused to restore with empty state, and the job failed with every record
+// since the last real marker unpublished. CI saw it once, on a runner slow
+// enough for the kill to land inside the marker's fsync.
+TEST(CheckpointCompletion, ATakeoverIgnoresAMarkerItsLeaderDiedPublishing) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_torn_marker_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    std::filesystem::create_directories(ha_dir);
+    std::filesystem::create_directories(ckpt_dir);
+
+    JobId job_id = 0;
+    std::uint64_t completed = 0;
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(a.await_registrations(2s));
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 100;
+        ckpt.max_restarts_on_worker_loss = 0;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        ASSERT_GT(job_id, 0U);
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value());
+        const auto tasks = decode_deploy(*deploy).tasks;
+        ASSERT_FALSE(tasks.empty());
+        std::uint16_t port_seed = 41100;
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
+        }
+        auto trigger = w.await_frame(MessageKind::TriggerCheckpoint);
+        ASSERT_TRUE(trigger.has_value());
+        completed = decode_trigger_checkpoint(*trigger).checkpoint_id;
+        for (const auto& t : tasks) {
+            ASSERT_TRUE(w.ack_checkpoint(job_id, completed, t.role, t.subtask_idx, /*ok=*/true));
+        }
+        ASSERT_TRUE(ckpt_await([&] {
+            return std::filesystem::exists(written_marker_path(ckpt_dir, job_id, completed));
+        })) << "the checkpoint's marker never landed";
+        w.close();
+        a.stop();
+    }
+
+    // What the killed leader left: the next checkpoint's marker body in the
+    // temp file write_string_fsync_rename names, never renamed into place.
+    const auto real = written_marker_path(ckpt_dir, job_id, completed);
+    const auto torn = written_marker_path(ckpt_dir, job_id, completed + 1);
+    {
+        std::ofstream out(torn.string() + ".tmp.74715.0", std::ios::binary);
+        out << "job=" << job_id << "\ncheckpoint=" << (completed + 1) << "\n";
+    }
+    ASSERT_FALSE(std::filesystem::exists(torn));
+    ASSERT_TRUE(std::filesystem::exists(real));
+
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(b.await_registrations(2s));
+        b.recover_persisted_jobs();
+        auto deploy = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value()) << "the recovered job was never deployed";
+        const auto msg = decode_deploy(*deploy);
+        EXPECT_EQ(msg.restore_from_checkpoint_id, completed)
+            << "the takeover restored from checkpoint " << msg.restore_from_checkpoint_id
+            << ", whose marker was never published (only " << torn.filename().string()
+            << ".tmp.* exists); the last published marker is " << real.filename().string();
+        w.close();
+        b.stop();
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 // A takeover before the job has completed a checkpoint of its own. The new
 // leader used to take the job's own latest id, 0, as the restore point; the
 // deploy lint refuses a restore directory with id 0, so the recovery threw and

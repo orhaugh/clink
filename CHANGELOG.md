@@ -18,6 +18,23 @@ suite's runs never filled a batch before a barrier, and a new one does. The
 sink now finalises prepared transactions over a second connection of its own,
 so each subtask holds two connections.
 
+**An HA takeover no longer restores from a checkpoint whose marker its dead
+leader never published.** A completion marker is written to a temp file,
+fsynced and renamed into place, and the takeover found the newest marker by
+reading the id off the front of each file name in the job's marker directory.
+A leader killed between the fsync and the rename left a temp file
+(`COMPLETED-<id>.tmp.<pid>.<n>`) that the takeover counted as that checkpoint
+completed. It restored from a checkpoint with no marker, the restore read state
+from the marker directory, where there is none, every subtask refused to
+restore with empty state, and the job failed once its restarts were spent,
+with everything since the last published marker unpublished. Only a whole
+marker name counts now, there and where a takeover numbers its next
+checkpoints. `HaFailoverTest.ExactlyOnceSurvivesACoordinatorFailover` failed
+this way once in CI, on a runner slow enough for the kill to land inside the
+marker's fsync; `CheckpointCompletion.ATakeoverIgnoresAMarkerItsLeaderDiedPublishing`
+plants the temp file a dead leader leaves and checks that the takeover restores
+from the marker before it.
+
 **The plugin upload takes the same recovery options as the other submit
 routes.** `POST /api/v1/jobs` (multipart `job_so`) reads `checkpoint_dir`,
 `checkpoint_interval_ms`, `state_backend`, `max_restarts_on_worker_loss`,

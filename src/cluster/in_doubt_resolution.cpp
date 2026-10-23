@@ -171,9 +171,17 @@ std::uint64_t new_run_checkpoint_floor(const std::string& checkpoint_dir,
             if (name.rfind(prefix, 0) != 0) {
                 continue;
             }
+            // A whole marker only: a temp file an interrupted publish left
+            // (<marker>.tmp.<pid>.<n>) is not one, as latest_marker_id_on_disk
+            // in coordinator.cpp also holds.
+            const auto digits = std::string_view{name}.substr(prefix.size());
+            if (digits.empty() ||
+                digits.find_first_not_of("0123456789") != std::string_view::npos) {
+                continue;
+            }
             try {
-                floor = std::max(
-                    floor, static_cast<std::uint64_t>(std::stoull(name.substr(prefix.size()))));
+                floor =
+                    std::max(floor, static_cast<std::uint64_t>(std::stoull(std::string{digits})));
             } catch (const std::exception&) {
                 // Not a marker this layout names; it bounds nothing.
             }
