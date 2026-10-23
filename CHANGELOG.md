@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**The PostgreSQL two-phase-commit sink commits while the next interval's
+transaction is open.** The sink wrote an interval's rows into a transaction on
+its one connection, opened at the interval's first flush, and committed the
+previous checkpoint's prepared transaction on that same connection when the
+commit arrived. Once a subtask received `batch_records` rows (default 1000), or
+`max_bytes`, before the previous checkpoint's commit reached it, that commit ran
+inside the open transaction, which PostgreSQL refuses ("COMMIT PREPARED cannot
+run inside a transaction block"). The refusal aborted the open transaction, its
+next INSERT failed, and the job restarted until its restart budget was spent
+and then failed. Nothing was committed twice or lost: the prepared transaction
+stayed prepared for a restore to commit. A dense stream hit it on nearly every
+interval, a per-authorisation decision stream among them; the exactly-once
+suite's runs never filled a batch before a barrier, and a new one does. The
+sink now finalises prepared transactions over a second connection of its own,
+so each subtask holds two connections.
+
 **The plugin upload takes the same recovery options as the other submit
 routes.** `POST /api/v1/jobs` (multipart `job_so`) reads `checkpoint_dir`,
 `checkpoint_interval_ms`, `state_backend`, `max_restarts_on_worker_loss`,
@@ -636,6 +652,9 @@ after 240 s and writes every thread's backtrace to the job log and to
   (on Redis, `tls_sni` sets the name checked), reissue the certificate with
   that name in its `subjectAltName`, or set `tls_verify_hostname='false'`,
   which still verifies the chain.
+- The PostgreSQL two-phase-commit sink holds two connections per subtask, one
+  for the interval's transaction and one that finalises prepared transactions:
+  allow for them in the server's `max_connections`.
 
 ## v0.11.0 (October 2026)
 

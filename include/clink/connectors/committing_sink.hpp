@@ -60,9 +60,12 @@
 // whose client handle is not thread-safe must serialise access itself - a
 // libpq connection shared unsynchronised between a barrier's PREPARE and a
 // dispatched COMMIT PREPARED desyncs the wire protocol and blocks both
-// threads forever (found by the Postgres exactly-once suite; see the
-// conn_mu_ in postgres_json_sink_2pc.hpp). Filesystem-rename sinks and
-// thread-safe clients (AWS SDK, librdkafka) need nothing extra. What a
+// threads forever (found by the Postgres exactly-once suite). Serialising is
+// not always enough: a commit that finds the next interval's transaction
+// open on a shared session runs inside it, which PostgreSQL refuses, so the
+// Postgres sink finalises over a connection of its own (see
+// postgres_json_sink_2pc.hpp). Filesystem-rename sinks and thread-safe
+// clients (AWS SDK, librdkafka) need nothing extra. What a
 // connector may rely on: commit() and abort() never run concurrently with
 // close(), and never after it. The sink's runner fences dispatch before its
 // teardown begins (Sink::fence_commit_dispatch) and waits for a commit already

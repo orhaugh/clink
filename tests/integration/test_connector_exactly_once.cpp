@@ -255,6 +255,45 @@ TEST_F(PostgresExactlyOnceTest, ACleanRunCommitsEveryRecordExactlyOnce) {
     EXPECT_EQ(prepared_count(), 0) << "the job completed but left a prepared transaction behind";
 }
 
+// A dense stream. The sink flushes a full batch into the interval's
+// transaction as it arrives, so with records streaming in that transaction
+// is open on the connection for most of every interval, and the previous
+// checkpoint's COMMIT PREPARED, dispatched on the worker's reader thread the
+// moment that checkpoint completes, landed inside it: "COMMIT PREPARED cannot
+// run inside a transaction block", the open transaction aborted, the next
+// INSERT refused, and the job restarted until its budget was spent. Forty
+// records at fifty milliseconds never fill a batch before the barrier, so the
+// suite above never opened that window; a fraud showcase's per-authorisation
+// decision stream, tens of flushes an interval, opened it on every interval.
+// Here the sink flushes every record, so the transaction is open from each
+// interval's first row, and there is no restart budget: one refused commit
+// fails the run.
+TEST_F(PostgresExactlyOnceTest, ADenseStreamCommitsWhileTheNextIntervalIsOpen) {
+    constexpr int kTotal = 20000;
+    ::setenv("CLINK_2PC_TOTAL", "20000", 1);
+    ::setenv("CLINK_2PC_TICK_MS", "0", 1);
+    ::setenv("CLINK_PG_BATCH_RECORDS", "1", 1);
+    struct UnsetBatch {
+        ~UnsetBatch() { ::unsetenv("CLINK_PG_BATCH_RECORDS"); }
+    } unset_batch;
+
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    bring_up(c);
+    auto sub = submit(c, /*max_restarts=*/0);
+    ASSERT_NE(sub, nullptr);
+    const auto code = sub->await_exit(180s);
+    ASSERT_TRUE(code.has_value()) << "submitter never exited";
+    ASSERT_EQ(*code, 0) << "a dense run did not complete: a commit of the previous checkpoint "
+                           "refused on the connection holding the next interval's transaction "
+                           "fails the job";
+
+    const auto v = clink::itest::verify_exactly_once_records(rows(), kTotal);
+    EXPECT_TRUE(v.clean()) << "a dense Postgres 2PC run did not commit each record exactly once: "
+                           << clink::itest::describe(v);
+    EXPECT_EQ(prepared_count(), 0) << "the job completed but left a prepared transaction behind";
+}
+
 TEST_F(PostgresExactlyOnceTest, EveryRecordIsCommittedExactlyOnceAcrossAWorkerKill) {
     constexpr int kTotal = 40;
     ::setenv("CLINK_2PC_TOTAL", "40", 1);

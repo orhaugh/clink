@@ -65,6 +65,11 @@ void define_job(clink::api::Pipeline& pipeline) {
     sink.params["conninfo"] = dsn;
     sink.params["table"] = table;
     sink.params["columns"] = "v";
+    // CLINK_PG_BATCH_RECORDS: the sink's flush threshold, for a test that
+    // wants the interval's transaction open from its first record.
+    if (const char* b = std::getenv("CLINK_PG_BATCH_RECORDS"); b != nullptr && *b != '\0') {
+        sink.params["batch_records"] = b;
+    }
 
     pipeline.source<std::string>(src).sink(sink);
 }

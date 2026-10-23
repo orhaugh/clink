@@ -184,7 +184,7 @@ The source side of exactly-once is `snapshot_offset` / `restore_offset` on `Sour
 | `Source::snapshot_offset` / `restore_offset` | Source-offset persistence and replay |
 | `Source::notify_checkpoint_complete` / `notify_checkpoint_aborted` | Source-side commit/abort hooks for irreversible-consume sources (messaging acks, the PostgreSQL CDC slot confirmation) |
 | `Sink::on_barrier` / `on_commit` / `on_abort` | 2PC pre-commit / commit / rollback hooks |
-| `Sink::set_commit_group` / `commit_group` | Atomic-commit group membership |
+| `Sink::set_commit_group` / `commit_group` | Commit-group membership: a failed ack aborts the group at once; no cross-sink atomicity (see above) |
 
 ## Configuration and knobs
 

@@ -28,6 +28,17 @@
 // other job's prepared transaction). Ids prepared by an older binary have no
 // generation ("clink_<uid>_sub<N>_<ckpt>") and are still reconciled.
 //
+// Two connections per subtask. The data connection carries the interval's
+// transaction: BEGIN at its first flush, the INSERTs, PREPARE at the barrier.
+// The finalisation connection carries COMMIT PREPARED, ROLLBACK PREPARED and
+// the pg_prepared_xacts lookups. They cannot share one: once a write fills a
+// batch before the barrier (batch_records or max_bytes), the next interval's
+// transaction is open on the data connection, and the previous checkpoint's
+// commit, dispatched the moment that checkpoint completes, would run inside it,
+// which PostgreSQL refuses ("COMMIT PREPARED cannot run inside a transaction
+// block") and which aborts the open transaction. A server must allow two
+// connections for every subtask of the sink.
+//
 // Reconciliation covers the subtasks this one succeeds (RestoreSuccession):
 // after a rescale a subtask finalises transactions prepared under other
 // indices, while a new subtask may already be preparing under the same index.
@@ -91,8 +102,9 @@ public:
     }
 
     void on_open() override {
-        std::lock_guard lk(conn_mu_);
-        connect_();
+        std::scoped_lock lk(conn_mu_, commit_mu_);
+        conn_ = connect_();
+        commit_conn_ = connect_();
         reconcile_orphans_();
     }
 
@@ -118,18 +130,20 @@ public:
             return std::nullopt;
         }
         const std::string gid = gtxid_(checkpoint_id);
-        exec_("PREPARE TRANSACTION '" + gid + "'");
+        exec_(conn_.get(), "PREPARE TRANSACTION '" + gid + "'");
         in_txn_ = false;
         return gid;
     }
 
-    // COMMIT PREPARED. Idempotent: a gid already gone from pg_prepared_xacts
-    // (committed on a prior attempt) is a no-op.
+    // COMMIT PREPARED, over the finalisation connection: the data connection
+    // may already hold the next interval's transaction. Idempotent: a gid
+    // already gone from pg_prepared_xacts (committed on a prior attempt) is a
+    // no-op.
     bool commit(const std::string& gid) override {
-        std::lock_guard lk(conn_mu_);
+        std::lock_guard lk(commit_mu_);
         if (gid_is_prepared_(gid)) {
             const auto t0 = std::chrono::steady_clock::now();
-            exec_("COMMIT PREPARED '" + gid + "'");
+            exec_(commit_conn_.get(), "COMMIT PREPARED '" + gid + "'");
             const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - t0)
                                 .count();
@@ -139,11 +153,11 @@ public:
         return true;
     }
 
-    // ROLLBACK PREPARED. Idempotent.
+    // ROLLBACK PREPARED, over the finalisation connection. Idempotent.
     void abort(const std::string& gid) override {
-        std::lock_guard lk(conn_mu_);
+        std::lock_guard lk(commit_mu_);
         if (gid_is_prepared_(gid)) {
-            exec_("ROLLBACK PREPARED '" + gid + "'");
+            exec_(commit_conn_.get(), "ROLLBACK PREPARED '" + gid + "'");
         }
     }
 
@@ -151,23 +165,24 @@ public:
     std::string deserialize(std::string_view bytes) const override { return std::string(bytes); }
 
     void close() override {
-        std::lock_guard lk(conn_mu_);
+        std::scoped_lock lk(conn_mu_, commit_mu_);
         if (conn_) {
             if (in_txn_) {
                 try {
-                    exec_("ROLLBACK");  // an unprepared interval is discarded
+                    exec_(conn_.get(), "ROLLBACK");  // an unprepared interval is discarded
                 } catch (...) {
                 }
                 in_txn_ = false;
             }
             conn_.reset();
         }
+        commit_conn_.reset();
     }
 
     std::string name() const override { return opts_.name; }
 
 private:
-    void connect_() {
+    std::unique_ptr<PGconn, PgconnDeleter> connect_() {
         PGconn* c = PQconnectdb(opts_.conninfo.c_str());
         if (PQstatus(c) != CONNECTION_OK) {
             const std::string err = PQerrorMessage(c);
@@ -178,17 +193,18 @@ private:
         // connection (see postgres_tls.hpp).
         clink::connectors::pg::assert_no_silent_downgrade(
             c, opts_.conninfo, "postgres_json_sink_2pc");
-        conn_.reset(c);
+        return std::unique_ptr<PGconn, PgconnDeleter>(c);
     }
 
-    // Run a command, throwing on failure. Used for BEGIN / INSERT / PREPARE /
-    // COMMIT PREPARED / ROLLBACK PREPARED.
-    void exec_(const std::string& sql) {
-        PGresult* r = PQexec(conn_.get(), sql.c_str());
+    // Run a command on one of the two connections, throwing on failure: BEGIN,
+    // INSERT, PREPARE and ROLLBACK on the data connection, COMMIT PREPARED and
+    // ROLLBACK PREPARED on the finalisation connection.
+    void exec_(PGconn* c, const std::string& sql) {
+        PGresult* r = PQexec(c, sql.c_str());
         const auto st = r != nullptr ? PQresultStatus(r) : PGRES_FATAL_ERROR;
         if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
             const std::string err =
-                r != nullptr ? PQresultErrorMessage(r) : std::string(PQerrorMessage(conn_.get()));
+                r != nullptr ? PQresultErrorMessage(r) : std::string(PQerrorMessage(c));
             PQclear(r);
             clink::metrics::connector::error_inc("postgres", "sink");
             throw std::runtime_error(opts_.name + ": " + sql + " failed: " + err);
@@ -214,7 +230,7 @@ private:
             throw std::runtime_error(opts_.name + ": write before open()");
         }
         if (!in_txn_) {
-            exec_("BEGIN");
+            exec_(conn_.get(), "BEGIN");
             in_txn_ = true;
         }
         const std::string sql =
@@ -225,7 +241,7 @@ private:
                                     /*update_columns=*/{},
                                     pending_,
                                     [this](std::string_view s) { return escape_(s); });
-        exec_(sql);
+        exec_(conn_.get(), sql);
         clink::metrics::connector::records_out_inc("postgres", pending_.size());
         clink::metrics::connector::bytes_out_inc("postgres", pending_bytes_);
         pending_.clear();
@@ -298,15 +314,16 @@ private:
         return out;
     }
 
+    // Called with commit_mu_ held (or both mutexes, from on_open).
     bool gid_is_prepared_(const std::string& gid) {
-        if (!conn_) {
+        if (!commit_conn_) {
             // close() won the connection under a racing late dispatch. Refuse
             // rather than touch a dead handle: the thrown error keeps the
             // persisted handle in place for restore-time recovery.
             throw std::runtime_error(opts_.name + ": connection already closed");
         }
         const char* params[1] = {gid.c_str()};
-        PGresult* r = PQexecParams(conn_.get(),
+        PGresult* r = PQexecParams(commit_conn_.get(),
                                    "SELECT 1 FROM pg_prepared_xacts WHERE gid = $1",
                                    1,
                                    nullptr,
@@ -315,8 +332,8 @@ private:
                                    nullptr,
                                    0);
         if (r == nullptr || PQresultStatus(r) != PGRES_TUPLES_OK) {
-            const std::string err =
-                r != nullptr ? PQresultErrorMessage(r) : std::string(PQerrorMessage(conn_.get()));
+            const std::string err = r != nullptr ? PQresultErrorMessage(r)
+                                                 : std::string(PQerrorMessage(commit_conn_.get()));
             PQclear(r);
             throw std::runtime_error(opts_.name + ": pg_prepared_xacts lookup failed: " + err);
         }
@@ -335,7 +352,7 @@ private:
         std::vector<std::string> out;
         const std::string prefix = ident_prefix_();
         const auto owner = this->succession();
-        PGresult* r = PQexec(conn_.get(), "SELECT gid FROM pg_prepared_xacts");
+        PGresult* r = PQexec(commit_conn_.get(), "SELECT gid FROM pg_prepared_xacts");
         if (r != nullptr && PQresultStatus(r) == PGRES_TUPLES_OK) {
             for (int i = 0; i < PQntuples(r); ++i) {
                 std::string gid = PQgetvalue(r, i, 0);
@@ -367,25 +384,28 @@ private:
         const std::set<std::string> keep(keep_vec.begin(), keep_vec.end());
         for (const auto& gid : our_prepared_gids_()) {
             if (keep.count(gid) == 0) {
-                exec_("ROLLBACK PREPARED '" + gid + "'");
+                exec_(commit_conn_.get(), "ROLLBACK PREPARED '" + gid + "'");
             }
         }
     }
 
     PostgresJsonSink2PCOptions opts_;
-    // Serialises every use of conn_. A libpq connection is NOT thread-safe,
-    // and this sink is genuinely used from two threads: write/prepare_commit/
-    // close run on the subtask's task thread, while on_commit/on_abort
-    // dispatch from the worker's reader thread when CommitCheckpoint arrives.
-    // Unsynchronised, an on_commit overlapping a barrier's BEGIN/INSERT/
-    // PREPARE interleaved protocol messages on the one socket and desynced
-    // the stream - both threads then blocked in poll() forever (found by the
-    // Postgres exactly-once integration suite: the clean run wedged at EOS
-    // with the reader thread stuck in gid_is_prepared_ and the runner
-    // waiting on commit-dispatch drain). Held across the external call by
-    // design; contention is one commit against one barrier, both bounded.
+    // One mutex per connection, because the sink is used from two threads:
+    // write, prepare_commit and close run on the subtask's task thread, while
+    // commit and abort dispatch from the worker's commit thread when a
+    // CommitCheckpoint arrives, concurrently with the next interval. A libpq
+    // connection is not thread-safe (an unsynchronised commit interleaved
+    // protocol messages with a barrier's INSERTs on one socket and wedged both
+    // threads), and a session holding an open transaction cannot run COMMIT
+    // PREPARED at all, which is why the two verbs no longer share a
+    // connection (see the header comment). conn_mu_ guards the data
+    // connection and in_txn_, commit_mu_ the finalisation connection; on_open
+    // and close take both, through scoped_lock. Each is held across its
+    // external call by design.
     std::mutex conn_mu_;
     std::unique_ptr<PGconn, PgconnDeleter> conn_;
+    std::mutex commit_mu_;
+    std::unique_ptr<PGconn, PgconnDeleter> commit_conn_;
     std::vector<std::string> pending_;
     std::size_t pending_bytes_{0};
     bool in_txn_{false};
