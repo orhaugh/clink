@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## v0.12.0 (October 2026)
+
+Exactly-once is held to account across the sink portfolio: every sink that
+writes at the barrier or prepares there declares that it owns its chain's
+checkpoint and a gate keeps every shipped sink classified, the file and Kafka
+sinks write out and wait at every barrier, the two-phase-commit file and object
+sinks keep each run's parts apart, and the PostgreSQL two-phase sink no longer
+fails a stream dense enough to fill a batch before its barrier. An HA takeover
+no longer restores from a checkpoint whose marker its dead leader never
+published, and the exactly-once specification covers an interval a sink found
+empty, a gap a fraud workload found. PostgreSQL change data capture arrives in
+SQL, with kept rows, shared slots, added columns, row filters and partitioned
+tables, and the CDC source no longer loses its place. Neo4j gains a sink and a
+read-only lookup for joins. Restores are repaired for RocksDB and ForSt state,
+shared checkpoint directories and remote reads, and the read API says what a
+job promises and what each connector declares, so an ops console can show it.
+The plugin ABI fingerprint rotates and several sinks now refuse arrangements
+they used to accept silently; see Compatibility below.
 
 **The PostgreSQL two-phase-commit sink commits while the next interval's
 transaction is open.** The sink wrote an interval's rows into a transaction on
@@ -642,6 +659,29 @@ after 240 s and writes every thread's backtrace to the job log and to
 
 **Compatibility.**
 
+- Seventeen headers on the plugin ABI surface changed, so the plugin ABI
+  fingerprint rotates: rebuild job modules against this release. The cluster
+  wire protocol is unchanged, so v0.11.0 and v0.12.0 nodes interoperate.
+- On a `Dag`, a sink that writes at the barrier or prepares there is refused
+  beside another sink on its chain, whichever is added first: give each such
+  sink its own chain, or declare `Dag::run_without_checkpoint_completion()`
+  where no checkpoint completes. `LocalExecutor` refuses an acknowledgement
+  callback for a Dag with parallel stages. SQL and job graphs plan every sink
+  as a subtask of its own and are not affected.
+- The Delta and Iceberg sinks refuse a parallelism above 1; a job graph saved
+  with either above 1 is refused at deploy and has to be planned again.
+- The two-phase-commit file and object sinks name their parts
+  `sub<N>-<run>-<ckpt>`; a reader that built a part's name from the checkpoint
+  alone has to list the committed directory or prefix instead.
+- The plain, string, upsert and message Kafka sinks fail a checkpoint when a
+  record was not acknowledged within `flush_timeout`, where they used to count
+  it in `delivery_errors` and carry on, and the upsert sink writes a delete as
+  a NULL-valued tombstone rather than an empty value.
+- RabbitMQ publishes are mandatory by default (`mandatory='false'` restores the
+  old behaviour); the HTTP sinks' `dlq='drop'` dead-letters only 400, 409 and
+  422 and retries, then fails on, every other refusal; an Elasticsearch record
+  without its `document_id` field is refused rather than indexed under a
+  generated id.
 - A PostgreSQL CDC job now confirms its replication slot only when a
   checkpoint completes, so a job running without checkpointing (no
   `--checkpoint-dir`) never releases WAL. Run CDC jobs with checkpointing, and
