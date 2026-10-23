@@ -51,7 +51,13 @@ cleanup() {
     fi
     if [ "${CLEANUP:-0}" = 1 ]; then
         "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
-        [ "${host_mode}" = 1 ] && rm -rf "${STATE}"
+        # An if, not `[ ... ] && rm`: this runs as the EXIT trap, and the
+        # trap's last status becomes the script's. Against an image
+        # (host_mode=0) the test is false, so the && form turned a run that
+        # had verified everything into exit 1.
+        if [ "${host_mode}" = 1 ]; then
+            rm -rf "${STATE}"
+        fi
     fi
 }
 trap cleanup EXIT
