@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -843,4 +844,69 @@ TEST(CancelTeardown, TheExternalCancelTokenReachesCancelRequestedAtOnce) {
     token->store(true, std::memory_order_release);
     EXPECT_TRUE(sink->signal.requested());
     exec.await_termination();
+}
+
+// A cancelled subtask reports what failed before its cancel, not what its
+// teardown threw afterwards. The worker's cancel token is the executor's
+// external token; operator_errors_before_cancel() is the prefix of the errors
+// caught while it was still unset.
+namespace {
+
+class CancelTeardownFailingSink final : public Sink<int> {
+public:
+    void on_data(const Batch<int>&) override { throw std::runtime_error("failed on its own"); }
+    std::string name() const override { return "cancel_teardown.failing_sink"; }
+};
+
+class CancelTeardownThrowingCloseSink final : public Sink<int> {
+public:
+    void on_data(const Batch<int>& batch) override {
+        writes.fetch_add(static_cast<int>(batch.size()), std::memory_order_relaxed);
+    }
+    void close() override { throw std::runtime_error("teardown after the cancel"); }
+    std::string name() const override { return "cancel_teardown.throwing_close_sink"; }
+
+    std::atomic<int> writes{0};
+};
+
+}  // namespace
+
+TEST(CancelTeardown, AnErrorFromBeforeTheCancelIsKeptAndATeardownErrorIsNot) {
+    {
+        // The operator fails, and only then is the subtask cancelled - as its
+        // peers are when the coordinator hears of the failure.
+        auto token = std::make_shared<std::atomic<bool>>(false);
+        Dag dag;
+        auto src = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+        dag.add_sink<int>(src, std::make_shared<CancelTeardownFailingSink>());
+        JobConfig cfg;
+        cfg.external_cancel_token = token;
+        LocalExecutor exec(std::move(dag), cfg);
+        exec.start();
+        ASSERT_TRUE(await([&] { return !exec.operator_errors().empty(); }, 5s));
+        token->store(true);
+        exec.await_termination();
+        const auto before = exec.operator_errors_before_cancel();
+        ASSERT_EQ(before.size(), 1U);
+        EXPECT_NE(before.front().second.find("failed on its own"), std::string::npos);
+    }
+    {
+        // Cancelled while healthy: the sink's close throws, after the cancel.
+        auto token = std::make_shared<std::atomic<bool>>(false);
+        auto sink = std::make_shared<CancelTeardownThrowingCloseSink>();
+        Dag dag;
+        auto src = dag.add_source<int>(std::make_shared<CancelTeardownEndlessSource>());
+        dag.add_sink<int>(src, sink);
+        JobConfig cfg;
+        cfg.external_cancel_token = token;
+        LocalExecutor exec(std::move(dag), cfg);
+        exec.start();
+        ASSERT_TRUE(await([&] { return sink->writes.load() > 0; }, 5s));
+        token->store(true);
+        exec.await_termination();
+        const auto all = exec.operator_errors();
+        ASSERT_EQ(all.size(), 1U) << "the sink's close did not throw, so this case tests nothing";
+        EXPECT_NE(all.front().second.find("teardown after the cancel"), std::string::npos);
+        EXPECT_TRUE(exec.operator_errors_before_cancel().empty());
+    }
 }

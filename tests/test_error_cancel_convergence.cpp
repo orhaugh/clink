@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -53,6 +54,7 @@
 #include "clink/cluster/type_registry.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/fault/fault_injection.hpp"
+#include "clink/operators/operator_base.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/network/connection.hpp"
@@ -871,6 +873,141 @@ TEST(ErrorCancelConvergence, AWorkerReturningUnderItsOwnIdMidDrainDoesNotWedgeTh
         << "no redeploy within 10s: the restart is waiting on a session that was replaced "
            "(item 73, same-id return)";
     // Best-effort: the coordinator is still running, and may be writing here.
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// ----- A chained subtask is cancelled with its job -----
+//
+// The worker's CancelJob, and the loss of its coordinator, flip only the
+// cancel tokens a subtask registered, and only the SubtaskRunner path
+// registered one. A chain - the path every subtask of two or more operators,
+// or with a fused endpoint, takes - had none. It still stopped when its
+// network peers closed, so this went unseen until a chain's upstream chains
+// failed while building, after the peer update: nothing ever connected to
+// its bridges or closed them, and it waited in their pop() for good. The
+// job's restart drain waited on it until the watchdog failed the job with
+// its restart budget unspent, and the chain outlived the coordinator itself.
+// Found by a SQL job whose Neo4j lookups refused their options, feeding a
+// UNION ALL into a sink.
+
+namespace {
+
+void register_ecc_refused_at_build() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        ensure_built_ins_registered();
+        clink::plugin::PluginRegistry reg;
+        reg.register_operator<std::int64_t, std::int64_t>(
+            "ecc_refused_at_build",
+            [](const clink::plugin::BuildContext&)
+                -> std::shared_ptr<Operator<std::int64_t, std::int64_t>> {
+                throw std::runtime_error("ecc_refused_at_build: refused when its chain is built");
+            });
+    });
+}
+
+// Two branches, each a source feeding a chain that refuses to build, fan in
+// to a chain led by a union: the union's inputs are the two chains that never
+// connect.
+JobGraphSpec ecc_refused_fan_in_graph(const std::filesystem::path& out) {
+    JobGraphSpec g;
+    const auto add = [&](std::string id,
+                         std::string type,
+                         std::vector<std::string> inputs,
+                         std::map<std::string, std::string> params = {}) {
+        OperatorSpec op;
+        op.id = std::move(id);
+        op.type = std::move(type);
+        op.inputs = std::move(inputs);
+        op.parallelism = 1;
+        op.out_channel = std::string{kChannelInt64};
+        op.params = std::move(params);
+        g.ops.push_back(std::move(op));
+    };
+    for (const std::string side : {"a", "b"}) {
+        add("src_" + side, "int64_range_source", {}, {{"count", "100000"}, {"delay_ms", "5"}});
+        add("refused_" + side, "ecc_refused_at_build", {"src_" + side});
+        add("id_" + side, "identity_int64", {"refused_" + side});
+    }
+    // The union heads a chain of its own: a two-input operator cannot join
+    // an upstream chain, and the operator after it makes this one more than
+    // a single op, so it takes the chain path.
+    add("union", "identity_int64", {"id_a", "id_b"});
+    add("id_union", "identity_int64", {"union"});
+    add("snk", "file_int64_sink", {"id_union"}, {{"path", out.string()}});
+    return g;
+}
+
+}  // namespace
+
+TEST(ErrorCancelConvergence, AChainWhoseUpstreamNeverConnectedIsCancelledWithItsJob) {
+    register_ecc_refused_at_build();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_ecc_chain_cancel_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 2;
+    cfg.watchdog_interval = 50ms;
+    // Long: a drain that waits on the stranded chain runs into it; one that
+    // cancels it is over in a moment.
+    cfg.restart_drain_timeout = 30s;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"ecc-chain"});
+    Worker::Config worker_cfg;
+    worker_cfg.slot_count = 16;
+    // Heap-held: a worker whose subtask never sees its cancel cannot stop, and
+    // is left behind rather than waited on (see stop_or_report below).
+    auto worker = std::make_unique<Worker>("ecc-chain", "127.0.0.1", worker_cfg);
+    worker->connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+    // Worker::stop() waits for every subtask to exit, so a stranded chain
+    // keeps it waiting for good: report that rather than hang the suite.
+    const auto stop_or_report = [&worker] {
+        auto stopped = std::make_shared<std::atomic<bool>>(false);
+        std::thread stopper([w = worker.get(), stopped] {
+            w->stop();
+            stopped->store(true);
+        });
+        const auto by = std::chrono::steady_clock::now() + 15s;
+        while (!stopped->load() && std::chrono::steady_clock::now() < by) {
+            std::this_thread::sleep_for(10ms);
+        }
+        if (stopped->load()) {
+            stopper.join();
+            return;
+        }
+        stopper.detach();
+        (void)worker.release();
+        ADD_FAILURE() << "the worker could not stop within 15s: a chained subtask of the "
+                         "cancelled job is still running";
+    };
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = (dir / "ckpt").string();
+    ckpt.interval_ms = 200;
+    const auto job_id = coordinator.submit_job(
+        ecc_refused_fan_in_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+
+    // Every attempt fails the same way, so the job spends its restarts and
+    // fails, each restart's drain cancelling the union chain at once.
+    EXPECT_TRUE(coordinator.await_job_completion(job_id, 20s))
+        << "the job neither restarted nor failed within 20s: a restart drain is waiting on a "
+           "chained subtask its cancel never reached";
+    const auto errors = coordinator.job_errors(job_id);
+    std::string all;
+    for (const auto& e : errors) {
+        all += e + "\n";
+    }
+    EXPECT_NE(all.find("refused when its chain is built"), std::string::npos) << all;
+    EXPECT_EQ(all.find("restart drain timed out"), std::string::npos) << all;
+
+    stop_or_report();
+    coordinator.stop();
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }

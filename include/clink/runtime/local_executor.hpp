@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -99,6 +100,17 @@ public:
         return operator_errors_;
     }
 
+    // The errors caught before JobConfig::external_cancel_token was set: the
+    // failures the job's operators met on their own, as distinct from what
+    // their teardown threw once the job was cancelled (a closed channel, a
+    // refused send). A prefix of operator_errors(); all of them when the job
+    // has no external token or was never cancelled.
+    std::vector<OperatorError> operator_errors_before_cancel() const {
+        std::lock_guard lock(error_mu_);
+        return {operator_errors_.begin(),
+                operator_errors_.begin() + static_cast<std::ptrdiff_t>(errors_before_cancel_)};
+    }
+
 private:
     void register_metrics();
     void report_memory_metrics_();
@@ -125,6 +137,10 @@ private:
     std::jthread external_cancel_watch_thread_;
     mutable std::mutex error_mu_;
     std::vector<OperatorError> operator_errors_;
+    // How many of operator_errors_ were caught before the external cancel
+    // token was set. A prefix: the token is never unset, and it is read under
+    // error_mu_ as each error is appended.
+    std::size_t errors_before_cancel_{0};
 };
 
 }  // namespace clink

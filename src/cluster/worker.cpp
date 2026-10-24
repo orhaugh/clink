@@ -323,6 +323,14 @@ inline ArrowBatcher<std::string> builtin_arrow_batcher<std::string>() {
     return string_arrow_batcher();
 }
 
+// A built-in arm's executor, cancelled when the subtask's registered token
+// flips, as a SubtaskRunner's is through its RunnerContext.
+inline JobConfig cancellable_config(const std::shared_ptr<std::atomic<bool>>& cancel_token) {
+    JobConfig cfg;
+    cfg.external_cancel_token = cancel_token;
+    return cfg;
+}
+
 // Source kind: factory<Source<Out>> -> output groups
 template <typename Out>
 void run_source_dispatch(std::shared_ptr<Source<Out>> src,
@@ -335,7 +343,7 @@ void run_source_dispatch(std::shared_ptr<Source<Out>> src,
     auto h0 = dag.template add_source<Out>(src);
     attach_output_groups<Out>(
         dag, h0, groups, codec, builtin_arrow_batcher<Out>(), routing, selector_fn);
-    LocalExecutor exec(std::move(dag));
+    LocalExecutor exec(std::move(dag), cancellable_config(cancel_token));
     // NOT a bare exec.run(): the executor CATCHES operator-thread exceptions
     // into operator_errors_ and returns normally, so a bare run() reports a
     // clean exit for a subtask whose operator threw. See item 82.
@@ -350,7 +358,7 @@ void run_sink_dispatch(const std::vector<std::shared_ptr<void>>& in_bridges,
     Dag dag;
     auto h0 = build_input_stage<In>(dag, in_bridges);
     dag.template add_sink<In>(h0, sink);
-    LocalExecutor exec(std::move(dag));
+    LocalExecutor exec(std::move(dag), cancellable_config(cancel_token));
     clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
 }
 
@@ -368,7 +376,7 @@ void run_operator_dispatch(const std::vector<std::shared_ptr<void>>& in_bridges,
     auto h1 = dag.template add_operator<In, Out>(h0, op);
     attach_output_groups<Out>(
         dag, h1, groups, out_codec, builtin_arrow_batcher<Out>(), routing, selector_fn);
-    LocalExecutor exec(std::move(dag));
+    LocalExecutor exec(std::move(dag), cancellable_config(cancel_token));
     clink::plugin::detail::run_subtask_to_completion(exec, cancel_token);
 }
 
@@ -2921,6 +2929,62 @@ void Worker::run_generic_subtask_(JobId job_id,
         }
     }
 
+    // Both paths below run the subtask in a LocalExecutor that the job's
+    // CancelJob and the coordinator's loss must reach, as they reach the
+    // SubtaskRunner path's: each flips only the tokens in
+    // per_job_cancel_tokens_, and neither path registered one. A chain whose
+    // upstream peers failed before connecting then waited in its bridges'
+    // pop() for good - no peer would ever close them - holding every restart
+    // drain of its job until the watchdog failed the job, and outliving the
+    // coordinator itself. Registered here, before anything is built, with the
+    // latch for a cancel that came first (cancelled_jobs_); released on return.
+    struct CancelTokenRegistration {
+        CancelTokenRegistration(Worker* w, JobId job, std::uint32_t sub_idx)
+            : worker(w),
+              job_id(job),
+              sub(sub_idx),
+              token(std::make_shared<std::atomic<bool>>(false)) {
+            std::lock_guard lock(worker->mu_);
+            worker->per_job_cancel_tokens_[job_id][sub] = token;
+            if (worker->cancelled_jobs_.count(job_id) != 0) {
+                token->store(true, std::memory_order_release);
+            }
+        }
+        ~CancelTokenRegistration() {
+            std::lock_guard lock(worker->mu_);
+            auto it = worker->per_job_cancel_tokens_.find(job_id);
+            if (it == worker->per_job_cancel_tokens_.end()) {
+                return;
+            }
+            if (auto s = it->second.find(sub); s != it->second.end() && s->second == token) {
+                it->second.erase(s);
+            }
+            if (it->second.empty()) {
+                worker->per_job_cancel_tokens_.erase(it);
+            }
+        }
+        CancelTokenRegistration(const CancelTokenRegistration&) = delete;
+        CancelTokenRegistration& operator=(const CancelTokenRegistration&) = delete;
+        CancelTokenRegistration(CancelTokenRegistration&&) = delete;
+        CancelTokenRegistration& operator=(CancelTokenRegistration&&) = delete;
+        Worker* worker;
+        JobId job_id;
+        std::uint32_t sub;
+        std::shared_ptr<std::atomic<bool>> token;
+    };
+    const CancelTokenRegistration cancel_registration(this, job_id, task.subtask_idx);
+    const auto& subtask_cancel_token = cancel_registration.token;
+    // Cancelled before anything is built: run nothing. A cancel that lands
+    // during the build below starts the executor with its token already set,
+    // which cancels every runner as soon as it starts.
+    if (subtask_cancel_token->load(std::memory_order_acquire)) {
+        log::info("worker.cancel",
+                  "job_id=" + std::to_string(job_id) + " subtask " +
+                      std::to_string(task.subtask_idx) +
+                      " was cancelled before it started; not running it");
+        return;
+    }
+
     // 5. Legacy fallback: typed Dag dispatch via OperatorRegistry.
     // Handles length>=2 chains (composition via ChainedOperator) and
     // any op types not yet migrated to the runner registry.
@@ -3265,6 +3329,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 },
             .runner_role = task.role,
         };
+        rctx.cancel_token = subtask_cancel_token;
         LocalExecutor exec(std::move(dag), clink::plugin::detail::make_subtask_job_config(rctx));
         // Constructed after exec so reverse destruction retires the commit
         // dispatch gate - draining any in-flight CommitCheckpoint/
@@ -3304,19 +3369,9 @@ void Worker::run_generic_subtask_(JobId job_id,
         return;
     }
 
-    // These built-in dispatch arms register no cancel token of their own (only
-    // the SubtaskRunner path above does), so look up this subtask's if one
-    // exists. It decides whether an operator exception is a genuine failure or
-    // the legitimate teardown throw of a cancelled subtask.
-    const auto subtask_cancel_token = [&]() -> std::shared_ptr<std::atomic<bool>> {
-        std::lock_guard lock(mu_);
-        if (auto it = per_job_cancel_tokens_.find(job_id); it != per_job_cancel_tokens_.end()) {
-            if (auto s = it->second.find(task.subtask_idx); s != it->second.end()) {
-                return s->second;
-            }
-        }
-        return nullptr;
-    }();
+    // The built-in dispatch arms run under the token registered above: it
+    // cancels their executor, and decides whether an operator exception is a
+    // genuine failure or the legitimate teardown throw of a cancelled subtask.
 
     if (op.kind == OperatorKind::Source) {
         const auto* fac = reg.find_source(op.type, op.out_channel);

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**A cancel reaches every subtask of a job.** A worker cancels a job's subtasks by
+flipping the cancel tokens they registered, and only a subtask that runs one
+operator through its registered runner registered one. A chain of operators,
+which is how SQL plans most of a pipeline, did not, and stopped only when its
+network peers closed. One whose upstream chains failed while being built, after
+the peer update, therefore never stopped: nothing ever connected to its inputs,
+the job's restart drain waited for it until the watchdog failed the job with
+its restarts unspent, and it kept running after its coordinator was gone. A
+SQL job whose Neo4j lookups refused their options, feeding a `UNION ALL`, did
+exactly this. Chains, and operators run by the built-in dispatch arms, now
+register a token before they build anything, so a restart's drain cancels them
+at once. A cancelled subtask also reports what failed before its cancel: it
+used to drop every error once cancelled, teardown's and its own alike, so an
+operator that failed and was then cancelled with its peers left the job's
+errors naming only a peer's refused send. Teardown errors are still dropped
+(`LocalExecutor::operator_errors_before_cancel()` is the new, additive accessor
+that tells them apart).
+
 **A join takes a subquery on either side, as it takes a common table
 expression.** A top-level join with a subquery side was planned as a multi-way
 join, which plans neither lookup nor outer joins: a lookup join probing

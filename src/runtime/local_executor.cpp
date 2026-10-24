@@ -275,6 +275,10 @@ void LocalExecutor::start() {
 #endif
                     {
                         std::lock_guard lock(error_mu_);
+                        const auto& ext = config_.external_cancel_token;
+                        if (!(ext && ext->load(std::memory_order_acquire))) {
+                            ++errors_before_cancel_;
+                        }
                         operator_errors_.emplace_back(op_name, std::move(message));
                     }
                     // Wake every edge, including a producer blocked on an

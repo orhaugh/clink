@@ -303,16 +303,17 @@ public:
 // so run_task_ reports had_error=true and the coordinator restarts. Without this, a
 // bounded source's end-of-stream final-checkpoint throw (the watchdog-restart
 // signal when the final checkpoint times out) would be silently swallowed and
-// the job could complete with an uncommitted tail. Skipped when the subtask was
-// cancelled: teardown can legitimately throw (closed channels) and a cancelled
-// job must not spuriously restart - run_task_ already reports had_error there.
+// the job could complete with an uncommitted tail. For a cancelled subtask only
+// what failed before the cancel is reported: its teardown can legitimately
+// throw (closed channels, refused sends), and that must not read as a failure,
+// but an operator that failed on its own and was cancelled afterwards - its
+// peers cancelled because of it - did fail, and dropping that hid the job's
+// one real error behind a peer's transport failure.
 inline void run_subtask_to_completion(clink::LocalExecutor& exec,
                                       const std::shared_ptr<std::atomic<bool>>& cancel_token) {
     exec.run();
-    if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
-        return;
-    }
-    auto errs = exec.operator_errors();
+    const bool cancelled = cancel_token && cancel_token->load(std::memory_order_acquire);
+    auto errs = cancelled ? exec.operator_errors_before_cancel() : exec.operator_errors();
     if (errs.empty()) {
         return;
     }
