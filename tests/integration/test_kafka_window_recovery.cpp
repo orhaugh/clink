@@ -1026,6 +1026,21 @@ TEST_F(KafkaWindowRecoveryTest, AFencedPartialCommitFallsBackWithoutDuplicates) 
         "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
         "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
 
+    // The seed windows go in before the job starts, so its sources read them
+    // on their first poll. The fault fails one of the job's first commits,
+    // under a second in, and the replay suppression this gate pins arms only
+    // from a receipt that carries a watermark. Produced after the submit, the
+    // seeds could reach the job only after that checkpoint on a fast run,
+    // which then committed nothing and left suppression nothing to arm on.
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 2; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
     Process submit;
     ASSERT_TRUE(submit.spawn("submit-sql-fenced",
                              sql_binary(),
@@ -1050,15 +1065,6 @@ TEST_F(KafkaWindowRecoveryTest, AFencedPartialCommitFallsBackWithoutDuplicates) 
     const auto submit_code = submit.await_exit(30s);
     ASSERT_TRUE(submit_code.has_value());
     ASSERT_EQ(*submit_code, 0) << submit.read_log();
-
-    std::map<WindowKey, Aggregate> expected;
-    for (int window = 0; window < 2; ++window) {
-        const auto start = kBase + (window * 10'000);
-        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
-        for (int key = 0; key < kKeys; ++key) {
-            expected[{key, start}] = {2, (2 * key) + 3};
-        }
-    }
 
     const auto advance_base = kBase + 50'000;
     std::atomic<bool> stop_feed{false};
@@ -1441,6 +1447,19 @@ TEST_F(KafkaWindowRecoveryTest, AnUnreceiptedCommitInAMixedVerdictIsNotReplayedA
         "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
         "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
 
+    // The seed windows go in before the job starts, so its sources read them
+    // on their first poll and the checkpoint the fault interrupts already
+    // holds records: suppression arms only from a receipt that carries a
+    // watermark, and a checkpoint taken before any record arrived has none.
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 2; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
     Process submit;
     ASSERT_TRUE(submit.spawn("submit-sql-mixed",
                              sql_binary(),
@@ -1465,15 +1484,6 @@ TEST_F(KafkaWindowRecoveryTest, AnUnreceiptedCommitInAMixedVerdictIsNotReplayedA
     const auto submit_code = submit.await_exit(30s);
     ASSERT_TRUE(submit_code.has_value());
     ASSERT_EQ(*submit_code, 0) << submit.read_log();
-
-    std::map<WindowKey, Aggregate> expected;
-    for (int window = 0; window < 2; ++window) {
-        const auto start = kBase + (window * 10'000);
-        produce_json(kafka_->brokers(), input_topic_, window_records(start, kKeys));
-        for (int key = 0; key < kKeys; ++key) {
-            expected[{key, start}] = {2, (2 * key) + 3};
-        }
-    }
 
     const auto advance_base = kBase + 50'000;
     std::atomic<bool> stop_feed{false};
