@@ -297,6 +297,70 @@ TEST(Kafka, ProduceEmitsPartialBatchWithinBatchMaxWait) {
     EXPECT_LT(partial_elapsed, 400ms);
 }
 
+TEST(Kafka, ARecordOnAQuietStreamIsHandedOnWithinTheBoundNotThePollTimeout) {
+    // A record on a quiet stream is handed on within batch_max_wait of its
+    // arrival, not after poll_timeout. librdkafka's batch consume waits for
+    // every message a call asks for until its timeout, so a first fetch that
+    // asked for the whole batch held a lone record for all of poll_timeout:
+    // every record of a stream slower than max_batch_size per poll_timeout
+    // waited up to 100 ms, by default, before the pipeline saw it.
+    MockCluster mock;
+    const std::string topic = "quiet-stream";
+    mock.create_topic(topic);
+
+    KafkaSink::Options sink_opts;
+    sink_opts.brokers = mock.brokers();
+    sink_opts.topic = topic;
+    sink_opts.linger_ms = std::chrono::milliseconds{0};
+    SinkHarness sink_h(sink_opts);
+
+    KafkaSource::Options src_opts;
+    src_opts.brokers = mock.brokers();
+    src_opts.topic = topic;
+    src_opts.group_id = "quiet-group";
+    src_opts.auto_offset_reset = "earliest";
+    // Long, so a call that waits it out cannot pass for one that returned on
+    // its record. The bound keeps its default.
+    src_opts.poll_timeout = 5000ms;
+    SourceHarness src_h(src_opts);
+
+    // Past subscribe and assignment, which can take seconds on the mock.
+    Batch<KafkaMessage> first;
+    first.emplace(KafkaMessage{"first"});
+    sink_h.sink->on_data(first);
+    sink_h.sink->flush();
+    ASSERT_EQ(drain(*src_h.source, 1, 15s).size(), 1U);
+
+    // One record onto the now quiet stream.
+    Batch<KafkaMessage> lone;
+    lone.emplace(KafkaMessage{"lone"});
+    sink_h.sink->on_data(lone);
+    sink_h.sink->flush();
+    const auto sent = std::chrono::steady_clock::now();
+
+    BoundedChannel<StreamElement<KafkaMessage>> ch(8);
+    Emitter<KafkaMessage> em(&ch);
+    std::vector<std::string> got;
+    std::chrono::steady_clock::duration took{};
+    while (got.empty() && std::chrono::steady_clock::now() - sent < 10s) {
+        src_h.source->produce(em);
+        while (auto el = ch.try_pop()) {
+            if (el->is_data()) {
+                for (auto& r : el->as_data()) {
+                    got.push_back(r.value().payload);
+                }
+            }
+        }
+        took = std::chrono::steady_clock::now() - sent;
+    }
+    ASSERT_EQ(got, std::vector<std::string>{"lone"});
+    // Fetching it from the mock takes well under a second and the bound adds
+    // 5 ms; waiting out the poll timeout takes 5 s.
+    EXPECT_LT(took, 2500ms) << "the record waited "
+                            << std::chrono::duration_cast<std::chrono::milliseconds>(took).count()
+                            << " ms";
+}
+
 TEST(Kafka, KeysAndHeadersRoundTrip) {
     MockCluster mock;
     const std::string topic = "with-meta";

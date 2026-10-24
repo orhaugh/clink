@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**A record on a quiet Kafka stream reaches the pipeline within
+`batch_max_wait_ms`, not the poll timeout.** The source's first fetch of each
+batch asked librdkafka for the whole batch, and librdkafka waits for every
+message a call asks for until its timeout. Every batch therefore waited
+until it was full or the poll timeout had passed: on a stream slower than
+`max_batch_size` records per poll timeout, each record waited up to 100 ms,
+by default, before the pipeline saw it, where the bound promises 5 ms. The
+first fetch now asks for one record and returns as soon as it is there, and
+the rest of the batch is filled within the bound after it; a saturated
+consumer still fills its batch at once. The wait came in with the batched
+fetch in v0.3.0.
+
 **A `BOOLEAN` column is a condition on its own.** `WHERE active` and
 `CASE WHEN flagged THEN ...` were refused with "WHERE predicate kind not
 supported", in a `CASE` expression too, so a boolean column had to be compared

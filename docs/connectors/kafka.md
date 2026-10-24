@@ -60,21 +60,29 @@ Options are read from `BuildContext` parameters in `impls/kafka/src/register_fac
 | `auto_offset_reset` | No | `earliest` | Where to start when no committed/restored offset exists: `earliest`, `latest` or `none`. |
 | `format` | No | (plain text / JSON) | `avro`, `protobuf` or `json-schema` selects a registry-framed value format on `kafka_text_source` / `kafka_source_string`: each message is decoded to one JSON object text. Takes `schema_registry_url` and the other `schema_registry_*` options; see [Schema Registry formats](schema-registry.md). |
 | `decode_error` | No | `fail` | With a registry format: `fail` stops the job on a message the format cannot decode (topic, partition, offset and reason in the error); `skip` drops it, logs, and continues. |
-| `batch_max_wait_ms` | No | `5` | Bounds TOTAL batch formation time in the source's poll loop. Waiting for the first record of a batch still blocks up to `poll_timeout` (idle stays cheap); once a batch has begun, the fill loop stops when this bound elapses and emits a partial batch instead of waiting to accumulate `max_batch_size` records. Keeps per-record latency on a paced or trickling input proportional to this bound rather than `max_batch_size / input-rate`; a saturated consumer queue fills `max_batch_size` well inside the bound, so throughput at the ceiling is unaffected. `0` disables the bound. |
+| `batch_max_wait_ms` | No | `5` | Bounds TOTAL batch formation time in the source's poll loop. Waiting for the first record of a batch still blocks up to `poll_timeout` (idle stays cheap), and returns as soon as that record is there; from then, the fill loop stops when this bound elapses and emits a partial batch instead of waiting to accumulate `max_batch_size` records. Keeps per-record latency on a paced or trickling input proportional to this bound rather than `max_batch_size / input-rate`; a saturated consumer queue fills `max_batch_size` well inside the bound, so throughput at the ceiling is unaffected. `0` disables the bound. |
+| `poll_timeout_ms` | No | `100` | How long the source waits for the first record of a batch before returning without one. |
+| `max_batch_size` | No | `2048` | Records per batch handed downstream. |
 
-The `KafkaSource::Options` struct also carries `poll_timeout` (100 ms), `max_batch_size` (2048), `commit_mode` (`Auto` on the struct; the registered factories force `Manual`), `enable_debug` (false), `metric_prefix` (`default`), `partition_discovery_interval` (30 s; 0 disables) and the deterministic-ownership pair `subtask_index`/`source_parallelism` (0/1, meaning a standalone source owns every partition). The ownership pair and the `Manual` commit mode are set by the registered factories from the build context: an engine-managed source must not write consumer-group offsets, because the engine's checkpoints are the only resume authority - librdkafka's auto-commit records consumed positions no checkpoint completed, and a restore for a partition without an offset row would resume from that group offset, past records whose effects died with the rewound attempt. For the same reason a fresh partition's start offset is resolved to a concrete number BEFORE `assign()` - the group's committed offset where one exists (a courtesy lookup with engine-owned, bounded retries), else the `auto_offset_reset` policy via the broker's watermarks, else the broker-resolved logical BEGINNING/END - and never librdkafka's `OFFSET_STORED`: leaving the resolution to the client makes the fetch position depend on the group coordinator answering, and on a fresh broker whose `__consumer_offsets` topic was still settling, one `NOT_COORDINATOR` reply left the assignment pending forever - no records, no error, every gauge zero and healthy (issue #8). The resolved number also seeds the partition's resume row, so even a job's first checkpoint carries one for every partition. The remaining options are not parsed from `BuildContext` parameters, so they take their struct defaults unless the typed class is constructed directly.
+The `KafkaSource::Options` struct also carries `commit_mode` (`Auto` on the struct; the registered factories force `Manual`), `enable_debug` (false), `metric_prefix` (`default`), `partition_discovery_interval` (30 s; 0 disables) and the deterministic-ownership pair `subtask_index`/`source_parallelism` (0/1, meaning a standalone source owns every partition). The ownership pair and the `Manual` commit mode are set by the registered factories from the build context: an engine-managed source must not write consumer-group offsets, because the engine's checkpoints are the only resume authority - librdkafka's auto-commit records consumed positions no checkpoint completed, and a restore for a partition without an offset row would resume from that group offset, past records whose effects died with the rewound attempt. For the same reason a fresh partition's start offset is resolved to a concrete number BEFORE `assign()` - the group's committed offset where one exists (a courtesy lookup with engine-owned, bounded retries), else the `auto_offset_reset` policy via the broker's watermarks, else the broker-resolved logical BEGINNING/END - and never librdkafka's `OFFSET_STORED`: leaving the resolution to the client makes the fetch position depend on the group coordinator answering, and on a fresh broker whose `__consumer_offsets` topic was still settling, one `NOT_COORDINATOR` reply left the assignment pending forever - no records, no error, every gauge zero and healthy (issue #8). The resolved number also seeds the partition's resume row, so even a job's first checkpoint carries one for every partition. The remaining options are not parsed from `BuildContext` parameters, so they take their struct defaults unless the typed class is constructed directly.
 
 ### How the source fetches
 
 `produce()` fills its batch with `rd_kafka_consume_batch_queue()` on the queue
-returned by `rd_kafka_queue_get_consumer()`, so a full batch is normally ONE fetch
-call rather than one call per record. The C++ `consume()` wrapper it replaced took
-the queue lock, dequeued a single op and heap-allocated a wrapper object for every
-record; measured against a real broker that cost 586 ns of CPU per record where the
-batched form costs 456 ns, a 22% reduction. Offset bookkeeping accumulates in a short
-scratch vector merged into the offset map once per batch (it was a red-black tree
-lookup per record for a value only the checkpoint reads), and the `consumed` /
-`consume_errors` counters increment once per batch.
+returned by `rd_kafka_queue_get_consumer()`, so a full batch is normally two fetch
+calls rather than one call per record: the first asks for one record and returns as
+soon as it is there, and the second asks for the rest of the batch within
+`batch_max_wait_ms`. librdkafka waits for every message a call asks for until the
+call's timeout, so a first call that asked for the whole batch held a quiet stream's
+records for the whole poll timeout before the pipeline saw any of them;
+`Kafka.ARecordOnAQuietStreamIsHandedOnWithinTheBoundNotThePollTimeout` requires a lone
+record to arrive well inside a five-second poll timeout. The C++ `consume()` wrapper
+the batched form replaced took the queue lock, dequeued a single op and heap-allocated
+a wrapper object for every record; measured against a real broker that cost 586 ns of
+CPU per record where the batched form costs 456 ns, a 22% reduction. Offset
+bookkeeping accumulates in a short scratch vector merged into the offset map once per
+batch (it was a red-black tree lookup per record for a value only the checkpoint
+reads), and the `consumed` / `consume_errors` counters increment once per batch.
 
 Polling that queue counts as a consumer poll, so `max.poll.interval.ms` keeps being
 reset and group membership behaves exactly as before. Rebalance ops travel on the same
@@ -249,7 +257,7 @@ When going through the plugin registry, call `clink::kafka::install(registry)` o
 
 ## Limitations
 
-- librdkafka commit-mode, batching and timeout knobs (`commit_mode`, `poll_timeout`, `max_batch_size`, `linger_ms`, `produce_timeout`, `flush_timeout`, `fixed_partition`, `metric_prefix`) exist on the `Options` structs but are not parsed from factory parameters, so through the registered factories they always take their struct defaults.
+- librdkafka commit-mode and timeout knobs (`commit_mode`, `produce_timeout`, `flush_timeout`, `fixed_partition`, `metric_prefix`) exist on the `Options` structs but are not parsed from factory parameters, so through the registered factories they always take their struct defaults.
 - SASL and TLS are configured through the options in the Authentication and TLS section above (plus the generic `kafka.<property>` escape hatch); other security mechanisms are reachable only via that escape hatch.
 - The transactional sink requires a unique `transactional_id`; with `parallelism > 1` the factory appends the subtask index, and the uniqueness contract across producer instances is otherwise the caller's responsibility.
 - The upsert sink requires every input value to be a JSON object; malformed or non-object values are silently skipped, and `primary_key` is mandatory.

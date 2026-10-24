@@ -582,18 +582,27 @@ bool KafkaSource::produce(Emitter<KafkaMessage>& out) {
     batch.reserve(impl_->opts.max_batch_size);
     std::uint64_t bytes_read = 0;
     // batch_max_wait bounds TOTAL fill time: the first record may block up
-    // to poll_timeout (idle stays cheap), but once the batch is non-empty
-    // the remaining fill window shrinks to the deadline, so a paced or
+    // to poll_timeout (idle stays cheap), but once the batch has its first
+    // record the fill window runs for the bound from there, so a paced or
     // trickling input gets a prompt partial batch instead of waiting for
     // max_batch_size records to accumulate.
+    //
+    // rd_kafka_consume_batch_queue() waits for ALL the messages it is asked
+    // for until its timeout, not for the first of them. Asked for the whole
+    // batch, the first call held a quiet stream's records for all of
+    // poll_timeout. With a bound, the first call therefore asks for one
+    // record and returns as soon as it is here, and the rest of the batch is
+    // filled within the bound after it.
     const auto wait_bound = impl_->opts.batch_max_wait;
-    const auto fill_deadline = std::chrono::steady_clock::now() + wait_bound;
+    const bool bounded = wait_bound > std::chrono::milliseconds::zero();
+    std::chrono::steady_clock::time_point fill_deadline{};
     // Fill in BATCHED FETCHES rather than one message per call. Each
     // rd_kafka_consume_batch_queue() takes the queue lock once and returns up to
     // the remaining batch capacity, where the per-message path took the lock,
     // dequeued one op and heap-allocated a wrapper object for every single
     // record. The loop repeats only while the batch is still short and the fill
-    // deadline has not passed, so a full batch is normally ONE fetch call.
+    // deadline has not passed, so a full batch is normally two fetch calls: the
+    // first record, then the rest.
     std::size_t filled = 0;
     std::uint64_t consumed_ok = 0;
     std::uint64_t error_count = 0;
@@ -603,7 +612,10 @@ bool KafkaSource::produce(Emitter<KafkaMessage>& out) {
             break;
         }
         int timeout_ms = static_cast<int>(impl_->opts.poll_timeout.count());
-        if (filled > 0 && wait_bound > std::chrono::milliseconds::zero()) {
+        std::size_t want = impl_->opts.max_batch_size - filled;
+        if (bounded && filled == 0) {
+            want = 1;
+        } else if (bounded) {
             const auto now = std::chrono::steady_clock::now();
             if (now >= fill_deadline) {
                 break;
@@ -612,15 +624,16 @@ bool KafkaSource::produce(Emitter<KafkaMessage>& out) {
                 std::chrono::duration_cast<std::chrono::milliseconds>(fill_deadline - now);
             timeout_ms = std::min(timeout_ms, static_cast<int>(remaining.count()) + 1);
         }
-        const ssize_t got = rd_kafka_consume_batch_queue(impl_->cqueue,
-                                                         timeout_ms,
-                                                         impl_->fetch_buf.data() + filled,
-                                                         impl_->opts.max_batch_size - filled);
+        const ssize_t got = rd_kafka_consume_batch_queue(
+            impl_->cqueue, timeout_ms, impl_->fetch_buf.data() + filled, want);
         if (got <= 0) {
             // 0 = the timeout elapsed with nothing available; <0 = a queue-level
             // error, which the per-message path reached as ERR__TIMED_OUT too.
             // Either way stop filling and emit whatever is already in hand.
             break;
+        }
+        if (filled == 0) {
+            fill_deadline = std::chrono::steady_clock::now() + wait_bound;
         }
         for (ssize_t k = 0; k < got; ++k) {
             rd_kafka_message_t* msg = impl_->fetch_buf[filled + static_cast<std::size_t>(k)];
