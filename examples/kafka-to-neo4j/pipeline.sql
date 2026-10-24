@@ -54,7 +54,8 @@ CREATE TABLE transfers_for_signals (
 -- Accounts and transfers are found by their ids under uniqueness constraints,
 -- and a transfer's two relationships are created only by the transaction that
 -- creates the transfer, so a replayed or concurrent duplicate finds the node
--- and creates nothing.
+-- and creates nothing. Each batch is first reduced to one row per transfer:
+-- two copies in one batch would both see the node as just created.
 CREATE TABLE transfer_graph (
     event_id  BIGINT,
     sender    VARCHAR,
@@ -69,9 +70,10 @@ CREATE TABLE transfer_graph (
     batch_size = '100',
     flush_interval_ms = '500',
     statement = 'UNWIND $rows AS row
+                 WITH row.event_id AS id, collect(row)[0] AS row
                  MERGE (s:Account {id: row.sender})
                  MERGE (r:Account {id: row.recipient})
-                 MERGE (t:Transfer {event_id: row.event_id})
+                 MERGE (t:Transfer {event_id: id})
                    ON CREATE SET t.amount = row.amount, t.at = row.at,
                                  t.at_time = datetime({epochMillis: row.at}), t._created = true
                  WITH s, r, t

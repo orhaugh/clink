@@ -43,9 +43,10 @@ CREATE TABLE graph (
   username  = 'neo4j',
   password  = 'env://NEO4J_PASSWORD',
   statement = 'UNWIND $rows AS row
+               WITH row.event_id AS id, collect(row)[0] AS row
                MERGE (s:Account {id: row.sender})
                MERGE (r:Account {id: row.recipient})
-               MERGE (t:Transfer {event_id: row.event_id})
+               MERGE (t:Transfer {event_id: id})
                  ON CREATE SET t.amount = row.amount, t.at = row.at, t._created = true
                WITH s, r, t
                CALL (s, r, t) { WITH s, r, t WHERE t._created
@@ -149,6 +150,7 @@ A statement converges under replay when applying a batch twice, in either order 
 
 - **Key every node by a stable business id under a uniqueness constraint**, and reach it with `MERGE` on that id. `CREATE CONSTRAINT account_id FOR (a:Account) REQUIRE a.id IS UNIQUE`. The constraint is what makes concurrent `MERGE`s on one id serialise instead of creating two nodes.
 - **Give each event a node keyed by its event id**, and create the event's relationships only in the transaction that creates that node, as the example above does with `ON CREATE SET t._created = true` and the conditional `CALL`: a replayed or concurrent duplicate finds the node and creates nothing. Neo4j Community has no relationship uniqueness constraint, so a bare `MERGE (a)-[:SENT]->(t)` is not proof against two concurrent transactions.
+- **Reduce each batch to one row per event first**, as the example above does with `WITH row.event_id AS id, collect(row)[0] AS row`. One batch can hold an event twice when whatever writes the topic sent it twice, and the node is then created by that batch's own transaction for both copies: Cypher runs each clause over all of a batch's rows before the next, so both see `_created` and both create the relationships. Measured on the tested server: the statement without the reduction gave an event sent twice in one batch two `SENT` relationships, and the same event in two batches one.
 - **A mutable property needs an ordering rule**, or an older event replayed after a newer one overwrites it. Keep the position of the value (its event time and id) beside it and write only when the row is newer. Two things make that hold. Cypher runs each clause over all of a batch's rows before the next clause, so two rows for one key would both compare with the stored value and the later row would win; reduce the batch to the newest row per key first. And two subtasks could both read the old position; take the node's write lock before reading it:
 
 ```cypher
