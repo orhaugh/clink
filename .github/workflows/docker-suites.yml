@@ -129,11 +129,15 @@ jobs:
           retention-days: 14
       - name: Upload the harness logs on failure
         # The harness keeps its scratch tree, with every Coordinator and Worker
-        # log, when a case fails.
+        # log, when a case fails, and the protocol trace every process of the
+        # case wrote: the steps of the recovery a log line does not record,
+        # from the checkpoints triggered after a redeploy to each subtask's ack.
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: docker-suites-harness-logs
-          path: /tmp/clink_it_*/logs/**
+          path: |
+            /tmp/clink_it_*/logs/**
+            /tmp/clink_it_*/protocol-trace/**
           if-no-files-found: ignore
           retention-days: 14
