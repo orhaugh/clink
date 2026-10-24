@@ -40,9 +40,10 @@ inline std::vector<std::string> columns_from_schema(const std::string& schema) {
 inline std::string build_delete_sql(const std::string& table,
                                     const std::vector<std::string>& key_columns,
                                     const std::vector<std::string>& json_rows,
-                                    const EscapeFn& esc) {
+                                    const EscapeFn& esc,
+                                    const sqljson::TimeColumns& times = {}) {
     return sqljson::build_delete_by_keys_sql(
-        table, key_columns, json_rows, esc, sqljson::kPostgres);
+        table, key_columns, json_rows, esc, sqljson::kPostgres, times);
 }
 
 // Whether a column is in the conflict-target set.
@@ -132,7 +133,8 @@ inline std::string build_insert_sql(const std::string& table,
                                     const std::vector<std::string>& conflict_columns,
                                     const std::vector<std::string>& update_columns,
                                     const std::vector<std::string>& json_rows,
-                                    const EscapeFn& esc) {
+                                    const EscapeFn& esc,
+                                    const sqljson::TimeColumns& times = {}) {
     const bool has_conflict = on_conflict == "update" || on_conflict == "nothing";
     if (!on_conflict.empty() && !has_conflict) {
         throw std::runtime_error("postgres: on_conflict must be 'update' or 'nothing' (got '" +
@@ -164,7 +166,8 @@ inline std::string build_insert_sql(const std::string& table,
             ? merge_rows_by_key(json_rows, conflict_columns, set_cols)
             : json_rows,
         esc,
-        sqljson::kPostgres);
+        sqljson::kPostgres,
+        times);
     if (!has_conflict) {
         return sql;
     }

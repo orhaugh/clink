@@ -40,8 +40,11 @@ namespace clink::mysql {
 
 struct MysqlJsonUpsertSinkOptions {
     ConnectOptions conn;
-    std::string table;                        // target table (required)
-    std::vector<std::string> columns;         // full projection for the upsert (required)
+    std::string table;                 // target table (required)
+    std::vector<std::string> columns;  // full projection for the upsert (required)
+    // Columns holding a TIMESTAMP, written as timestamp literals rather than
+    // the epoch milliseconds the SQL Row path carries (timestamp_columns).
+    sqljson::TimeColumns timestamp_columns;
     std::vector<std::string> key_columns;     // PRIMARY KEY - the DELETE key (required)
     std::vector<std::string> update_columns;  // upsert SET list (empty = all columns)
     std::size_t batch_records{1000};
@@ -72,7 +75,12 @@ public:
         }
     }
 
-    void open() override { conn_ = std::make_unique<Connection>(opts_.conn); }
+    void open() override {
+        conn_ = std::make_unique<Connection>(opts_.conn);
+        // TIMESTAMP columns are written as their UTC wall time, and a MySQL
+        // TIMESTAMP column reads a literal in the session's time zone.
+        conn_->exec("SET time_zone = '+00:00'");
+    }
 
     void on_data(const Batch<std::string>& batch) override {
         for (const auto& rec : batch) {
@@ -113,13 +121,14 @@ public:
             // A netted key is in exactly one bucket, so upserts and deletes touch
             // disjoint keys - statement order between them does not matter.
             if (!upserts.empty()) {
-                conn_->exec(
-                    build_insert_sql(opts_.table,
-                                     opts_.columns,
-                                     /*upsert=*/true,
-                                     opts_.update_columns,
-                                     upserts,
-                                     [this](std::string_view s) { return conn_->escape(s); }));
+                conn_->exec(build_insert_sql(
+                    opts_.table,
+                    opts_.columns,
+                    /*upsert=*/true,
+                    opts_.update_columns,
+                    upserts,
+                    [this](std::string_view s) { return conn_->escape(s); },
+                    opts_.timestamp_columns));
             }
             if (!deletes.empty()) {
                 conn_->exec(sqljson::build_delete_by_keys_sql(
@@ -127,7 +136,8 @@ public:
                     opts_.key_columns,
                     deletes,
                     [this](std::string_view s) { return conn_->escape(s); },
-                    sqljson::kMysql));
+                    sqljson::kMysql,
+                    opts_.timestamp_columns));
             }
             conn_->exec("COMMIT");
         } catch (...) {

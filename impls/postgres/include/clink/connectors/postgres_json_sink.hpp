@@ -42,9 +42,12 @@ struct PgconnDeleter {
 };
 
 struct PostgresJsonSinkOptions {
-    std::string conninfo;                       // libpq conninfo (required)
-    std::string table;                          // target table (required)
-    std::vector<std::string> columns;           // authoritative projection (required)
+    std::string conninfo;              // libpq conninfo (required)
+    std::string table;                 // target table (required)
+    std::vector<std::string> columns;  // authoritative projection (required)
+    // Columns holding a TIMESTAMP, written as timestamp literals rather than
+    // the epoch milliseconds the SQL Row path carries (timestamp_columns).
+    sqljson::TimeColumns timestamp_columns;
     std::string on_conflict;                    // "" | "update" | "nothing"
     std::vector<std::string> conflict_columns;  // ON CONFLICT target (required if on_conflict set)
     std::vector<std::string> update_columns;    // DO UPDATE SET list (empty = all non-key)
@@ -134,14 +137,15 @@ public:
         const std::size_t bytes = pending_bytes_;
         const auto t0 = std::chrono::steady_clock::now();
         try {
-            const std::string sql =
-                pgsql::build_insert_sql(opts_.table,
-                                        opts_.columns,
-                                        opts_.on_conflict,
-                                        opts_.conflict_columns,
-                                        opts_.update_columns,
-                                        pending_,
-                                        [this](std::string_view s) { return escape_(s); });
+            const std::string sql = pgsql::build_insert_sql(
+                opts_.table,
+                opts_.columns,
+                opts_.on_conflict,
+                opts_.conflict_columns,
+                opts_.update_columns,
+                pending_,
+                [this](std::string_view s) { return escape_(s); },
+                opts_.timestamp_columns);
             PGresult* res = PQexec(conn_.get(), sql.c_str());
             const bool ok = res != nullptr && PQresultStatus(res) == PGRES_COMMAND_OK;
             if (!ok) {

@@ -29,8 +29,11 @@ namespace clink::mysql {
 
 struct MysqlSinkOptions {
     ConnectOptions conn;
-    std::string table;                        // target table (required)
-    std::vector<std::string> columns;         // authoritative projection (required)
+    std::string table;                 // target table (required)
+    std::vector<std::string> columns;  // authoritative projection (required)
+    // Columns holding a TIMESTAMP, written as timestamp literals rather than
+    // the epoch milliseconds the SQL Row path carries (timestamp_columns).
+    sqljson::TimeColumns timestamp_columns;
     bool upsert{false};                       // ON DUPLICATE KEY UPDATE
     std::vector<std::string> update_columns;  // upsert SET list (empty = all columns)
     std::size_t batch_records{1000};
@@ -61,7 +64,12 @@ public:
         }
     }
 
-    void open() override { conn_ = std::make_unique<Connection>(opts_.conn); }
+    void open() override {
+        conn_ = std::make_unique<Connection>(opts_.conn);
+        // TIMESTAMP columns are written as their UTC wall time, and a MySQL
+        // TIMESTAMP column reads a literal in the session's time zone.
+        conn_->exec("SET time_zone = '+00:00'");
+    }
 
     void on_data(const Batch<std::string>& batch) override {
         for (const auto& rec : batch) {
@@ -94,13 +102,14 @@ public:
         const std::size_t bytes = pending_bytes_;
         const auto t0 = std::chrono::steady_clock::now();
         try {
-            const std::string sql =
-                build_insert_sql(opts_.table,
-                                 opts_.columns,
-                                 opts_.upsert,
-                                 opts_.update_columns,
-                                 pending_,
-                                 [this](std::string_view s) { return conn_->escape(s); });
+            const std::string sql = build_insert_sql(
+                opts_.table,
+                opts_.columns,
+                opts_.upsert,
+                opts_.update_columns,
+                pending_,
+                [this](std::string_view s) { return conn_->escape(s); },
+                opts_.timestamp_columns);
             conn_->exec(sql);
         } catch (...) {
             clink::metrics::connector::error_inc("mysql", "sink");

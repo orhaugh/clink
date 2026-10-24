@@ -78,6 +78,9 @@ struct PostgresJsonSink2PCOptions {
     std::string conninfo;              // libpq conninfo (required)
     std::string table;                 // target table (required)
     std::vector<std::string> columns;  // authoritative projection (required)
+    // Columns holding a TIMESTAMP, written as timestamp literals rather than
+    // the epoch milliseconds the SQL Row path carries (timestamp_columns).
+    sqljson::TimeColumns timestamp_columns;
     std::uint32_t subtask_idx{0};
     std::size_t batch_records{1000};  // flush pending into the txn at this many rows
     std::size_t max_bytes{0};         // byte-based flush threshold (0 = off)
@@ -239,14 +242,15 @@ private:
             exec_(conn_.get(), "BEGIN");
             in_txn_ = true;
         }
-        const std::string sql =
-            pgsql::build_insert_sql(opts_.table,
-                                    opts_.columns,
-                                    /*on_conflict=*/"",
-                                    /*conflict_columns=*/{},
-                                    /*update_columns=*/{},
-                                    pending_,
-                                    [this](std::string_view s) { return escape_(s); });
+        const std::string sql = pgsql::build_insert_sql(
+            opts_.table,
+            opts_.columns,
+            /*on_conflict=*/"",
+            /*conflict_columns=*/{},
+            /*update_columns=*/{},
+            pending_,
+            [this](std::string_view s) { return escape_(s); },
+            opts_.timestamp_columns);
         exec_(conn_.get(), sql);
         clink::metrics::connector::records_out_inc("postgres", pending_.size());
         clink::metrics::connector::bytes_out_inc("postgres", pending_bytes_);

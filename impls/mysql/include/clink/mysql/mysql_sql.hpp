@@ -42,9 +42,10 @@ inline std::string build_insert_sql(const std::string& table,
                                     bool upsert,
                                     const std::vector<std::string>& update_columns,
                                     const std::vector<std::string>& json_rows,
-                                    const EscapeFn& esc) {
+                                    const EscapeFn& esc,
+                                    const sqljson::TimeColumns& times = {}) {
     std::string sql =
-        sqljson::build_insert_head_values(table, columns, json_rows, esc, sqljson::kMysql);
+        sqljson::build_insert_head_values(table, columns, json_rows, esc, sqljson::kMysql, times);
     if (upsert) {
         sql += " AS clink_new ON DUPLICATE KEY UPDATE ";
         const auto& set_cols = update_columns.empty() ? columns : update_columns;

@@ -297,4 +297,52 @@ TEST(MysqlLive, CursorSourceDoesNotReemitBoundaryRow) {
     EXPECT_EQ(ids.size(), static_cast<std::size_t>(kN));
 }
 
+// A TIMESTAMP arrives as epoch milliseconds. Named in timestamp_columns, it
+// lands in a DATETIME column as its UTC wall time and in a TIMESTAMP column as
+// the same instant: the sink runs its session in UTC, so MySQL reads the
+// literal as UTC however the server's own time zone is set. Before, both were
+// sent as integers, which MySQL refuses or misreads as a date.
+TEST(MysqlLive, TimestampColumnsLandAsTimestamps) {
+    if (!mysql_configured()) {
+        GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN";
+    }
+    const std::string tbl = unique_table();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+        c.exec("CREATE TABLE `" + tbl +
+               "` (id INT PRIMARY KEY, at DATETIME(3), seen TIMESTAMP(3) NULL, n BIGINT)");
+    }
+    MysqlSinkOptions o;
+    o.conn = parse_dsn();
+    o.table = tbl;
+    o.columns = {"id", "at", "seen", "n"};
+    o.timestamp_columns = clink::sqljson::parse_timestamp_columns("at:ts,seen:tstz");
+    {
+        MysqlSink sink(o);
+        sink.open();
+        Batch<std::string> b;
+        b.emplace(
+            std::string{R"({"id":1,"at":1792863688105,"seen":1792863688105,"n":1792863688105})"});
+        b.emplace(std::string{R"({"id":2,"at":null,"seen":null,"n":null})"});
+        sink.on_data(b);
+        sink.flush();
+        sink.close();
+    }
+    Connection c{parse_dsn()};
+    c.exec("SET time_zone = '+00:00'");
+    Result r = c.query(
+        "SELECT DATE_FORMAT(at, '%Y-%m-%d %H:%i:%s.%f'), "
+        "CAST(UNIX_TIMESTAMP(seen) * 1000 AS SIGNED), n, "
+        "(SELECT COUNT(*) FROM `" +
+        tbl + "` WHERE id=2 AND at IS NULL AND seen IS NULL) FROM `" + tbl + "` WHERE id=1");
+    MYSQL_ROW row = r.fetch_row();
+    ASSERT_NE(row, nullptr);
+    EXPECT_STREQ(row[0], "2026-10-24 17:41:28.105000");
+    EXPECT_STREQ(row[1], "1792863688105");
+    EXPECT_STREQ(row[2], "1792863688105");
+    EXPECT_STREQ(row[3], "1");
+    c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+}
+
 #endif  // CLINK_HAS_MYSQL

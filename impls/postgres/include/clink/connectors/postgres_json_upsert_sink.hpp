@@ -45,9 +45,12 @@
 namespace clink {
 
 struct PostgresJsonUpsertSinkOptions {
-    std::string conninfo;                  // libpq conninfo (required)
-    std::string table;                     // target table (required)
-    std::vector<std::string> columns;      // full projection for the upsert (required)
+    std::string conninfo;              // libpq conninfo (required)
+    std::string table;                 // target table (required)
+    std::vector<std::string> columns;  // full projection for the upsert (required)
+    // Columns holding a TIMESTAMP, written as timestamp literals rather than
+    // the epoch milliseconds the SQL Row path carries (timestamp_columns).
+    sqljson::TimeColumns timestamp_columns;
     std::vector<std::string> key_columns;  // PRIMARY KEY - conflict target + delete key (required)
     std::size_t batch_records{1000};
     std::string name{"postgres_upsert_sink"};
@@ -133,19 +136,23 @@ public:
             // A netted key is in exactly one bucket, so upserts and deletes touch
             // disjoint keys - statement order between them does not matter.
             if (!upserts.empty()) {
-                exec_(pgsql::build_insert_sql(opts_.table,
-                                              opts_.columns,
-                                              /*on_conflict=*/"update",
-                                              /*conflict_columns=*/opts_.key_columns,
-                                              /*update_columns=*/{},
-                                              upserts,
-                                              [this](std::string_view s) { return escape_(s); }));
+                exec_(pgsql::build_insert_sql(
+                    opts_.table,
+                    opts_.columns,
+                    /*on_conflict=*/"update",
+                    /*conflict_columns=*/opts_.key_columns,
+                    /*update_columns=*/{},
+                    upserts,
+                    [this](std::string_view s) { return escape_(s); },
+                    opts_.timestamp_columns));
             }
             if (!deletes.empty()) {
                 exec_(pgsql::build_delete_sql(
-                    opts_.table, opts_.key_columns, deletes, [this](std::string_view s) {
-                        return escape_(s);
-                    }));
+                    opts_.table,
+                    opts_.key_columns,
+                    deletes,
+                    [this](std::string_view s) { return escape_(s); },
+                    opts_.timestamp_columns));
             }
             exec_("COMMIT");
         } catch (...) {

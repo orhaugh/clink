@@ -92,8 +92,11 @@ The programmatic `PostgresCdcSource::Options` also carries `proto_version` (1; s
 | `batch_records` | No | `1000` | Flush threshold in records. A value of 0 is clamped to 1. |
 | `max_bytes` | No | `0` | Byte-based flush threshold; 0 disables it. |
 | `linger_ms` | No | `0` | Maximum buffer age before flush, in milliseconds; 0 disables it. |
+| `timestamp_columns` | No | derived | Comma-separated `<column>:ts` or `<column>:tstz`: the columns written as timestamps. On the SQL path the planner names every `TIMESTAMP` column. Taken by the three sinks on this page. |
 
 Note: `columns` is required at the `PostgresJsonSink` level; on the SQL Row path it is filled from the table DDL via `schema_columns`, so it need not be repeated in the WITH clause.
+
+**Timestamps.** The SQL Row path carries a `TIMESTAMP` as epoch milliseconds, and each sink writes a column named in `timestamp_columns` as a timestamp literal instead of that number: a `TIMESTAMP` as its time in UTC (`'2026-10-24 17:41:28.105'`), for a `timestamp` column, and a `TIMESTAMP WITH TIME ZONE` as that instant (`'2026-10-24 17:41:28.105+00'`), so a `timestamptz` column stores the same instant whatever the session's time zone. A value outside years 1 to 9999 fails the batch. A `DATE` is written as `'YYYY-MM-DD'`. To store epoch milliseconds in a `bigint` column, declare the SQL column `BIGINT`.
 
 ## Transport security
 

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**The PostgreSQL and MySQL sinks write a `TIMESTAMP` as a timestamp.** The SQL
+Row path carries a `TIMESTAMP` as epoch milliseconds, and these sinks wrote that
+number as it was, so a `timestamp`, `timestamptz`, `DATETIME` or `TIMESTAMP`
+column refused it, and every SQL job writing a timestamp into them failed. The
+planner now names a table's `TIMESTAMP` columns to the sink, which writes each
+as a literal of its time in UTC, with `+00` for a `TIMESTAMP WITH TIME ZONE` into
+PostgreSQL; the MySQL sinks run their session in UTC. This changes what a
+column declared `TIMESTAMP` but stored in a `bigint` receives: declare it
+`BIGINT` to keep writing epoch milliseconds.
+
 **`UNION ALL` matches columns by position.** A row from the second query of a
 union kept its own column names, so every column whose name differed from the
 first query's reached the sink missing and was written as NULL: in

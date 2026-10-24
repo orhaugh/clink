@@ -71,6 +71,9 @@ Source: `conn_options_from` in `impls/mysql/src/register_factories.cpp` and the 
 | `batch_records` | No | `1000` | Flush threshold by record count; `0` is coerced to `1`. |
 | `max_bytes` | No | `0` | Byte-based flush threshold; `0` disables it. |
 | `linger_ms` | No | `0` | Linger before flushing a partial batch, in milliseconds; `0` disables it. |
+| `timestamp_columns` | No | derived | Comma-separated `<column>:ts` or `<column>:tstz`: the columns written as timestamps. On the SQL path the planner names every `TIMESTAMP` column. Taken by `mysql_upsert_sink` too. |
+
+**Timestamps.** The SQL Row path carries a `TIMESTAMP` as epoch milliseconds, and the sink writes a column named in `timestamp_columns` as its time in UTC (`'2026-10-24 17:41:28.105'`) instead of that number. Both MySQL sinks run their session with `time_zone = '+00:00'`, so a `DATETIME` column holds the UTC wall time and a `TIMESTAMP` column the same instant whatever the server's time zone. A value outside years 1 to 9999 fails the batch. To store epoch milliseconds in a `BIGINT` column, declare the SQL column `BIGINT`.
 
 Source: the `mysql_sink` lambda in `impls/mysql/src/register_factories.cpp` and `MysqlSinkOptions` in `impls/mysql/include/clink/mysql/mysql_sink.hpp`.
 

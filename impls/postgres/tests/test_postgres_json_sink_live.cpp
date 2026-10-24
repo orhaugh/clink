@@ -216,4 +216,45 @@ TEST(PostgresJsonSinkLive, NullAndMissingFieldsBecomeSqlNull) {
     run_sql("DROP TABLE IF EXISTS " + tbl);
 }
 
+// A TIMESTAMP arrives as epoch milliseconds. Named in timestamp_columns, it
+// lands in a timestamp column as the same wall time read as UTC, and in a
+// timestamptz column as the same instant, though the sink's own session is set
+// to another time zone. Before, both were sent as integers and refused.
+TEST(PostgresJsonSinkLive, TimestampColumnsLandAsTimestamps) {
+    if (!pg_configured()) {
+        GTEST_SKIP() << "set CLINK_POSTGRES_CDC_TEST_DSN (docker/integration-services.yml)";
+    }
+    const std::string tbl = "pjs_ts_" + uniq();
+    run_sql("DROP TABLE IF EXISTS " + tbl);
+    run_sql("CREATE TABLE " + tbl +
+            " (id int primary key, at timestamp(3), seen timestamptz(3), n bigint)");
+
+    PostgresJsonSinkOptions o;
+    o.conninfo = pg_dsn() + " options='-c TimeZone=Asia/Tokyo'";
+    o.table = tbl;
+    o.columns = {"id", "at", "seen", "n"};
+    o.timestamp_columns = clink::sqljson::parse_timestamp_columns("at:ts,seen:tstz");
+    sink_write(o,
+               {R"({"id":1,"at":1792863688105,"seen":1792863688105,"n":1792863688105})",
+                R"({"id":2,"at":-1,"seen":-1,"n":-1})",
+                R"({"id":3,"at":null,"seen":null,"n":null})"});
+
+    const auto epoch_ms = [&](const std::string& col, int id) {
+        return scalar("SELECT (extract(epoch FROM " + col + ") * 1000)::bigint FROM " + tbl +
+                      " WHERE id=" + std::to_string(id));
+    };
+    EXPECT_EQ(epoch_ms("at", 1), "1792863688105");
+    EXPECT_EQ(epoch_ms("seen", 1), "1792863688105");
+    EXPECT_EQ(scalar("SELECT at::text FROM " + tbl + " WHERE id=1"), "2026-10-24 17:41:28.105");
+    EXPECT_EQ(epoch_ms("at", 2), "-1");
+    EXPECT_EQ(epoch_ms("seen", 2), "-1");
+    // A column the planner does not name keeps the number.
+    EXPECT_EQ(scalar("SELECT n FROM " + tbl + " WHERE id=1"), "1792863688105");
+    EXPECT_EQ(scalar("SELECT COUNT(*) FROM " + tbl +
+                     " WHERE id=3 AND at IS NULL AND seen IS "
+                     "NULL"),
+              "1");
+    run_sql("DROP TABLE IF EXISTS " + tbl);
+}
+
 #endif  // CLINK_HAS_POSTGRES

@@ -935,6 +935,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                 // need not repeat columns= matching the DDL.
                 o.columns = pgsql::columns_from_schema(ctx.param_or("schema_columns", ""));
             }
+            o.timestamp_columns =
+                sqljson::parse_timestamp_columns(ctx.param_or("timestamp_columns", ""));
             o.on_conflict = ctx.param_or("on_conflict", "");
             o.conflict_columns = split_csv(ctx.param_or("conflict_columns", ""));
             o.update_columns = split_csv(ctx.param_or("update_columns", ""));
@@ -964,6 +966,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (o.columns.empty()) {
                 o.columns = pgsql::columns_from_schema(ctx.param_or("schema_columns", ""));
             }
+            o.timestamp_columns =
+                sqljson::parse_timestamp_columns(ctx.param_or("timestamp_columns", ""));
             o.subtask_idx = ctx.subtask_idx;
             o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
             o.max_bytes = static_cast<std::size_t>(ctx.param_int64_or("max_bytes", 0));
@@ -994,6 +998,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (o.columns.empty()) {
                 o.columns = pgsql::columns_from_schema(ctx.param_or("schema_columns", ""));
             }
+            o.timestamp_columns =
+                sqljson::parse_timestamp_columns(ctx.param_or("timestamp_columns", ""));
             o.key_columns = split_csv(ctx.param_or("key_columns", ""));
             o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
             o.name = "postgres_upsert_sink";

@@ -795,6 +795,42 @@ TEST(SqlPhysical, PostgresConnectorSinkLowers) {
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
 }
 
+// A TIMESTAMP reaches the JSON SQL sinks as epoch milliseconds; the planner
+// names the TIMESTAMP columns of a PostgreSQL or MySQL table so the sink writes
+// them as timestamps, and names none for a table that has none.
+TEST(SqlPhysical, PostgresAndMysqlSinksAreToldWhichColumnsAreTimestamps) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (a BIGINT, at TIMESTAMP(3), seen TIMESTAMP(3) WITH TIME ZONE, d DATE) "
+        "WITH (connector='file', format='json', path='/tmp/i.ndjson');"
+        "CREATE TABLE pg_out (a BIGINT, at TIMESTAMP(3), seen TIMESTAMP(3) WITH TIME ZONE, d DATE) "
+        "WITH (connector='postgres', format='json', conninfo='host=pg', table='events');"
+        "CREATE TABLE pg_eo (a BIGINT, at TIMESTAMP(3), seen TIMESTAMP(3) WITH TIME ZONE, d DATE) "
+        "WITH (connector='postgres', format='json', conninfo='host=pg', table='events', "
+        "delivery_guarantee='exactly_once');"
+        "CREATE TABLE my_out (a BIGINT, at TIMESTAMP(3), seen TIMESTAMP(3) WITH TIME ZONE, d DATE) "
+        "WITH (connector='mysql', format='json', host='my', table='events');"
+        "CREATE TABLE pg_plain (a BIGINT, d DATE) "
+        "WITH (connector='postgres', format='json', conninfo='host=pg', table='plain');");
+    for (const auto& st : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    PhysicalPlanner pp;
+    for (const auto& [table, op_type] :
+         std::vector<std::pair<std::string, std::string>>{{"pg_out", "postgres_sink"},
+                                                          {"pg_eo", "postgres_2pc_sink"},
+                                                          {"my_out", "mysql_sink"}}) {
+        const std::string sql = "INSERT INTO " + table + " SELECT a, at, seen, d FROM src_t";
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*bind_insert(cat, sql.c_str())));
+        const auto* snk = find_op(spec, op_type);
+        ASSERT_NE(snk, nullptr) << op_type;
+        EXPECT_EQ(snk->params.at("timestamp_columns"), "at:ts,seen:tstz") << op_type;
+    }
+    auto plain = pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat, "INSERT INTO pg_plain SELECT a, d FROM src_t")));
+    EXPECT_EQ(find_op(plain, "postgres_sink")->params.count("timestamp_columns"), 0U);
+}
+
 // clink mode='upsert' (changelog) is NOT silently accepted for postgres - use the
 // on_conflict='update' WITH-option instead.
 TEST(SqlPhysical, PostgresConnectorSinkRejectsChangelogUpsert) {

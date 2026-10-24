@@ -703,6 +703,25 @@ std::string render_sql_column_types(const TableDef& table) {
     return out;
 }
 
+// The TIMESTAMP columns of a table a JSON SQL sink (PostgreSQL, MySQL) writes,
+// as that sink's timestamp_columns param. The Row path carries a TIMESTAMP as
+// epoch milliseconds, which a timestamp column refuses as an integer; the sink
+// writes a column named here as a timestamp literal instead.
+std::map<std::string, std::string> timestamp_columns_param(const TableDef& table) {
+    std::string csv;
+    for (const auto& c : table.columns) {
+        if (c.type && c.type->id() == arrow::Type::TIMESTAMP) {
+            const bool zoned =
+                !static_cast<const arrow::TimestampType&>(*c.type).timezone().empty();
+            csv += (csv.empty() ? "" : ",") + c.name + (zoned ? ":tstz" : ":ts");
+        }
+    }
+    if (csv.empty()) {
+        return {};
+    }
+    return {{"timestamp_columns", csv}};
+}
+
 RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
     require_kafka_for_registry_format(table, connector);
@@ -914,7 +933,10 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         // sink does not implement; use the WITH-option on_conflict='update' (+
         // conflict_columns) for idempotent insert-or-update by key.
         if (exactly_once) {
-            return RowConnectorBinding{"postgres_2pc_sink", kChannelString, "row_to_json_string"};
+            return RowConnectorBinding{"postgres_2pc_sink",
+                                       kChannelString,
+                                       "row_to_json_string",
+                                       timestamp_columns_param(table)};
         }
         if (upsert) {
             // Changelog-aware upsert: maintain the table by PRIMARY KEY (upsert on
@@ -925,12 +947,13 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             for (std::size_t i = 0; i < table.primary_key.size(); ++i) {
                 keys += (i ? "," : "") + table.primary_key[i];
             }
-            return RowConnectorBinding{"postgres_upsert_sink",
-                                       kChannelString,
-                                       "row_to_json_string",
-                                       {{"key_columns", keys}}};
+            auto params = timestamp_columns_param(table);
+            params["key_columns"] = keys;
+            return RowConnectorBinding{
+                "postgres_upsert_sink", kChannelString, "row_to_json_string", std::move(params)};
         }
-        return RowConnectorBinding{"postgres_sink", kChannelString, "row_to_json_string"};
+        return RowConnectorBinding{
+            "postgres_sink", kChannelString, "row_to_json_string", timestamp_columns_param(table)};
     }
     if (connector == "http") {
         // HTTP(S) bulk / webhook sink (at-least-once; no 2PC). Each row is
@@ -1071,10 +1094,13 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
             for (std::size_t i = 0; i < table.primary_key.size(); ++i) {
                 keys += (i ? "," : "") + table.primary_key[i];
             }
+            auto params = timestamp_columns_param(table);
+            params["key_columns"] = keys;
             return RowConnectorBinding{
-                "mysql_upsert_sink", kChannelString, "row_to_json_string", {{"key_columns", keys}}};
+                "mysql_upsert_sink", kChannelString, "row_to_json_string", std::move(params)};
         }
-        return RowConnectorBinding{"mysql_sink", kChannelString, "row_to_json_string"};
+        return RowConnectorBinding{
+            "mysql_sink", kChannelString, "row_to_json_string", timestamp_columns_param(table)};
     }
     if (connector == "firehose") {
         // Amazon Data Firehose sink (PutRecordBatch). At-least-once; no partition
