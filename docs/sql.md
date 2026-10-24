@@ -412,10 +412,16 @@ HAVING n > 10;
 ```
 
 !!! warning "Unbounded state"
-    A plain (non-windowed) `GROUP BY`, `SELECT DISTINCT`, and stream-stream joins
-    keep per-key state for the life of the job, with no TTL in this version. Use
-    them over bounded sources, or window the aggregation so state is released when
-    a window fires.
+    A plain (non-windowed) `GROUP BY`, `SELECT DISTINCT`, a stream-stream join, a
+    set operation and a ranking (`ROW_NUMBER` and its kin) keep state for every key
+    or row they have seen. Over an unbounded source such a query is refused when it
+    is planned unless that state is bounded: a window on the aggregation or the
+    ranking, a time-bounded `ON` condition on the join, or `state_ttl` on a table
+    the query reads (`'30s'`, `'15m'`, `'1h'`, `'7d'` or a number of milliseconds),
+    which releases a key once no row has touched it for that long, in event time
+    unless the table sets `state_ttl_domain = 'processing_time'`. `state_ttl` does
+    not bound a ranking. Ending the query with `ALLOW UNBOUNDED STATE` accepts the
+    state as it is.
 
 ## Windows
 
@@ -684,8 +690,6 @@ Being explicit so you are not surprised at compile time:
 - **No `INSERT ... VALUES`**, no `CREATE TABLE AS SELECT` / `SELECT INTO` (use a
   materialised view), no `ILIKE`, no `JOIN ... USING` / `NATURAL JOIN`, no
   `WATERMARK FOR ...` clause (use the `WITH` options), no temporal or `BYTEA` casts.
-- **No state TTL** on unbounded joins, `DISTINCT`, or unbounded `GROUP BY` in this
-  version.
 - **Silently accepted, then ignored:** `WITH CHECK OPTION` on a view; the options
   to `EXPLAIN ANALYZE` / `EXPLAIN VERBOSE` (no execution or timing). (Inline
   `PRIMARY KEY` is honoured; every other column constraint is rejected, never
