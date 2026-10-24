@@ -54,6 +54,18 @@ PostgreSQL CDC tables on one replication slot
 ([several tables on one slot](connectors/postgres.md#several-tables-on-one-slot));
 two separate jobs naming the same slot are refused, with the set named.
 
+Each sink in a set is held to the guarantee its own table declares in
+`delivery_guarantee`, through the sources it reads, and a sink table that
+declares none is held to the strongest guarantee any table in the set
+declares. A set can therefore write one table exactly once and another at
+least once, as long as the at-least-once table says so: a Kafka table with
+`delivery_guarantee='exactly_once'` beside a Neo4j table with
+`delivery_guarantee='at_least_once'`. Left undeclared, the Neo4j table would
+be held to exactly once and the set refused. The job reports what its weakest
+sink gives; its guarantee report (`guarantee_reasons` on
+`GET /api/v1/jobs/:id`) gives the guarantee each sink is held to and the one
+its own sources let it give.
+
 ## Your first pipeline
 
 Read newline-delimited JSON, keep the checkout clicks, write them out:

@@ -332,6 +332,110 @@ TEST_F(GuaranteeGateTest, ExactlyOnceIsRejectedOnANonDurableStateBackend) {
     EXPECT_NE(reject.find("non-durable state backend"), std::string::npos);
 }
 
+// --- sinks that declare different guarantees -----------------------------
+//
+// A job's sinks can each declare a delivery_guarantee, as the tables of a
+// statement set do. Each sink is held to its own, through its own sources;
+// one that declares none is held to the strongest the job declares.
+
+TEST_F(GuaranteeGateTest, AnAtLeastOnceSinkThatSaysSoIsAllowedBesideAnExactlyOnceOne) {
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "src"));
+    g.ops.push_back(
+        op("file_line_sink", "graph", {"src"}, {{"delivery_guarantee", "at_least_once"}}));
+    g.ops.push_back(op("file_2pc_sink_string",
+                       "fence",
+                       {"src"},
+                       {{"dir", "/tmp/o"}, {"delivery_guarantee", "exactly_once"}}));
+    connectors::GuaranteeReport report;
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), &report);
+    EXPECT_TRUE(reject.empty()) << reject;
+    // The job is reported as what its weakest sink gives, as any job is,
+    // and the report says what each sink gives.
+    EXPECT_EQ(report.level, connectors::EndToEndGuarantee::StateExactlyOnceOutputAtLeastOnce);
+    const auto text = report.render_text();
+    EXPECT_NE(text.find("sink 'fence' (file_2pc_sink_string) is held to "
+                        "exactly_once_two_phase_commit, which it declares, and through its own "
+                        "sources gives END_TO_END_EXACTLY_ONCE"),
+              std::string::npos)
+        << text;
+    EXPECT_NE(text.find("sink 'graph' (file_line_sink) is held to at_least_once, which it "
+                        "declares"),
+              std::string::npos)
+        << text;
+}
+
+TEST_F(GuaranteeGateTest, ASinkThatDeclaresNothingIsHeldToTheStrongestTheJobDeclares) {
+    // Beside an exactly-once sink, a sink with no declaration is the job
+    // asking for exactly-once everywhere, and a plain sink cannot give it.
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "src"));
+    g.ops.push_back(op("file_line_sink", "graph", {"src"}));
+    g.ops.push_back(op("file_2pc_sink_string",
+                       "fence",
+                       {"src"},
+                       {{"dir", "/tmp/o"}, {"delivery_guarantee", "exactly_once"}}));
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), nullptr);
+    ASSERT_FALSE(reject.empty());
+    EXPECT_NE(reject.find("file_line_sink"), std::string::npos) << reject;
+}
+
+TEST_F(GuaranteeGateTest, AnUndeclaredSinkIsHeldToTheStrongestEvenBesideADeclaredWeakOne) {
+    // One sink saying at-least-once does not lower what the others are held
+    // to: the undeclared one is still held to exactly-once, and refused.
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "src"));
+    g.ops.push_back(
+        op("file_line_sink", "said", {"src"}, {{"delivery_guarantee", "at_least_once"}}));
+    g.ops.push_back(op("file_line_sink", "silent", {"src"}));
+    g.ops.push_back(op("file_2pc_sink_string",
+                       "fence",
+                       {"src"},
+                       {{"dir", "/tmp/o"}, {"delivery_guarantee", "exactly_once"}}));
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), nullptr);
+    ASSERT_FALSE(reject.empty());
+    EXPECT_NE(reject.find("sink 'silent'"), std::string::npos) << reject;
+    EXPECT_EQ(reject.find("sink 'said':"), std::string::npos) << reject;
+    EXPECT_EQ(reject.find("sink 'fence':"), std::string::npos) << reject;
+}
+
+TEST_F(GuaranteeGateTest, AnotherSinksSourceDoesNotCapAnExactlyOnceSink) {
+    // A source that cannot replay caps the sinks it feeds, not the job.
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "replayable"));
+    g.ops.push_back(op("custom_feed_source", "unreplayable"));
+    g.ops.push_back(op("file_2pc_sink_string",
+                       "fence",
+                       {"replayable"},
+                       {{"dir", "/tmp/o"}, {"delivery_guarantee", "exactly_once"}}));
+    g.ops.push_back(
+        op("file_line_sink", "trace", {"unreplayable"}, {{"delivery_guarantee", "at_most_once"}}));
+    connectors::GuaranteeReport report;
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), &report);
+    EXPECT_TRUE(reject.empty()) << reject;
+    EXPECT_EQ(report.level, connectors::EndToEndGuarantee::AtMostOnceSource);
+}
+
+TEST_F(GuaranteeGateTest, AnExactlyOnceSinkIsRefusedThroughAnUnreplayableSourceOfItsOwn) {
+    JobGraphSpec g;
+    g.ops.push_back(op("file_line_source", "replayable"));
+    g.ops.push_back(op("custom_feed_source", "unreplayable"));
+    g.ops.push_back(op("identity_string", "both", {"replayable", "unreplayable"}));
+    g.ops.push_back(op("file_2pc_sink_string",
+                       "fence",
+                       {"both"},
+                       {{"dir", "/tmp/o"}, {"delivery_guarantee", "exactly_once"}}));
+    g.ops.push_back(
+        op("file_line_sink", "graph", {"replayable"}, {{"delivery_guarantee", "at_least_once"}}));
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), nullptr);
+    ASSERT_FALSE(reject.empty());
+    EXPECT_NE(reject.find("sink 'fence': requested exactly_once_two_phase_commit"),
+              std::string::npos)
+        << reject;
+    EXPECT_NE(reject.find("custom_feed_source"), std::string::npos) << reject;
+    EXPECT_EQ(reject.find("sink 'graph':"), std::string::npos) << reject;
+}
+
 // --- replay determinism -------------------------------------------------
 //
 // Delivery and determinism are orthogonal answers and must not be

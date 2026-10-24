@@ -1,6 +1,7 @@
 #include "clink/cluster/guarantee_gate.hpp"
 
 #include <algorithm>
+#include <optional>
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/connectors/capability.hpp"
@@ -36,6 +37,89 @@ std::vector<Roles> classify(const JobGraphSpec& graph) {
         roles[i].is_sink = !consumed[i] && !roles[i].is_source;
     }
     return roles;
+}
+
+connectors::PipelineConnector connector_of(const OperatorSpec& op, bool is_source) {
+    connectors::PipelineConnector pc;
+    pc.op_type = op.type;
+    pc.is_source = is_source;
+    pc.connector_name = connector_name_for_op_type(op.type);
+    // An unmatched op is reported as undeclared rather than dropped: the
+    // analyser then assumes the worst for it. Dropping would let an
+    // unrecognised sink quietly not count towards the weakest link.
+    pc.declaration_missing = pc.connector_name.empty();
+    pc.supplied_options.reserve(op.params.size());
+    for (const auto& [k, _] : op.params) {
+        pc.supplied_options.push_back(k);
+    }
+    // Carried so the analyser can tell whether transactional sinks commit
+    // as a unit or independently.
+    if (const auto cg = op.params.find("commit_group"); cg != op.params.end()) {
+        pc.commit_group = cg->second;
+    }
+    return pc;
+}
+
+// The ops a sink reads through: the sink itself and every op that feeds it.
+std::vector<bool> feeding(const JobGraphSpec& graph, std::size_t sink) {
+    std::vector<bool> in(graph.ops.size(), false);
+    std::vector<std::size_t> todo{sink};
+    in[sink] = true;
+    while (!todo.empty()) {
+        const auto i = todo.back();
+        todo.pop_back();
+        for (const auto& id : graph.ops[i].inputs) {
+            for (std::size_t j = 0; j < graph.ops.size(); ++j) {
+                if (!in[j] && graph.ops[j].id == id) {
+                    in[j] = true;
+                    todo.push_back(j);
+                }
+            }
+        }
+    }
+    return in;
+}
+
+struct HeldSink {
+    std::size_t op{0};
+    connectors::DeliveryGuarantee want{connectors::DeliveryGuarantee::AtLeastOnce};
+    bool declared{false};
+};
+
+// What each sink is held to, when the sinks of one job declare different
+// guarantees; empty when they do not, which is every job but those. A sink
+// with a delivery_guarantee of its own is held to it. A sink without one is
+// held to the strongest guarantee declared anywhere in the job, as the job
+// as a whole is: leaving it undeclared beside an exactly-once sink is how a
+// job asks for exactly-once everywhere, and it is refused if that sink
+// cannot give it.
+std::vector<HeldSink> held_sinks(const JobGraphSpec& graph,
+                                 const std::vector<Roles>& roles,
+                                 const std::optional<connectors::DeliveryGuarantee>& strongest) {
+    if (!strongest.has_value()) {
+        return {};
+    }
+    std::vector<HeldSink> held;
+    bool differ = false;
+    for (std::size_t i = 0; i < graph.ops.size(); ++i) {
+        if (!roles[i].is_sink) {
+            continue;
+        }
+        HeldSink h{i, *strongest, false};
+        const auto it = graph.ops[i].params.find("delivery_guarantee");
+        if (it != graph.ops[i].params.end()) {
+            if (const auto own = connectors::delivery_from_string(it->second); own.has_value()) {
+                h.want = *own;
+                h.declared = true;
+            }
+        }
+        differ = differ || h.want != *strongest;
+        held.push_back(h);
+    }
+    if (!differ) {
+        held.clear();
+    }
+    return held;
 }
 
 }  // namespace
@@ -92,28 +176,10 @@ connectors::PipelineFacts pipeline_facts_from_graph(const JobGraphSpec& graph,
 
     const auto roles = classify(graph);
     for (std::size_t i = 0; i < graph.ops.size(); ++i) {
-        const auto& op = graph.ops[i];
         if (!roles[i].is_source && !roles[i].is_sink) {
             continue;  // a mid-chain operator has no delivery semantics
         }
-        connectors::PipelineConnector pc;
-        pc.op_type = op.type;
-        pc.is_source = roles[i].is_source;
-        pc.connector_name = connector_name_for_op_type(op.type);
-        // An unmatched op is reported as undeclared rather than dropped:
-        // the analyser then assumes the worst for it. Dropping would let an
-        // unrecognised sink quietly not count towards the weakest link.
-        pc.declaration_missing = pc.connector_name.empty();
-        pc.supplied_options.reserve(op.params.size());
-        for (const auto& [k, _] : op.params) {
-            pc.supplied_options.push_back(k);
-        }
-        // Carried so the analyser can tell whether transactional sinks
-        // commit as a unit or independently.
-        if (const auto cg = op.params.find("commit_group"); cg != op.params.end()) {
-            pc.commit_group = cg->second;
-        }
-        facts.connectors.push_back(std::move(pc));
+        facts.connectors.push_back(connector_of(graph.ops[i], roles[i].is_source));
     }
 
     // What the submitter asked for. Carried on any participating op's
@@ -218,7 +284,46 @@ std::string check_delivery_guarantee(const JobGraphSpec& graph,
                                      const CheckpointConfig& checkpoint,
                                      connectors::GuaranteeReport* out_report) {
     const auto facts = pipeline_facts_from_graph(graph, checkpoint);
-    auto report = connectors::analyse_pipeline(facts);
+    const auto roles = classify(graph);
+    const auto held = held_sinks(graph, roles, facts.requested);
+    connectors::GuaranteeReport report;
+    std::vector<std::string> held_lines;
+    if (held.empty()) {
+        report = connectors::analyse_pipeline(facts);
+    } else {
+        // The sinks declare different guarantees, so each is checked for
+        // the one it is held to, through its own sources, and the job is
+        // reported as what its weakest sink gives, as any job is. An
+        // at-least-once sink beside an exactly-once one neither caps the
+        // exactly-once one nor is refused for being what it says it is;
+        // what is refused is a sink that cannot give its own guarantee.
+        auto job = facts;
+        job.requested.reset();
+        report = connectors::analyse_pipeline(job);
+        for (const auto& h : held) {
+            const auto& sink = graph.ops[h.op];
+            const auto mask = feeding(graph, h.op);
+            auto own = facts;
+            own.connectors.clear();
+            for (std::size_t j = 0; j < graph.ops.size(); ++j) {
+                if (mask[j] && (roles[j].is_source || j == h.op)) {
+                    own.connectors.push_back(connector_of(graph.ops[j], roles[j].is_source));
+                }
+            }
+            own.requested = h.want;
+            const auto verdict = connectors::analyse_pipeline(own);
+            held_lines.push_back(
+                "sink '" + sink.id + "' (" + sink.type + ") is held to " +
+                std::string(connectors::to_string(h.want)) +
+                (h.declared ? ", which it declares" : ", the strongest the job declares") +
+                ", and through its own sources gives " +
+                std::string(connectors::to_string(verdict.level)));
+            report.reasons.push_back(held_lines.back());
+            for (const auto& r : verdict.rejections) {
+                report.rejections.push_back("sink '" + sink.id + "': " + r);
+            }
+        }
+    }
 
     if (report.acceptable()) {
         // Logged on the ALLOW path too. An operator should be able to see
@@ -230,6 +335,9 @@ std::string check_delivery_guarantee(const JobGraphSpec& graph,
                 std::string(connectors::to_string(report.level)) +
                 (report.limiting_factor.empty() ? std::string{}
                                                 : " (limited by " + report.limiting_factor + ")"));
+        for (const auto& line : held_lines) {
+            log::info("coordinator.guarantee", line);
+        }
         for (const auto& w : report.warnings) {
             log::warn("coordinator.guarantee", w);
         }

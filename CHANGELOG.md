@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+**A statement set can write one table exactly once and another at least once.**
+A job used to be held to the strongest guarantee any of its tables declared, so
+a set with an exactly-once Kafka table and an at-least-once Neo4j table was
+refused at submission even when the Neo4j table declared
+`delivery_guarantee='at_least_once'` itself. Each sink is now held to the
+guarantee its own table declares, checked through the sources that feed it, and
+a table that declares none is still held to the strongest the job declares, so
+a set that leaves a weaker table undeclared is refused as before. The job is
+reported as what its weakest sink gives, and its `guarantee_reasons` name each
+sink's guarantee.
+
 ## v0.12.2 (October 2026)
 
 A fix for a job that could stop for good after it deployed or restarted, while
