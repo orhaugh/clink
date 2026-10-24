@@ -182,6 +182,7 @@ add_executable(clink_core_tests
     test_checkpoint_retention.cpp
     test_close_reason_alignment.cpp
     test_close_completes_alignment.cpp
+    test_skipped_barrier_alignment.cpp
     test_cli_tls_args.cpp
     test_side_output.cpp
     test_real_connectors_factory.cpp

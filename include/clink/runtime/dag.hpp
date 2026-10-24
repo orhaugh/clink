@@ -253,11 +253,12 @@ private:
 };
 
 // Connects a multi-input runner's aligner to its operator: the alignment
-// metrics under the operator's id, and one log line the first time it aligns
-// a barrier stamped Unaligned (unaligned checkpoints, an adaptive checkpoint
-// the policy turned unaligned, or a per-operator override). Logged once per
-// runner rather than per barrier; clink_op_barrier_forced_alignments_total
-// counts every one.
+// metrics under the operator's id, one log line the first time it aligns a
+// barrier stamped Unaligned (unaligned checkpoints, an adaptive checkpoint the
+// policy turned unaligned, or a per-operator override), and one the first time
+// it drops a barrier an input went past without delivering. Each logged once
+// per runner rather than per barrier; clink_op_barrier_forced_alignments_total
+// and clink_op_barrier_skipped_total count every one.
 inline void observe_alignment(MultiInputAlignment& align, const RuntimeContext& ctx) {
     align.set_operator_id(ctx.operator_id().value(), ctx.metrics());
     align.set_forced_alignment_notice([&ctx](CheckpointBarrier b) {
@@ -266,6 +267,17 @@ inline void observe_alignment(MultiInputAlignment& align, const RuntimeContext& 
                      "inputs: unaligned and adaptive checkpoints align at every fan-in, so each "
                      "checkpoint is a consistent cut. Logged once; "
                      "clink_op_barrier_forced_alignments_total counts every one.");
+    });
+    align.set_skipped_barrier_notice([&ctx](std::uint64_t ck, std::uint64_t past) {
+        ctx.log_warn("checkpoint " + std::to_string(ck) +
+                     " cannot align at this operator: one of its inputs delivered checkpoint " +
+                     std::to_string(past) +
+                     " without it, so a source upstream never emitted that barrier. The "
+                     "operator went on without it rather than wait for a barrier that cannot "
+                     "arrive, and checkpoint " +
+                     std::to_string(ck) +
+                     " cannot complete. Logged once; clink_op_barrier_skipped_total counts every "
+                     "one.");
     });
 }
 

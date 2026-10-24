@@ -28,6 +28,13 @@
 //                                        unaligned or adaptive
 //                                        checkpoints are paying aligned
 //                                        latency at this fan-in
+//   - barrier_skipped_total            : per-operator barriers dropped
+//                                        because one of the operator's
+//                                        inputs had gone past them without
+//                                        delivering them; each names a
+//                                        checkpoint that cannot complete,
+//                                        and nonzero means a source
+//                                        upstream missed a trigger
 //   - subtask_snapshot_ack_total       : SubtaskCheckpointed ok acks
 //   - subtask_snapshot_failure_total   : SubtaskCheckpointed not-ok
 //                                        acks (snapshot threw or
@@ -199,6 +206,13 @@ inline void barrier_aligned(MetricsRegistry* reg, std::uint64_t op_id, std::uint
 inline void barrier_forced_aligned(MetricsRegistry* reg, std::uint64_t op_id) {
     MetricsRegistry& r = reg != nullptr ? *reg : MetricsRegistry::global();
     r.counter(op_metric_name("barrier_forced_alignments_total", op_id)).increment();
+}
+
+// A barrier MultiInputAlignment dropped because one of its inputs had gone past
+// it without delivering it: that checkpoint cannot complete.
+inline void barrier_skipped(MetricsRegistry* reg, std::uint64_t op_id) {
+    MetricsRegistry& r = reg != nullptr ? *reg : MetricsRegistry::global();
+    r.counter(op_metric_name("barrier_skipped_total", op_id)).increment();
 }
 
 }  // namespace ckpt

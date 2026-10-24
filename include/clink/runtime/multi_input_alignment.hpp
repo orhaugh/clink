@@ -33,6 +33,18 @@ namespace clink {
 // the rows still queued on the other inputs to reach the operator after it,
 // outside the checkpoint their sources' offsets already put them in, and only
 // a capture of those rows into the checkpoint makes that sound.
+//
+// An input that delivers a barrier newer than one it never delivered has gone
+// past it for good: barriers reach an input in id order, so that input will
+// not deliver the older one, and the older checkpoint can never align here. The
+// aligner drops it and releases the inputs paused on it, and drops any later
+// delivery of it, rather than keep those inputs paused for a barrier that
+// cannot arrive. Without that, the input that went past paused on its newer
+// barrier too, no input was read again, and the operator, and everything
+// downstream of it, stopped for good. An upstream source that never emitted a
+// checkpoint's barrier is the usual cause; the checkpoint it skipped cannot
+// complete, and the job carries on from the next one. A terminal barrier is
+// never dropped this way: the close that follows it completes it.
 class MultiInputAlignment {
 public:
     // Alias to CheckpointBarrier::Mode. The aligner formerly
@@ -53,6 +65,7 @@ public:
     // forward-on-first-delivery path for a capture that is correct.
     explicit MultiInputAlignment(std::size_t input_count, bool captures_in_flight = false)
         : input_wm_(input_count, Watermark::min()),
+          passed_(input_count, 0),
           paused_(input_count, false),
           closed_(input_count, false),
           cancelled_close_(input_count, false),
@@ -85,6 +98,18 @@ public:
     }
 
     [[nodiscard]] std::uint64_t forced_alignments() const noexcept { return forced_alignments_; }
+
+    // Called once, on the first barrier this aligner drops because an input
+    // went past it without delivering it (see the class comment), with that
+    // checkpoint's id and the id of the newer barrier that went past it. The
+    // runner routes it to its log; the count of every one is
+    // skipped_barriers() and, with an operator id set,
+    // clink_op_barrier_skipped_total.
+    void set_skipped_barrier_notice(std::function<void(std::uint64_t, std::uint64_t)> notice) {
+        skipped_barrier_notice_ = std::move(notice);
+    }
+
+    [[nodiscard]] std::uint64_t skipped_barriers() const noexcept { return skipped_barriers_; }
 
     struct WatermarkAdvance {
         bool forward{false};
@@ -158,7 +183,26 @@ public:
     // given checkpoint id pins the mode for that checkpoint at this
     // aligner.
     BarrierAdvance on_barrier(std::size_t i, CheckpointBarrier b) {
-        auto& seen = seen_barriers_[b.id().value()];
+        const auto ck = b.id().value();
+        if (!b.is_terminal()) {
+            // At or below the newest barrier this input already delivered:
+            // out of order on its own channel, and whatever it could have
+            // aligned with has moved on.
+            if (passed_[i] != 0 && ck <= passed_[i]) {
+                note_skipped_(ck, passed_[i]);
+                return {};
+            }
+            passed_[i] = ck;
+            // Every pending id below this one that input i never delivered,
+            // it never will.
+            drop_passed_by_(i, ck);
+            // Another input already went past this id without delivering it.
+            if (const auto past = passed_by_another_(i, ck); past != 0) {
+                note_skipped_(ck, past);
+                return {};
+            }
+        }
+        auto& seen = seen_barriers_[ck];
         if (seen.empty()) {
             seen.assign(input_wm_.size(), false);
             // First delivery for this id wins the mode decision.
@@ -286,6 +330,7 @@ public:
             return std::nullopt;
         }
         input_wm_.push_back(Watermark{emitted_wm_.timestamp()});
+        passed_.push_back(0);
         paused_.push_back(false);
         closed_.push_back(false);
         cancelled_close_.push_back(false);
@@ -381,6 +426,70 @@ private:
         seen_mode_.erase(ck_id);
         seen_terminal_.erase(ck_id);
         first_seen_time_.erase(ck_id);
+    }
+
+    // Input i delivered barrier `ck`: drop every pending barrier below it that
+    // i never delivered, and unpause the inputs that did deliver it, which are
+    // exactly the inputs paused on it. A terminal barrier stays: the close that
+    // follows it completes it. So does one forwarded on its first delivery,
+    // which has nothing paused on it.
+    void drop_passed_by_(std::size_t i, std::uint64_t ck) {
+        std::vector<std::uint64_t> dropped;
+        for (const auto& [pending, flags] : seen_barriers_) {
+            if (pending >= ck || (i < flags.size() && flags[i]) ||
+                forwards_on_first_delivery_(pending)) {
+                continue;
+            }
+            if (const auto t = seen_terminal_.find(pending);
+                t != seen_terminal_.end() && t->second) {
+                continue;
+            }
+            dropped.push_back(pending);
+        }
+        std::sort(dropped.begin(), dropped.end());
+        for (const auto pending : dropped) {
+            const auto& flags = seen_barriers_.at(pending);
+            for (std::size_t j = 0; j < flags.size() && j < paused_.size(); ++j) {
+                if (flags[j] && !closed_[j]) {
+                    paused_[j] = false;
+                }
+            }
+            seen_barriers_.erase(pending);
+            seen_mode_.erase(pending);
+            seen_terminal_.erase(pending);
+            first_seen_time_.erase(pending);
+            note_skipped_(pending, ck);
+        }
+    }
+
+    // The newest barrier an alive input other than i delivered without ever
+    // delivering `ck`, or 0 when none has gone past it.
+    [[nodiscard]] std::uint64_t passed_by_another_(std::size_t i, std::uint64_t ck) const {
+        const auto it = seen_barriers_.find(ck);
+        std::uint64_t past = 0;
+        for (std::size_t k = 0; k < passed_.size(); ++k) {
+            if (k == i || closed_[k] || passed_[k] <= ck) {
+                continue;
+            }
+            const bool delivered =
+                it != seen_barriers_.end() && k < it->second.size() && it->second[k];
+            if (!delivered) {
+                past = std::max(past, passed_[k]);
+            }
+        }
+        return past;
+    }
+
+    // Count a dropped barrier, and hand the first one to the runner's notice
+    // so it is logged once per operator rather than per barrier.
+    void note_skipped_(std::uint64_t ck, std::uint64_t past) {
+        ++skipped_barriers_;
+        if (op_id_for_metrics_ != 0) {
+            clink::metrics::ckpt::barrier_skipped(metrics_, op_id_for_metrics_);
+        }
+        if (skipped_barriers_ == 1 && skipped_barrier_notice_) {
+            skipped_barrier_notice_(ck, past);
+        }
     }
 
     BarrierAdvance check_alignment_(std::uint64_t ck_id) {
@@ -553,6 +662,10 @@ private:
     // terminal barrier. GC'd alongside seen_barriers_.
     std::unordered_map<std::uint64_t, bool> seen_terminal_;
     std::vector<Watermark> input_wm_;
+    // The newest non-terminal barrier id each input has delivered (0: none).
+    // Barriers reach an input in id order, so an input that delivered one has
+    // gone past every lower id for good.
+    std::vector<std::uint64_t> passed_;
     std::vector<bool> paused_;
     std::vector<bool> closed_;
     // Whether each closed input closed by CANCELLATION rather than clean
@@ -584,6 +697,10 @@ private:
     // the first of them is handed to.
     std::uint64_t forced_alignments_{0};
     std::function<void(CheckpointBarrier)> forced_alignment_notice_;
+    // Barriers dropped because an input went past them without delivering
+    // them (see the class comment), and the notice the first is handed to.
+    std::uint64_t skipped_barriers_{0};
+    std::function<void(std::uint64_t, std::uint64_t)> skipped_barrier_notice_;
 };
 
 }  // namespace clink

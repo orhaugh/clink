@@ -384,13 +384,16 @@ void lagging_input_closes(const Dag::ParallelStageHandle<V>& upstream, ChannelCl
 }
 
 // As above, but input 0 delivers a barrier before it closes, so the runner has
-// it paused for alignment when the close lands; input 1 delivers a different
-// barrier, which can only align once input 0's close is seen.
+// it paused for alignment when the close lands, and only seeing that close
+// frees input 1's time. Input 1 delivers that barrier and the next one later,
+// once the close has been seen. (It used to deliver only the next one. Under
+// the skipped-barrier rule that is input 1 going past input 0's barrier, which
+// releases input 0 before its close lands, so the close was no longer seen on
+// a paused input.)
 void lagging_input_closes_while_paused(const Dag::ParallelStageHandle<V>& upstream) {
     upstream.emitters[0]->emit_watermark(at(kLagging));
     upstream.emitters[0]->emit_barrier(aligned(kLaggingBarrier));
     upstream.emitters[1]->emit_watermark(at(kLeading));
-    upstream.emitters[1]->emit_barrier(aligned(kLeadingBarrier));
     upstream.emitters[0]->close_all();
 }
 
@@ -412,15 +415,21 @@ void expect_close_frees_time(Seen& seen,
                 : "the last close leaves end of stream to flush()");
 }
 
+// The paused input's close frees input 1's time; the barriers input 1 then
+// delivers align against the closed input, in order.
 void expect_paused_close_frees_time(Seen& seen,
                                     RunnerThread& runner,
                                     const Dag::ParallelStageHandle<V>& upstream) {
-    EXPECT_TRUE(await([&] { return seen.reached(kLeading) && seen.saw_barrier(kLeadingBarrier); }))
-        << "a close on a paused input must free its time and the other input's barrier";
+    EXPECT_TRUE(await([&] { return seen.reached(kLeading); }))
+        << "a close on a paused input must free the other input's time";
+    upstream.emitters[1]->emit_barrier(aligned(kLaggingBarrier));
+    upstream.emitters[1]->emit_barrier(aligned(kLeadingBarrier));
+    EXPECT_TRUE(await([&] { return seen.saw_barrier(kLeadingBarrier); }))
+        << "a barrier the open input delivers must align against the closed one";
     upstream.emitters[1]->close_all();
     ASSERT_TRUE(runner.finishes());
     EXPECT_EQ(seen.watermarks(), (std::vector<std::int64_t>{kLagging, kLeading}));
-    EXPECT_EQ(seen.barriers(), (std::vector<std::uint64_t>{kLeadingBarrier, kLaggingBarrier}));
+    EXPECT_EQ(seen.barriers(), (std::vector<std::uint64_t>{kLaggingBarrier, kLeadingBarrier}));
 }
 
 }  // namespace
@@ -526,8 +535,9 @@ TEST(CloseFreesTime, AForwardOperatorLeavesEndOfStreamToFlush) {
 }
 
 // The two-input runners poll a paused input only once its barrier aligns, so
-// the same paused close is the case to pin for them: input 0 is paused at one
-// barrier and closes, input 1 delivers another and stays open.
+// the same paused close is the case to pin for them: input 0 is paused at a
+// barrier and closes, and input 1 stays open, delivering that barrier and the
+// next only once the close has freed its time.
 namespace {
 
 // Reads a runner's output channel from the test thread.
@@ -558,7 +568,6 @@ std::pair<std::shared_ptr<Ch>, std::shared_ptr<Ch>> paused_lagging_input_and_ope
     in0->push(StreamElement<V>::barrier(aligned(kLaggingBarrier)));
     in0->close();
     in1->push(StreamElement<V>::watermark(at(kLeading)));
-    in1->push(StreamElement<V>::barrier(aligned(kLeadingBarrier)));
     return {in0, in1};
 }
 
@@ -567,13 +576,19 @@ void expect_two_input_paused_close_frees_time(Dag& dag, const StageHandle<V>& h,
     RunnerThread runner(dag, h.runner_index);
     EXPECT_TRUE(await([&] {
         log.drain();
-        return log.seen.reached(kLeading) && log.seen.saw_barrier(kLeadingBarrier);
-    })) << "a close on a paused input must free its time and the other input's barrier";
+        return log.seen.reached(kLeading);
+    })) << "a close on a paused input must free the other input's time";
+    in1.push(StreamElement<V>::barrier(aligned(kLaggingBarrier)));
+    in1.push(StreamElement<V>::barrier(aligned(kLeadingBarrier)));
+    EXPECT_TRUE(await([&] {
+        log.drain();
+        return log.seen.saw_barrier(kLeadingBarrier);
+    })) << "a barrier the open input delivers must align against the closed one";
     in1.close();
     ASSERT_TRUE(runner.finishes());
     log.drain();
     EXPECT_EQ(log.seen.watermarks(), (std::vector<std::int64_t>{kLagging, kLeading, kEndOfTime}));
-    EXPECT_EQ(log.seen.barriers(), (std::vector<std::uint64_t>{kLeadingBarrier, kLaggingBarrier}));
+    EXPECT_EQ(log.seen.barriers(), (std::vector<std::uint64_t>{kLaggingBarrier, kLeadingBarrier}));
 }
 
 }  // namespace

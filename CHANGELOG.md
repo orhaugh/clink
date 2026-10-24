@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+**An operator that merges several inputs no longer stops for good when one of
+them skips a checkpoint.** Barriers reach an input in id order, so an input that
+delivers barrier N+1 without N has gone past N, which can then never align. The
+operator kept the inputs that had delivered N paused for it and paused the
+skipping input on N+1 as well, so no input was read again, and the operator and
+everything downstream of it stopped while the job still reported itself running.
+It now drops N and goes on to N+1: N cannot complete, and the next checkpoint
+does. Each such barrier counts in `clink_op_barrier_skipped_total`, and the
+operator logs the first, since a source upstream that missed a trigger is the
+usual cause.
+
 ## v0.12.1 (October 2026)
 
 A fix for exactly-once into PostgreSQL: a takeover could restore from a
