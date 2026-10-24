@@ -277,7 +277,9 @@ protected:
     // subtask owns, deserialized: those of every previous subtask it succeeds
     // (see succession()). Intended for a connector that must reconcile an
     // external registry at on_open() - e.g. an XA sink that rolls back prepared
-    // transactions NOT in this set (their checkpoint never became durable).
+    // transactions NOT in this set, whose checkpoints no restore chooses again
+    // (the coordinator passes over a COMPLETED marker the job's last deploy
+    // restored below; see RestoredRecord in clink/cluster/in_doubt_resolution.hpp).
     // Safe to call from on_open(): recover_all_() has not yet run, so the full
     // pending set is still present.
     std::vector<Committable> pending_committables() const {
