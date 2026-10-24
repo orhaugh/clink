@@ -330,6 +330,30 @@ std::string input_base_id(const std::string& ref) {
 // operator between it and the sink passes rows through or applies them by key.
 // A consumer that retracts - a grouping, a join - never counted that row, and
 // a retraction of it would be wrong, so there the stage drops such deletes.
+// Removes the ops in `dropped` and points every input that named one of them
+// at what `rewire` maps it to.
+void drop_and_rewire(cluster::JobGraphSpec& spec,
+                     const std::set<std::string>& dropped,
+                     const std::map<std::string, std::string>& rewire) {
+    if (rewire.empty()) {
+        return;
+    }
+    std::vector<cluster::OperatorSpec> kept;
+    kept.reserve(spec.ops.size());
+    for (auto& op : spec.ops) {
+        if (dropped.count(op.id) != 0) {
+            continue;
+        }
+        for (auto& in : op.inputs) {
+            if (const auto it = rewire.find(in); it != rewire.end()) {
+                in = it->second;
+            }
+        }
+        kept.push_back(std::move(op));
+    }
+    spec.ops = std::move(kept);
+}
+
 // CDC tables that name the same server and replication slot share one source:
 // a slot has one reader. The fused source captures every table (`tables`, one
 // entry per PostgreSQL table) and routes each row to its table's branch with
@@ -440,23 +464,50 @@ void fuse_cdc_sources(cluster::JobGraphSpec& spec) {
             }
         }
     }
-    if (rewire.empty()) {
-        return;
-    }
-    std::vector<cluster::OperatorSpec> kept;
-    kept.reserve(spec.ops.size());
-    for (auto& op : spec.ops) {
-        if (fused_away.count(op.id) != 0) {
+    drop_and_rewire(spec, fused_away, rewire);
+}
+
+// Tables declared shared_reader='true' are read once per job. Every scan of
+// one such table in a job - each statement of a statement set that reads it,
+// or a query that reads it twice - compiles to a source op that differs from
+// the others only in its projection hint, which a Kafka source cannot act on
+// (each scan's JSON bridge keeps its own). So the first op feeds the consumers
+// of all of them: the statements read one stream, cut at the same checkpoint
+// barriers, and the topic is fetched once. It also ties the statements' pace
+// together, since a slow sink holds the shared reader back for every
+// statement; that is why a table asks for it rather than getting it by
+// default.
+void share_readers(cluster::JobGraphSpec& spec) {
+    std::map<std::string, std::vector<std::size_t>> groups;
+    for (std::size_t i = 0; i < spec.ops.size(); ++i) {
+        const auto& op = spec.ops[i];
+        const auto it = op.params.find("shared_reader");
+        if (!op.inputs.empty() || it == op.params.end() || it->second != "true") {
             continue;
         }
-        for (auto& in : op.inputs) {
-            if (const auto it = rewire.find(in); it != rewire.end()) {
-                in = it->second;
+        std::string key =
+            op.type + '\n' + op.out_channel + '\n' + std::to_string(op.parallelism) + '\n';
+        for (const auto& [k, v] : op.params) {
+            if (k != "projected_columns") {
+                key += k + '=' + v + '\n';
             }
         }
-        kept.push_back(std::move(op));
+        groups[key].push_back(i);
     }
-    spec.ops = std::move(kept);
+    std::set<std::string> shared_away;
+    std::map<std::string, std::string> rewire;
+    for (const auto& [key, members] : groups) {
+        if (members.size() < 2) {
+            continue;
+        }
+        auto& reader = spec.ops[members.front()];
+        reader.params.erase("projected_columns");
+        for (std::size_t m = 1; m < members.size(); ++m) {
+            rewire[spec.ops[members[m]].id] = reader.id;
+            shared_away.insert(spec.ops[members[m]].id);
+        }
+    }
+    drop_and_rewire(spec, shared_away, rewire);
 }
 
 void decide_cdc_unheld_deletes(cluster::JobGraphSpec& spec) {
@@ -3189,6 +3240,7 @@ cluster::JobGraphSpec PhysicalPlanner::compile(const LogicalSink& root) const {
     mark_changelog_producers(spec);
     decide_cdc_unheld_deletes(spec);
     fuse_cdc_sources(spec);
+    share_readers(spec);
     propagate_forced_singletons(spec);
     enable_columnar_output(spec);
     // Every operator in this spec is planner-emitted engine code: wall-clock
@@ -3286,6 +3338,7 @@ cluster::JobGraphSpec merge_statement_set(std::vector<cluster::JobGraphSpec> spe
         out.column_lineage = clink::config::JsonValue{std::move(lineage)}.serialize(0);
     }
     fuse_cdc_sources(out);
+    share_readers(out);
     propagate_forced_singletons(out);
     return out;
 }

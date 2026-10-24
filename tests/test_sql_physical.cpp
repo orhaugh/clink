@@ -1098,6 +1098,131 @@ TEST(SqlPhysical, AStatementSetIsOneJobAndItsCdcTablesShareTheSlot) {
     EXPECT_EQ(ops_of(submitted.front(), "postgres_cdc_source").size(), 1U);
 }
 
+// A Kafka table declared shared_reader='true' is read once per job: the
+// statements of a set that read it, and a query that reads it twice, take the
+// same source, each through its own JSON bridge and projection.
+namespace {
+
+Catalog kafka_catalog(const std::string& shared) {
+    Catalog cat;
+    const std::string kafka =
+        "connector='kafka', format='json', brokers='kafka:9092', "
+        "group_id='keeper', auto_offset_reset='earliest'";
+    auto s = parse(
+        "CREATE TABLE transfers (id VARCHAR, src VARCHAR, dst VARCHAR, amount DOUBLE, ts BIGINT) "
+        "WITH (" +
+        kafka + ", topic='transfers'" + shared +
+        ");"
+        "CREATE TABLE transfers_late (id VARCHAR, src VARCHAR, dst VARCHAR, amount DOUBLE, "
+        "ts BIGINT) WITH (connector='kafka', format='json', brokers='kafka:9092', "
+        "group_id='keeper', auto_offset_reset='latest', topic='transfers'" +
+        shared +
+        ");"
+        "CREATE TABLE graph (id VARCHAR, src VARCHAR, dst VARCHAR, amount DOUBLE, ts BIGINT) "
+        "WITH (connector='print', format='json');"
+        "CREATE TABLE announced (id VARCHAR, ts BIGINT) WITH (connector='print', "
+        "format='json');");
+    for (const auto& st : s.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    return cat;
+}
+
+cluster::JobGraphSpec kafka_statement_set(const Catalog& cat,
+                                          const std::string& second_from = "transfers") {
+    // Optimised, as a submitted statement is, so each scan carries the
+    // projection its statement reads.
+    PhysicalPlanner pp;
+    std::vector<cluster::JobGraphSpec> specs;
+    specs.push_back(pp.compile(static_cast<const LogicalSink&>(
+        *optimize(bind_insert(cat, "INSERT INTO graph SELECT * FROM transfers")))));
+    const std::string announce = "INSERT INTO announced SELECT id, ts FROM " + second_from;
+    specs.push_back(
+        pp.compile(static_cast<const LogicalSink&>(*optimize(bind_insert(cat, announce.c_str())))));
+    return merge_statement_set(std::move(specs));
+}
+
+}  // namespace
+
+TEST(SqlPhysical, AStatementSetReadsAKafkaTableThatAsksForItThroughOneReader) {
+    const auto merged = kafka_statement_set(kafka_catalog(", shared_reader='true'"));
+    const auto sources = ops_of(merged, "kafka_source_string");
+    ASSERT_EQ(sources.size(), 1U);
+    const auto& reader = *sources.front();
+    // The reader carries no projection: it fetches each message whole, and
+    // each statement's bridge decodes what that statement reads.
+    EXPECT_EQ(reader.params.count("projected_columns"), 0U);
+    const auto bridges = ops_of(merged, "json_string_to_row_columnar");
+    ASSERT_EQ(bridges.size(), 2U);
+    std::set<std::string> projections;
+    for (const auto* bridge : bridges) {
+        EXPECT_EQ(bridge->inputs, (std::vector<std::string>{reader.id}));
+        projections.insert(bridge->params.count("projected_columns") != 0U
+                               ? bridge->params.at("projected_columns")
+                               : std::string{"(all)"});
+    }
+    EXPECT_EQ(projections.size(), 2U) << "each statement keeps its own projection";
+    std::set<std::string> ids;
+    for (const auto& op : merged.ops) {
+        ids.insert(op.id);
+    }
+    for (const auto& op : merged.ops) {
+        for (const auto& in : op.inputs) {
+            EXPECT_EQ(ids.count(in.substr(0, in.find_first_of(".:"))), 1U)
+                << op.id << " reads " << in;
+        }
+    }
+}
+
+TEST(SqlPhysical, AKafkaTableThatDoesNotAskIsReadOncePerStatement) {
+    EXPECT_EQ(ops_of(kafka_statement_set(kafka_catalog("")), "kafka_source_string").size(), 2U);
+    EXPECT_EQ(
+        ops_of(kafka_statement_set(kafka_catalog(", shared_reader='false'")), "kafka_source_string")
+            .size(),
+        2U);
+}
+
+TEST(SqlPhysical, TablesOverOneTopicThatReadItDifferentlyDoNotShareAReader) {
+    // Same topic, a different start: two readers, whatever they ask for.
+    const auto merged =
+        kafka_statement_set(kafka_catalog(", shared_reader='true'"), "transfers_late");
+    EXPECT_EQ(ops_of(merged, "kafka_source_string").size(), 2U);
+}
+
+TEST(SqlPhysical, AQueryThatReadsASharedKafkaTableTwiceReadsItOnce) {
+    const Catalog cat = kafka_catalog(", shared_reader='true'");
+    PhysicalPlanner pp;
+    const auto spec = pp.compile(static_cast<const LogicalSink&>(
+        *optimize(bind_insert(cat,
+                              "INSERT INTO announced SELECT id, ts FROM transfers UNION ALL "
+                              "SELECT dst, ts FROM transfers"))));
+    EXPECT_EQ(ops_of(spec, "kafka_source_string").size(), 1U);
+}
+
+TEST(SqlPhysical, SharedReaderIsRefusedOffKafkaAndOutsideItsValues) {
+    Catalog cat;
+    const auto check = [&](const std::string& ddl) {
+        try {
+            const auto s = parse(ddl);
+            for (const auto& st : s.statements) {
+                cat.register_table(std::get<ast::CreateTableStmt>(st));
+            }
+            return std::string{};
+        } catch (const std::exception& e) {
+            return std::string{e.what()};
+        }
+    };
+    const auto off_kafka = check(
+        "CREATE TABLE f (line VARCHAR) WITH (connector='file', path='/tmp/x', "
+        "shared_reader='true');");
+    EXPECT_NE(off_kafka.find("shared_reader applies to connector='kafka'"), std::string::npos)
+        << off_kafka;
+    const auto bad_value = check(
+        "CREATE TABLE k (line VARCHAR) WITH (connector='kafka', brokers='b', topic='t', "
+        "shared_reader='yes');");
+    EXPECT_NE(bad_value.find("shared_reader"), std::string::npos) << bad_value;
+}
+
 // M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via
 // the row_to_json_string bridge, with format=jsoneachrow FORCED by the binding
 // (the SQL format='json' channel selector is stripped before the factory).

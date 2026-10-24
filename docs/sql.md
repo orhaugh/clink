@@ -54,6 +54,17 @@ PostgreSQL CDC tables on one replication slot
 ([several tables on one slot](connectors/postgres.md#several-tables-on-one-slot));
 two separate jobs naming the same slot are refused, with the set named.
 
+A Kafka table can ask for one reader per job with `shared_reader='true'`.
+Every statement in the set that reads it then reads the same stream through
+one consumer, cut at the same checkpoint barriers, and the topic is fetched
+once rather than once per statement. Without it, each statement has a reader
+of its own, and at a checkpoint one statement may have read further than
+another. A shared reader ties the statements' pace together: a slow sink holds
+it back for every statement that reads the table. Setting or clearing it
+changes the job's graph, so start the job fresh rather than restoring a
+checkpoint taken with the other setting, which the statements would resume
+from one position rather than each from its own.
+
 Each sink in a set is held to the guarantee its own table declares in
 `delivery_guarantee`, through the sources it reads, and a sink table that
 declares none is held to the strongest guarantee any table in the set

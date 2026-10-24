@@ -38,6 +38,9 @@ const std::vector<ClosedDomain>& closed_domains() {
         {"insert_format", {"native", "jsoneachrow"}},
         // A PostgreSQL CDC table's row-keeping stage; the planner reads it.
         {"keep_rows", {"true", "false"}},
+        // One reader for every scan of a Kafka table in a job; the planner
+        // reads it (share_readers).
+        {"shared_reader", {"true", "false"}},
         // How a JSON-writing sink renders NaN and the infinities. Read off
         // config::non_finite_from_option, which the planner and the sink
         // factories also check against.
@@ -75,6 +78,7 @@ const std::vector<std::string>& interpreted_table_options() {
         "insert_format",
         "json_non_finite",
         "keep_rows",
+        "shared_reader",
     };
     return opts;
 }
@@ -134,6 +138,21 @@ std::vector<TableOptionProblem> check_table_options(
                     problems.push_back({key,
                                         "table '" + table_name +
                                             "': insert_format applies to connector='clickhouse' "
+                                            "only; this table's connector is '" +
+                                            connector + "'"});
+                }
+            }
+            // shared_reader is honoured for Kafka source tables, whose
+            // source emits each message's text for a per-scan bridge to
+            // decode, so scans that differ only in what they project can
+            // share it. Elsewhere it would do nothing, silently.
+            if (key == "shared_reader") {
+                const auto c = properties.find("connector");
+                const std::string connector = c == properties.end() ? "" : c->second;
+                if (connector != "kafka") {
+                    problems.push_back({key,
+                                        "table '" + table_name +
+                                            "': shared_reader applies to connector='kafka' "
                                             "only; this table's connector is '" +
                                             connector + "'"});
                 }

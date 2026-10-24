@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A Kafka table can be read once per job.** With `shared_reader='true'`, every
+statement of a statement set that reads the table, and a query that reads it
+twice, take one consumer between them: they read the same stream, cut at the
+same checkpoint barriers, and the topic is fetched once instead of once per
+statement. Each statement used to have a reader of its own, so at a checkpoint
+one statement could have read further than another, and a sink fed by one
+could get ahead of a sink fed by the other. Sharing ties the statements' pace
+together, since a slow sink holds the reader back for all of them, so a table
+asks for it. Setting or clearing it changes the job's graph: start such a job
+fresh rather than restoring a checkpoint taken with the other setting.
+
 **A statement set can write one table exactly once and another at least once.**
 A job used to be held to the strongest guarantee any of its tables declared, so
 a set with an exactly-once Kafka table and an at-least-once Neo4j table was
