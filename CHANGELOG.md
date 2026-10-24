@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**A join takes a subquery on either side, as it takes a common table
+expression.** A top-level join with a subquery side was planned as a multi-way
+join, which plans neither lookup nor outer joins: a lookup join probing
+`(SELECT DISTINCT ...) AS t` was refused with "lookup table ... is not supported
+inside a multi-way join", and a `LEFT JOIN` onto a grouped subquery with
+"outer/full joins with a non-base side ... are not supported yet". The subquery
+is now registered under its alias first, as a CTE is, and the join is planned
+as one over two tables. A join one of whose sides is itself a join still takes
+the multi-way path, INNER only.
+
 **The PostgreSQL and MySQL sinks write a `TIMESTAMP` as a timestamp.** The SQL
 Row path carries a `TIMESTAMP` as epoch milliseconds, and these sinks wrote that
 number as it was, so a `timestamp`, `timestamptz`, `DATETIME` or `TIMESTAMP`

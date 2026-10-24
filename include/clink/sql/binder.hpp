@@ -156,6 +156,12 @@ private:
     // TableRef and the derived-table (SubqueryItem) paths of bind_join_rel.
     BoundRel bind_base_table_rel(const ast::TableRef& ref) const;
 
+    // Register a derived table (a FROM subquery) as a synthetic table under
+    // its alias, binding its body, and return a reference to it: a reference to
+    // the alias then plans the subquery's body, as a CTE's does. Shared by
+    // bind_join_rel and the top-level join in bind_select.
+    ast::TableRef register_derived_table(const ast::SubqueryItem& sq) const;
+
     const Catalog& catalog_;
     // WITH clause. Synthetic TableDefs serve column
     // resolution for CTE references inside the outer SELECT; matching

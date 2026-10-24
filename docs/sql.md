@@ -451,7 +451,9 @@ GROUP BY TUMBLE(datetime, INTERVAL '10' SECOND), bidder;
 
 A join reads as `FROM a JOIN b ON <condition>`. Only `ON` is accepted;
 `USING (...)` and `NATURAL JOIN` are not supported. In clauses after the join,
-refer to columns either qualified (`a.x`) or flattened (`a_x`).
+refer to columns either qualified (`a.x`) or flattened (`a_x`). Each side may be
+a table, a common table expression or an aliased subquery, `(SELECT ...) AS a`,
+with every kind of join below.
 
 **Inner equi-join.** The common case:
 

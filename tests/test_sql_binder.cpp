@@ -2805,6 +2805,53 @@ TEST(SqlBinder, LookupJoinRejections) {
         TranslationError);
 }
 
+// The probe side of a lookup join can be a subquery, as it can be a CTE:
+// the derived table is registered under its alias and the join is planned as
+// a lookup join over it. It used to take the multi-way join path, which
+// refused the lookup table as "not supported inside a multi-way join".
+TEST(SqlBinder, LookupJoinProbesASubquery) {
+    Catalog cat = lookup_join_catalog();
+    Binder b(cat);
+    auto plan = b.bind_select(
+        as_select(parse("SELECT o.cust, c.name FROM (SELECT DISTINCT cust FROM orders) o "
+                        "JOIN customers c ON o.cust = c.id")));
+    const auto* jn = join_node(plan.get());
+    ASSERT_NE(jn, nullptr);
+    ASSERT_EQ(jn->kind(), "LookupJoin");
+    const auto& lj = static_cast<const LogicalLookupJoin&>(*jn);
+    EXPECT_EQ(lj.probe_alias(), "o");
+    EXPECT_EQ(lj.probe_columns(), (std::vector<std::string>{"cust"}));
+    EXPECT_EQ(lj.input().kind(), "Distinct");  // the subquery's own plan feeds the probe
+    // LEFT, as over a table.
+    auto left = b.bind_select(
+        as_select(parse("SELECT o.cust, c.name FROM (SELECT DISTINCT cust FROM orders) o "
+                        "LEFT JOIN customers c ON o.cust = c.id")));
+    ASSERT_NE(join_node(left.get()), nullptr);
+    EXPECT_TRUE(static_cast<const LogicalLookupJoin&>(*join_node(left.get())).outer());
+}
+
+// An outer equi-join can have a subquery on either side, as it can a CTE.
+TEST(SqlBinder, OuterJoinTakesASubquerySide) {
+    Catalog cat;
+    auto regs = parse(
+        "CREATE TABLE a (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/a.ndjson');"
+        "CREATE TABLE b (k BIGINT, w BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/b.ndjson')");
+    for (const auto& st : regs.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    Binder bd(cat);
+    auto plan = bd.bind_select(
+        as_select(parse("SELECT a.k, t.total FROM a "
+                        "LEFT JOIN (SELECT k, SUM(w) AS total FROM b GROUP BY k) AS t "
+                        "ON a.k = t.k")));
+    const auto* jn = join_node(plan.get());
+    ASSERT_NE(jn, nullptr);
+    ASSERT_EQ(jn->kind(), "EquiJoin");
+    EXPECT_EQ(static_cast<const LogicalEquiJoin&>(*jn).join_type(), JoinType::LeftOuter);
+}
+
 TEST(SqlBinder, EmptyFromRejected) {
     Catalog cat;
     Binder b(cat);

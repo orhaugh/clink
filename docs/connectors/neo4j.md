@@ -223,7 +223,7 @@ FROM signals s
 LEFT JOIN device_context d ON s.account = d.account;
 ```
 
-- The lookup table goes on the right of an `INNER` or `LEFT` join, with one equality between a probe column and a lookup column, either way round. A lookup table on the left, a `RIGHT` or `FULL` join, any other `ON`, a lookup table inside a multi-way join and a lookup table read with `FROM` are refused when the query is planned. The probe side can be any table or common table expression, a windowed aggregate included.
+- The lookup table goes on the right of an `INNER` or `LEFT` join, with one equality between a probe column and a lookup column, either way round. A lookup table on the left, a `RIGHT` or `FULL` join, any other `ON`, a lookup table inside a multi-way join and a lookup table read with `FROM` are refused when the query is planned. The probe side can be any table, common table expression or aliased subquery, a windowed aggregate included.
 - `function = 'neo4j'` selects this connector's own operator, `neo4j_lookup_join_row`; the table's other options configure it.
 - `LEFT JOIN`: every probe row comes out once, in input order. On a match the lookup's key column carries the probe's key and the result columns the statement's values; on a no-match the key and result columns are NULL. `INNER JOIN` drops the no-matches.
 - A row's change kind passes through: a retraction is enriched and stays a retraction.

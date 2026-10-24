@@ -2596,48 +2596,53 @@ Binder::BoundRel Binder::bind_base_table_rel(const ast::TableRef& ref) const {
     return r;
 }
 
+ast::TableRef Binder::register_derived_table(const ast::SubqueryItem& sq) const {
+    // Pre-bind the body and register it as a synthetic table exactly like a
+    // single-FROM derived table, so make_table_plan returns the sub-plan.
+    if (sq.alias.empty()) {
+        bind_error("derived table requires an alias", sq.loc.pos);
+    }
+    if (cte_synth_tables_.count(sq.alias) != 0) {
+        bind_error("derived-table alias collides with an in-scope table or CTE: " + sq.alias,
+                   sq.loc.pos);
+    }
+    // Reject an alias that collides with a base table: registering it in the
+    // cte overlay would shadow the base table, so another join side that
+    // references that base name would silently resolve to this derived table.
+    if (catalog_.get_table(sq.alias) != nullptr) {
+        bind_error("derived-table alias '" + sq.alias +
+                       "' collides with a base table of the same name; rename the alias",
+                   sq.loc.pos);
+    }
+    auto body_plan = bind_select(*sq.body);
+    auto body_schema = body_plan->schema();
+    TableDef synth;
+    synth.name = sq.alias;
+    synth.columns.reserve(static_cast<std::size_t>(body_schema->num_fields()));
+    for (int i = 0; i < body_schema->num_fields(); ++i) {
+        synth.columns.push_back(
+            ColumnSpec{body_schema->field(i)->name(), body_schema->field(i)->type()});
+    }
+    cte_synth_tables_.emplace(sq.alias, std::move(synth));
+    cte_plans_.emplace(sq.alias, std::move(body_plan));
+    ast::TableRef tr;
+    tr.name = sq.alias;
+    tr.alias = sq.alias;
+    tr.loc = sq.loc;
+    return tr;
+}
+
 Binder::BoundRel Binder::bind_join_rel(const ast::FromItem& item) const {
     if (std::holds_alternative<ast::TableRef>(item)) {
         return bind_base_table_rel(std::get<ast::TableRef>(item));
     }
     if (std::holds_alternative<std::unique_ptr<ast::SubqueryItem>>(item)) {
-        // A derived table (subquery, e.g. a windowed aggregate) as a join side.
-        // Pre-bind its body and register it as a synthetic table exactly like a
-        // single-FROM derived table, so make_table_plan returns the sub-plan and
-        // the base-table path prefixes its columns as <alias>_<col> in the join
-        // output - identical naming to a base-table side.
-        const auto& sq = *std::get<std::unique_ptr<ast::SubqueryItem>>(item);
-        if (sq.alias.empty()) {
-            bind_error("derived table requires an alias", sq.loc.pos);
-        }
-        if (cte_synth_tables_.count(sq.alias) != 0) {
-            bind_error("derived-table alias collides with an in-scope table or CTE: " + sq.alias,
-                       sq.loc.pos);
-        }
-        // Reject an alias that collides with a base table: registering it in the
-        // cte overlay would shadow the base table, so another join side that
-        // references that base name would silently resolve to this derived table.
-        if (catalog_.get_table(sq.alias) != nullptr) {
-            bind_error("derived-table alias '" + sq.alias +
-                           "' collides with a base table of the same name; rename the alias",
-                       sq.loc.pos);
-        }
-        auto body_plan = bind_select(*sq.body);
-        auto body_schema = body_plan->schema();
-        TableDef synth;
-        synth.name = sq.alias;
-        synth.columns.reserve(static_cast<std::size_t>(body_schema->num_fields()));
-        for (int i = 0; i < body_schema->num_fields(); ++i) {
-            synth.columns.push_back(
-                ColumnSpec{body_schema->field(i)->name(), body_schema->field(i)->type()});
-        }
-        cte_synth_tables_.emplace(sq.alias, std::move(synth));
-        cte_plans_.emplace(sq.alias, std::move(body_plan));
-        ast::TableRef tr;
-        tr.name = sq.alias;
-        tr.alias = sq.alias;
-        tr.loc = sq.loc;
-        return bind_base_table_rel(tr);
+        // A derived table (subquery, e.g. a windowed aggregate) as a join side,
+        // registered as a synthetic table so the base-table path prefixes its
+        // columns as <alias>_<col> in the join output - identical naming to a
+        // base-table side.
+        return bind_base_table_rel(
+            register_derived_table(*std::get<std::unique_ptr<ast::SubqueryItem>>(item)));
     }
     if (std::holds_alternative<std::unique_ptr<ast::JoinClause>>(item)) {
         const auto& jc = *std::get<std::unique_ptr<ast::JoinClause>>(item);
@@ -4274,8 +4279,15 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
                 jt = JoinType::FullOuter;
                 break;
         }
-        const bool both_base = std::holds_alternative<ast::TableRef>(jc.left) &&
-                               std::holds_alternative<ast::TableRef>(jc.right);
+        // A join of two relations takes the inline path below, which plans
+        // lookup, interval and outer joins; a relation is a table, a CTE or a
+        // derived table (a subquery), which is registered under its alias first,
+        // as a CTE is. Only a side that is itself a join takes the nested path.
+        const auto is_relation = [](const ast::FromItem& side) {
+            return std::holds_alternative<ast::TableRef>(side) ||
+                   std::holds_alternative<std::unique_ptr<ast::SubqueryItem>>(side);
+        };
+        const bool both_base = is_relation(jc.left) && is_relation(jc.right);
         if (!both_base) {
             // Nested multi-way join: build a left-deep INNER equi-join tree and
             // register its root as the synthetic __join derived table (mirroring
@@ -4286,8 +4298,8 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             // message.
             if (jt != JoinType::Inner) {
                 bind_error(
-                    "outer/full joins with a non-base side (a derived table or nested join) are "
-                    "not supported yet (v1); only INNER joins may have such a side",
+                    "outer/full joins with a nested join on one side are not supported yet (v1); "
+                    "only INNER joins may have such a side",
                     jc.loc.pos);
             }
             BoundRel root = bind_join_rel(stmt.from_items[0]);
@@ -4306,8 +4318,14 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             tr.loc = jc.loc;
             derived_table_ref = std::move(tr);
         } else {
-            const auto& left_ref = std::get<ast::TableRef>(jc.left);
-            const auto& right_ref = std::get<ast::TableRef>(jc.right);
+            const auto as_ref = [&](const ast::FromItem& side) {
+                if (std::holds_alternative<ast::TableRef>(side)) {
+                    return std::get<ast::TableRef>(side);
+                }
+                return register_derived_table(*std::get<std::unique_ptr<ast::SubqueryItem>>(side));
+            };
+            const ast::TableRef left_ref = as_ref(jc.left);
+            const ast::TableRef right_ref = as_ref(jc.right);
             const auto& left_def = resolve_table(catalog_, left_ref, cte_synth_tables_);
             const auto& right_def = resolve_table(catalog_, right_ref, cte_synth_tables_);
             std::string left_alias = left_ref.alias.value_or(left_def.name);
