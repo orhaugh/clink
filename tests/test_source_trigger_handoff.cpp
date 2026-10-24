@@ -54,15 +54,16 @@ std::filesystem::path handoff_hello_plugin_path() {
 }
 
 // Two sources on one worker, both feeding one keyed counter: the counter's
-// subtask merges them, so it aligns every barrier across the two.
-JobGraphSpec handoff_graph(const std::filesystem::path& out) {
+// subtask merges them, so it aligns every barrier across the two. Each source
+// emits `count` records, one every 25ms.
+JobGraphSpec handoff_graph(const std::filesystem::path& out, int count = 40) {
     JobGraphSpec g;
     OperatorSpec src;
     src.id = "src";
     src.type = "hello.GreetingSource";
     src.out_channel = "hello.Greeting";
     src.parallelism = 2;
-    src.params = {{"count", "40"}, {"start", "1"}, {"delay_ms", "25"}};
+    src.params = {{"count", std::to_string(count)}, {"start", "1"}, {"delay_ms", "25"}};
     g.ops.push_back(std::move(src));
     OperatorSpec cnt;
     cnt.id = "counter";
@@ -196,4 +197,90 @@ TEST(SourceTriggerHandoff, ASourceThatRegistersLateStillEmitsTheBarriersItsSibli
         EXPECT_EQ(completed.count(id), 1U)
             << "checkpoint " << id << " never completed although a later one did";
     }
+}
+
+// A savepoint is triggered as soon as the job is deployed: unlike the periodic
+// loop it does not wait for every subtask to report itself listening, so its
+// trigger can reach a worker before the job's sources there have parsed their
+// chains, let alone registered their injectors. The worker held triggers for a
+// source only from its chain parse on, and dropped one that came earlier: the
+// savepoint never completed, and take_savepoint waited out its timeout (the
+// commit-teardown fence test timed out in CI this way). Every subtask's thread
+// is held before it parses its chain while the savepoint is taken, so the
+// trigger arrives while no source knows yet that it is one. The sources run for
+// far longer than the test: take_savepoint reports success once any checkpoint
+// at or above the savepoint's id completes, and a bounded job's end-of-stream
+// checkpoint would stand in for a savepoint that never happened.
+TEST(SourceTriggerHandoff, ASavepointTakenBeforeTheSourcesParseTheirChainsCompletes) {
+    const auto plugin = handoff_hello_plugin_path();
+    if (plugin.empty() || !std::filesystem::exists(plugin)) {
+        GTEST_SKIP() << "hello_plugin not built";
+    }
+    clink::fault::Registry::instance().reset();
+    struct RegistryReset {
+        ~RegistryReset() { clink::fault::Registry::instance().reset(); }
+    } reset_on_exit;
+
+    Coordinator::Config cfg;
+    cfg.max_restarts = 0;
+    Coordinator coordinator(cfg);
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-handoff-savepoint"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-handoff-savepoint", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    const auto tag = std::to_string(::getpid());
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto ckpt = tmp / ("clink_handoff_sp_ckpt_" + tag);
+    const auto out = tmp / ("clink_handoff_sp_out_" + tag);
+    std::filesystem::remove_all(ckpt);
+    std::filesystem::remove(out);
+
+    // Ordinal 0: every subtask of the job waits here, the two sources included.
+    const clink::fault::ScopedFault guard(clink::fault::Rule{
+        .point = clink::fault::points::kWorkerBeforeChainParse,
+        .ordinal = 0,
+        .action = clink::fault::Action::Delay,
+        .arg = 1000,
+    });
+
+    clink::application::JobSubmitter submitter("127.0.0.1", port);
+    clink::application::SubmitOptions opts;
+    opts.wait_for_completion = false;
+    opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
+    opts.checkpoint.checkpoint_dir = ckpt.string();
+    // No periodic checkpoints: the savepoint is the only one under test.
+    opts.checkpoint.interval_ms = 0;
+    const auto r = submitter.submit(handoff_graph(out, 100'000).to_json(), {plugin.string()}, opts);
+    ASSERT_TRUE(r.ok) << r.reject_message;
+
+    // Its trigger is queued behind the job's Deploy, so the worker has the
+    // Deploy before the trigger and the subtasks have not parsed their chains.
+    const auto sp = coordinator.take_savepoint(r.job_id, clink::test_support::scale_slack(15s));
+    const auto completed = handoff_completed_ids(ckpt);
+    const bool cancelled = coordinator.cancel_job(r.job_id).ok;
+    const bool finished =
+        coordinator.await_job_completion(r.job_id, clink::test_support::scale_slack(30s));
+
+    // Gathered before the cluster stops, and asserted after.
+    const auto hits =
+        clink::fault::Registry::instance().hits(clink::fault::points::kWorkerBeforeChainParse);
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove_all(ckpt);
+    std::filesystem::remove(out);
+
+    // Vacuity: the two sources, the counter and the sink all waited.
+    EXPECT_GE(hits, 4U);
+    ASSERT_TRUE(sp.ok) << "the savepoint triggered before the sources parsed their chains never "
+                          "completed: "
+                       << sp.message;
+    EXPECT_EQ(completed.count(sp.checkpoint_id), 1U)
+        << "the savepoint reported checkpoint " << sp.checkpoint_id
+        << " but its COMPLETED marker is not there";
+    EXPECT_TRUE(cancelled);
+    EXPECT_TRUE(finished) << "the job did not finish after its cancel";
 }

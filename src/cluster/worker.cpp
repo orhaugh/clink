@@ -424,6 +424,14 @@ SubtaskRunner make_int64_int64_match_join_runner() {
     };
 }
 
+// Whether a generic subtask running `chain` hands the worker barrier
+// injectors: only the single-op source path of run_generic_subtask_ does. A
+// source fused into a chain registers none.
+bool registers_source_injectors(const OperatorChainSpec& chain) {
+    return chain.ops.size() == 1 && chain.ops[0].kind == OperatorKind::Source &&
+           !chain.fused_source.has_value() && !chain.fused_sink.has_value();
+}
+
 }  // namespace
 
 void register_builtin_joins(RunnerRegistry& rr) {
@@ -1766,6 +1774,25 @@ void Worker::handle_deploy_(MessageReader& r) {
         return;
     }
 
+    // The sources among the tasks, whose checkpoint triggers are held from
+    // here until each registers its barrier injectors: a savepoint is
+    // triggered as soon as the job is deployed, without waiting for its
+    // subtasks to report themselves listening, so its trigger can arrive
+    // before a source's thread has even parsed its chain. Each hold goes to
+    // the thread that runs its subtask. A chain spec that does not parse is
+    // left to fail its subtask, which reports it.
+    std::unordered_map<std::uint32_t, std::shared_ptr<HeldSourceTriggers>> held_for;
+    for (const auto& task : msg.tasks) {
+        if (task.role != kGenericSubtaskRole) {
+            continue;
+        }
+        try {
+            if (registers_source_injectors(OperatorChainSpec::from_json(task.extra_config))) {
+                held_for[task.subtask_idx] = std::make_shared<HeldSourceTriggers>();
+            }
+        } catch (const std::exception&) {
+        }
+    }
     {
         std::lock_guard lock(mu_);
         in_flight_tasks_ += msg.tasks.size();
@@ -1775,12 +1802,15 @@ void Worker::handle_deploy_(MessageReader& r) {
         // injects a checkpoint id the coordinator has already moved past
         // (observed: a restarted source persisting checkpoint-1..N.snap over
         // the files its restore point was about to be read from). None can:
-        // triggers are held per source subtask from the moment that subtask
-        // parses its chain (held_source_triggers_), which is after this
-        // Deploy, and every earlier incarnation's triggers arrived before it.
+        // each source's triggers are held from here (held_source_triggers_),
+        // in an entry this Deploy creates fresh, and every earlier
+        // incarnation's triggers arrived before it.
         for (const auto& task : msg.tasks) {
             const PendingKey key{msg.job_id, task.role, task.subtask_idx};
             pending_[key] = std::make_shared<PendingTask>();
+        }
+        for (const auto& [sub, held] : held_for) {
+            held_source_triggers_[msg.job_id][sub] = held;
         }
         // Stash this job's checkpoint config so the trigger handler
         // can find the right barrier injectors for the right job.
@@ -1823,6 +1853,11 @@ void Worker::handle_deploy_(MessageReader& r) {
         // pthread keeps its stack mapping.
         reap_finished_task_threads_locked_();
         auto done = std::make_shared<std::atomic<bool>>(false);
+        std::shared_ptr<HeldSourceTriggers> held;
+        if (auto h = held_for.find(task_subtask_idx);
+            h != held_for.end() && task_role == kGenericSubtaskRole) {
+            held = h->second;
+        }
         std::thread t([this,
                        jid,
                        task = std::move(task),
@@ -1835,7 +1870,8 @@ void Worker::handle_deploy_(MessageReader& r) {
                        adaptive,
                        expected_versions,
                        udfs,
-                       done] {
+                       done,
+                       held = std::move(held)] {
             // Set on EVERY exit path, including an exception escaping
             // run_task_: a thread that died is exactly the one whose
             // handle must be reclaimed.
@@ -1853,7 +1889,8 @@ void Worker::handle_deploy_(MessageReader& r) {
                       unaligned,
                       adaptive,
                       expected_versions,
-                      udfs);
+                      udfs,
+                      held);
         });
         task_threads_.push_back(
             TaskThread{std::move(t), std::move(done), jid, task_role, task_subtask_idx});
@@ -1933,7 +1970,33 @@ void Worker::run_task_(JobId job_id,
                        bool unaligned_checkpoints,
                        bool adaptive_barrier_mode,
                        const std::string& expected_state_versions_packed,
-                       const std::string& udfs_packed) {
+                       const std::string& udfs_packed,
+                       std::shared_ptr<HeldSourceTriggers> held_triggers) {
+    // The triggers the Deploy held for this subtask, if it is a source.
+    // Normally the source's registration takes the entry out; this covers a
+    // subtask that fails or is cancelled before its runner registers, and a
+    // runner that never does.
+    struct HeldTriggersRelease {
+        HeldTriggersRelease(Worker* w,
+                            JobId job,
+                            std::uint32_t sub_idx,
+                            std::shared_ptr<HeldSourceTriggers> h)
+            : worker(w), job_id(job), sub(sub_idx), held(std::move(h)) {}
+        Worker* worker;
+        JobId job_id;
+        std::uint32_t sub;
+        std::shared_ptr<HeldSourceTriggers> held;
+        ~HeldTriggersRelease() {
+            if (held) {
+                std::lock_guard lock(worker->mu_);
+                worker->release_held_source_triggers_locked_(job_id, sub, held);
+            }
+        }
+        HeldTriggersRelease(const HeldTriggersRelease&) = delete;
+        HeldTriggersRelease& operator=(const HeldTriggersRelease&) = delete;
+        HeldTriggersRelease(HeldTriggersRelease&&) = delete;
+        HeldTriggersRelease& operator=(HeldTriggersRelease&&) = delete;
+    } held_release{this, job_id, task.subtask_idx, held_triggers};
     metrics::worker::subtask_started();
     const auto task_start = std::chrono::steady_clock::now();
     bool had_error = false;
@@ -1963,7 +2026,8 @@ void Worker::run_task_(JobId job_id,
                                  restore_from_generation,
                                  unaligned_checkpoints,
                                  adaptive_barrier_mode,
-                                 expected_state_versions_packed);
+                                 expected_state_versions_packed,
+                                 held_triggers);
         } else {
             auto it = roles_.find(task.role);
             if (it == roles_.end()) {
@@ -2095,7 +2159,8 @@ void Worker::run_generic_subtask_(JobId job_id,
                                   std::uint32_t restore_from_generation,
                                   bool unaligned_ckpt,
                                   bool adaptive_barrier_mode,
-                                  const std::string& expected_state_versions_packed) {
+                                  const std::string& expected_state_versions_packed,
+                                  std::shared_ptr<HeldSourceTriggers> held_triggers) {
     // Built-in channels and op-runners must be present before we look
     // up TypeRegistry entries for bridge construction. Idempotent.
     ensure_built_ins_registered();
@@ -2142,6 +2207,7 @@ void Worker::run_generic_subtask_(JobId job_id,
     }
     const auto& bundle_tr = *job_tr;
 
+    CLINK_FAULT_POINT(clink::fault::points::kWorkerBeforeChainParse);
     // 1. Parse the OperatorChainSpec embedded by the JobPlanner. A bare
     // parser message ("TAPE_ERROR: ...") with no payload is unactionable, so
     // name the artefact and carry a bounded excerpt of what arrived.
@@ -2175,42 +2241,11 @@ void Worker::run_generic_subtask_(JobId job_id,
     // A source hands the worker its barrier injectors only once its runner is
     // built, after the PeerUpdate this subtask is about to ask for, while the
     // coordinator triggers checkpoints from the moment that PeerUpdate goes
-    // out. Hold every trigger for it from here, ahead of the SubtaskListening
-    // below, so it emits the same barriers as its siblings however late it
-    // registers (held_source_triggers_). The runner that registers injectors
-    // is the single-op source path below; a source fused into a chain does
-    // not register any.
-    std::shared_ptr<HeldSourceTriggers> held_triggers;
-    if (chain.ops.size() == 1 && op.kind == OperatorKind::Source &&
-        !chain.fused_source.has_value() && !chain.fused_sink.has_value()) {
-        held_triggers = std::make_shared<HeldSourceTriggers>();
-        std::lock_guard lock(mu_);
-        held_source_triggers_[job_id][task.subtask_idx] = held_triggers;
-    }
-    // Normally the registration takes the entry out; this covers a subtask
-    // that fails or is cancelled before its runner registers, and a runner
-    // that never does.
-    struct HeldTriggersRelease {
-        HeldTriggersRelease(Worker* w,
-                            JobId job,
-                            std::uint32_t sub_idx,
-                            std::shared_ptr<HeldSourceTriggers> h)
-            : worker(w), job_id(job), sub(sub_idx), held(std::move(h)) {}
-        Worker* worker;
-        JobId job_id;
-        std::uint32_t sub;
-        std::shared_ptr<HeldSourceTriggers> held;
-        ~HeldTriggersRelease() {
-            if (held) {
-                std::lock_guard lock(worker->mu_);
-                worker->release_held_source_triggers_locked_(job_id, sub, held);
-            }
-        }
-        HeldTriggersRelease(const HeldTriggersRelease&) = delete;
-        HeldTriggersRelease& operator=(const HeldTriggersRelease&) = delete;
-        HeldTriggersRelease(HeldTriggersRelease&&) = delete;
-        HeldTriggersRelease& operator=(HeldTriggersRelease&&) = delete;
-    } held_release{this, job_id, task.subtask_idx, held_triggers};
+    // out, and a savepoint from the moment the job is deployed. The Deploy
+    // has held every trigger for it since (held_triggers,
+    // held_source_triggers_), so it emits the same barriers as its siblings
+    // however late it registers; registers_source_injectors() decided which
+    // subtasks get a hold, from this same chain spec.
 
     // 2. Bind one NetworkBridgeSource per input edge. With multi-input
     // (union/join), each upstream connects to a distinct port on this
@@ -2565,8 +2600,8 @@ void Worker::run_generic_subtask_(JobId job_id,
             // Callback the source runner uses to register its barrier
             // injectors with the worker. Multiple subtasks per (job, sub_idx)
             // would overwrite; in v1 each subtask has at most one set.
-            // Registration injects every trigger held for this source since it
-            // parsed its chain (held_source_triggers_), oldest first, and does
+            // Registration injects every trigger held for this source since its
+            // Deploy (held_source_triggers_), oldest first, and does
             // it under the lock: a trigger the reader thread handles after
             // this registration is injected after it, so this source's
             // barriers stay in trigger order. Injection only queues the

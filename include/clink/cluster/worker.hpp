@@ -239,6 +239,9 @@ private:
 
     void handle_deploy_(MessageReader& r);
     void handle_peer_update_(MessageReader& r);
+    // Checkpoint triggers held for a subtask; defined with
+    // held_source_triggers_ below.
+    struct HeldSourceTriggers;
     void run_task_(JobId job_id,
                    const DeploymentTask& task,
                    const std::string& checkpoint_dir,
@@ -249,7 +252,8 @@ private:
                    bool unaligned_checkpoints,
                    bool adaptive_barrier_mode,
                    const std::string& expected_state_versions_packed,
-                   const std::string& udfs_packed = {});
+                   const std::string& udfs_packed = {},
+                   std::shared_ptr<HeldSourceTriggers> held_triggers = {});
     void run_generic_subtask_(JobId job_id,
                               const DeploymentTask& task,
                               const std::string& checkpoint_dir,
@@ -259,7 +263,8 @@ private:
                               std::uint32_t restore_from_generation,
                               bool unaligned_checkpoints,
                               bool adaptive_barrier_mode,
-                              const std::string& expected_state_versions_packed);
+                              const std::string& expected_state_versions_packed,
+                              std::shared_ptr<HeldSourceTriggers> held_triggers);
     void handle_trigger_checkpoint_(MessageReader& r);
     void handle_commit_checkpoint_(MessageReader& r);
     // The dispatch body handle_commit_checkpoint_ enqueues: sink commit
@@ -456,25 +461,28 @@ private:
     std::unordered_map<JobId, std::unordered_map<std::uint32_t, SubtaskInjectors>>
         per_job_injectors_;
 
-    // Checkpoint triggers held for a source subtask until it hands the worker
-    // its barrier injectors. A source registers them only once its runner is
-    // built, after the PeerUpdate, and the coordinator triggers from the
-    // moment that PeerUpdate goes out. So each source puts an entry here
-    // before its SubtaskListening lets the PeerUpdate go, every trigger for
-    // the job lands in it until the source registers, and registration
-    // injects them in the order they came: every source of the job emits the
-    // same barriers, however late it comes up. The worker used to queue only
-    // the newest trigger, and only while no source of the job had registered,
-    // replaying it into whichever registered first; a sibling that registered
-    // later never emitted that checkpoint's barrier, and every operator
-    // merging the two paused its other inputs to wait for it, for ever.
+    // Checkpoint triggers held for a subtask until it hands the worker its
+    // barrier injectors. A source registers them only once its runner is
+    // built, after the PeerUpdate, while the coordinator triggers periodic
+    // checkpoints from the moment that PeerUpdate goes out, and a savepoint
+    // from the moment the job is deployed. So the Deploy puts an entry here
+    // for every subtask whose chain registers injectors (the single-op source
+    // path, registers_source_injectors() in worker.cpp) before its thread
+    // starts, every trigger for the job lands in it, and the source's
+    // registration injects the triggers in the order they came: every source
+    // of the job emits the same barriers, however late it comes up. The
+    // worker used to queue only the newest trigger, and only while no source
+    // of the job had registered, replaying it into whichever registered
+    // first; a sibling that registered later never emitted that checkpoint's
+    // barrier, and every operator merging the two paused its other inputs to
+    // wait for it, for ever.
     //
     // Generation-stamped, so registration re-validates each against the
     // CURRENT deploy: replaying a trigger stamped for an old generation into a
     // new one is the follow-up 49 leftover (F84). The barrier mode rides along
     // so a held trigger injects the barrier the direct path would. Keyed by
-    // (job_id, subtask_idx); the subtask run that created an entry holds it
-    // too, and only that run removes it, so a later run of the same index
+    // (job_id, subtask_idx); the Deploy hands each entry to the subtask run it
+    // starts, and only that run removes it, so a later run of the same index
     // never inherits it. Bounded (kMaxHeldSourceTriggers, oldest dropped), so
     // a source whose runner never registers cannot grow it for its lifetime.
     struct HeldTrigger {

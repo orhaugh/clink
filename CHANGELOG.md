@@ -11,10 +11,13 @@ arrived before either was replayed into whichever registered first; the other
 never emitted that checkpoint's barrier, and every operator merging the two
 waited for it for good. The Kafka broker-outage recovery gate stalled this way
 after a redeploy, with every channel downstream of the merge empty. A worker now
-holds every trigger for each source subtask from the moment it parses its chain
-until it registers, then injects them in order, with the barrier mode each was
-issued with. The new `worker.before_source_injectors` fault point holds a
-source's registration, which is how the test reproduces it.
+holds every trigger for each source subtask from the moment it accepts the
+job's Deploy until the source registers, then injects them in order, with the
+barrier mode each was issued with. A savepoint is held the same way: it is
+triggered as soon as the job is deployed, before any source has come up. The
+new `worker.before_source_injectors` and `worker.before_chain_parse` fault
+points hold a source's registration and a subtask's start, which is how the
+tests reproduce both.
 
 **An operator that merges several inputs no longer stops for good when one of
 them skips a checkpoint.** Barriers reach an input in id order, so an input that

@@ -459,6 +459,12 @@ inline constexpr char kWorkerAfterTriggerDelivered[] = "worker.after_trigger_del
 // which is the window in which a trigger reached only the sources registered
 // by then and the late one never emitted that checkpoint's barrier.
 inline constexpr char kWorkerBeforeSourceInjectors[] = "worker.before_source_injectors";
+// A generic subtask's thread has started and is about to parse its operator
+// chain, so the worker has accepted its Deploy but the subtask does not yet know
+// whether it is a source. A Delay here holds it in that window, which only a
+// savepoint trigger can reach: the periodic loop waits for every subtask to
+// report itself listening, and a savepoint does not.
+inline constexpr char kWorkerBeforeChainParse[] = "worker.before_chain_parse";
 // A CommitCheckpoint has been taken off the worker's dispatch queue and is
 // about to reach the subtasks' commit callbacks, on the commit-dispatch thread,
 // while the reader goes on handling frames. A Block here is a dispatch that
