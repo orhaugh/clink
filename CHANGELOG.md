@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## v0.12.2 (October 2026)
+
+A fix for a job that could stop for good after it deployed or restarted, while
+still reporting itself running. A checkpoint trigger that reached a worker
+before all of the job's sources there had come up was emitted by some sources
+and not by others, and every operator merging them waited for the missing
+barrier. The job stopped producing output; nothing it had committed was lost or
+duplicated. This was the intermittent stall of the Kafka broker-outage recovery
+test that the v0.12.0 notes disclosed. There are no state-format, API or
+wire-protocol changes. The plugin ABI fingerprint changes: the merge fix is in
+headers compiled into every job module, so modules built against v0.12.1 or
+earlier must be rebuilt against v0.12.2, and a cluster refuses an old one at
+submission, naming the headers that differ.
 
 **Every source of a job emits every checkpoint's barrier, however late it comes
 up.** A worker hands each checkpoint trigger to the barrier injectors its source
