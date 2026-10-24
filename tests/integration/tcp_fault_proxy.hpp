@@ -6,7 +6,15 @@
 // It forwards bytes unchanged until told otherwise, and then can:
 //   * drop every open connection with a reset (drop_all);
 //   * refuse: reset every open connection and every new one at once, the
-//     local model of a server that is down or unreachable (set_refusing);
+//     local model of a server that is down or unreachable (set_refusing).
+//     A new connection is accepted and then reset, so the client's connect
+//     succeeds and a request it writes at once can land before the reset:
+//     the client sees a reply lost after its request was sent, not a refused
+//     connection. A protocol that writes its request straight after connect
+//     (HTTP) can therefore record an attempt's outcome as unknown. A test
+//     that asserts every attempt was refused unsent closes the proxy
+//     instead, so nothing listens and connect itself fails (the Neo4j sink's
+//     outage test does);
 //   * blackhole: keep the connections open but forward nothing either way,
 //     so the client waits on its own timeouts (set_blackhole);
 //   * cut an INSERT mid-upload: once the server's reply to an INSERT
