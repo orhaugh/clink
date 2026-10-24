@@ -2368,6 +2368,39 @@ std::string compile_node(const LogicalPlan& node,
         }
         std::string left_id = compile_node(un.left(), ch, spec, next_id, async_agg);
         std::string right_id = compile_node(un.right(), ch, spec, next_id, async_agg);
+        // UNION ALL matches columns by position, and its rows take the
+        // union's own column names. A Row carries its fields by name, so a
+        // side whose names differ is renamed on its way in; union_row passes
+        // rows through, and a side that reached it under its own names
+        // arrived with every column whose name differed missing, read
+        // downstream as NULL.
+        const auto rename_to_union = [&](std::string side_id, const LogicalPlan& side) {
+            const auto from = side.schema();
+            const auto to = un.schema();
+            if (from == nullptr || to == nullptr || from->num_fields() != to->num_fields() ||
+                from->field_names() == to->field_names()) {
+                return side_id;
+            }
+            const auto csv = [](const std::vector<std::string>& names) {
+                std::string out;
+                for (const auto& n : names) {
+                    out += (out.empty() ? "" : ",") + n;
+                }
+                return out;
+            };
+            cluster::OperatorSpec bind;
+            bind.id = "unibind_" + std::to_string(next_id++);
+            bind.type = "row_bind_columns";
+            bind.inputs = {std::move(side_id)};
+            bind.out_channel = std::string{kChannelRow};
+            bind.params["select_columns"] = csv(from->field_names());
+            bind.params["sink_columns"] = csv(to->field_names());
+            std::string id = bind.id;
+            spec.ops.push_back(std::move(bind));
+            return id;
+        };
+        left_id = rename_to_union(std::move(left_id), un.left());
+        right_id = rename_to_union(std::move(right_id), un.right());
         cluster::OperatorSpec op;
         op.id = "uni_" + std::to_string(next_id++);
         op.type = "union_row";

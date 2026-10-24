@@ -10087,6 +10087,73 @@ TEST(SqlRuntime, UnionAllMergesTwoFileSources) {
     std::filesystem::remove(out_path);
 }
 
+// UNION ALL matches columns by position: a row from the right side reaches
+// the sink under the union's column names, whatever the right side calls
+// them. The right side used to keep its own names, so every column whose
+// name differed from the left's arrived missing and was written as NULL.
+TEST(SqlRuntime, UnionAllMatchesColumnsByPositionNotName) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(::getpid());
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto a_path = dir / ("clink_sql_union_pos_a_" + tag + ".ndjson");
+    const auto b_path = dir / ("clink_sql_union_pos_b_" + tag + ".ndjson");
+    const auto out_path = dir / ("clink_sql_union_pos_out_" + tag + ".ndjson");
+    std::filesystem::remove(out_path);
+    write_lines(a_path, {R"({"id":1,"url":"a1"})", R"({"id":2,"url":"a2"})"});
+    write_lines(b_path, {R"({"ident":10,"link":"b1"})", R"({"ident":20,"link":"b2"})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE a (id BIGINT, url TEXT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     a_path.string() +
+                     "');"
+                     "CREATE TABLE b (ident BIGINT, link TEXT) "
+                     "WITH (connector='file', format='json', path='" +
+                     b_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (id BIGINT, url TEXT, n BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    // The right side renames one column, keeps one under another name, and
+    // computes the third.
+    auto spec = compile(cat,
+                        "INSERT INTO out_t "
+                        "SELECT id, url, id * 2 AS n FROM a UNION ALL "
+                        "SELECT ident AS id, link, ident * 2 FROM b");
+
+    InProcessCluster cluster("worker-sql-union-pos", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::set<std::string> got;
+    for (const auto& l : read_lines(out_path)) {
+        const auto js = clink::config::parse(l);
+        const auto& o = js.as_object();
+        const auto text = [&](const char* k) {
+            const auto it = o.find(k);
+            if (it == o.end() || it->second.is_null()) {
+                return std::string{"NULL"};
+            }
+            return it->second.is_string()
+                       ? it->second.as_string()
+                       : std::to_string(static_cast<std::int64_t>(it->second.as_number()));
+        };
+        got.insert(text("id") + "|" + text("url") + "|" + text("n"));
+    }
+    EXPECT_EQ(got, (std::set<std::string>{"1|a1|2", "2|a2|4", "10|b1|20", "20|b2|40"}));
+
+    std::filesystem::remove(a_path);
+    std::filesystem::remove(b_path);
+    std::filesystem::remove(out_path);
+}
+
 // Set operations UNION (distinct) / INTERSECT / EXCEPT. Duplicates
 // within a side are eliminated; EXCEPT is a changelog (a left row is
 // retracted when the right side later produces it), so we replay the

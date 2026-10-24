@@ -638,6 +638,7 @@ A wasm UDAF works anywhere a built-in aggregate does, including windowed
 
 `UNION` (distinct), `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT` and
 `EXCEPT ALL` combine two queries; the branches must match in column count and type.
+Columns match by position, and the result takes the first query's column names.
 
 `ORDER BY` requires a `LIMIT` at the top level (an unbounded sort has no meaning on
 a stream), and its columns must be in the `SELECT` output. `LIMIT n [OFFSET m]`

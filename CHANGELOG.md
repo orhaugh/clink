@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**`UNION ALL` matches columns by position.** A row from the second query of a
+union kept its own column names, so every column whose name differed from the
+first query's reached the sink missing and was written as NULL: in
+`SELECT id, url FROM a UNION ALL SELECT ident, link FROM b`, each of `b`'s rows
+came out with `id` and `url` NULL. The second query's rows now take the union's
+column names by position, as SQL defines it, and a query whose names already
+match is planned as before.
+
 **A Kafka table can be read once per job.** With `shared_reader='true'`, every
 statement of a statement set that reads the table, and a query that reads it
 twice, take one consumer between them: they read the same stream, cut at the

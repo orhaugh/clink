@@ -1223,6 +1223,40 @@ TEST(SqlPhysical, SharedReaderIsRefusedOffKafkaAndOutsideItsValues) {
     EXPECT_NE(bad_value.find("shared_reader"), std::string::npos) << bad_value;
 }
 
+// A union side whose column names differ from the union's is renamed by
+// position on its way in; a side whose names match passes as it is.
+TEST(SqlPhysical, AUnionSideIsRenamedToTheUnionsColumnsOnlyWhenItsNamesDiffer) {
+    const Catalog cat = kafka_catalog("");
+    PhysicalPlanner pp;
+    const auto spec = pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat,
+                     "INSERT INTO announced SELECT id, ts FROM transfers UNION ALL "
+                     "SELECT dst, ts FROM transfers")));
+    const auto unions = ops_of(spec, "union_row");
+    ASSERT_EQ(unions.size(), 1U);
+    std::vector<const cluster::OperatorSpec*> binds;
+    for (const auto& in : unions.front()->inputs) {
+        for (const auto& op : spec.ops) {
+            if (op.id == in && op.type == "row_bind_columns") {
+                binds.push_back(&op);
+            }
+        }
+    }
+    ASSERT_EQ(binds.size(), 1U) << "only the side named dst is renamed";
+    EXPECT_EQ(binds.front()->params.at("select_columns"), "dst,ts");
+    EXPECT_EQ(binds.front()->params.at("sink_columns"), "id,ts");
+
+    const auto same = pp.compile(static_cast<const LogicalSink&>(
+        *bind_insert(cat,
+                     "INSERT INTO announced SELECT id, ts FROM transfers UNION ALL "
+                     "SELECT id, ts FROM transfers")));
+    for (const auto& in : ops_of(same, "union_row").front()->inputs) {
+        for (const auto& op : same.ops) {
+            EXPECT_FALSE(op.id == in && op.type == "row_bind_columns") << in;
+        }
+    }
+}
+
 // M1: connector='clickhouse' SINK lowers to clickhouse_sink (string channel) via
 // the row_to_json_string bridge, with format=jsoneachrow FORCED by the binding
 // (the SQL format='json' channel selector is stripped before the factory).
