@@ -456,17 +456,44 @@ private:
     std::unordered_map<JobId, std::unordered_map<std::uint32_t, SubtaskInjectors>>
         per_job_injectors_;
 
-    // Triggers that arrived before any source registered injectors for
-    // the job. Drained on the first register_source_injectors() call for
-    // that job. Avoids the deploy/trigger race where the coordinator fires a
-    // periodic checkpoint while the worker is still bringing up the chain.
-    // Queued (checkpoint_id, generation) pairs. Generation-stamped so the
-    // replay-at-registration path can re-validate against the CURRENT deploy:
-    // a deploy may land between queueing and replay, and replaying a trigger
-    // stamped for the old generation into the new one is the follow-up 49
-    // leftover (F84).
-    std::unordered_map<JobId, std::vector<std::pair<std::uint64_t, std::uint64_t>>>
-        pending_triggers_;
+    // Checkpoint triggers held for a source subtask until it hands the worker
+    // its barrier injectors. A source registers them only once its runner is
+    // built, after the PeerUpdate, and the coordinator triggers from the
+    // moment that PeerUpdate goes out. So each source puts an entry here
+    // before its SubtaskListening lets the PeerUpdate go, every trigger for
+    // the job lands in it until the source registers, and registration
+    // injects them in the order they came: every source of the job emits the
+    // same barriers, however late it comes up. The worker used to queue only
+    // the newest trigger, and only while no source of the job had registered,
+    // replaying it into whichever registered first; a sibling that registered
+    // later never emitted that checkpoint's barrier, and every operator
+    // merging the two paused its other inputs to wait for it, for ever.
+    //
+    // Generation-stamped, so registration re-validates each against the
+    // CURRENT deploy: replaying a trigger stamped for an old generation into a
+    // new one is the follow-up 49 leftover (F84). The barrier mode rides along
+    // so a held trigger injects the barrier the direct path would. Keyed by
+    // (job_id, subtask_idx); the subtask run that created an entry holds it
+    // too, and only that run removes it, so a later run of the same index
+    // never inherits it. Bounded (kMaxHeldSourceTriggers, oldest dropped), so
+    // a source whose runner never registers cannot grow it for its lifetime.
+    struct HeldTrigger {
+        std::uint64_t checkpoint_id{0};
+        std::uint64_t generation{0};
+        std::uint8_t barrier_mode_plus1{0};
+    };
+    struct HeldSourceTriggers {
+        std::vector<HeldTrigger> triggers;
+    };
+    static constexpr std::size_t kMaxHeldSourceTriggers = 256;
+    std::unordered_map<JobId,
+                       std::unordered_map<std::uint32_t, std::shared_ptr<HeldSourceTriggers>>>
+        held_source_triggers_;
+    // Under mu_: drop the job's held-trigger entry for `sub` if it is still
+    // `held`, the one this subtask run created.
+    void release_held_source_triggers_locked_(JobId job_id,
+                                              std::uint32_t sub,
+                                              const std::shared_ptr<HeldSourceTriggers>& held);
     // The generation each job is currently deployed at on this worker (F84).
     std::unordered_map<JobId, std::uint64_t> per_job_generation_;
 

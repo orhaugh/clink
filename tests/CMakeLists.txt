@@ -116,6 +116,7 @@ add_executable(clink_core_tests
     test_sink_chain_ownership.cpp
     test_commit_teardown_fence.cpp
     test_checkpoint_completion.cpp
+    test_source_trigger_handoff.cpp
     test_protocol_trace.cpp
     test_checkpoint_retention_e2e.cpp
     test_restart_drain_readiness.cpp

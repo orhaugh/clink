@@ -452,6 +452,13 @@ inline constexpr char kWorkerBeforeSubtaskFinished[] = "worker.before_subtask_fi
 // the window in which a takeover that numbered only above the files it could
 // see reused the id.
 inline constexpr char kWorkerAfterTriggerDelivered[] = "worker.after_trigger_delivered";
+// A source subtask is about to hand its barrier injectors to the worker, on its
+// task thread, after the PeerUpdate and before its runner starts. A Delay here
+// is a source slow to come up beside a sibling of the same job on the same
+// worker: checkpoint triggers arrive while it has no injectors registered,
+// which is the window in which a trigger reached only the sources registered
+// by then and the late one never emitted that checkpoint's barrier.
+inline constexpr char kWorkerBeforeSourceInjectors[] = "worker.before_source_injectors";
 // A CommitCheckpoint has been taken off the worker's dispatch queue and is
 // about to reach the subtasks' commit callbacks, on the commit-dispatch thread,
 // while the reader goes on handling frames. A Block here is a dispatch that

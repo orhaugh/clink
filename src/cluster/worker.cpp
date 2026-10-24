@@ -1568,14 +1568,13 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
         }
         return;
     }
-    // Snapshot per-job injectors under the lock; release before
-    // invoking so injection (which pushes into BoundedChannels and may
-    // block) doesn't contend with deploy / peer-update bookkeeping.
-    // If no sources have registered yet for the job, queue the trigger
-    // so the first registration can replay it. This eliminates the race
-    // where the coordinator fires a periodic trigger while the chain is still
-    // coming up locally.
+    // Snapshot per-job injectors under the lock and invoke them after it, so
+    // injection does not contend with deploy / peer-update bookkeeping. A
+    // source of the job that has not registered its injectors yet gets the
+    // trigger held for it instead (held_source_triggers_), and injected when
+    // it registers.
     std::vector<RunnerContext::SourceInjectorFn> to_invoke;
+    bool held = false;
     {
         std::lock_guard lock(mu_);
         // Generation fence (F84). A trigger issued against one topology and
@@ -1597,29 +1596,51 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
                 return;
             }
         }
-        auto job_it = per_job_injectors_.find(msg.job_id);
-        if (job_it == per_job_injectors_.end() || job_it->second.empty()) {
-            // Keep only the NEWEST queued trigger. Checkpoint N subsumes
-            // N-1, so replaying one barrier is all the leading-interval
-            // race needs - and a worker that hosts no source for this job
-            // (its injectors never register) otherwise accumulates the
-            // job's entire trigger history. A restarted deployment landing
-            // on such a worker had that backlog replayed into its restored
-            // sources from id 1: dozens of stale barriers re-persisted
-            // snapshot files the pre-restart run had already written
-            // (clobbering the restore point's offsets with post-restore
-            // ones) and pre-committed the 2PC sink under checkpoint ids
-            // the coordinator had already retired, wedging it against its
-            // commit-wait bound.
-            auto& q = pending_triggers_[msg.job_id];
-            q.clear();
-            q.push_back({msg.checkpoint_id, msg.generation});
+        if (auto job_it = per_job_injectors_.find(msg.job_id); job_it != per_job_injectors_.end()) {
+            for (auto& [sub_idx, entry] : job_it->second) {
+                for (auto& fn : entry.injectors) {
+                    to_invoke.push_back(fn);
+                }
+            }
+        }
+        if (auto held_it = held_source_triggers_.find(msg.job_id);
+            held_it != held_source_triggers_.end()) {
+            for (auto& [sub_idx, entry] : held_it->second) {
+                auto& triggers = entry->triggers;
+                if (triggers.size() >= kMaxHeldSourceTriggers) {
+                    triggers.erase(triggers.begin());
+                }
+                triggers.push_back(HeldTrigger{.checkpoint_id = msg.checkpoint_id,
+                                               .generation = msg.generation,
+                                               .barrier_mode_plus1 = msg.barrier_mode_plus1});
+                held = true;
+            }
+        }
+        if (to_invoke.empty() && !held) {
+            // No source of this job runs on this worker, registered or still
+            // coming up, so there is nothing to deliver the barrier to. A
+            // source deployed here later belongs to a later deployment, which
+            // this trigger is not part of. Keeping it would be the defect the
+            // old per-job queue had to guard against: a worker with no source
+            // of the job accumulated its trigger history, and a restarted
+            // deployment landing here replayed it into its restored sources
+            // from id 1, re-persisting snapshot files the earlier run had
+            // written and pre-committing the 2PC sink under retired ids.
             return;
         }
-        for (auto& [sub_idx, entry] : job_it->second) {
-            for (auto& fn : entry.injectors) {
-                to_invoke.push_back(fn);
-            }
+        // Traced before any injection, not after: an injected barrier can
+        // reach a sink and be prepared before this thread runs again, and the
+        // trace must show the delivery ahead of the prepare it causes. Under
+        // the lock, because a source that registers the moment it is released
+        // injects a held trigger on its own thread.
+        if (protocol_trace::enabled()) {
+            protocol_trace::Event("DeliverBarrier")
+                .u("job", msg.job_id)
+                .u("ckpt", msg.checkpoint_id)
+                .u("epoch", msg.coordinator_epoch)
+                .s("worker", worker_id_)
+                .b("fenced", false)
+                .emit();
         }
     }
     // Per-trigger barrier mode (adaptive checkpoints). When the
@@ -1630,18 +1651,6 @@ void Worker::handle_trigger_checkpoint_(MessageReader& r) {
     const auto barrier_mode = msg.barrier_mode_plus1 == 2 ? CheckpointBarrier::Mode::Unaligned
                                                           : CheckpointBarrier::Mode::Aligned;
     CheckpointBarrier barrier(CheckpointId{msg.checkpoint_id}, barrier_mode);
-    // Traced before the injection, not after: an injected barrier can reach a
-    // sink and be prepared before this thread runs again, and the trace must
-    // show the delivery ahead of the prepare it causes.
-    if (protocol_trace::enabled()) {
-        protocol_trace::Event("DeliverBarrier")
-            .u("job", msg.job_id)
-            .u("ckpt", msg.checkpoint_id)
-            .u("epoch", msg.coordinator_epoch)
-            .s("worker", worker_id_)
-            .b("fenced", false)
-            .emit();
-    }
     for (auto& fn : to_invoke) {
         try {
             fn(barrier);
@@ -1761,17 +1770,14 @@ void Worker::handle_deploy_(MessageReader& r) {
         std::lock_guard lock(mu_);
         in_flight_tasks_ += msg.tasks.size();
         deployed_ = true;
-        // A Deploy starts a fresh incarnation of the job on this worker:
-        // any trigger queued against a previous incarnation is stale, and
-        // replaying it into the new deployment's sources injects a
-        // checkpoint id the coordinator has already moved past (observed:
-        // a restarted source persisting checkpoint-1..N.snap over the
-        // files its restore point was about to be read from). The
-        // coordinator's next periodic trigger arrives within one interval,
-        // so dropping the backlog costs nothing. Triggers that land AFTER
-        // this Deploy and before the sources register still queue and
-        // replay - that is the leading-interval race the queue exists for.
-        pending_triggers_.erase(msg.job_id);
+        // A Deploy starts a fresh incarnation of the job on this worker, and
+        // no trigger of an earlier one may reach its sources: replaying one
+        // injects a checkpoint id the coordinator has already moved past
+        // (observed: a restarted source persisting checkpoint-1..N.snap over
+        // the files its restore point was about to be read from). None can:
+        // triggers are held per source subtask from the moment that subtask
+        // parses its chain (held_source_triggers_), which is after this
+        // Deploy, and every earlier incarnation's triggers arrived before it.
         for (const auto& task : msg.tasks) {
             const PendingKey key{msg.job_id, task.role, task.subtask_idx};
             pending_[key] = std::make_shared<PendingTask>();
@@ -2054,6 +2060,7 @@ void Worker::run_task_(JobId job_id,
             per_job_group_cutovers_.erase(job_id);
             per_job_rebinds_.erase(job_id);
             per_job_injectors_.erase(job_id);
+            held_source_triggers_.erase(job_id);
         }
     }
 
@@ -2164,6 +2171,46 @@ void Worker::run_generic_subtask_(JobId job_id,
     // For chains of length >= 2 we fold the ops into a single
     // Operator<chain_in, chain_out> via repeated ChainedOperator.
     const auto& op = chain.ops[0];
+
+    // A source hands the worker its barrier injectors only once its runner is
+    // built, after the PeerUpdate this subtask is about to ask for, while the
+    // coordinator triggers checkpoints from the moment that PeerUpdate goes
+    // out. Hold every trigger for it from here, ahead of the SubtaskListening
+    // below, so it emits the same barriers as its siblings however late it
+    // registers (held_source_triggers_). The runner that registers injectors
+    // is the single-op source path below; a source fused into a chain does
+    // not register any.
+    std::shared_ptr<HeldSourceTriggers> held_triggers;
+    if (chain.ops.size() == 1 && op.kind == OperatorKind::Source &&
+        !chain.fused_source.has_value() && !chain.fused_sink.has_value()) {
+        held_triggers = std::make_shared<HeldSourceTriggers>();
+        std::lock_guard lock(mu_);
+        held_source_triggers_[job_id][task.subtask_idx] = held_triggers;
+    }
+    // Normally the registration takes the entry out; this covers a subtask
+    // that fails or is cancelled before its runner registers, and a runner
+    // that never does.
+    struct HeldTriggersRelease {
+        HeldTriggersRelease(Worker* w,
+                            JobId job,
+                            std::uint32_t sub_idx,
+                            std::shared_ptr<HeldSourceTriggers> h)
+            : worker(w), job_id(job), sub(sub_idx), held(std::move(h)) {}
+        Worker* worker;
+        JobId job_id;
+        std::uint32_t sub;
+        std::shared_ptr<HeldSourceTriggers> held;
+        ~HeldTriggersRelease() {
+            if (held) {
+                std::lock_guard lock(worker->mu_);
+                worker->release_held_source_triggers_locked_(job_id, sub, held);
+            }
+        }
+        HeldTriggersRelease(const HeldTriggersRelease&) = delete;
+        HeldTriggersRelease& operator=(const HeldTriggersRelease&) = delete;
+        HeldTriggersRelease(HeldTriggersRelease&&) = delete;
+        HeldTriggersRelease& operator=(HeldTriggersRelease&&) = delete;
+    } held_release{this, job_id, task.subtask_idx, held_triggers};
 
     // 2. Bind one NetworkBridgeSource per input edge. With multi-input
     // (union/join), each upstream connects to a distinct port on this
@@ -2518,63 +2565,55 @@ void Worker::run_generic_subtask_(JobId job_id,
             // Callback the source runner uses to register its barrier
             // injectors with the worker. Multiple subtasks per (job, sub_idx)
             // would overwrite; in v1 each subtask has at most one set.
-            // On first registration we replay any triggers the coordinator fired
-            // before the chain was ready, so periodic checkpoints never
-            // drop the leading interval.
-            auto register_injectors = [this, job_id, sub = task.subtask_idx](
+            // Registration injects every trigger held for this source since it
+            // parsed its chain (held_source_triggers_), oldest first, and does
+            // it under the lock: a trigger the reader thread handles after
+            // this registration is injected after it, so this source's
+            // barriers stay in trigger order. Injection only queues the
+            // barrier for the source's runner, so it is cheap to hold the
+            // lock across. The DeliverBarrier trace line for each was written
+            // when the trigger arrived.
+            auto register_injectors = [this, job_id, sub = task.subtask_idx, held_triggers](
                                           std::vector<RunnerContext::SourceInjectorFn> injectors) {
-                std::vector<std::pair<std::uint64_t, std::uint64_t>> replay;
-                std::vector<RunnerContext::SourceInjectorFn> snapshot;
-                std::uint64_t current_gen = 0;
-                {
-                    std::lock_guard lock(mu_);
-                    auto& entry = per_job_injectors_[job_id][sub];
-                    entry.injectors = std::move(injectors);
-                    auto pt_it = pending_triggers_.find(job_id);
-                    if (pt_it != pending_triggers_.end()) {
-                        replay = std::move(pt_it->second);
-                        pending_triggers_.erase(pt_it);
-                    }
-                    if (!replay.empty()) {
-                        snapshot = entry.injectors;
-                        if (auto g = per_job_generation_.find(job_id);
-                            g != per_job_generation_.end()) {
-                            current_gen = g->second;
-                        }
-                    }
+                CLINK_FAULT_POINT(clink::fault::points::kWorkerBeforeSourceInjectors);
+                std::lock_guard lock(mu_);
+                auto& entry = per_job_injectors_[job_id][sub];
+                entry.injectors = std::move(injectors);
+                if (!held_triggers) {
+                    return;
                 }
-                for (auto [ckpt_id, trig_gen] : replay) {
+                release_held_source_triggers_locked_(job_id, sub, held_triggers);
+                std::uint64_t current_gen = 0;
+                if (auto g = per_job_generation_.find(job_id); g != per_job_generation_.end()) {
+                    current_gen = g->second;
+                }
+                for (const auto& t : held_triggers->triggers) {
                     // Re-validate at REPLAY time (F84): a deploy can land between
-                    // queueing and this drain, and a trigger stamped for the old
+                    // holding and this drain, and a trigger stamped for the old
                     // generation replayed into the new one writes the old id into
                     // the new generation's directories.
-                    if (trig_gen != 0 && current_gen != 0 && trig_gen != current_gen) {
+                    if (t.generation != 0 && current_gen != 0 && t.generation != current_gen) {
                         log::warn("worker.checkpoint",
-                                  "dropping queued checkpoint trigger " + std::to_string(ckpt_id) +
-                                      " for job " + std::to_string(job_id) +
-                                      ": stamped generation " + std::to_string(trig_gen) +
-                                      ", deployed generation " + std::to_string(current_gen));
+                                  "dropping held checkpoint trigger " +
+                                      std::to_string(t.checkpoint_id) + " for job " +
+                                      std::to_string(job_id) + ": stamped generation " +
+                                      std::to_string(t.generation) + ", deployed generation " +
+                                      std::to_string(current_gen));
                         continue;
                     }
-                    CheckpointBarrier barrier(CheckpointId{ckpt_id});
-                    // Traced before the injection, as in handle_trigger_checkpoint_.
-                    if (protocol_trace::enabled()) {
-                        protocol_trace::Event("DeliverBarrier")
-                            .u("job", job_id)
-                            .u("ckpt", ckpt_id)
-                            .u("epoch", bound_epoch_.load(std::memory_order_acquire))
-                            .s("worker", worker_id_)
-                            .b("fenced", false)
-                            .emit();
-                    }
-                    for (auto& fn : snapshot) {
+                    const CheckpointBarrier barrier(CheckpointId{t.checkpoint_id},
+                                                    t.barrier_mode_plus1 == 2
+                                                        ? CheckpointBarrier::Mode::Unaligned
+                                                        : CheckpointBarrier::Mode::Aligned);
+                    for (auto& fn : entry.injectors) {
                         try {
                             fn(barrier);
                         } catch (...) {
-                            // Best-effort.
+                            // Best-effort, as on the direct path.
                         }
                     }
                 }
+                held_triggers->triggers.clear();
             };
             // 2PC commit-callback registration. Sink runners that
             // implement the 2PC protocol register one or more callbacks
@@ -3559,7 +3598,25 @@ std::size_t Worker::registration_count(JobId job_id) const {
         for (const auto& [_, v] : it->second)
             n += v.size();
     }
+    if (auto it = held_source_triggers_.find(job_id); it != held_source_triggers_.end()) {
+        n += it->second.size();
+    }
     return n;
+}
+
+void Worker::release_held_source_triggers_locked_(JobId job_id,
+                                                  std::uint32_t sub,
+                                                  const std::shared_ptr<HeldSourceTriggers>& held) {
+    auto job_it = held_source_triggers_.find(job_id);
+    if (job_it == held_source_triggers_.end()) {
+        return;
+    }
+    if (auto it = job_it->second.find(sub); it != job_it->second.end() && it->second == held) {
+        job_it->second.erase(it);
+    }
+    if (job_it->second.empty()) {
+        held_source_triggers_.erase(job_it);
+    }
 }
 
 void Worker::reap_finished_task_threads_locked_() {
