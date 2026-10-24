@@ -241,6 +241,7 @@ the usual comparisons and combinators:
 |---|---|
 | `=` `<>` `!=` `<` `<=` `>` `>=` | column-vs-literal, column-vs-column, or expression operands |
 | `AND` `OR` `NOT` | boolean combinators |
+| `flagged` | a `BOOLEAN` column on its own, as `flagged = true`: NULL does not hold; also in `CASE WHEN` |
 | `x BETWEEN lo AND hi` | `x` must be a bare column |
 | `x IN (v, ...)` / `NOT IN` | literal value lists |
 | `x IS NULL` / `IS NOT NULL` | two-valued |

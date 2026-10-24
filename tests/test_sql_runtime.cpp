@@ -10154,6 +10154,62 @@ TEST(SqlRuntime, UnionAllMatchesColumnsByPositionNotName) {
     std::filesystem::remove(out_path);
 }
 
+// A BOOLEAN column is a condition on its own, in WHERE and in CASE WHEN, as
+// in SQL: it holds where the column is true, and not where it is false or
+// NULL. It was refused with "WHERE predicate kind not supported", in a CASE
+// expression too.
+TEST(SqlRuntime, ABooleanColumnIsAConditionOnItsOwn) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(::getpid());
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto in_path = dir / ("clink_sql_bool_cond_in_" + tag + ".ndjson");
+    const auto out_path = dir / ("clink_sql_bool_cond_out_" + tag + ".ndjson");
+    std::filesystem::remove(out_path);
+    write_lines(in_path,
+                {R"({"id":1,"flagged":true})", R"({"id":2,"flagged":false})", R"({"id":3})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE t (id BIGINT, flagged BOOLEAN) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE out_t (id BIGINT, verdict TEXT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT id, CASE WHEN flagged THEN 'hold' ELSE "
+                        "'approve' END FROM t WHERE flagged OR id > 1");
+
+    InProcessCluster cluster("worker-sql-bool-cond", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::set<std::string> got;
+    for (const auto& l : read_lines(out_path)) {
+        const auto js = clink::config::parse(l);
+        got.insert(std::to_string(static_cast<std::int64_t>(js.at("id").as_number())) + "|" +
+                   js.at("verdict").as_string());
+    }
+    EXPECT_EQ(got, (std::set<std::string>{"1|hold", "2|approve", "3|approve"}));
+
+    // Any other type is refused, and says what to do instead.
+    try {
+        (void)compile(cat, "INSERT INTO out_t SELECT id, 'x' FROM t WHERE id");
+        ADD_FAILURE() << "a BIGINT column was accepted as a condition on its own";
+    } catch (const std::exception& e) {
+        EXPECT_NE(std::string{e.what()}.find("is not BOOLEAN"), std::string::npos) << e.what();
+    }
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // Set operations UNION (distinct) / INTERSECT / EXCEPT. Duplicates
 // within a side are eliminated; EXCEPT is a changelog (a left row is
 // retracted when the right side later produces it), so we replay the

@@ -1132,6 +1132,28 @@ clink::config::JsonValue lower_predicate(const ast::Expression& expr, const Tabl
             return JsonValue{std::move(obj)};
         }
     }
+    // A BOOLEAN column on its own is a predicate, as in `WHERE active` or
+    // `CASE WHEN flagged THEN ...`: the column compared with true, so NULL is
+    // not true either.
+    if (std::holds_alternative<ast::ColumnRef>(expr)) {
+        const auto col = resolve_column_name(expr, source);
+        for (const auto& c : source.columns) {
+            if (c.name != col) {
+                continue;
+            }
+            if (!c.type || c.type->id() != arrow::Type::BOOL) {
+                bind_error("column '" + col +
+                               "' is not BOOLEAN, so it is not a condition on its own; compare it "
+                               "with a value",
+                           std::get<ast::ColumnRef>(expr).loc.pos);
+            }
+            JsonObject obj;
+            obj["op"] = JsonValue{std::string{"eq"}};
+            obj["col"] = JsonValue{col};
+            obj["literal"] = JsonValue{true};
+            return JsonValue{std::move(obj)};
+        }
+    }
     bind_error("WHERE predicate kind not supported", 0);
 }
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**A `BOOLEAN` column is a condition on its own.** `WHERE active` and
+`CASE WHEN flagged THEN ...` were refused with "WHERE predicate kind not
+supported", in a `CASE` expression too, so a boolean column had to be compared
+with `true`. It now holds where the column is true and not where it is false or
+NULL, as `= true` does; a column of another type on its own is refused, saying
+so.
+
 **A cancel reaches every subtask of a job.** A worker cancels a job's subtasks by
 flipping the cancel tokens they registered, and only a subtask that runs one
 operator through its registered runner registered one. A chain of operators,
