@@ -226,6 +226,7 @@ add_executable(clink_core_tests
     test_dag_iteration.cpp
     test_process_function.cpp
     test_cep.cpp
+    test_cep_event_time_order.cpp
     test_cep_state_ttl.cpp
     test_state_processor.cpp
     test_harness_framework.cpp

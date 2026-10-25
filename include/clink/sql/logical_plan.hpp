@@ -311,19 +311,24 @@ public:
                           std::vector<MrDefineSpec> defines,
                           std::vector<MrMeasureSpec> measures,
                           std::shared_ptr<arrow::Schema> schema,
-                          bool all_rows = false)
+                          bool all_rows = false,
+                          bool order_by_event_time = false)
         : input_(std::move(input)),
           partition_columns_(std::move(partition_columns)),
           order_column_(std::move(order_column)),
           pattern_(std::move(pattern)),
           defines_(std::move(defines)),
           measures_(std::move(measures)),
-          schema_(std::move(schema)),
-          all_rows_(all_rows) {}
+          all_rows_(all_rows),
+          order_by_event_time_(order_by_event_time),
+          schema_(std::move(schema)) {}
 
     // ALL ROWS PER MATCH: emit every matched input row (plus measures and
     // any CLASSIFIER()), not one summary row per match.
     [[nodiscard]] bool all_rows() const noexcept { return all_rows_; }
+    // ORDER BY names the input's event-time column, so each partition's rows
+    // are matched in event-time order rather than arrival order.
+    [[nodiscard]] bool order_by_event_time() const noexcept { return order_by_event_time_; }
 
     [[nodiscard]] const LogicalPlan& input() const noexcept { return *input_; }
     [[nodiscard]] std::unique_ptr<LogicalPlan>& input_mut() noexcept { return input_; }
@@ -347,6 +352,7 @@ private:
     std::vector<MrDefineSpec> defines_;
     std::vector<MrMeasureSpec> measures_;
     bool all_rows_{false};
+    bool order_by_event_time_{false};
     std::shared_ptr<arrow::Schema> schema_;
 };
 

@@ -33,17 +33,25 @@
 //     span exceeds within(). Expired partials route exactly as
 //     watermark pruning routes them (trailing-negative success on the
 //     main output, otherwise the timed-out side output).
+//   * order_by_event_time() matches each key's records in event-time
+//     order rather than arrival order: a record is held in KeyedState
+//     under "__cep_held__" until the watermark passes it, then fed to
+//     the pattern with the key's other held records in event-time order.
+//     A record at or behind the watermark is late and dropped.
 //
 // Non-keyed CEP routes through a sentinel key 0 - the non-keyed
 // fluent helper wires a constant int64-extractor. Either path uses
 // the same operator.
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -220,6 +228,46 @@ inline Codec<PartialMatch<T>> partial_match_codec(Codec<T> t_codec) {
         }};
 }
 
+// A record held until the watermark passes it, so that it can be matched in
+// event-time order (CepOperator::order_by_event_time).
+template <typename T>
+struct HeldRecord {
+    std::int64_t ts;
+    T value;
+};
+
+// Codec for HeldRecord<T>. Layout: [int64 ts] [T bytes].
+template <typename T>
+inline Codec<HeldRecord<T>> held_record_codec(Codec<T> t_codec) {
+    return Codec<HeldRecord<T>>{
+        .encode =
+            [t_codec](const HeldRecord<T>& h) {
+                typename Codec<HeldRecord<T>>::Bytes out;
+                const auto ts = static_cast<std::uint64_t>(h.ts);
+                for (int i = 0; i < 8; ++i) {
+                    out.push_back(static_cast<std::byte>((ts >> (i * 8)) & 0xFF));
+                }
+                auto value = t_codec.encode(h.value);
+                out.insert(out.end(), value.begin(), value.end());
+                return out;
+            },
+        .decode =
+            [t_codec](typename Codec<HeldRecord<T>>::BytesView b) -> std::optional<HeldRecord<T>> {
+            if (b.size() < 8) {
+                return std::nullopt;
+            }
+            std::uint64_t ts = 0;
+            for (int i = 0; i < 8; ++i) {
+                ts |= static_cast<std::uint64_t>(static_cast<unsigned char>(b[i])) << (i * 8);
+            }
+            auto value = t_codec.decode(b.subspan(8));
+            if (!value.has_value()) {
+                return std::nullopt;
+            }
+            return HeldRecord<T>{static_cast<std::int64_t>(ts), std::move(*value)};
+        }};
+}
+
 }  // namespace detail
 
 // CepOperator<T, U>: T-in, U-out NFA-based pattern matcher.
@@ -328,7 +376,23 @@ public:
         return *this;
     }
 
+    // Match each key's records in event-time order rather than arrival order.
+    // A record is held in keyed state until the watermark passes it, then fed
+    // to the pattern with the key's other held records in event-time order
+    // (arrival order among equal times), so a record that arrives out of order
+    // but ahead of the watermark takes its place in time. A record at or behind
+    // the watermark is late and dropped, as drop_late_records() drops it; a
+    // record without an event time is matched where it arrives. Held records
+    // are checkpointed with the partials, and the end of the input releases
+    // them. SQL MATCH_RECOGNIZE turns this on when its ORDER BY is the
+    // event-time column.
+    CepOperator& order_by_event_time(bool on = true) {
+        order_by_event_time_ = on;
+        return *this;
+    }
+
     void open() override {
+        due_.clear();
         auto* rt = this->runtime();
         if (rt == nullptr || !rt->has_state_backend()) {
             // Without a state backend, fall back to an in-memory shadow
@@ -336,23 +400,46 @@ public:
             // always supplies a backend; this branch is for unit tests
             // using a no-state Dag.
             state_.reset();
+            held_.reset();
+            for (const auto& [k, held] : held_shadow_) {
+                due_.emplace(held.front().ts, k);
+            }
             return;
         }
         state_ = std::make_unique<KeyedState<std::int64_t, std::vector<detail::PartialMatch<T>>>>(
             rt->template keyed_state<std::int64_t, std::vector<detail::PartialMatch<T>>>(
                 kSlotName, int64_codec(), vector_codec(detail::partial_match_codec<T>(t_codec_))));
+        if (order_by_event_time_) {
+            held_ = std::make_unique<KeyedState<std::int64_t, std::vector<detail::HeldRecord<T>>>>(
+                rt->template keyed_state<std::int64_t, std::vector<detail::HeldRecord<T>>>(
+                    kHeldSlotName,
+                    int64_codec(),
+                    vector_codec(detail::held_record_codec<T>(t_codec_))));
+            // When each key's held records fall due is not checkpointed: it is
+            // rebuilt from the held records a restore brought back, which are
+            // this subtask's own after a rescale.
+            held_->scan([this](std::int64_t k, const std::vector<detail::HeldRecord<T>>& held) {
+                if (!held.empty()) {
+                    due_.emplace(held.front().ts, k);
+                }
+            });
+        }
     }
 
     void process(const StreamElement<T>& element, Emitter<U>& out) override {
         if (element.is_data()) {
             Batch<U> batch_out;
             for (const auto& rec : element.as_data()) {
-                if (drop_late_ && have_wm_) {
-                    if (const auto ts = rec.event_time(); ts && ts->millis() <= current_wm_) {
-                        continue;
-                    }
+                const auto ts = rec.event_time();
+                if ((drop_late_ || order_by_event_time_) && have_wm_ && ts &&
+                    ts->millis() <= current_wm_) {
+                    continue;
                 }
                 const auto k = key_fn_(rec.value());
+                if (order_by_event_time_ && ts) {
+                    hold_(k, ts->millis(), rec.value());
+                    continue;
+                }
                 advance_for_key_(k, rec, batch_out);
             }
             if (!batch_out.empty()) {
@@ -369,6 +456,12 @@ public:
         if (!wm.is_idle()) {
             have_wm_ = true;
             current_wm_ = std::max(current_wm_, wm.timestamp().millis());
+            // Held records the watermark has passed reach the pattern before
+            // partials are pruned at it, and before it goes downstream, so a
+            // match they complete is not behind it.
+            if (order_by_event_time_) {
+                release_held_(current_wm_, out);
+            }
         }
         // The eviction bound is the tighter of within() and state_ttl().
         // Both prune the same way and route evicted partials to the same
@@ -381,23 +474,145 @@ public:
         Operator<T, U>::on_watermark(wm, out);
     }
 
-    void flush(Emitter<U>& /*out*/) override {
+    void flush(Emitter<U>& out) override {
+        // End of input: every held record is due, so the pattern sees them all
+        // in event-time order.
+        if (order_by_event_time_) {
+            release_held_(std::numeric_limits<std::int64_t>::max(), out);
+        }
         // End-of-stream: drop incomplete partials silently. // default is the same - partials that
         // never complete are not surfaced as output unless the user wires a timed-out side output,
         // which is deferred in v1.
+    }
+
+    // The late bound rides operator state beside the operator's timers, so a
+    // restore drops the records the run before it would have dropped, rather
+    // than matching or holding a replayed record behind a watermark it had
+    // already passed.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot = "") override {
+        Operator<T, U>::snapshot_timers(backend, op_id, slot);
+        if (!drop_late_ && !order_by_event_time_) {
+            return;
+        }
+        const std::string key = std::string(kLateBoundKey) + slot;
+        if (!have_wm_) {
+            backend.erase_operator_state(op_id, key);
+            return;
+        }
+        std::array<char, 8> bytes{};
+        const auto v = static_cast<std::uint64_t>(current_wm_);
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            bytes[i] = static_cast<char>((v >> (i * 8)) & 0xFF);
+        }
+        backend.put_operator_state(op_id, key, StateBackend::ValueView{bytes.data(), bytes.size()});
+    }
+
+    void restore_timers(StateBackend& backend,
+                        OperatorId op_id,
+                        const std::string& slot = "") override {
+        Operator<T, U>::restore_timers(backend, op_id, slot);
+        if (!drop_late_ && !order_by_event_time_) {
+            return;
+        }
+        const std::string key = std::string(kLateBoundKey) + slot;
+        auto v = backend.get_operator_state(op_id, key);
+        if (!v.has_value() || v->size() < 8) {
+            return;
+        }
+        std::uint64_t raw = 0;
+        for (std::size_t i = 0; i < 8; ++i) {
+            raw |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
+        }
+        have_wm_ = true;
+        current_wm_ = static_cast<std::int64_t>(raw);
     }
 
     std::string name() const override { return name_; }
 
 private:
     static constexpr const char* kSlotName = "__cep_partials__";
+    static constexpr const char* kHeldSlotName = "__cep_held__";
+    static constexpr const char* kLateBoundKey = "__cep_late_bound";
 
-    // The late bound drop_late_records() applies: the highest watermark seen.
-    // Not checkpointed: after a restore the source replays from the
-    // checkpoint, and the first batch's watermark sets it again.
+    // The late bound drop_late_records() and order_by_event_time() apply: the
+    // highest watermark seen, checkpointed by snapshot_timers().
     bool drop_late_{false};
+    bool order_by_event_time_{false};
     bool have_wm_{false};
     std::int64_t current_wm_{0};
+
+    std::vector<detail::HeldRecord<T>> load_held_(std::int64_t k) const {
+        if (!held_) {
+            auto it = held_shadow_.find(k);
+            return it == held_shadow_.end() ? std::vector<detail::HeldRecord<T>>{} : it->second;
+        }
+        return held_->get(k).value_or(std::vector<detail::HeldRecord<T>>{});
+    }
+
+    void save_held_(std::int64_t k, std::vector<detail::HeldRecord<T>> held) {
+        if (!held_) {
+            if (held.empty()) {
+                held_shadow_.erase(k);
+            } else {
+                held_shadow_[k] = std::move(held);
+            }
+            return;
+        }
+        if (held.empty()) {
+            held_->erase(k);
+        } else {
+            held_->put(k, held);
+        }
+    }
+
+    // Hold a record until the watermark passes it, after any of the key's held
+    // records at the same time, so arrival order breaks ties.
+    void hold_(std::int64_t k, std::int64_t ts, const T& value) {
+        auto held = load_held_(k);
+        if (held.empty() || ts < held.front().ts) {
+            if (!held.empty()) {
+                due_.erase({held.front().ts, k});
+            }
+            due_.emplace(ts, k);
+        }
+        const auto at = std::upper_bound(
+            held.begin(), held.end(), ts, [](std::int64_t t, const detail::HeldRecord<T>& h) {
+                return t < h.ts;
+            });
+        held.insert(at, detail::HeldRecord<T>{ts, value});
+        save_held_(k, std::move(held));
+    }
+
+    // Feed every held record at or before `bound` to the pattern: key by key,
+    // in the order each key's earliest held record falls due, and each key's
+    // records in event-time order.
+    void release_held_(std::int64_t bound, Emitter<U>& out) {
+        Batch<U> batch_out;
+        while (!due_.empty() && due_.begin()->first <= bound) {
+            const std::int64_t k = due_.begin()->second;
+            due_.erase(due_.begin());
+            auto held = load_held_(k);
+            const auto end = std::upper_bound(
+                held.begin(),
+                held.end(),
+                bound,
+                [](std::int64_t t, const detail::HeldRecord<T>& h) { return t < h.ts; });
+            for (auto it = held.begin(); it != end; ++it) {
+                advance_for_key_(
+                    k, Record<T>{std::move(it->value), EventTime::from_millis(it->ts)}, batch_out);
+            }
+            held.erase(held.begin(), end);
+            if (!held.empty()) {
+                due_.emplace(held.front().ts, k);
+            }
+            save_held_(k, std::move(held));
+        }
+        if (!batch_out.empty()) {
+            out.emit_data(std::move(batch_out));
+        }
+    }
 
     std::vector<detail::PartialMatch<T>> load_partials_(std::int64_t k) const {
         if (!state_) {
@@ -910,6 +1125,13 @@ private:
 
     clink::FlatMap<std::int64_t, std::vector<detail::PartialMatch<T>>> shadow_;
     std::unique_ptr<KeyedState<std::int64_t, std::vector<detail::PartialMatch<T>>>> state_;
+
+    // Records held for order_by_event_time(), per key in event-time order, and
+    // (earliest held time, key) for every key holding any, so a watermark
+    // visits only the keys it releases.
+    clink::FlatMap<std::int64_t, std::vector<detail::HeldRecord<T>>> held_shadow_;
+    std::unique_ptr<KeyedState<std::int64_t, std::vector<detail::HeldRecord<T>>>> held_;
+    std::set<std::pair<std::int64_t, std::int64_t>> due_;
 
     // Optional timed-out side output. timed_out_tag_id_ is just for
     // introspection; the emitter closure (built by with_timed_out_output)

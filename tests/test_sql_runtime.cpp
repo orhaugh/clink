@@ -3486,6 +3486,76 @@ TEST(SqlRuntime, MatchRecognizeDropsARowBehindTheWatermark) {
     EXPECT_EQ(matches, 1U) << "the resent credit and debit, behind the watermark, matched again";
 }
 
+// With ORDER BY on the event-time column, MATCH_RECOGNIZE matches each
+// partition's rows in event-time order: a row that arrives out of order but
+// ahead of the watermark is held until the watermark passes it, then takes its
+// place in time. A debit that arrives before the credit it passes on still
+// completes the pattern, and nothing matches before the watermark passes both.
+TEST(SqlRuntime, MatchRecognizeMatchesRowsInEventTimeOrder) {
+    ensure_sql_installed_once();
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE pay (acct BIGINT, ts BIGINT, dir VARCHAR, amount DOUBLE) "
+                    "WITH (connector='file', format='json', path='/tmp/mr_order_in.ndjson', "
+                    "event_time_column='ts');"
+                    "CREATE TABLE out_mr (acct BIGINT, onward DOUBLE) "
+                    "WITH (connector='file', format='json', path='/tmp/mr_order_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_mr SELECT * FROM pay MATCH_RECOGNIZE ("
+                        "  PARTITION BY acct ORDER BY ts"
+                        "  MEASURES LAST(d.amount) AS onward"
+                        "  PATTERN (c d)"
+                        "  DEFINE c AS dir = 'credit', "
+                        "         d AS dir = 'debit' AND amount <= PREV(amount))");
+    std::map<std::string, std::string> params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "match_recognize_row") {
+            params = op.params;
+        }
+    }
+    ASSERT_FALSE(params.empty());
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "match_recognize_row", std::string{kChannelRow}, std::string{kChannelRow});
+    ASSERT_NE(factory, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = params;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+    op->open();
+
+    BoundedChannel<StreamElement<Row>> ch(16);
+    Emitter<Row> em(&ch);
+    const auto matched = [&ch] {
+        std::vector<double> onward;
+        while (auto el = ch.try_pop()) {
+            if (el->is_data()) {
+                for (const auto& r : el->as_data().records()) {
+                    onward.push_back(r.value().values.at("onward").as_number());
+                }
+            }
+        }
+        return onward;
+    };
+    Batch<Row> b;
+    for (const auto& [ts, dir, amount] :
+         {std::tuple{20, "debit", 90.0}, std::tuple{10, "credit", 100.0}}) {
+        Row r;
+        r.values["acct"] = clink::config::JsonValue{1.0};
+        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["dir"] = clink::config::JsonValue{std::string{dir}};
+        r.values["amount"] = clink::config::JsonValue{amount};
+        b.emplace(std::move(r), EventTime{ts});
+    }
+    op->process(StreamElement<Row>::data(std::move(b)), em);
+    EXPECT_TRUE(matched().empty()) << "matched before the watermark passed the rows";
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{15}}), em);
+    EXPECT_TRUE(matched().empty()) << "the debit at 20 is ahead of a watermark at 15";
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{20}}), em);
+    EXPECT_EQ(matched(), std::vector<double>{90.0})
+        << "the debit, delivered before its credit, did not complete the pattern";
+}
+
 TEST(SqlRuntime, MatchRecognizeDefineExpressionOperandThreshold) {
     // A DEFINE comparison whose operand is an EXPRESSION - `price <
     // PREV(price) * 0.9` - rather than a bare column or literal. The binder

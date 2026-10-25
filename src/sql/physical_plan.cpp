@@ -2061,6 +2061,7 @@ std::string compile_node(const LogicalPlan& node,
 
         op.params["partition_keys"] = keys_csv;
         op.params["order_column"] = mr.order_column();
+        op.params["order_by_event_time"] = mr.order_by_event_time() ? "true" : "false";
         op.params["rows_per_match"] = mr.all_rows() ? "all" : "one";
 
         clink::config::JsonArray pat;

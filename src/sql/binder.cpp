@@ -3071,6 +3071,13 @@ std::unique_ptr<LogicalPlan> Binder::bind_match_recognize(
     }
     auto out_schema = arrow::schema(fields);
 
+    // Rows carry the event time of the column the source declares (a CTE or
+    // subquery passes it through), so ORDER BY on that column can be honoured
+    // in event time. Ordered by any other column, rows match as they arrive.
+    const auto etc = source.properties.find("event_time_column");
+    const bool order_by_event_time =
+        etc != source.properties.end() && !etc->second.empty() && etc->second == mrc.order_by;
+
     auto input = make_table_plan(mrc.input.name, source, mrc.loc.pos);
     return std::make_unique<LogicalMatchRecognize>(std::move(input),
                                                    mrc.partition_by,
@@ -3079,7 +3086,8 @@ std::unique_ptr<LogicalPlan> Binder::bind_match_recognize(
                                                    std::move(defines),
                                                    std::move(measures),
                                                    out_schema,
-                                                   mrc.all_rows);
+                                                   mrc.all_rows,
+                                                   order_by_event_time);
 }
 
 std::unique_ptr<LogicalPlan> Binder::bind_process_table_function(

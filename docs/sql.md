@@ -531,12 +531,17 @@ WHERE rn <= 3;
 
 ## Pattern matching
 
-`MATCH_RECOGNIZE` finds sequences of rows within a partition. It matches each
-partition's rows in the order they arrive, so the input has to arrive in
-`ORDER BY` order, as a time-ordered stream does. A row that arrives at or behind
-the watermark is late and dropped, as an `OVER` aggregate drops it; a row that
-arrives out of order but ahead of the watermark is matched where it arrives. It
-needs the Row channel (`format='json'`).
+`MATCH_RECOGNIZE` finds sequences of rows within a partition. When `ORDER BY`
+names the table's event-time column (`event_time_column`, which a common table
+expression or subquery can pass through), each partition's rows are matched in
+event-time order: a row is held until the watermark passes it, then takes its
+place among the partition's rows by time, rows with the same time in the order
+they arrived. A match is therefore emitted once the watermark passes its last
+row, and held rows are part of the job's checkpoint. A row that arrives at or
+behind the watermark is late and dropped, as an `OVER` aggregate drops it.
+Ordered by any other column, or over a table without an event-time column, rows
+are matched in the order they arrive, so the input has to arrive in `ORDER BY`
+order. It needs the Row channel (`format='json'`).
 
 ```sql
 SELECT * FROM ticks MATCH_RECOGNIZE (

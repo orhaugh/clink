@@ -40,7 +40,7 @@ embedded or submits to a cluster, unchanged.
 | Parallel query semantics | Job parallelism preserves global SQL results by key-routing partitioned state and retaining a singleton stage for operators that need the whole relation. Unordered delivery, incomplete ordering ties, processing time, nondeterministic functions and floating-point low bits remain qualified | [SQL frontend](internals/sql-frontend.md) |
 | Joins | Stream-stream interval joins, multi-way INNER joins with cost-based reordering (applied only when estimated cheaper), lookup joins | [SQL frontend](internals/sql-frontend.md) |
 | Types | `BIGINT`/`DOUBLE`/`VARCHAR`/`BOOLEAN`/timestamps, `DECIMAL` (exact, 128-bit), `ARRAY`/`MAP`/`ROW`, `MULTISET` | [SQL frontend](internals/sql-frontend.md) |
-| Pattern matching | `MATCH_RECOGNIZE` v1 on the CEP engine | [SQL frontend](internals/sql-frontend.md) |
+| Pattern matching | `MATCH_RECOGNIZE` v1 on the CEP engine, in event-time order when `ORDER BY` is the event-time column | [SQL frontend](internals/sql-frontend.md) |
 | Extensibility | Scalar UDFs (`LANGUAGE SQL` and native), UDAFs, the Table API producing the same `JobGraphSpec` | [SQL frontend](internals/sql-frontend.md) |
 | SQL-native ML | `CREATE MODEL` / `ML_PREDICT` (HTTP, ONNX opt-in, native closures), `VECTOR_SEARCH`, full-refresh materialized tables | [SQL frontend](internals/sql-frontend.md) |
 

@@ -13755,10 +13755,12 @@ void install(clink::plugin::PluginRegistry& reg) {
     // CEP engine. Rebuilds a Pattern<Row> from the params (strict-contiguity
     // steps, DEFINE predicates as json_predicate closures, greedy quantifiers)
     // and drives CepOperator<Row,Row>. ONE ROW PER MATCH; the SelectFn emits
-    // partition-key columns + FIRST/LAST(var.col) measures. v1: matches over
-    // per-key ARRIVAL order, so the input must be ordered by the ORDER BY
-    // column (the usual time-ordered stream). Params: partition_keys (CSV),
-    // order_column, pattern / defines / measures (JSON arrays).
+    // partition-key columns + FIRST/LAST(var.col) measures. When ORDER BY is
+    // the input's event-time column (order_by_event_time), each partition's
+    // rows are matched in event-time order as the watermark passes them;
+    // otherwise in arrival order, so the input must arrive ordered by the
+    // ORDER BY column. Params: partition_keys (CSV), order_column,
+    // order_by_event_time, pattern / defines / measures (JSON arrays).
     reg.register_operator<Row, Row>(
         "match_recognize_row", [](const BuildContext& ctx) -> std::shared_ptr<Operator<Row, Row>> {
             const auto pattern_text = ctx.param_or("pattern", "");
@@ -13768,6 +13770,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             const auto defines_text = ctx.param_or("defines", "[]");
             const auto measures_text = ctx.param_or("measures", "[]");
             const auto partition_keys = ctx.param_or("partition_keys", "");
+            const bool event_time_order = ctx.param_or("order_by_event_time", "false") == "true";
 
             auto pattern_json = clink::config::parse(pattern_text);
             auto defines_json = clink::config::parse(defines_text.empty() ? "[]" : defines_text);
@@ -13985,6 +13988,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                                         "match_recognize_row");
                 // A row at or behind the watermark is late: dropped, as OVER drops it.
                 op->drop_late_records();
+                op->order_by_event_time(event_time_order);
                 return op;
             }
 
@@ -14015,6 +14019,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 std::move(*pattern), row_json_codec(), key_fn, select_fn, "match_recognize_row");
             // A row at or behind the watermark is late: dropped, as OVER drops it.
             op->drop_late_records();
+            op->order_by_event_time(event_time_order);
             return op;
         });
 

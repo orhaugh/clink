@@ -358,6 +358,54 @@ TEST(SqlPreparse, MatchRecognizeCompilesToOp) {
     EXPECT_TRUE(has_keyer);
 }
 
+// MATCH_RECOGNIZE matches in event-time order only when ORDER BY is the column
+// its rows take their event time from: the table's own, or one a common table
+// expression passes through. Ordered by another column, or over a table with
+// no event time, rows match as they arrive.
+TEST(SqlPreparse, MatchRecognizeOrdersByEventTimeOnlyOnTheEventTimeColumn) {
+    Catalog cat;
+    auto ddl = parse(
+        "CREATE TABLE timed (acct BIGINT, ts BIGINT, seq BIGINT, amount BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/mr_eto_timed.ndjson', "
+        "event_time_column='ts');"
+        "CREATE TABLE untimed (acct BIGINT, ts BIGINT, seq BIGINT, amount BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/mr_eto_untimed.ndjson');"
+        "CREATE TABLE out_mr (acct BIGINT, last_amount BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/mr_eto_out.ndjson')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    const auto mr = [](const std::string& from, const std::string& order_by) {
+        return "SELECT * FROM " + from +
+               " MATCH_RECOGNIZE ("
+               "  PARTITION BY acct ORDER BY " +
+               order_by +
+               "  MEASURES LAST(b.amount) AS last_amount"
+               "  PATTERN (a b)"
+               "  DEFINE a AS amount > 100, b AS amount > 200)";
+    };
+    const auto event_time_order = [&](const std::string& query) {
+        Binder b(cat);
+        const std::string sql = "INSERT INTO out_mr " + query;
+        auto plan = b.bind_insert(std::get<ast::InsertStmt>(parse(sql).statements[0]));
+        plan = clink::sql::optimize(std::move(plan));
+        clink::sql::PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const clink::sql::LogicalSink&>(*plan));
+        for (const auto& op : spec.ops) {
+            if (op.type == "match_recognize_row") {
+                return op.params.at("order_by_event_time");
+            }
+        }
+        return std::string{"no match_recognize_row op"};
+    };
+    EXPECT_EQ(event_time_order(mr("timed", "ts")), "true");
+    EXPECT_EQ(event_time_order(mr("timed", "seq")), "false");
+    EXPECT_EQ(event_time_order(mr("untimed", "ts")), "false");
+    EXPECT_EQ(
+        event_time_order("WITH big AS (SELECT * FROM timed WHERE amount > 50) " + mr("big", "ts")),
+        "true");
+}
+
 TEST(SqlPreparse, MatchRecognizeRejections) {
     // missing DEFINE
     EXPECT_THROW((void)parse("SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY k ORDER BY ts "
