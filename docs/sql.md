@@ -501,8 +501,17 @@ FROM payments;
 
 `OVER` supports `SUM/COUNT/AVG/MIN/MAX`, plus `FIRST_VALUE`, `LAST_VALUE` and
 `LAG(col[, offset])`, with an optional `ROWS/RANGE BETWEEN n PRECEDING AND CURRENT ROW`
-frame on the plain aggregates. `LEAD`, `NTILE` and `FOLLOWING` frames are not
+frame on the plain aggregates. A `RANGE` frame's `n` is in the units of the
+`ORDER BY` column: `RANGE BETWEEN 3600000 PRECEDING AND CURRENT ROW` is the last
+hour of an epoch-millisecond time. `LEAD`, `NTILE` and `FOLLOWING` frames are not
 supported.
+
+The query selects `*` beside its `OVER` aggregates; other select items are
+refused, so project in an outer query. It reads a table that declares
+`event_time_column` directly, with an optional `WHERE`; a common table expression
+or subquery between them is refused, because the time column's role does not
+carry through it. Each partition's rows are emitted in event-time order as the
+watermark passes them, and a row that arrives behind the watermark is dropped.
 
 **Top-N per key** uses a ranking function in a subquery with an outer bound:
 
@@ -519,8 +528,11 @@ WHERE rn <= 3;
 
 ## Pattern matching
 
-`MATCH_RECOGNIZE` finds sequences of rows within a partition, ordered by event
-time. It needs the Row channel (`format='json'`).
+`MATCH_RECOGNIZE` finds sequences of rows within a partition. It matches each
+partition's rows in the order they arrive, so the input has to arrive in
+`ORDER BY` order, as a time-ordered stream does: a row that arrives late is
+matched where it arrives, after the rows that came before it, rather than
+dropped. It needs the Row channel (`format='json'`).
 
 ```sql
 SELECT * FROM ticks MATCH_RECOGNIZE (
