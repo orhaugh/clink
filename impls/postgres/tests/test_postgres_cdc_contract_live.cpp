@@ -909,8 +909,14 @@ TEST(PostgresCdcContractLive, OnlyACompletedCheckpointConfirmsTheSlot) {
         {
             Session s(f.dsn());
             history.add(s.returning(insert_rows(f.table(), 1, 100)));
+            // A row in a transaction of its own: once its change is here, the
+            // source has read the first transaction to its commit, so
+            // checkpoint 1 resumes past it. Taken at the first transaction's
+            // last change it could still be inside that transaction, resume
+            // from before it, and confirm nothing when it completed.
+            history.add(s.returning(insert_rows(f.table(), 101, 101)));
         }
-        run.pump_until([&] { return down.changes().size() >= 100; });
+        run.pump_until([&] { return down.changes().size() >= 101; });
         run.checkpoint(backends, 1);
         // Status updates go out every 100 ms; give them a second.
         const auto settle = Clock::now() + 1s;
@@ -927,14 +933,14 @@ TEST(PostgresCdcContractLive, OnlyACompletedCheckpointConfirmsTheSlot) {
             Session s(f.dsn());
             history.add(s.returning(update_rows(f.table(), "id <= 50")));
         }
-        run.pump_until([&] { return down.changes().size() >= 150; });
+        run.pump_until([&] { return down.changes().size() >= 151; });
         run.checkpoint(backends, 2);
         run.abort(2);
         {
             Session s(f.dsn());
             history.add(s.returning(delete_rows(f.table(), "id <= 10")));
         }
-        run.pump_until([&] { return down.changes().size() >= 160; });
+        run.pump_until([&] { return down.changes().size() >= 161; });
         run.checkpoint(backends, 3);  // never completes
         const auto quiet = Clock::now() + 1s;
         while (Clock::now() < quiet) {
@@ -1099,8 +1105,11 @@ TEST(PostgresCdcContractLive, AValueTheContractCannotCarryStopsTheSourceEveryTim
         {
             Session s(f.dsn());
             (void)s.returning(insert_rows(f.table(), 1, 5));
+            // Its own transaction, so checkpoint 1 resumes past the first:
+            // see OnlyACompletedCheckpointConfirmsTheSlot.
+            (void)s.returning(insert_rows(f.table(), 6, 6));
         }
-        run.pump_until([&] { return down.changes().size() >= 5; });
+        run.pump_until([&] { return down.changes().size() >= 6; });
         run.checkpoint(backends, 1);
         run.complete(1);
         run.pump_until([&] { return f.confirmed() > start; }, 20s);
