@@ -10343,6 +10343,124 @@ TEST(SqlRuntime, OverReadsACommonTableExpressionThatDropsDuplicatesFirst) {
     std::filesystem::remove(out_path);
 }
 
+// An OVER aggregate reads another: a window per payer feeds a window per payer
+// and payee, so each transfer carries the payer's recent count and when the
+// payer first paid that payee. The second window was refused, since the first
+// one's output carried no event-time column.
+TEST(SqlRuntime, AnOverAggregateReadsAnotherOverAggregate) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(::getpid());
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto in_path = dir / ("clink_sql_over_over_in_" + tag + ".ndjson");
+    const auto out_path = dir / ("clink_sql_over_over_out_" + tag + ".ndjson");
+    std::filesystem::remove(out_path);
+    write_lines(in_path,
+                {R"({"p":1,"q":10,"amount":100,"ts":1})",
+                 R"({"p":1,"q":11,"amount":50,"ts":2})",
+                 R"({"p":1,"q":10,"amount":30,"ts":3})",
+                 R"({"p":2,"q":10,"amount":70,"ts":4})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE transfers (p BIGINT, q BIGINT, amount BIGINT, "
+                                 "ts BIGINT) WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE out_t (p BIGINT, q BIGINT, amount BIGINT, ts BIGINT, n BIGINT, "
+                     "first_at BIGINT) WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    auto spec =
+        compile(cat,
+                "INSERT INTO out_t WITH per_payer AS (SELECT *, COUNT(*) OVER (PARTITION "
+                "BY p ORDER BY ts RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS n "
+                "FROM transfers) "
+                "SELECT *, FIRST_VALUE(ts) OVER (PARTITION BY p, q ORDER BY ts) AS first_at "
+                "FROM per_payer");
+
+    InProcessCluster cluster("worker-sql-over-over", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::multiset<std::string> got;
+    for (const auto& l : read_lines(out_path)) {
+        const auto js = clink::config::parse(l);
+        const auto num = [&](const char* k) {
+            return std::to_string(static_cast<std::int64_t>(js.at(k).as_number()));
+        };
+        got.insert(num("p") + "|" + num("q") + "|" + num("ts") + "|" + num("n") + "|" +
+                   num("first_at"));
+    }
+    EXPECT_EQ(got,
+              (std::multiset<std::string>{"1|10|1|1|1", "1|11|2|2|2", "1|10|3|3|1", "2|10|4|1|4"}));
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
+// An OVER aggregate's output row keeps the event time of the row it was computed
+// for, as a window's output does, so an operator that reads it in event time
+// places it in time. It went out with none.
+TEST(SqlRuntime, AnOverAggregateRowKeepsItsEventTime) {
+    ensure_sql_installed_once();
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE evt (u BIGINT, ts BIGINT, amount BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/over_et_in.ndjson', "
+                    "event_time_column='ts');"
+                    "CREATE TABLE out_t (u BIGINT, ts BIGINT, amount BIGINT, n BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/over_et_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_t SELECT *, COUNT(*) OVER (PARTITION BY u ORDER BY ts) "
+                        "AS n FROM evt");
+    std::map<std::string, std::string> params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "over_aggregate_row") {
+            params = op.params;
+        }
+    }
+    ASSERT_FALSE(params.empty()) << "no over_aggregate_row op in the compiled spec";
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "over_aggregate_row", std::string{kChannelRow}, std::string{kChannelRow});
+    ASSERT_NE(factory, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = params;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+    op->open();
+
+    BoundedChannel<StreamElement<Row>> ch(16);
+    Emitter<Row> em(&ch);
+    Batch<Row> b;
+    for (const std::int64_t ts : {10, 20}) {
+        Row r;
+        r.values["u"] = clink::config::JsonValue{1.0};
+        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["amount"] = clink::config::JsonValue{5.0};
+        b.emplace(std::move(r), EventTime{ts});
+    }
+    op->process(StreamElement<Row>::data(std::move(b)), em);
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{20}}), em);
+
+    std::vector<std::pair<std::int64_t, std::int64_t>> stamped;  // (ts column, event time)
+    while (auto el = ch.try_pop()) {
+        if (!el->is_data()) {
+            continue;
+        }
+        for (const auto& rec : el->as_data().records()) {
+            ASSERT_TRUE(rec.event_time().has_value()) << "an OVER row went out with no event time";
+            stamped.emplace_back(static_cast<std::int64_t>(rec.value().values.at("ts").as_number()),
+                                 rec.event_time()->millis());
+        }
+    }
+    EXPECT_EQ(stamped, (std::vector<std::pair<std::int64_t, std::int64_t>>{{10, 10}, {20, 20}}));
+}
+
 // A BOOLEAN column is a condition on its own, in WHERE and in CASE WHEN, as
 // in SQL: it holds where the column is true, and not where it is false or
 // NULL. It was refused with "WHERE predicate kind not supported", in a CASE

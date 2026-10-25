@@ -974,6 +974,35 @@ TEST(SqlBinder, OverReadsADerivedTableThatKeepsTheEventTimeColumn) {
     }
 }
 
+// An OVER aggregate reads a derived table that is itself an OVER aggregate: the
+// first keeps every column, the time column included, so a window per user can
+// feed a window per user and amount. It was refused as a derived table that
+// carries no event time. An OVER output named like the time column makes the
+// name ambiguous, so a window over that is still refused.
+TEST(SqlBinder, OverReadsAnotherOverAggregate) {
+    Catalog cat;
+    register_events(cat);
+    Binder b(cat);
+    auto plan = b.bind_select(
+        as_select(parse("WITH per_user AS (SELECT *, COUNT(*) OVER (PARTITION BY user_id "
+                        "ORDER BY ts RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS n FROM evt) "
+                        "SELECT *, FIRST_VALUE(ts) OVER (PARTITION BY user_id, amount ORDER BY ts) "
+                        "AS first_at FROM per_user")));
+    ASSERT_EQ(plan->kind(), "OverAggregate");
+    EXPECT_EQ(static_cast<const LogicalOverAggregate&>(*plan).input().kind(), "OverAggregate");
+
+    try {
+        (void)b.bind_select(
+            as_select(parse("WITH shadowed AS (SELECT *, COUNT(*) OVER (PARTITION BY user_id "
+                            "ORDER BY ts) AS ts FROM evt) "
+                            "SELECT *, COUNT(*) OVER (PARTITION BY user_id ORDER BY ts) AS n "
+                            "FROM shadowed")));
+        ADD_FAILURE() << "an OVER output named like the time column was taken as the time column";
+    } catch (const TranslationError& e) {
+        EXPECT_NE(std::string{e.what()}.find("ambiguous"), std::string::npos) << e.what();
+    }
+}
+
 TEST(SqlBinder, OverFollowingFrameRejected) {
     // A FOLLOWING end bound is rejected at translation.
     EXPECT_THROW(parse("SELECT SUM(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) "

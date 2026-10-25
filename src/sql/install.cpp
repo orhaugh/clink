@@ -4924,7 +4924,7 @@ private:
                 }
                 entry_meta_.put(key, 0, meta.value);
                 entry_pending_.erase(key, 0);
-                batch.emplace(std::move(result));
+                batch.emplace(std::move(result), EventTime{ts});
                 if (batch.size() >= 64) {
                     out.emit_data(std::move(batch));
                     batch = Batch<Row>{};
@@ -5000,7 +5000,13 @@ private:
                 out_row.values[s.output_name] = std::move(v);
             }
         }
-        emit_batch.push(Record<Row>{std::move(out_row)});
+        // The row keeps its event time, so an operator that reads this one's
+        // output in event time, another OVER or a pattern, places it in time.
+        if (const auto ts = ts_of_(r)) {
+            emit_batch.push(Record<Row>{std::move(out_row), EventTime{*ts}});
+        } else {
+            emit_batch.push(Record<Row>{std::move(out_row)});
+        }
 
         if (max_lag_ > 0) {
             st.recent.push_back(r);

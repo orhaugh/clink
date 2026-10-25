@@ -672,8 +672,12 @@ TEST(SqlMemoryBudget, WorkingFamiliesSpillAndRestoreWithIdenticalPerKeyChangelog
                     if (e.is_data())
                         for (const auto& rec : e.as_data()) {
                             const auto& row = rec.value();
+                            // The event time a row goes out with is part of the
+                            // output: spilled or not, it must be the same.
+                            const auto at = rec.event_time();
                             result[row.values.at("k").serialize(0)].push_back(
-                                config::JsonValue{to_json_object(row.values)}.serialize(0));
+                                config::JsonValue{to_json_object(row.values)}.serialize(0) + "@" +
+                                (at ? std::to_string(at->millis()) : std::string{"none"}));
                         }
                     return true;
                 });

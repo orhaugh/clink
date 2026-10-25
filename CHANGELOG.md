@@ -29,8 +29,11 @@ SELECT *, COUNT(*) OVER (...) FROM once` was refused with "OVER aggregate
 requires the source table to declare event_time_column", and a step that drops
 duplicates could not stand in front of a window. A derived table now carries
 its source's event-time column when it keeps it unchanged, through `DISTINCT`,
-a filter, or a projection that keeps or renames it. One that computes, groups
-or joins still carries none, and the refusal now says what qualifies.
+a filter, a projection that keeps or renames it, or another `OVER` aggregate,
+so a window per account can feed a window per account and payee; each `OVER`
+row now keeps the event time of the row it was computed for. One that
+computes, groups or joins still carries none, and the refusal now says what
+qualifies.
 
 **A restart drain that times out names only the subtasks that did not
 drain.** The job's error listed every subtask the drain expected, those that

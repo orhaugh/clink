@@ -1279,10 +1279,11 @@ void check_sink_compatibility(const TableDef& sink, const arrow::Schema& source_
 // The event-time column a derived table's plan carries through unchanged, so
 // the derived table can declare it as the table it reads does: the column of a
 // scanned table that declares event_time_column, kept through filters and
-// DISTINCT, and through a projection that outputs it as a bare column
-// reference, under its own name or another. Anything that computes, groups or
-// joins carries none, so an OVER aggregate, a window or an interval join over
-// the derived table is refused as it was.
+// DISTINCT, through a projection that outputs it as a bare column reference,
+// under its own name or another, and through an OVER aggregate, which emits
+// every row with its event time once the watermark passes it. Anything that
+// computes, groups or joins carries none, so an OVER aggregate, a window or an
+// interval join over the derived table is refused as it was.
 std::optional<std::string> carried_event_time_column(const LogicalPlan& plan) {
     const auto kind = plan.kind();
     if (kind == "Scan") {
@@ -1297,6 +1298,20 @@ std::optional<std::string> carried_event_time_column(const LogicalPlan& plan) {
     }
     if (kind == "Distinct") {
         return carried_event_time_column(static_cast<const LogicalDistinct&>(plan).input());
+    }
+    if (kind == "OverAggregate") {
+        // Every input column is kept, so the time column is too, unless an
+        // OVER output takes its name.
+        const auto& over = static_cast<const LogicalOverAggregate&>(plan);
+        auto inner = carried_event_time_column(over.input());
+        if (inner) {
+            for (const auto& out : over.outputs()) {
+                if (out.output_name == *inner) {
+                    return std::nullopt;
+                }
+            }
+        }
+        return inner;
     }
     if (kind == "Project") {
         const auto& project = static_cast<const LogicalProject&>(plan);
