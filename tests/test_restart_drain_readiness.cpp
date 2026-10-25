@@ -413,4 +413,91 @@ TEST(RestartDrainReadiness, AReplacementSessionCancelsSurvivorsBeforeRedeploy) {
     std::filesystem::remove_all(dir, ec);
 }
 
+// A drain that times out names the subtasks that did not drain, each with the
+// worker holding it, and none that did. The list walked every key the drain
+// expected, so a subtask that had drained was named as well, with "?" for its
+// worker since it had left the pending list, and a post-mortem was sent after
+// a subtask that had done what it was asked.
+TEST(RestartDrainReadiness, ADrainTimeoutNamesOnlyTheSubtasksThatDidNotDrain) {
+    ensure_built_ins_registered();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_drain_timeout_names_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    Coordinator::Config cfg;
+    cfg.watchdog_interval = 50ms;
+    cfg.restart_drain_timeout = 1500ms;
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"dw-a", "dw-b"});
+
+    auto wa = std::make_unique<DrainFakeWorker>(port, "dw-a");
+    auto wb = std::make_unique<DrainFakeWorker>(port, "dw-b");
+    ASSERT_TRUE(wa->valid() && wb->valid());
+    ASSERT_TRUE(wa->register_and_ack());
+    ASSERT_TRUE(wb->register_and_ack());
+    ASSERT_TRUE(coordinator.await_registrations(2s));
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = dir.string();  // non-empty -> subtask errors take the whole-job path
+    ckpt.max_restarts_on_worker_loss = 3;
+    const auto job_id = coordinator.submit_job(
+        three_task_graph(dir / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+
+    struct Deployed {
+        DrainFakeWorker* worker{nullptr};
+        std::string id;
+        std::vector<std::pair<std::string, std::uint32_t>> tasks;
+    };
+    Deployed a{wa.get(), "dw-a", {}};
+    Deployed b{wb.get(), "dw-b", {}};
+    std::uint16_t fake_port = 43000;
+    for (auto* d : {&a, &b}) {
+        auto deploy = d->worker->await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(deploy.has_value()) << "a worker never received its Deploy";
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            d->tasks.emplace_back(t.role, t.subtask_idx);
+            ASSERT_TRUE(d->worker->report_listening(job_id, t.role, t.subtask_idx, fake_port++));
+        }
+    }
+    Deployed& survivor = a.tasks.size() == 2 ? a : b;
+    Deployed& quiet = a.tasks.size() == 2 ? b : a;
+    ASSERT_EQ(survivor.tasks.size(), 2U) << "expected a 2/1 split across the two workers";
+    ASSERT_EQ(quiet.tasks.size(), 1U);
+
+    // One of the survivor's subtasks fails: the whole job restarts, and the
+    // drain expects the survivor's other subtask and the quiet worker's.
+    ASSERT_TRUE(survivor.worker->send_finished(
+        job_id, survivor.tasks[0].first, survivor.tasks[0].second, /*had_error=*/true));
+    ASSERT_TRUE(survivor.worker->await_frame(MessageKind::CancelJob, 10s).has_value())
+        << "the subtask error never started a restart drain";
+    // The survivor's other subtask drains. The quiet worker's never does,
+    // though its worker stays registered and heartbeating.
+    ASSERT_TRUE(survivor.worker->send_finished(
+        job_id, survivor.tasks[1].first, survivor.tasks[1].second, /*had_error=*/false));
+
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, 15s))
+        << "the drain deadline never failed the job";
+    std::string all;
+    for (const auto& e : coordinator.job_errors(job_id)) {
+        all += e + "\n";
+    }
+    const auto key = [](const std::pair<std::string, std::uint32_t>& t) {
+        return t.first + ":" + std::to_string(t.second);
+    };
+    EXPECT_NE(all.find("survivors did not drain: " + key(quiet.tasks[0]) + " on " + quiet.id + ")"),
+              std::string::npos)
+        << all;
+    EXPECT_EQ(all.find(key(survivor.tasks[1])), std::string::npos)
+        << "the drained subtask is named as undrained: " << all;
+
+    quiet.worker->close();
+    survivor.worker->close();
+    coordinator.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 }  // namespace

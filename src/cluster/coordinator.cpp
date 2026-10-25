@@ -7129,9 +7129,20 @@ void Coordinator::watchdog_loop_() {
                     // a drain timeout with an anonymous survivor is
                     // undiagnosable from a transcript, and this line is what
                     // splits "which subtask" from "which worker" in a
-                    // post-mortem (watch item 63).
-                    std::string undrained;
+                    // post-mortem (watch item 63). A key that drained is
+                    // credited in restart_drained_keys and has left
+                    // pending_per_worker, so it is not owed: listing every
+                    // expected key named those too, each "on ?", beside the
+                    // one that held the drain.
+                    std::vector<std::string> owed;
                     for (const auto& key : job->restart_drain_expected) {
+                        if (job->restart_drained_keys.count(key) == 0) {
+                            owed.push_back(key);
+                        }
+                    }
+                    std::sort(owed.begin(), owed.end());
+                    std::string undrained = owed.empty() ? "none" : "";
+                    for (const auto& key : owed) {
                         std::string owner = "?";
                         for (const auto& [worker_id, pending] : job->pending_per_worker) {
                             for (const auto& [role, sub] : pending) {

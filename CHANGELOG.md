@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**A restart drain that times out names only the subtasks that did not
+drain.** The job's error listed every subtask the drain expected, those that
+had drained included, each of those "on ?" because a drained subtask has left
+the pending list, so a post-mortem began with subtasks that had done what
+they were asked. It now names each subtask still owed and the worker holding
+it.
+
 **A record on a quiet Kafka stream reaches the pipeline within
 `batch_max_wait_ms`, not the poll timeout.** The source's first fetch of each
 batch asked librdkafka for the whole batch, and librdkafka waits for every
