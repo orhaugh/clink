@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**`MATCH_RECOGNIZE` drops a row that arrives behind the watermark.** It matched
+every row where it arrived, so a credit and a debit a producer resent, both
+behind the watermark, matched a pattern a second time. A row at or behind the
+watermark is now late and dropped, as an `OVER` aggregate drops it. A row that
+arrives out of order but ahead of the watermark is still matched where it
+arrives. A DataStream CEP pattern is unchanged unless it calls
+`CepOperator::drop_late_records()`.
+
 **An `OVER` aggregate reads a common table expression or subquery that passes
 the event-time column through.** A window could read only a table that declares
 `event_time_column`, so `WITH once AS (SELECT DISTINCT ... FROM payments)

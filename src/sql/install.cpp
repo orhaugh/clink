@@ -13977,11 +13977,15 @@ void install(clink::plugin::PluginRegistry& reg) {
                     }
                     return out_rows;
                 };
-                return std::make_shared<clink::cep::CepOperator<Row, Row>>(std::move(*pattern),
-                                                                           row_json_codec(),
-                                                                           key_fn,
-                                                                           flat_select,
-                                                                           "match_recognize_row");
+                auto op =
+                    std::make_shared<clink::cep::CepOperator<Row, Row>>(std::move(*pattern),
+                                                                        row_json_codec(),
+                                                                        key_fn,
+                                                                        flat_select,
+                                                                        "match_recognize_row");
+                // A row at or behind the watermark is late: dropped, as OVER drops it.
+                op->drop_late_records();
+                return op;
             }
 
             auto select_fn = [part_cols,
@@ -14007,8 +14011,11 @@ void install(clink::plugin::PluginRegistry& reg) {
                 return out;
             };
 
-            return std::make_shared<clink::cep::CepOperator<Row, Row>>(
+            auto op = std::make_shared<clink::cep::CepOperator<Row, Row>>(
                 std::move(*pattern), row_json_codec(), key_fn, select_fn, "match_recognize_row");
+            // A row at or behind the watermark is late: dropped, as OVER drops it.
+            op->drop_late_records();
+            return op;
         });
 
     // tumbling_window_row / hopping_window_row: per-(group, window)

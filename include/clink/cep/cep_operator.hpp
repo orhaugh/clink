@@ -316,6 +316,18 @@ public:
         return *this;
     }
 
+    // Drop a record whose event time is at or behind the last watermark
+    // rather than match it where it arrives: the watermark says every record
+    // up to it has been seen, so such a record is late, and matching it would
+    // place it after records that came before it in event time. SQL
+    // MATCH_RECOGNIZE turns this on, as an OVER aggregate drops a late row.
+    // Off by default, so a DataStream pattern matches every record in arrival
+    // order unless it asks.
+    CepOperator& drop_late_records(bool on = true) {
+        drop_late_ = on;
+        return *this;
+    }
+
     void open() override {
         auto* rt = this->runtime();
         if (rt == nullptr || !rt->has_state_backend()) {
@@ -335,6 +347,11 @@ public:
         if (element.is_data()) {
             Batch<U> batch_out;
             for (const auto& rec : element.as_data()) {
+                if (drop_late_ && have_wm_) {
+                    if (const auto ts = rec.event_time(); ts && ts->millis() <= current_wm_) {
+                        continue;
+                    }
+                }
                 const auto k = key_fn_(rec.value());
                 advance_for_key_(k, rec, batch_out);
             }
@@ -349,6 +366,10 @@ public:
     }
 
     void on_watermark(Watermark wm, Emitter<U>& out) override {
+        if (!wm.is_idle()) {
+            have_wm_ = true;
+            current_wm_ = std::max(current_wm_, wm.timestamp().millis());
+        }
         // The eviction bound is the tighter of within() and state_ttl().
         // Both prune the same way and route evicted partials to the same
         // timed-out side output; they differ only in that within() ALSO
@@ -370,6 +391,13 @@ public:
 
 private:
     static constexpr const char* kSlotName = "__cep_partials__";
+
+    // The late bound drop_late_records() applies: the highest watermark seen.
+    // Not checkpointed: after a restore the source replays from the
+    // checkpoint, and the first batch's watermark sets it again.
+    bool drop_late_{false};
+    bool have_wm_{false};
+    std::int64_t current_wm_{0};
 
     std::vector<detail::PartialMatch<T>> load_partials_(std::int64_t k) const {
         if (!state_) {

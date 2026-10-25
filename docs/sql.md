@@ -533,9 +533,10 @@ WHERE rn <= 3;
 
 `MATCH_RECOGNIZE` finds sequences of rows within a partition. It matches each
 partition's rows in the order they arrive, so the input has to arrive in
-`ORDER BY` order, as a time-ordered stream does: a row that arrives late is
-matched where it arrives, after the rows that came before it, rather than
-dropped. It needs the Row channel (`format='json'`).
+`ORDER BY` order, as a time-ordered stream does. A row that arrives at or behind
+the watermark is late and dropped, as an `OVER` aggregate drops it; a row that
+arrives out of order but ahead of the watermark is matched where it arrives. It
+needs the Row channel (`format='json'`).
 
 ```sql
 SELECT * FROM ticks MATCH_RECOGNIZE (

@@ -3420,6 +3420,72 @@ TEST(SqlRuntime, MatchRecognizePrevInDefineMatchesTheClassicV) {
     EXPECT_EQ(static_cast<std::int64_t>(r.values.at("top").as_number()), 95);
 }
 
+// MATCH_RECOGNIZE drops a row that arrives at or behind the watermark, as an
+// OVER aggregate does: the watermark says every row up to it has been seen, so a
+// late row is not matched where it arrives. It used to be: a credit and a debit
+// a producer resent, behind the watermark, matched a second time.
+TEST(SqlRuntime, MatchRecognizeDropsARowBehindTheWatermark) {
+    ensure_sql_installed_once();
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE pay (acct BIGINT, ts BIGINT, dir VARCHAR, amount DOUBLE) "
+                    "WITH (connector='file', format='json', path='/tmp/mr_late_in.ndjson', "
+                    "event_time_column='ts');"
+                    "CREATE TABLE out_mr (acct BIGINT, onward DOUBLE) "
+                    "WITH (connector='file', format='json', path='/tmp/mr_late_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_mr SELECT * FROM pay MATCH_RECOGNIZE ("
+                        "  PARTITION BY acct ORDER BY ts"
+                        "  MEASURES LAST(d.amount) AS onward"
+                        "  PATTERN (c d)"
+                        "  DEFINE c AS dir = 'credit', "
+                        "         d AS dir = 'debit' AND amount <= PREV(amount))");
+    std::map<std::string, std::string> params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "match_recognize_row") {
+            params = op.params;
+        }
+    }
+    ASSERT_FALSE(params.empty());
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "match_recognize_row", std::string{kChannelRow}, std::string{kChannelRow});
+    ASSERT_NE(factory, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = params;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+    op->open();
+
+    const auto pair = [] {
+        Batch<Row> b;
+        for (const auto& [ts, dir, amount] :
+             {std::tuple{10, "credit", 100.0}, std::tuple{20, "debit", 90.0}}) {
+            Row r;
+            r.values["acct"] = clink::config::JsonValue{1.0};
+            r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+            r.values["dir"] = clink::config::JsonValue{std::string{dir}};
+            r.values["amount"] = clink::config::JsonValue{amount};
+            b.emplace(std::move(r), EventTime{ts});
+        }
+        return b;
+    };
+    BoundedChannel<StreamElement<Row>> ch(16);
+    Emitter<Row> em(&ch);
+    op->process(StreamElement<Row>::data(pair()), em);
+    op->process(StreamElement<Row>::watermark(Watermark{EventTime{20}}), em);
+    // The same two again, as a producer that retried would resend them.
+    op->process(StreamElement<Row>::data(pair()), em);
+
+    std::size_t matches = 0;
+    while (auto el = ch.try_pop()) {
+        if (el->is_data()) {
+            matches += el->as_data().size();
+        }
+    }
+    EXPECT_EQ(matches, 1U) << "the resent credit and debit, behind the watermark, matched again";
+}
+
 TEST(SqlRuntime, MatchRecognizeDefineExpressionOperandThreshold) {
     // A DEFINE comparison whose operand is an EXPRESSION - `price <
     // PREV(price) * 0.9` - rather than a bare column or literal. The binder
