@@ -10154,6 +10154,59 @@ TEST(SqlRuntime, UnionAllMatchesColumnsByPositionNotName) {
     std::filesystem::remove(out_path);
 }
 
+// An OVER aggregate reads a common table expression that drops duplicates
+// first, so a row sent twice is counted once. The window could only read a
+// table directly, so a dedupe step could not stand in front of it and the copy
+// counted as another row.
+TEST(SqlRuntime, OverReadsACommonTableExpressionThatDropsDuplicatesFirst) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(::getpid());
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto in_path = dir / ("clink_sql_over_cte_in_" + tag + ".ndjson");
+    const auto out_path = dir / ("clink_sql_over_cte_out_" + tag + ".ndjson");
+    std::filesystem::remove(out_path);
+    write_lines(in_path,
+                {R"({"u":1,"ts":1,"amount":10})",
+                 R"({"u":1,"ts":1,"amount":10})",
+                 R"({"u":1,"ts":2,"amount":5})",
+                 R"({"u":2,"ts":3,"amount":7})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE evt (u BIGINT, ts BIGINT, amount BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "', event_time_column='ts');"
+                     "CREATE TABLE out_t (u BIGINT, ts BIGINT, amount BIGINT, n BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    auto spec = compile(cat,
+                        "INSERT INTO out_t WITH once AS (SELECT DISTINCT u, ts, amount FROM evt) "
+                        "SELECT *, COUNT(*) OVER (PARTITION BY u ORDER BY ts "
+                        "RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS n FROM once");
+
+    InProcessCluster cluster("worker-sql-over-cte", 12);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::multiset<std::string> got;
+    for (const auto& l : read_lines(out_path)) {
+        const auto js = clink::config::parse(l);
+        got.insert(std::to_string(static_cast<std::int64_t>(js.at("u").as_number())) + "|" +
+                   std::to_string(static_cast<std::int64_t>(js.at("ts").as_number())) + "|" +
+                   std::to_string(static_cast<std::int64_t>(js.at("n").as_number())));
+    }
+    EXPECT_EQ(got, (std::multiset<std::string>{"1|1|1", "1|2|2", "2|3|1"}));
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // A BOOLEAN column is a condition on its own, in WHERE and in CASE WHEN, as
 // in SQL: it holds where the column is true, and not where it is false or
 // NULL. It was refused with "WHERE predicate kind not supported", in a CASE

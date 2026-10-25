@@ -1276,6 +1276,62 @@ void check_sink_compatibility(const TableDef& sink, const arrow::Schema& source_
     }
 }
 
+// The event-time column a derived table's plan carries through unchanged, so
+// the derived table can declare it as the table it reads does: the column of a
+// scanned table that declares event_time_column, kept through filters and
+// DISTINCT, and through a projection that outputs it as a bare column
+// reference, under its own name or another. Anything that computes, groups or
+// joins carries none, so an OVER aggregate, a window or an interval join over
+// the derived table is refused as it was.
+std::optional<std::string> carried_event_time_column(const LogicalPlan& plan) {
+    const auto kind = plan.kind();
+    if (kind == "Scan") {
+        const auto& props = static_cast<const LogicalScan&>(plan).table().properties;
+        if (auto it = props.find("event_time_column"); it != props.end() && !it->second.empty()) {
+            return it->second;
+        }
+        return std::nullopt;
+    }
+    if (kind == "Filter") {
+        return carried_event_time_column(static_cast<const LogicalFilter&>(plan).input());
+    }
+    if (kind == "Distinct") {
+        return carried_event_time_column(static_cast<const LogicalDistinct&>(plan).input());
+    }
+    if (kind == "Project") {
+        const auto& project = static_cast<const LogicalProject&>(plan);
+        const auto inner = carried_event_time_column(project.input());
+        if (!inner) {
+            return std::nullopt;
+        }
+        for (const auto& out : project.outputs()) {
+            const auto expr = clink::config::parse(out.expr_json);
+            if (expr.is_object() && expr.as_object().size() == 1 && expr.contains("col") &&
+                expr.at("col").is_string() && expr.at("col").as_string() == *inner) {
+                return out.name;
+            }
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// A synthetic table for a derived table's plan: its columns, and the
+// event-time column it carries through, if any.
+TableDef derived_table_def(const std::string& name, const LogicalPlan& plan) {
+    const auto schema = plan.schema();
+    TableDef synth;
+    synth.name = name;
+    synth.columns.reserve(static_cast<std::size_t>(schema->num_fields()));
+    for (int i = 0; i < schema->num_fields(); ++i) {
+        synth.columns.push_back(ColumnSpec{schema->field(i)->name(), schema->field(i)->type()});
+    }
+    if (const auto etc = carried_event_time_column(plan)) {
+        synth.properties["event_time_column"] = *etc;
+    }
+    return synth;
+}
+
 }  // namespace
 
 // --- Aggregate-aware SELECT binding -------------------------------
@@ -2637,15 +2693,7 @@ ast::TableRef Binder::register_derived_table(const ast::SubqueryItem& sq) const 
                    sq.loc.pos);
     }
     auto body_plan = bind_select(*sq.body);
-    auto body_schema = body_plan->schema();
-    TableDef synth;
-    synth.name = sq.alias;
-    synth.columns.reserve(static_cast<std::size_t>(body_schema->num_fields()));
-    for (int i = 0; i < body_schema->num_fields(); ++i) {
-        synth.columns.push_back(
-            ColumnSpec{body_schema->field(i)->name(), body_schema->field(i)->type()});
-    }
-    cte_synth_tables_.emplace(sq.alias, std::move(synth));
+    cte_synth_tables_.emplace(sq.alias, derived_table_def(sq.alias, *body_plan));
     cte_plans_.emplace(sq.alias, std::move(body_plan));
     ast::TableRef tr;
     tr.name = sq.alias;
@@ -3453,8 +3501,11 @@ std::unique_ptr<LogicalPlan> Binder::bind_over_aggregate(
     // operator's per-row frame closes exactly when the watermark passes.
     auto etc = source.properties.find("event_time_column");
     if (etc == source.properties.end() || etc->second.empty()) {
-        bind_error("OVER aggregate requires the source table to declare event_time_column",
-                   first.loc.pos);
+        bind_error(
+            "OVER aggregate requires its source to carry an event-time column: a table that "
+            "declares event_time_column, or a common table expression or subquery over one "
+            "that passes the column through unchanged",
+            first.loc.pos);
     }
     if (etc->second != order_col) {
         bind_error("OVER aggregate ORDER BY column must be the source event_time_column ('" +
@@ -4200,15 +4251,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
                 bind_error("duplicate CTE name: " + cte.name, cte.loc.pos);
             }
             auto body_plan = bind_select(*cte.body);
-            auto schema = body_plan->schema();
-            TableDef synth;
-            synth.name = cte.name;
-            synth.columns.reserve(static_cast<std::size_t>(schema->num_fields()));
-            for (int i = 0; i < schema->num_fields(); ++i) {
-                synth.columns.push_back(
-                    ColumnSpec{schema->field(i)->name(), schema->field(i)->type()});
-            }
-            cte_synth_tables_.emplace(cte.name, std::move(synth));
+            cte_synth_tables_.emplace(cte.name, derived_table_def(cte.name, *body_plan));
             cte_plans_.emplace(cte.name, std::move(body_plan));
         }
     }
@@ -4572,15 +4615,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             }
         }
 
-        auto body_schema = body_plan->schema();
-        TableDef synth;
-        synth.name = sq.alias;
-        synth.columns.reserve(static_cast<std::size_t>(body_schema->num_fields()));
-        for (int i = 0; i < body_schema->num_fields(); ++i) {
-            synth.columns.push_back(
-                ColumnSpec{body_schema->field(i)->name(), body_schema->field(i)->type()});
-        }
-        cte_synth_tables_.emplace(sq.alias, std::move(synth));
+        cte_synth_tables_.emplace(sq.alias, derived_table_def(sq.alias, *body_plan));
         cte_plans_.emplace(sq.alias, std::move(body_plan));
         ast::TableRef tr;
         tr.name = sq.alias;

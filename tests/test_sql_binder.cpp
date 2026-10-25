@@ -939,6 +939,41 @@ TEST(SqlBinder, OverBoundedFrameRejectedForNavigationFns) {
                  TranslationError);
 }
 
+// An OVER aggregate reads a common table expression or subquery that passes
+// the source's event-time column through unchanged, through a DISTINCT, a
+// filter or a projection that renames it, as it reads the table. It was refused
+// with "requires the source table to declare event_time_column", so a dedupe
+// step could not stand in front of a window. A derived table that computes the
+// column carries no event time and is still refused.
+TEST(SqlBinder, OverReadsADerivedTableThatKeepsTheEventTimeColumn) {
+    Catalog cat;
+    register_events(cat);
+    Binder b(cat);
+    auto cte = b.bind_select(as_select(
+        parse("WITH once AS (SELECT DISTINCT user_id, ts, amount FROM evt WHERE amount > 0) "
+              "SELECT *, COUNT(*) OVER (PARTITION BY user_id ORDER BY ts "
+              "RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) AS n FROM once")));
+    ASSERT_EQ(cte->kind(), "OverAggregate");
+    const auto& ov = static_cast<const LogicalOverAggregate&>(*cte);
+    EXPECT_EQ(ov.input().kind(), "Distinct");
+
+    auto renamed = b.bind_select(
+        as_select(parse("SELECT *, SUM(amount) OVER (PARTITION BY u ORDER BY at) AS running "
+                        "FROM (SELECT user_id AS u, ts AS at, amount FROM evt) AS t")));
+    EXPECT_EQ(renamed->kind(), "OverAggregate");
+
+    try {
+        (void)b.bind_select(as_select(
+            parse("WITH moved AS (SELECT user_id, ts + 1 AS ts, amount FROM evt) "
+                  "SELECT *, COUNT(*) OVER (PARTITION BY user_id ORDER BY ts) AS n FROM moved")));
+        ADD_FAILURE() << "a computed time column was taken as the event-time column";
+    } catch (const TranslationError& e) {
+        EXPECT_NE(std::string{e.what()}.find("passes the column through unchanged"),
+                  std::string::npos)
+            << e.what();
+    }
+}
+
 TEST(SqlBinder, OverFollowingFrameRejected) {
     // A FOLLOWING end bound is rejected at translation.
     EXPECT_THROW(parse("SELECT SUM(x) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) "

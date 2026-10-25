@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**An `OVER` aggregate reads a common table expression or subquery that passes
+the event-time column through.** A window could read only a table that declares
+`event_time_column`, so `WITH once AS (SELECT DISTINCT ... FROM payments)
+SELECT *, COUNT(*) OVER (...) FROM once` was refused with "OVER aggregate
+requires the source table to declare event_time_column", and a step that drops
+duplicates could not stand in front of a window. A derived table now carries
+its source's event-time column when it keeps it unchanged, through `DISTINCT`,
+a filter, or a projection that keeps or renames it. One that computes, groups
+or joins still carries none, and the refusal now says what qualifies.
+
 **A restart drain that times out names only the subtasks that did not
 drain.** The job's error listed every subtask the drain expected, those that
 had drained included, each of those "on ?" because a drained subtask has left

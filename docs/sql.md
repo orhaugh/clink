@@ -508,10 +508,13 @@ supported.
 
 The query selects `*` beside its `OVER` aggregates; other select items are
 refused, so project in an outer query. It reads a table that declares
-`event_time_column` directly, with an optional `WHERE`; a common table expression
-or subquery between them is refused, because the time column's role does not
-carry through it. Each partition's rows are emitted in event-time order as the
-watermark passes them, and a row that arrives behind the watermark is dropped.
+`event_time_column`, with an optional `WHERE`, or a common table expression or
+subquery over one that passes the time column through unchanged: through
+`DISTINCT`, a filter, or a projection that keeps or renames it. A step that drops
+duplicates can therefore stand in front of a window. A derived table that
+computes, groups or joins carries no event-time column, and is refused. Each
+partition's rows are emitted in event-time order as the watermark passes them,
+and a row that arrives behind the watermark is dropped.
 
 **Top-N per key** uses a ranking function in a subquery with an outer bound:
 
