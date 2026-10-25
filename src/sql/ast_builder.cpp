@@ -1,6 +1,7 @@
 #include "clink/sql/ast_builder.hpp"
 
 #include <cctype>
+#include <charconv>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -185,6 +186,7 @@ ast::Expression translate_expression(const JsonValue& wrapper);
 ast::TypeName translate_type_name(const JsonValue& body);
 std::optional<std::int64_t> interval_typecast_to_ms(const ast::TypeName& type,
                                                     const JsonValue& arg_wrapper);
+std::optional<std::int64_t> whole_number_literal(const JsonValue& fval);
 ast::FromItem translate_from_item(const JsonValue& wrapper);
 ast::SelectStmt translate_select_stmt(const JsonValue& body);
 ast::TableRef translate_range_var(const JsonValue& body);
@@ -484,6 +486,9 @@ ast::Expression translate_func_call(const JsonValue& body) {
                     n = iv.contains("ival") && iv.at("ival").is_number()
                             ? static_cast<std::int64_t>(iv.at("ival").as_number())
                             : 0;  // PG omits ival for 0
+                } else if (ok == "A_Const" && ob->contains("fval") && ob->at("fval").is_object()) {
+                    // 28 days of milliseconds is past 32 bits.
+                    n = whole_number_literal(ob->at("fval"));
                 } else if (ok == "TypeCast" && ob->contains("typeName")) {
                     auto tn = translate_type_name(ob->at("typeName"));
                     if (ob->contains("arg"))
@@ -524,6 +529,22 @@ ast::Expression translate_coalesce_expr(const JsonValue& body) {
 // low 16 bits as a bitmask (HOUR=1024, MINUTE=2048, SECOND=4096,
 // DAY=8); the inner A_Const carries the numeric quantity as a string.
 // Returns std::nullopt when the unit isn't one we handle.
+// A whole number the parser carried as a numeric string: an integer literal
+// wider than 32 bits arrives as {"fval": "2419200000"}, not as an ival.
+// nullopt for anything with a fraction or a sign, or past 64 bits.
+std::optional<std::int64_t> whole_number_literal(const JsonValue& fval) {
+    if (!fval.contains("fval") || !fval.at("fval").is_string()) {
+        return std::nullopt;
+    }
+    const std::string& raw = fval.at("fval").as_string();
+    std::int64_t v = 0;
+    const auto [end, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), v);
+    if (ec != std::errc{} || end != raw.data() + raw.size()) {
+        return std::nullopt;
+    }
+    return v;
+}
+
 std::optional<std::int64_t> interval_typecast_to_ms(const ast::TypeName& type,
                                                     const JsonValue& arg_wrapper) {
     if (type.name != "interval")

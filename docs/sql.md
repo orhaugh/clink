@@ -503,7 +503,9 @@ FROM payments;
 `LAG(col[, offset])`, with an optional `ROWS/RANGE BETWEEN n PRECEDING AND CURRENT ROW`
 frame on the plain aggregates. A `RANGE` frame's `n` is in the units of the
 `ORDER BY` column: `RANGE BETWEEN 3600000 PRECEDING AND CURRENT ROW` is the last
-hour of an epoch-millisecond time. `LEAD`, `NTILE` and `FOLLOWING` frames are not
+hour of an epoch-millisecond time, and an interval in seconds, minutes, hours or
+days counts milliseconds, so `RANGE BETWEEN INTERVAL '28' DAY PRECEDING AND
+CURRENT ROW` is the last 28 days. `LEAD`, `NTILE` and `FOLLOWING` frames are not
 supported.
 
 The query selects `*` beside its `OVER` aggregates; other select items are

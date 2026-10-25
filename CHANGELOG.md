@@ -22,6 +22,13 @@ order, as `MATCH_RECOGNIZE` does when its `ORDER BY` is the event-time column.
 A record at or behind the watermark is dropped as late. A pattern that does
 not call it matches records as they arrive, as before.
 
+**A `RANGE` frame takes an offset past 32 bits.** `RANGE BETWEEN 2419200000
+PRECEDING AND CURRENT ROW`, 28 days of milliseconds, was refused with "window
+frame PRECEDING offset must be a non-negative constant": the SQL parser hands
+an integer wider than 32 bits over as a numeric string, which the frame did not
+read. It now takes any whole number that fits in 64 bits; a fraction is still
+refused. `INTERVAL '28' DAY` always worked, and the SQL page now says so.
+
 **An `OVER` aggregate reads a common table expression or subquery that passes
 the event-time column through.** A window could read only a table that declares
 `event_time_column`, so `WITH once AS (SELECT DISTINCT ... FROM payments)

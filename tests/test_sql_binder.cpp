@@ -927,6 +927,27 @@ TEST(SqlBinder, OverBoundedFrameBindsRowsAndRange) {
     EXPECT_EQ(ov.outputs()[1].frame_start, 5);
 }
 
+// A RANGE frame's offset can be any whole number. 28 days of milliseconds,
+// 2419200000, is past 32 bits, which the SQL parser hands over as a numeric
+// string rather than an integer, and the frame was refused as not being a
+// constant. INTERVAL '28' DAY reaches the same offset; a fraction is refused.
+TEST(SqlBinder, OverRangeFrameTakesAnOffsetPastThirtyTwoBits) {
+    Catalog cat;
+    register_events(cat);
+    Binder b(cat);
+    const auto offset = [&](const std::string& frame) {
+        auto plan = b.bind_select(as_select(
+            parse("SELECT *, COUNT(*) OVER (PARTITION BY user_id ORDER BY ts RANGE BETWEEN " +
+                  frame + " PRECEDING AND CURRENT ROW) AS n FROM evt")));
+        const auto& ov = static_cast<const LogicalOverAggregate&>(*plan);
+        EXPECT_EQ(ov.outputs().at(0).frame_mode, 2);  // RANGE
+        return ov.outputs().at(0).frame_start;
+    };
+    EXPECT_EQ(offset("2419200000"), 2419200000);
+    EXPECT_EQ(offset("INTERVAL '28' DAY"), 2419200000);
+    EXPECT_THROW((void)offset("1.5"), TranslationError);
+}
+
 TEST(SqlBinder, OverBoundedFrameRejectedForNavigationFns) {
     Catalog cat;
     register_events(cat);
