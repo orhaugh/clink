@@ -630,6 +630,39 @@ TEST(LocalSubmitter, FluentCepTimedOutSideOutputRoutesExpiredPartials) {
     std::filesystem::remove(expired_path);
 }
 
+TEST(LocalSubmitter, FluentCepOrderByEventTimeMatchesRecordsInEventTimeOrder) {
+    // order_by_event_time() on the fluent surface, end to end: the source
+    // delivers 3 before 1, both inside the assigner's 10 ms of
+    // out-of-orderness, and the pattern "1 then 3" still matches once the
+    // watermark passes them. In arrival order it sees 3 first and never
+    // matches.
+    cluster::ensure_built_ins_registered();
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_local_submitter_cep_event_time.txt";
+    std::filesystem::remove(out_path);
+
+    auto env = Pipeline::create();
+    auto p = cep::Pattern<std::int64_t>::begin("a")
+                 .where([](const std::int64_t& v) { return v == 1; })
+                 .next("b")
+                 .where([](const std::int64_t& v) { return v == 3; });
+    auto keyed = env.from_elements<std::int64_t>({3, 1})
+                     .assign_timestamps_bounded([](const std::int64_t& v) { return EventTime{v}; },
+                                                std::chrono::milliseconds(10))
+                     .key_by([](const std::int64_t&) -> std::int64_t { return 0; });
+    cep::pattern(keyed, p, int64_codec())
+        .order_by_event_time()
+        .select<std::int64_t>([](const cep::PatternMatch<std::int64_t>& m) -> std::int64_t {
+            return m.at("a").front() * 10 + m.at("b").front();
+        })
+        .sink(FileInt64Sink::builder().path(out_path.string()).build());
+
+    cluster::LocalSubmitter::submit(env);
+
+    EXPECT_EQ(read_lines(out_path), (std::vector<std::string>{"13"}));
+    std::filesystem::remove(out_path);
+}
+
 // A uid is what pins a stateful operator's OperatorId, and the OperatorId is what
 // every keyed-state slot is written under. On this path the operators are built
 // by DagBuilder closures that never see the uid, so unless the submitter stamps

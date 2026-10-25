@@ -15,6 +15,8 @@
 //   * key_fn_      - int64 extractor over T. For keyed: the extractor
 //                    looked up from KeyExtractorRegistry by key_by_.
 //                    For non-keyed: a constant-0 extractor.
+//   * order_by_event_time_ - set by order_by_event_time(); the operator
+//                    then matches each key's records in event-time order.
 //
 // The .select<U>() call mints an inline op type, registers a runner
 // factory that builds the CepOperator at runtime, and appends an
@@ -54,6 +56,21 @@ public:
           t_codec_(std::move(t_codec)),
           key_fn_(std::move(key_fn)) {}
 
+    // Match each key's records in event-time order rather than the order they
+    // arrive: each record is held until the watermark passes it, then fed to
+    // the pattern with the key's other held records by event time, records at
+    // the same time in the order they arrived. A record at or behind the
+    // watermark is late and dropped; one without an event time is matched
+    // where it arrives. Held records are checkpointed with the partial
+    // matches, and the end of the input releases them. The stream needs event
+    // times and watermarks, from assign_timestamps_bounded() upstream for
+    // example. Applies to the select(), select_with_timed_out() or
+    // flat_select() that follows.
+    PatternStream& order_by_event_time() {
+        order_by_event_time_ = true;
+        return *this;
+    }
+
     // Materialise the CEP operator and emit one U per completed
     // pattern match. The selector receives the full PatternMatch<T>
     // (step-name -> matched events) and returns the user's payload.
@@ -71,11 +88,15 @@ public:
         auto pattern = pattern_;
         auto t_codec = t_codec_;
         auto key_fn = key_fn_;
+        const bool event_time_order = order_by_event_time_;
         reg.template register_operator<T, U>(
             op_type,
-            [pattern, t_codec, key_fn, fn = std::move(fn), op_type](
+            [pattern, t_codec, key_fn, fn = std::move(fn), op_type, event_time_order](
                 const ::clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
-                return std::make_shared<CepOperator<T, U>>(pattern, t_codec, key_fn, fn, op_type);
+                auto op =
+                    std::make_shared<CepOperator<T, U>>(pattern, t_codec, key_fn, fn, op_type);
+                op->order_by_event_time(event_time_order);
+                return op;
             });
         cluster::OperatorSpec op;
         op.id = std::move(id);
@@ -115,6 +136,7 @@ public:
         auto pattern = pattern_;
         auto t_codec = t_codec_;
         auto key_fn = key_fn_;
+        const bool event_time_order = order_by_event_time_;
         reg.template register_operator<T, U>(
             op_type,
             [pattern,
@@ -123,10 +145,13 @@ public:
              fn = std::move(fn),
              timed_out_tag,
              timed_out_fn = std::move(timed_out_fn),
-             op_type](const ::clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
+             op_type,
+             event_time_order](
+                const ::clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
                 auto op =
                     std::make_shared<CepOperator<T, U>>(pattern, t_codec, key_fn, fn, op_type);
                 op->template with_timed_out_output<U>(timed_out_tag, timed_out_fn);
+                op->order_by_event_time(event_time_order);
                 return op;
             });
         cluster::OperatorSpec op;
@@ -154,13 +179,16 @@ public:
         auto pattern = pattern_;
         auto t_codec = t_codec_;
         auto key_fn = key_fn_;
+        const bool event_time_order = order_by_event_time_;
         reg.template register_operator<T, U>(
             op_type,
-            [pattern, t_codec, key_fn, fn = std::move(fn), op_type](
+            [pattern, t_codec, key_fn, fn = std::move(fn), op_type, event_time_order](
                 const ::clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
                 typename CepOperator<T, U>::FlatSelectFn flat_fn = fn;
-                return std::make_shared<CepOperator<T, U>>(
-                    pattern, t_codec, key_fn, flat_fn, op_type);
+                auto op =
+                    std::make_shared<CepOperator<T, U>>(pattern, t_codec, key_fn, flat_fn, op_type);
+                op->order_by_event_time(event_time_order);
+                return op;
             });
         cluster::OperatorSpec op;
         op.id = std::move(id);
@@ -180,6 +208,7 @@ private:
     Pattern<T> pattern_;
     Codec<T> t_codec_;
     std::function<std::int64_t(const T&)> key_fn_;
+    bool order_by_event_time_{false};
 };
 
 }  // namespace clink::cep

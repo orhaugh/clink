@@ -12,8 +12,15 @@ the same time in the order they arrived; held rows are part of the checkpoint,
 and a match is emitted once the watermark passes its last row. A row at or
 behind the watermark is late and dropped, as an `OVER` aggregate drops it, and
 the bound that decides lateness is checkpointed. Ordered by another column,
-rows are still matched as they arrive. A DataStream CEP pattern is unchanged
-unless it calls `CepOperator::order_by_event_time()` or `drop_late_records()`.
+rows are still matched as they arrive. A typed CEP pattern keeps arrival
+order unless it asks for event-time order.
+
+**A typed CEP pattern can match in event-time order.**
+`cep::pattern(stream, pattern, codec).order_by_event_time()` holds each record
+until the watermark passes it and matches each key's records in event-time
+order, as `MATCH_RECOGNIZE` does when its `ORDER BY` is the event-time column.
+A record at or behind the watermark is dropped as late. A pattern that does
+not call it matches records as they arrive, as before.
 
 **An `OVER` aggregate reads a common table expression or subquery that passes
 the event-time column through.** A window could read only a table that declares
