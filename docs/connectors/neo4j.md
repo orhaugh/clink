@@ -336,6 +336,8 @@ Measured with [`benchmarks/clink_neo4j_lookup_bench.cpp`](https://github.com/orh
 
 In the pool rows each client waits for its own lookup, so the latency is one lookup's. In the operator rows rows are fed as fast as the operator takes them, so the latency, from handing a row in to its emission, includes the wait behind the other rows in flight: about `max_in_flight` divided by the throughput. One request costs about 0.8 ms here whether it is the point read or the two-hop read, so request round trips rather than graph work bound these figures, and concurrency is the lever until the server is saturated; at 16 requests the point read varied most between runs (3,600 to 5,800 per second). These figures are for comparing changes on this machine. They are not a capacity statement: the server shares the machine, and Docker Desktop's network path is part of every request.
 
+The first lookups of a job are slower than the rest. Neo4j plans a statement the first time it runs it, and the open check's `EXPLAIN`, run with `$key` as NULL, does not leave a plan the lookups reuse. On the same machine, with the server's query caches cleared, the first lookup of a two-hop statement took 80 to 310 ms and the next ones 3 to 7 ms, and lookups that arrived while the first was being planned waited for it. Expect that after a job starts, and after the server's plan cache is cleared.
+
 ## Security
 
 - Credentials come from `username`/`password` or `bearer_token`, normally as `env://` references. They are sent only in the `Authorization` header, never logged, and never part of an error.
