@@ -289,9 +289,9 @@ User-defined functions run inside the read transaction, so they cannot write to 
 ### Checkpoints, watermarks and order
 
 - **Order.** Results leave in input order, whatever order the replies come back in.
-- **Markers.** Before the operator forwards a watermark or a checkpoint barrier, every lookup started before it has finished and its row has been emitted. A watermark therefore never overtakes the rows it covers, and a checkpoint never holds a lookup in flight: in-flight work is drained before the barrier is acknowledged, not stored. The operator has no state, and a restore replays the input after the checkpoint and looks those rows up again.
+- **Markers.** A watermark leaves after every row that arrived before it and before every row that arrived after it, so it never overtakes the rows it covers. It does not stop lookups starting: it waits behind the rows ahead of it, and the rows behind it are looked up meanwhile, so a stream with a watermark after every record still runs up to `max_concurrent_requests` reads at once while it catches up. Before the operator forwards a checkpoint barrier, every lookup started before it has finished and its row has been emitted, so a checkpoint never holds a lookup in flight: in-flight work is drained before the barrier is acknowledged, not stored. The operator has no state, and a restore replays the input after the checkpoint and looks those rows up again.
 - **Cost.** A barrier waits for the slowest lookup in flight, up to the retry budget, so slow or failing reads lengthen checkpoint alignment.
-- **Latency.** While lookups are in flight the runner wakes the operator every 2 ms to emit those that have finished, so a result does not wait for the next input element.
+- **Latency.** While lookups are in flight the runner wakes the operator every 2 ms to emit those that have finished, so neither a result nor a watermark waiting behind it waits for the next input element.
 
 ### Consistency and replay
 

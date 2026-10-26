@@ -31,13 +31,26 @@
 //   - drain(): emit completed tasks from the head of the ordered
 //     queue. Stops at the first not-done task to preserve input
 //     order. Unordered emit (out_of_order) emits any done task.
-//   - on_watermark / on_barrier: drain everything in-flight. For
-//     synchronous-completing tasks this is immediate; for tasks
-//     suspended on real I/O, this currently spin-waits with a
+//   - watermark: leaves after every record that arrived before it
+//     and before any that arrived after it, in both modes, but does
+//     not stop lookups starting. It waits in the queue behind the
+//     records ahead of it, the lookups of the records behind it start
+//     as they arrive, and drain() forwards it once nothing is ahead of
+//     it. A run of watermarks with no record between them keeps only
+//     its newest progress: the newest watermark that is not idle,
+//     then an idle mark if the run ends idle.
+//   - barrier and end of input: drain everything in flight first,
+//     since the operator keeps no state and nothing may be in flight
+//     across a checkpoint. For synchronous-completing tasks this is
+//     immediate; for tasks suspended on real I/O it spin-waits with a
 //     short sleep + resume() to let the user's awaitable advance.
-//     A proper async-aware barrier is a follow-on.
-//   - max_in_flight: process() blocks once max_in_flight tasks are
-//     queued so a slow lookup naturally throttles upstream.
+//   - wake-ups: while anything is in flight, next_timer_deadline_ms()
+//     asks the runner to wake the operator every kPollMs, and
+//     fire_due_timers() emits what has finished, so a result or a
+//     waiting watermark does not wait for the next input element.
+//   - max_in_flight: process() blocks once max_in_flight lookups are
+//     in flight so a slow lookup naturally throttles upstream;
+//     waiting watermarks do not count.
 //
 // Exception handling: a throwing Task<Out> body is captured on the
 // promise (see clink::async::Task). emit_slot_() calls Task::get()
@@ -45,6 +58,7 @@
 // as any other operator failure (typically: log + abort the job).
 // A user-configurable retry policy is left for a follow-on slice.
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -83,9 +97,9 @@ public:
                 // tasks with resume() and sleep briefly. For purely
                 // synchronous lookups the drain after kickoff brings
                 // us under capacity in one shot.
-                while (in_flight_.size() >= max_in_flight_) {
+                while (lookups_ >= max_in_flight_) {
                     drain_(out);
-                    if (in_flight_.size() < max_in_flight_)
+                    if (lookups_ < max_in_flight_)
                         break;
                     nudge_in_flight_();
                     std::this_thread::sleep_for(std::chrono::microseconds{100});
@@ -94,8 +108,14 @@ public:
             }
             drain_(out);
         } else if (element.is_watermark()) {
-            wait_for_all_(out);
-            this->on_watermark(element.as_watermark(), out);
+            // The watermark may not pass the records ahead of it, but it
+            // need not stop the lookups behind it: it waits in the queue.
+            drain_(out);
+            if (queue_.empty()) {
+                this->on_watermark(element.as_watermark(), out);
+            } else {
+                enqueue_watermark_(element.as_watermark());
+            }
         } else {
             wait_for_all_(out);
             this->on_barrier(element.as_barrier(), out);
@@ -107,7 +127,8 @@ public:
     void flush(Emitter<Out>& out) override { wait_for_all_(out); }
 
     // Advances every in-flight lookup once and emits what has finished
-    // (ordered: the finished head only). Never blocks, so an operator
+    // (ordered: the finished head only), with any watermark that no
+    // longer has a record ahead of it. Never blocks, so an operator
     // that wraps this one can call it between inputs, when the runner
     // wakes it, instead of holding finished results until the next
     // marker or until max_in_flight is reached.
@@ -116,12 +137,32 @@ public:
         drain_(out);
     }
 
+    // While anything is in flight, the runner wakes the operator every
+    // kPollMs to emit what has finished, so neither a result nor a
+    // watermark waiting behind it waits for the next input element.
+    void fire_due_timers(Emitter<Out>& out, std::int64_t now_ms) override {
+        Operator<In, Out>::fire_due_timers(out, now_ms);
+        if (!queue_.empty()) {
+            poll(out);
+        }
+    }
+
+    [[nodiscard]] std::optional<std::int64_t> next_timer_deadline_ms() const override {
+        auto next = Operator<In, Out>::next_timer_deadline_ms();
+        auto* rt = this->runtime();
+        if (!queue_.empty() && rt != nullptr) {
+            const std::int64_t soon = rt->timer_service()->now_ms() + kPollMs;
+            return next ? std::min(*next, soon) : soon;
+        }
+        return next;
+    }
+
     std::string name() const override { return name_; }
 
     // Test/diagnostic accessors. Not part of the public Operator
     // contract but useful for UTs to observe scheduling behaviour
     // without having to drive the input channel.
-    [[nodiscard]] std::size_t in_flight_count() const noexcept { return in_flight_.size(); }
+    [[nodiscard]] std::size_t in_flight_count() const noexcept { return lookups_; }
     [[nodiscard]] std::size_t emitted_count() const noexcept { return emitted_count_; }
 
 private:
@@ -135,6 +176,15 @@ private:
         explicit Slot(async::Task<Out> t) : task(std::move(t)) {}
     };
 
+    // One place in the queue: a lookup in flight, or a watermark waiting
+    // for the records that arrived before it.
+    struct Entry {
+        std::shared_ptr<Slot> slot;
+        std::optional<Watermark> watermark;
+    };
+
+    static constexpr std::int64_t kPollMs = 2;
+
     void kickoff_(const In& record) {
         // Build the lookup coroutine. fn_ returns a Task<Out>; we
         // resume() it once to advance past initial_suspend
@@ -142,32 +192,73 @@ private:
         // here; an async body suspends on its first co_await.
         auto slot = std::make_shared<Slot>(fn_(record));
         slot->task.resume();
-        in_flight_.push_back(std::move(slot));
+        queue_.push_back(Entry{std::move(slot), std::nullopt});
+        ++lookups_;
+    }
+
+    // Keeps a run of watermarks with no record between them to its newest
+    // progress, so the queue is bounded by the lookups in flight: a
+    // watermark that is not idle replaces the run, and an idle one replaces
+    // an idle mark at the end of it.
+    void enqueue_watermark_(Watermark wm) {
+        if (!wm.is_idle()) {
+            while (!queue_.empty() && queue_.back().watermark) {
+                queue_.pop_back();
+            }
+        } else if (!queue_.empty() && queue_.back().watermark &&
+                   queue_.back().watermark->is_idle()) {
+            queue_.pop_back();
+        }
+        queue_.push_back(Entry{nullptr, wm});
     }
 
     // Drain whatever is ready. Ordered emit pops from the head of
-    // in_flight_ while the head is done; stops at the first not-
-    // done task to preserve input order. Unordered emit walks the
-    // whole queue and emits everything ready.
+    // queue_ while the head is done or a watermark; stops at the first
+    // not-done task to preserve input order. Unordered emit walks the
+    // queue and emits every done task up to the first watermark that
+    // still has a task ahead of it: records leave in any order between
+    // two watermarks, but none passes one.
     void drain_(Emitter<Out>& out) {
         if (ordered_) {
-            while (!in_flight_.empty() && in_flight_.front()->task.done()) {
-                auto slot = std::move(in_flight_.front());
-                in_flight_.pop_front();
+            while (!queue_.empty()) {
+                auto& head = queue_.front();
+                if (head.watermark) {
+                    const Watermark wm = *head.watermark;
+                    queue_.pop_front();
+                    this->on_watermark(wm, out);
+                    continue;
+                }
+                if (!head.slot->task.done()) {
+                    break;
+                }
+                auto slot = std::move(head.slot);
+                queue_.pop_front();
+                --lookups_;
                 emit_slot_(*slot, out);
             }
         } else {
             // Walk-and-rebuild: emit done slots, keep the rest in
             // their relative order.
-            std::deque<std::shared_ptr<Slot>> kept;
-            for (auto& slot : in_flight_) {
-                if (slot->task.done()) {
-                    emit_slot_(*slot, out);
+            std::deque<Entry> kept;
+            bool held = false;
+            for (auto& entry : queue_) {
+                if (held) {
+                    kept.push_back(std::move(entry));
+                } else if (entry.watermark) {
+                    if (kept.empty()) {
+                        this->on_watermark(*entry.watermark, out);
+                    } else {
+                        held = true;
+                        kept.push_back(std::move(entry));
+                    }
+                } else if (entry.slot->task.done()) {
+                    --lookups_;
+                    emit_slot_(*entry.slot, out);
                 } else {
-                    kept.push_back(std::move(slot));
+                    kept.push_back(std::move(entry));
                 }
             }
-            in_flight_ = std::move(kept);
+            queue_ = std::move(kept);
         }
     }
 
@@ -180,23 +271,23 @@ private:
     // in process()'s backpressure loop and wait_for_all_, this
     // gives async awaitables time to deliver their continuation.
     void nudge_in_flight_() {
-        for (auto& slot : in_flight_) {
-            if (!slot->task.done()) {
-                slot->task.resume();
+        for (auto& entry : queue_) {
+            if (entry.slot && !entry.slot->task.done()) {
+                entry.slot->task.resume();
             }
         }
     }
 
-    // Block until every in-flight task is done, then drain. Used
-    // on barriers and watermarks where downstream needs every
-    // pending result delivered before the marker propagates. For
-    // tests with synchronous lookup bodies the first drain_ empties
-    // the queue; for async I/O bodies the spin-wait gives the
-    // backend a chance to deliver completions.
+    // Block until every in-flight task is done, then drain, waiting
+    // watermarks included. Used on barriers and at the end of input,
+    // where downstream needs every pending result delivered before the
+    // marker propagates. For tests with synchronous lookup bodies the
+    // first drain_ empties the queue; for async I/O bodies the
+    // spin-wait gives the backend a chance to deliver completions.
     void wait_for_all_(Emitter<Out>& out) {
-        while (!in_flight_.empty()) {
+        while (!queue_.empty()) {
             drain_(out);
-            if (in_flight_.empty())
+            if (queue_.empty())
                 break;
             nudge_in_flight_();
             std::this_thread::sleep_for(std::chrono::microseconds{100});
@@ -222,7 +313,8 @@ private:
     std::size_t max_in_flight_;
     bool ordered_;
     std::string name_;
-    std::deque<std::shared_ptr<Slot>> in_flight_;
+    std::deque<Entry> queue_;
+    std::size_t lookups_{0};
     std::size_t emitted_count_{0};
 };
 

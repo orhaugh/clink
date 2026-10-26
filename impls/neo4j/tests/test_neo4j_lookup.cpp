@@ -529,6 +529,38 @@ TEST(Neo4jLookup, RepliesOutOfOrderAreEmittedInOrderAndNoMarkerOvertakesThem) {
     ASSERT_GE(reads.size(), 3U);
 }
 
+TEST(Neo4jLookup, AWatermarkDoesNotHoldBackTheLookupsBehindIt) {
+    FakeLookupApi api({"shared", "evidence"});
+    LookupAnswer stall = one(1, "x");
+    stall.kind = LookupAnswer::Kind::Stall;
+    api.answer("1", stall);
+    api.answer("2", one(2, "x"));
+    Rig rig(api, {{"max_concurrent_requests", "4"}});
+    rig.op->open();
+    std::atomic<bool> returned{false};
+    std::thread feeder([&] {
+        rig.process(data({probe(1, 1)}));
+        rig.process(StreamElement<Row>::watermark(Watermark{EventTime{1000}}));
+        rig.process(data({probe(2, 2)}));
+        returned.store(true);
+    });
+    // Key 2 is read while key 1's read is still unanswered: the watermark
+    // between them waits behind key 1 instead of holding the input.
+    for (int i = 0; i < 200 && (api.reads().size() < 2 || !returned.load()); ++i) {
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_EQ(api.reads().size(), 2U);
+    EXPECT_TRUE(returned.load())
+        << "the watermark held the input until the read before it answered";
+    if (returned.load()) {
+        EXPECT_TRUE(rig.order().empty()) << "something left ahead of key 1";
+    }
+    api.release();
+    feeder.join();
+    rig.op->flush(rig.out);
+    EXPECT_EQ(rig.order(), (std::vector<std::string>{"row:1", "wm:1000", "row:2"}));
+}
+
 TEST(Neo4jLookup, FinishedLookupsAreEmittedWithoutWaitingForTheNextElement) {
     FakeLookupApi api({"shared", "evidence"});
     api.answer("1", one(1, "x"));

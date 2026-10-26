@@ -131,11 +131,12 @@ private:
 // neo4j_lookup_join_row: a SQL lookup join against Neo4j. Each probe row's key
 // is sent as $key to the lookup table's statement through the pool; the
 // result, or the no-match, is merged as the generic lookup join merges it.
-// Emission is in input order, and every lookup started before a watermark or
-// checkpoint barrier finishes and is emitted before the marker is forwarded
-// (AsyncLookupOperator), so no lookup is in flight across a checkpoint: a
-// restore replays the input after it and runs those lookups again. A lookup
-// that fails fails the task; it never becomes a no-match.
+// Emission is in input order (AsyncLookupOperator). A watermark leaves after
+// the rows ahead of it, and the rows behind it are looked up while it waits.
+// A checkpoint barrier is forwarded only once every lookup started before it
+// has finished and been emitted, so no lookup is in flight across a
+// checkpoint: a restore replays the input after it and runs those lookups
+// again. A lookup that fails fails the task; it never becomes a no-match.
 class Neo4jLookupJoin final : public Operator<clink::sql::Row, clink::sql::Row> {
 public:
     explicit Neo4jLookupJoin(LookupOptions options);

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**A lookup keeps reading while a watermark waits.** `AsyncLookupOperator`,
+which the Neo4j lookup and the async `ML_PREDICT` path run on, finished every
+lookup in flight before it passed a watermark on. A stream with a watermark
+after every record therefore had one lookup in flight at a time whenever a
+backlog formed, after a stall, a restore or a cold start, and caught up at the
+pace of one read after another. A watermark now waits in the queue behind the
+records that arrived before it and leaves once they have, while the records
+behind it are looked up. No record passes a watermark in either direction,
+ordered or not, and a run of waiting watermarks keeps only its newest
+progress. A checkpoint barrier and the end of input still wait for every
+lookup in flight. While anything is in flight the operator asks the runner to
+wake it every 2 ms, so a finished result or a waiting watermark leaves without
+waiting for the next input element.
+
 **`MATCH_RECOGNIZE` matches rows in event-time order and drops late rows.** It
 matched each partition's rows in the order they arrived, so a debit that
 arrived before the credit it passed on did not complete a pattern, and a
