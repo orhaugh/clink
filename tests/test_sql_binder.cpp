@@ -2173,13 +2173,85 @@ TEST(SqlBinder, ChainedCteSeesPriorCteInScope) {
     ASSERT_EQ(plan->kind(), "Project");
 }
 
-TEST(SqlBinder, CteReusedMoreThanOnceRejected) {
+namespace {
+
+// A plan as text, depth first, each scan with its table's name, e.g.
+// "Union(Project(Scan clicks),Project(Scan clicks))".
+std::string cte_plan_shape(const LogicalPlan& node) {
+    std::string out = node.kind();
+    if (out == "Scan") {
+        out += " " + static_cast<const LogicalScan&>(node).table().name;
+    }
+    const auto inputs = node.inputs();
+    if (!inputs.empty()) {
+        out += "(";
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            out += (i == 0 ? "" : ",") +
+                   (inputs[i] != nullptr ? cte_plan_shape(*inputs[i]) : std::string{"null"});
+        }
+        out += ")";
+    }
+    return out;
+}
+
+std::size_t cte_shape_count(const std::string& shape, const std::string& part) {
+    std::size_t n = 0;
+    for (auto at = shape.find(part); at != std::string::npos; at = shape.find(part, at + 1)) {
+        ++n;
+    }
+    return n;
+}
+
+}  // namespace
+
+// A CTE read twice: the first reference takes the plan bound with the WITH
+// clause and the second binds the CTE's query again, so each side of the
+// union scans the table itself.
+TEST(SqlBinder, ACteReadTwiceBindsAPlanForEachReference) {
     Catalog cat;
     register_clicks(cat);
     Binder b(cat);
-    EXPECT_THROW(b.bind_select(as_select(parse("WITH x AS (SELECT url FROM clicks) "
-                                               "SELECT url FROM x UNION ALL SELECT url FROM x"))),
-                 TranslationError);
+    auto plan =
+        b.bind_select(as_select(parse("WITH x AS (SELECT url FROM clicks) "
+                                      "SELECT url FROM x UNION ALL SELECT url FROM x")));
+    ASSERT_NE(plan, nullptr);
+    const auto shape = cte_plan_shape(*plan);
+    EXPECT_EQ(cte_shape_count(shape, "Scan clicks"), 2u) << shape;
+    EXPECT_EQ(cte_shape_count(shape, "Scan x"), 0u) << shape;
+}
+
+// A CTE that reads an earlier one, read twice: binding it again reads the
+// earlier CTE again too.
+TEST(SqlBinder, ACteReadTwiceReadsTheCteBeforeItAgain) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan =
+        b.bind_select(as_select(parse("WITH a AS (SELECT url FROM clicks WHERE user_id > 100), "
+                                      "     b AS (SELECT url FROM a) "
+                                      "SELECT url FROM b UNION ALL SELECT url FROM b")));
+    ASSERT_NE(plan, nullptr);
+    const auto shape = cte_plan_shape(*plan);
+    EXPECT_EQ(cte_shape_count(shape, "Scan clicks"), 2u) << shape;
+    EXPECT_EQ(cte_shape_count(shape, "Filter"), 2u) << shape;
+}
+
+// Bound again, a CTE sees what it saw where it was defined. In a's query
+// `clicks` is the catalog table, not the CTE named clicks defined after it
+// (whose query reads a, so a's first plan goes there), and both of the
+// outer query's reads of a plan the same scan, with no filter.
+TEST(SqlBinder, ACteBoundAgainSeesOnlyTheCtesBeforeIt) {
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto plan =
+        b.bind_select(as_select(parse("WITH a AS (SELECT user_id FROM clicks), "
+                                      "     clicks AS (SELECT user_id FROM a WHERE user_id > 100) "
+                                      "SELECT user_id FROM a UNION ALL SELECT user_id FROM a")));
+    ASSERT_NE(plan, nullptr);
+    const auto shape = cte_plan_shape(*plan);
+    EXPECT_EQ(cte_shape_count(shape, "Scan clicks"), 2u) << shape;
+    EXPECT_EQ(cte_shape_count(shape, "Filter"), 0u) << shape;
 }
 
 TEST(SqlBinder, CteDefinedButUnreferencedIsAllowed) {
@@ -3364,8 +3436,8 @@ TEST(SqlBinder, CreateViewRejectsNameCollisionWithTable) {
                  TranslationError);
 }
 
-// A view can be referenced more than once in a query (unlike a CTE, which is
-// at-most-once here): each reference re-binds the defining query independently.
+// A view can be referenced more than once in a query, as a CTE can: each
+// reference re-binds the defining query independently.
 TEST(SqlBinder, ViewReferencedTwiceExpandsEachTime) {
     Catalog cat;
     register_clicks(cat);
@@ -3374,6 +3446,22 @@ TEST(SqlBinder, ViewReferencedTwiceExpandsEachTime) {
     // Two references in a UNION ALL: both expand (no at-most-once CTE error).
     auto plan = b.bind_select(as_select(parse("SELECT url FROM v UNION ALL SELECT url FROM v")));
     ASSERT_NE(plan, nullptr);
+}
+
+// A view whose query reads its own CTE twice, expanded in a query that has a
+// CTE of its own: the view binds against the catalog and its own CTEs only,
+// so binding its CTE again does not look for the query's.
+TEST(SqlBinder, AViewThatReadsItsCteTwiceExpandsBesideTheQuerysOwnCte) {
+    Catalog cat;
+    register_clicks(cat);
+    make_view(cat,
+              "CREATE VIEW v AS WITH c AS (SELECT url FROM clicks) "
+              "SELECT url FROM c UNION ALL SELECT url FROM c");
+    Binder b(cat);
+    auto plan = b.bind_select(as_select(
+        parse("WITH o AS (SELECT url FROM clicks) SELECT url FROM v UNION ALL SELECT url FROM o")));
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(cte_shape_count(cte_plan_shape(*plan), "Scan clicks"), 3u);
 }
 
 // A view on a join side expands to its defining query, and the join resolves

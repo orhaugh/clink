@@ -261,6 +261,19 @@ SELECT * FROM orders
 WHERE user_id IN (SELECT user_id FROM vips);
 ```
 
+`WITH name AS (SELECT ...)` names a query that the rest of the statement reads
+as a table, and each common table expression can read the ones before it. A
+statement may read the same one more than once: each reference runs its query
+on its own and reads its tables again, so a Kafka table read twice has a
+reader for each read unless it declares `shared_reader='true'`.
+
+```sql
+WITH once AS (SELECT DISTINCT transaction_id, ts FROM transactions)
+SELECT transaction_id FROM once WHERE ts > 100
+UNION ALL
+SELECT transaction_id FROM once WHERE ts <= 100;
+```
+
 ## Functions
 
 A function name is resolved as a user-defined function first (see

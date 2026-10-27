@@ -10343,6 +10343,52 @@ TEST(SqlRuntime, OverReadsACommonTableExpressionThatDropsDuplicatesFirst) {
     std::filesystem::remove(out_path);
 }
 
+// A CTE read twice runs its query for each reference: both sides of the union
+// read every order, each through a DISTINCT of its own, so each id arrives
+// once per side and the copy is dropped on both. A second reference used to
+// be refused.
+TEST(SqlRuntime, ACteReadTwiceFeedsEveryRowToEachReference) {
+    ensure_sql_installed_once();
+    const auto tag = std::to_string(::getpid());
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto in_path = dir / ("clink_sql_cte_twice_in_" + tag + ".ndjson");
+    const auto out_path = dir / ("clink_sql_cte_twice_out_" + tag + ".ndjson");
+    std::filesystem::remove(out_path);
+    write_lines(in_path,
+                {R"({"id":1,"amount":10})", R"({"id":1,"amount":10})", R"({"id":2,"amount":3})"});
+
+    Catalog cat;
+    auto ddl = parse(std::string{"CREATE TABLE orders (id BIGINT, amount BIGINT) "
+                                 "WITH (connector='file', format='json', path='"} +
+                     in_path.string() +
+                     "');"
+                     "CREATE TABLE kept (id BIGINT) "
+                     "WITH (connector='file', format='json', path='" +
+                     out_path.string() + "')");
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    auto spec = compile(cat,
+                        "INSERT INTO kept WITH once AS (SELECT DISTINCT id, amount FROM orders) "
+                        "SELECT id FROM once UNION ALL SELECT id + 100 AS id FROM once");
+
+    InProcessCluster cluster("worker-sql-cte-twice", 8);
+    application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
+    application::SubmitOptions opts;
+    opts.wait_timeout = 15s;
+    auto result = submitter.submit(spec.to_json(), {}, opts);
+    ASSERT_TRUE(result.completed) << "reject: " << result.reject_message;
+    EXPECT_TRUE(result.ok) << "errors: " << (result.errors.empty() ? "(none)" : result.errors[0]);
+
+    std::multiset<std::int64_t> got;
+    for (const auto& l : read_lines(out_path)) {
+        got.insert(static_cast<std::int64_t>(clink::config::parse(l).at("id").as_number()));
+    }
+    EXPECT_EQ(got, (std::multiset<std::int64_t>{1, 2, 101, 102}));
+    std::filesystem::remove(in_path);
+    std::filesystem::remove(out_path);
+}
+
 // An OVER aggregate reads another: a window per payer feeds a window per payer
 // and payee, so each transfer carries the payer's recent count and when the
 // payer first paid that payee. The second window was refused, since the first

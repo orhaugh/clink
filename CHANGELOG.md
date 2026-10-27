@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**A query can read a common table expression more than once.** A second
+reference to a CTE was refused with "CTE referenced more than once (not yet
+supported)". The first reference now takes the plan bound with the `WITH`
+clause, and each later one binds the CTE's query again, as a view's references
+do, against the CTEs defined before it and nothing defined after. Each
+reference therefore runs the query on its own and reads its tables again: a
+Kafka table read twice has a reader for each read unless it declares
+`shared_reader='true'`. A CTE can be read by both sides of a union or a join,
+or by two lookup joins in one query.
+
 **A lookup keeps reading while a watermark waits.** `AsyncLookupOperator`,
 which the Neo4j lookup and the async `ML_PREDICT` path run on, finished every
 lookup in flight before it passed a watermark on. A stream with a watermark

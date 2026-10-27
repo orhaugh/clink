@@ -28,6 +28,14 @@
 
 namespace clink::sql {
 
+// A common table expression's defining query and the CTE names that were in
+// scope where it was defined, so a reference after the first can bind the
+// query again against what it could see then.
+struct CteDefinition {
+    const ast::SelectStmt* query = nullptr;
+    std::vector<std::string> scope;
+};
+
 class Binder {
 public:
     explicit Binder(const Catalog& catalog) noexcept : catalog_(catalog) {}
@@ -42,12 +50,18 @@ public:
 
 private:
     // Construct a plan node for the given table name. When a CTE in
-    // the current bind scope matches, that CTE's pre-bound plan is
-    // moved out (each CTE is at-most-once). Otherwise a
-    // plain LogicalScan against `resolved` is returned.
+    // the current bind scope matches, its first reference takes the plan
+    // bound with the WITH clause and each later one binds the CTE's query
+    // again (rebind_cte). Otherwise a plain LogicalScan against `resolved`
+    // is returned.
     std::unique_ptr<LogicalPlan> make_table_plan(const std::string& table_name,
                                                  const TableDef& resolved,
                                                  int pos) const;
+
+    // Bind a CTE's query again for a reference after its first, against the
+    // CTEs that were in scope where it was defined; the rest of the
+    // per-statement scope is saved and restored around it.
+    std::unique_ptr<LogicalPlan> rebind_cte(const std::string& name) const;
 
     // #61 phase 2: bind FROM <table> MATCH_RECOGNIZE (...) into a
     // LogicalMatchRecognize (input scan + partition/order keys + pattern +
@@ -166,11 +180,13 @@ private:
     // WITH clause. Synthetic TableDefs serve column
     // resolution for CTE references inside the outer SELECT; matching
     // entries in cte_plans_ are consumed (moved) at the point where a
-    // LogicalScan would otherwise be created. Each CTE is at-most-once
-    // (no plan-tree deep copy yet); the binder errors
-    // on a second reference.
+    // LogicalScan would otherwise be created. A CTE read again binds its
+    // query again from cte_definitions_, so each reference has a plan of its
+    // own, as a view's references do. A synthetic table that is not a CTE
+    // (a derived table, a join alias) has no definition and is read once.
     mutable std::unordered_map<std::string, TableDef> cte_synth_tables_;
     mutable std::unordered_map<std::string, std::unique_ptr<LogicalPlan>> cte_plans_;
+    mutable std::unordered_map<std::string, CteDefinition> cte_definitions_;
     // CREATE VIEW: the logical views currently being expanded (make_table_plan
     // re-binds a view's defining SELECT inline). A view re-entered while already
     // expanding is a cycle (direct or transitive self-reference) - rejected.

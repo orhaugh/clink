@@ -2570,19 +2570,60 @@ bool is_changelog_plan(const LogicalPlan& node) {
 
 namespace {}  // namespace
 
+// A CTE read more than once: the first reference took the plan bound with the
+// WITH clause, so bind its query again, against the CTEs that were in scope
+// where it was defined (a CTE sees only those before it, never a later one or
+// itself). Each of those binds again in turn if the query reads it. As with a
+// view's expansion, the rest of the per-statement scope is saved and
+// restored, on the throw path too.
+std::unique_ptr<LogicalPlan> Binder::rebind_cte(const std::string& name) const {
+    const CteDefinition def = cte_definitions_.at(name);
+    auto saved_synth = cte_synth_tables_;
+    auto saved_plans = std::move(cte_plans_);
+    auto saved_definitions = cte_definitions_;
+    const bool saved_topn = consumed_topn_where_;
+    cte_synth_tables_.clear();
+    cte_plans_.clear();
+    cte_definitions_.clear();
+    for (const auto& earlier : def.scope) {
+        cte_synth_tables_.emplace(earlier, saved_synth.at(earlier));
+        cte_plans_.emplace(earlier, nullptr);
+        cte_definitions_.emplace(earlier, saved_definitions.at(earlier));
+    }
+    consumed_topn_where_ = false;
+    auto restore = [&] {
+        cte_synth_tables_ = std::move(saved_synth);
+        cte_plans_ = std::move(saved_plans);
+        cte_definitions_ = std::move(saved_definitions);
+        consumed_topn_where_ = saved_topn;
+    };
+    std::unique_ptr<LogicalPlan> plan;
+    try {
+        plan = bind_select(*def.query);
+    } catch (...) {
+        restore();
+        throw;
+    }
+    restore();
+    return plan;
+}
+
 // Make a plan node for `table_name`: if it matches a CTE in the
-// current scope, consume that plan (each CTE is at-most-once);
-// otherwise return a plain LogicalScan against the resolved table.
+// current scope, the first reference consumes the plan bound with the WITH
+// clause and a later one binds the CTE's query again; otherwise return a
+// plain LogicalScan against the resolved table.
 std::unique_ptr<LogicalPlan> Binder::make_table_plan(const std::string& table_name,
                                                      const TableDef& resolved,
                                                      int pos) const {
     auto it = cte_plans_.find(table_name);
     if (it != cte_plans_.end()) {
-        if (it->second == nullptr) {
-            bind_error("CTE '" + table_name + "' referenced more than once (not yet supported)",
-                       pos);
+        if (it->second != nullptr) {
+            return std::move(it->second);
         }
-        return std::move(it->second);
+        if (cte_definitions_.contains(table_name)) {
+            return rebind_cte(table_name);
+        }
+        bind_error("'" + table_name + "' referenced more than once (not yet supported)", pos);
     }
     // CREATE VIEW: a logical view is expanded inline - re-bind its defining
     // SELECT as a sub-plan in place of a scan, so every reference site (single
@@ -2602,13 +2643,16 @@ std::unique_ptr<LogicalPlan> Binder::make_table_plan(const std::string& table_na
         // the outer binder corrupted.
         auto saved_synth = std::move(cte_synth_tables_);
         auto saved_plans = std::move(cte_plans_);
+        auto saved_definitions = std::move(cte_definitions_);
         const bool saved_topn = consumed_topn_where_;
         cte_synth_tables_.clear();
         cte_plans_.clear();
+        cte_definitions_.clear();
         consumed_topn_where_ = false;
         auto restore = [&] {
             cte_synth_tables_ = std::move(saved_synth);
             cte_plans_ = std::move(saved_plans);
+            cte_definitions_ = std::move(saved_definitions);
             consumed_topn_where_ = saved_topn;
             expanding_views_.erase(table_name);
         };
@@ -3409,6 +3453,7 @@ namespace {
 struct CteScopeGuard {
     std::unordered_map<std::string, TableDef>* synth;
     std::unordered_map<std::string, std::unique_ptr<LogicalPlan>>* plans;
+    std::unordered_map<std::string, CteDefinition>* definitions;
     bool owns;
     // CTE names already in scope when this guard was created. On exit we
     // erase only the names THIS scope added, leaving any enclosing scope's
@@ -3421,8 +3466,9 @@ struct CteScopeGuard {
     std::vector<std::string> entry_names;
     CteScopeGuard(std::unordered_map<std::string, TableDef>* s,
                   std::unordered_map<std::string, std::unique_ptr<LogicalPlan>>* p,
+                  std::unordered_map<std::string, CteDefinition>* d,
                   bool o)
-        : synth(s), plans(p), owns(o) {
+        : synth(s), plans(p), definitions(d), owns(o) {
         if (owns) {
             entry_names.reserve(synth->size());
             for (const auto& [name, _] : *synth) {
@@ -3440,6 +3486,9 @@ struct CteScopeGuard {
         }
         for (auto it = plans->begin(); it != plans->end();) {
             it = keep.contains(it->first) ? std::next(it) : plans->erase(it);
+        }
+        for (auto it = definitions->begin(); it != definitions->end();) {
+            it = keep.contains(it->first) ? std::next(it) : definitions->erase(it);
         }
     }
 };
@@ -4250,11 +4299,10 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
     // can reference cte1 (PG semantics). Each body gets a synthetic
     // TableDef whose columns come from the bound schema; the bound
     // plan is parked in cte_plans_ and consumed at the LogicalScan-
-    // creation site that references the CTE name. Each CTE is
-    // referenced at most once - the plan is moved out on use, so a
-    // second reference is detected at the consumption point. Multi-
-    // use would need LogicalPlan deep-copy, which we don't have yet.
-    // CTE bodies cannot themselves carry a WITH clause.
+    // creation site that references the CTE name. The plan is moved out
+    // on use, so a second reference binds the CTE's query again from
+    // cte_definitions_ (rebind_cte), against the CTEs defined before it,
+    // which are recorded here.
     // Always own the scope: a bind_select must clean up EVERY scratch entry it
     // adds, both WITH CTEs and synthetic FROM tables (join / MATCH_RECOGNIZE /
     // PTF / subquery). Gating cleanup on a WITH clause leaked the synthetic FROM
@@ -4263,7 +4311,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
     // snapshots the entries present at construction and erases only what THIS
     // scope adds, so nested binds keep the enclosing scope intact.
     const bool has_with = !stmt.with_clause.empty();
-    CteScopeGuard guard{&cte_synth_tables_, &cte_plans_, /*owns=*/true};
+    CteScopeGuard guard{&cte_synth_tables_, &cte_plans_, &cte_definitions_, /*owns=*/true};
     (void)guard;
     if (has_with) {
         for (const auto& cte : stmt.with_clause) {
@@ -4273,9 +4321,15 @@ std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) co
             if (cte_synth_tables_.count(cte.name) != 0) {
                 bind_error("duplicate CTE name: " + cte.name, cte.loc.pos);
             }
+            std::vector<std::string> scope;
+            scope.reserve(cte_definitions_.size());
+            for (const auto& [earlier, _] : cte_definitions_) {
+                scope.push_back(earlier);
+            }
             auto body_plan = bind_select(*cte.body);
             cte_synth_tables_.emplace(cte.name, derived_table_def(cte.name, *body_plan));
             cte_plans_.emplace(cte.name, std::move(body_plan));
+            cte_definitions_.emplace(cte.name, CteDefinition{cte.body.get(), std::move(scope)});
         }
     }
 
