@@ -98,6 +98,14 @@ public:
         query_type_ = std::move(query_type);
         operators_ = std::move(operators);
     }
+    // How long the server takes to plan the statement. Like the tested
+    // server, it applies maxExecutionTime only once the plan is made: an
+    // EXPLAIN given less time than that is answered, after the planning, with
+    // the server's timeout error.
+    void planning(std::chrono::milliseconds took) {
+        const std::lock_guard<std::mutex> lock(mu_);
+        planning_ = took;
+    }
     void explain_body(int status, std::string body) {
         const std::lock_guard<std::mutex> lock(mu_);
         explain_status_ = status;
@@ -119,6 +127,11 @@ public:
     [[nodiscard]] std::size_t explains() const {
         const std::lock_guard<std::mutex> lock(mu_);
         return explains_;
+    }
+    // Each EXPLAIN's maxExecutionTime as sent, "" when absent.
+    [[nodiscard]] std::vector<std::string> explain_limits() const {
+        const std::lock_guard<std::mutex> lock(mu_);
+        return explain_limits_;
     }
     [[nodiscard]] int max_concurrent() const { return max_active_.load(); }
     [[nodiscard]] int active() const { return active_.load(); }
@@ -194,6 +207,19 @@ private:
             std::unique_lock<std::mutex> lock(mu_);
             if (got.statement.rfind("EXPLAIN ", 0) == 0) {
                 ++explains_;
+                explain_limits_.push_back(got.max_execution_time);
+                if (planning_.count() > 0) {
+                    cv_.wait_for(lock, planning_, [this] { return released_; });
+                    if (!got.max_execution_time.empty() &&
+                        std::stoll(got.max_execution_time) * 1000 < planning_.count()) {
+                        res.status = 400;
+                        res.set_content(
+                            R"({"errors":[{"code":"Neo.ClientError.Transaction.)"
+                            R"(TransactionTimedOutClientConfiguration","message":"scripted"}]})",
+                            "application/vnd.neo4j.query");
+                        return;
+                    }
+                }
                 res.status = explain_status_;
                 res.set_content(explain_raw_.empty() ? explain_reply_() : explain_raw_,
                                 "application/vnd.neo4j.query");
@@ -246,8 +272,10 @@ private:
     std::vector<std::string> operators_{"ProduceResults", "Projection", "NodeUniqueIndexSeek"};
     int explain_status_{202};
     std::string explain_raw_;
+    std::chrono::milliseconds planning_{0};
     std::vector<LookupReceived> reads_;
     std::size_t explains_{0};
+    std::vector<std::string> explain_limits_;
     std::atomic<int> active_{0};
     std::atomic<int> max_active_{0};
 };

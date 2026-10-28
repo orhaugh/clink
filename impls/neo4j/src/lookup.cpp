@@ -119,12 +119,20 @@ void LookupPool::open() {
 // EXPLAIN the statement with $key as Null, read-only: nothing runs, and the
 // reply shows the credentials, the database, the syntax, the result columns,
 // the query type and the plan. Retried like a lookup, since it reads.
+//
+// maxExecutionTime goes with it so that a server that refuses the field is
+// found here, but not as server_timeout_s, which bounds a read. The server
+// applies the limit only once it has planned the statement, and planning can
+// take longer than a read may (seconds, on a server that has just started,
+// with every subtask's statement planned at once), so a check held to it fails
+// a statement that is fine. The check's limit is past the attempt's deadline
+// instead: a check that runs out of time ends there, and is retried.
 void LookupPool::check_statement_(Worker& w) {
     std::string body = "{\"statement\":";
     append_json_string("EXPLAIN " + opts_.statement, body);
     body += ",\"accessMode\":\"READ\"";
     if (opts_.server_timeout_s > 0) {
-        body += ",\"maxExecutionTime\":" + std::to_string(opts_.server_timeout_s);
+        body += ",\"maxExecutionTime\":" + std::to_string(opts_.request_timeout_ms / 1000 + 1);
     }
     body += ",\"parameters\":{\"key\":{\"$type\":\"Null\",\"_value\":null}}}";
     clink::http_connector::BoundedRequest check = request_;

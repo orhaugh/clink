@@ -711,6 +711,24 @@ TEST(Neo4jLookup, TheOpenCheckRefusesStatementsThatMayNotOnlyRead) {
     }
 }
 
+TEST(Neo4jLookup, TheOpenCheckIsNotHeldToTheReadLimitWhileTheServerPlans) {
+    // The server plans for longer than server_timeout_s. It applies the limit
+    // only once the plan is made, so a check held to it would fail a statement
+    // that is fine; the check is held to request_timeout_ms, and the reads
+    // still to server_timeout_s.
+    FakeLookupApi api({"shared", "evidence"});
+    api.planning(1500ms);
+    api.answer("4", one(2, "acct-09"));
+    Rig rig(api, {{"server_timeout_s", "1"}, {"request_timeout_ms", "4000"}});
+    rig.op->open();
+    ASSERT_EQ(api.explain_limits(), std::vector<std::string>{"5"});
+    rig.process(data({probe(1, 4)}));
+    rig.op->flush(rig.out);
+    ASSERT_EQ(rig.rows_out().size(), 1U);
+    ASSERT_EQ(api.reads().size(), 1U);
+    EXPECT_EQ(api.reads()[0].max_execution_time, "1");
+}
+
 TEST(Neo4jLookup, RowsHeldThroughAnOutageAllLeaveInOrderOnceTheServerAnswers) {
     FakeLookupApi api({"shared", "evidence"});
     for (int k = 1; k <= 60; ++k) {
