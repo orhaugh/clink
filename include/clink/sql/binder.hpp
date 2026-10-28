@@ -194,7 +194,8 @@ private:
     // Set when the outer WHERE was consumed by the
     // ROW_NUMBER pattern matcher; the regular projection path skips
     // the WHERE so the predicate doesn't get reapplied to the
-    // already-bounded LogicalTopNPerKey output.
+    // already-bounded LogicalTopNPerKey output. Scoped to one
+    // bind_select: it is cleared when that bind returns.
     mutable bool consumed_topn_where_ = false;
 };
 

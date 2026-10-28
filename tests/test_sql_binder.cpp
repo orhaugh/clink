@@ -109,6 +109,25 @@ TEST(SqlBinder, BindsSelectColumnList) {
     EXPECT_TRUE(schema->field(1)->type()->Equals(*arrow::utf8()));
 }
 
+TEST(SqlBinder, ATopNStatementDoesNotConsumeTheNextStatementsWhere) {
+    // The Top-N shape consumes its own outer WHERE (rn = 1) when the
+    // ranking is lowered. That consumption belonged to one statement, and
+    // leaked: the next statement the same Binder bound, as the second
+    // statement of a statement set, lost its WHERE and kept every row.
+    Catalog cat;
+    register_clicks(cat);
+    Binder b(cat);
+    auto top = b.bind_select(as_select(parse(
+        "SELECT user_id, url FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY ts "
+        "DESC) AS rn FROM clicks) latest WHERE rn = 1")));
+    ASSERT_NE(top, nullptr);
+    auto filtered = b.bind_select(as_select(parse("SELECT user_id FROM clicks WHERE url = 'x'")));
+    ASSERT_NE(filtered, nullptr);
+    ASSERT_EQ(filtered->kind(), "Project");
+    EXPECT_EQ(static_cast<const LogicalProject&>(*filtered).input().kind(), "Filter")
+        << "the WHERE of the statement after a Top-N must still be a Filter";
+}
+
 TEST(SqlBinder, SelectStarExpandsToAllColumns) {
     Catalog cat;
     register_clicks(cat);

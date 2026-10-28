@@ -4295,6 +4295,15 @@ std::unique_ptr<LogicalPlan> Binder::bind_scalar_select_projection(
 
 std::unique_ptr<LogicalPlan> Binder::bind_select(const ast::SelectStmt& stmt) const {
     BindTimingGuard bind_timer;
+    // The Top-N shape consumes the outer WHERE (`rn = 1`) when it lowers the
+    // ranking, and the flag recording that belongs to this statement. Left
+    // set, it dropped the WHERE of the next statement bound by the same
+    // Binder: the second statement of a statement set after a Top-N kept
+    // every row. A nested bind restores the flag it found on its way out.
+    struct ResetConsumedTopN {
+        bool& flag;
+        ~ResetConsumedTopN() { flag = false; }
+    } reset_consumed_topn{consumed_topn_where_};
     // WITH clause. Bind each CTE body sequentially so cte2
     // can reference cte1 (PG semantics). Each body gets a synthetic
     // TableDef whose columns come from the bound schema; the bound
