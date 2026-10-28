@@ -109,6 +109,27 @@ TEST_F(ConnectorCapabilityTest, SelfCheckAcceptsBrokerRedeliverySourceAtLeastOnc
     EXPECT_TRUE(broker_redelivery.self_check().empty());
 }
 
+TEST_F(ConnectorCapabilityTest, SelfCheckHoldsTheAcknowledgementModelToItsShape) {
+    // The acknowledgement model is a source's: it replays nothing itself
+    // and acknowledges at checkpoint completion, so a record that claims it
+    // while replaying from an offset, or without checkpoint participation,
+    // contradicts itself.
+    ConnectorCapabilities c{
+        .name = "ack_shape",
+        .is_source = true,
+        .replayable = false,
+        .offset_model = OffsetModel::Acknowledgement,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+    };
+    EXPECT_TRUE(c.self_check().empty());
+    c.replayable = true;
+    EXPECT_FALSE(c.self_check().empty());
+    c.replayable = false;
+    c.checkpoint_integrated = false;
+    EXPECT_FALSE(c.self_check().empty());
+}
+
 TEST_F(ConnectorCapabilityTest, SelfCheckRejectsIdempotentClaimWithNoNamedKey) {
     const ConnectorCapabilities bad{
         .name = "keyless",
@@ -327,6 +348,68 @@ TEST_F(ConnectorCapabilityTest, NonReplayableSourceIsAtMostOnceRegardlessOfSink)
     f.durable_state_backend = true;
     const auto r = analyse_pipeline(f);
     EXPECT_EQ(r.level, EndToEndGuarantee::AtMostOnceSource) << r.render_text();
+}
+
+TEST_F(ConnectorCapabilityTest, AnAcknowledgingSourceIsAtLeastOnceNotAtMostOnce) {
+    // The broker-redelivery model loses nothing: what a crash leaves
+    // unacknowledged comes back. What it cannot rule out is a checkpoint
+    // delivered twice, when the process dies between that checkpoint
+    // completing and the acknowledgement reaching the broker, so the job
+    // is at least once however its sink commits: an at-least-once request
+    // is honoured, an exactly-once one refused naming the source, and a
+    // keyed upsert still earns the effectively-once label, because a
+    // second delivery converges on the key.
+    CapabilityRegistry::instance().declare(ConnectorCapabilities{
+        .name = "test_acknowledging",
+        .version = "1",
+        .is_source = true,
+        .replayable = false,
+        .offset_model = OffsetModel::Acknowledgement,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+    });
+    CapabilityRegistry::instance().declare(ConnectorCapabilities{
+        .name = "test_keyed",
+        .version = "1",
+        .is_sink = true,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::EffectivelyOnceIdempotent,
+        .idempotency_key_option = "key",
+    });
+    struct Undeclare {
+        ~Undeclare() {
+            CapabilityRegistry::instance().undeclare("test_acknowledging");
+            CapabilityRegistry::instance().undeclare("test_keyed");
+        }
+    } cleanup;
+    PipelineFacts f;
+    f.connectors = {src("test_acknowledging"), snk("file_2pc", {"dir"})};
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    auto r = analyse_pipeline(f);
+    EXPECT_EQ(r.level, EndToEndGuarantee::AtLeastOnceSource) << r.render_text();
+    EXPECT_EQ(r.limiting_factor, "source 'test_acknowledging_source'");
+    EXPECT_TRUE(r.acceptable());
+
+    f.requested = DeliveryGuarantee::AtLeastOnce;
+    r = analyse_pipeline(f);
+    EXPECT_TRUE(r.acceptable()) << r.render_text();
+
+    f.requested = DeliveryGuarantee::ExactlyOnceTwoPhaseCommit;
+    r = analyse_pipeline(f);
+    ASSERT_FALSE(r.acceptable());
+    EXPECT_NE(r.rejections[0].find("AT_LEAST_ONCE_SOURCE"), std::string::npos) << r.rejections[0];
+    EXPECT_NE(r.rejections[0].find("test_acknowledging_source"), std::string::npos)
+        << r.rejections[0];
+
+    f.requested = DeliveryGuarantee::EffectivelyOnceIdempotent;
+    r = analyse_pipeline(f);
+    EXPECT_FALSE(r.acceptable()) << r.render_text();
+
+    f.connectors = {src("test_acknowledging"), snk("test_keyed", {"key"})};
+    r = analyse_pipeline(f);
+    EXPECT_EQ(r.level, EndToEndGuarantee::EffectivelyOnceRequiresIdempotentKey) << r.render_text();
+    EXPECT_TRUE(r.acceptable()) << r.render_text();
 }
 
 TEST_F(ConnectorCapabilityTest, RequestingExactlyOnceFromAWeakPipelineIsRejected) {

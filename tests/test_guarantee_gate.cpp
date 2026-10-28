@@ -436,6 +436,44 @@ TEST_F(GuaranteeGateTest, AnExactlyOnceSinkIsRefusedThroughAnUnreplayableSourceO
     EXPECT_EQ(reject.find("sink 'graph':"), std::string::npos) << reject;
 }
 
+TEST_F(GuaranteeGateTest, ASinkOverAnAcknowledgingSourceMayDeclareAtLeastOnceButNotExactlyOnce) {
+    // A broker that redelivers what was not acknowledged at a completed
+    // checkpoint loses nothing, so a sink's own declaration of at least
+    // once is honoured through such a source; exactly once is refused,
+    // because a checkpoint acknowledged late is delivered again.
+    connectors::CapabilityRegistry::instance().declare(connectors::ConnectorCapabilities{
+        .name = "ackfeed",
+        .version = "1",
+        .is_source = true,
+        .replayable = false,
+        .offset_model = connectors::OffsetModel::Acknowledgement,
+        .checkpoint_integrated = true,
+        .delivery = connectors::DeliveryGuarantee::AtLeastOnce,
+    });
+    struct Undeclare {
+        ~Undeclare() { connectors::CapabilityRegistry::instance().undeclare("ackfeed"); }
+    } cleanup;
+    JobGraphSpec g;
+    g.ops.push_back(op("ackfeed_source", "bus"));
+    g.ops.push_back(
+        op("file_line_sink", "out", {"bus"}, {{"delivery_guarantee", "at_least_once"}}));
+    connectors::GuaranteeReport report;
+    const auto reject = check_delivery_guarantee(g, durable_checkpointing(), &report);
+    EXPECT_TRUE(reject.empty()) << reject;
+    EXPECT_EQ(report.level, connectors::EndToEndGuarantee::AtLeastOnceSource);
+
+    JobGraphSpec h;
+    h.ops.push_back(op("ackfeed_source", "bus"));
+    h.ops.push_back(op("file_2pc_sink_string",
+                       "fence",
+                       {"bus"},
+                       {{"dir", "/tmp/o"}, {"delivery_guarantee", "exactly_once"}}));
+    const auto refused = check_delivery_guarantee(h, durable_checkpointing(), nullptr);
+    ASSERT_FALSE(refused.empty());
+    EXPECT_NE(refused.find("AT_LEAST_ONCE_SOURCE"), std::string::npos) << refused;
+    EXPECT_NE(refused.find("ackfeed_source"), std::string::npos) << refused;
+}
+
 // --- replay determinism -------------------------------------------------
 //
 // Delivery and determinism are orthogonal answers and must not be

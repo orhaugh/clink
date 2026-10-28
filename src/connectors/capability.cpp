@@ -81,6 +81,8 @@ std::string_view to_string(OffsetModel m) noexcept {
             return "timestamp";
         case OffsetModel::OpaqueToken:
             return "opaque_token";
+        case OffsetModel::Acknowledgement:
+            return "acknowledgement";
     }
     return "?";
 }
@@ -133,10 +135,13 @@ std::vector<std::string> ConnectorCapabilities::self_check() const {
     // offset the checkpoint carries, or BROKER REDELIVERY - the ack is
     // deferred to checkpoint completion, so everything unacknowledged sits
     // on the server and comes back after a crash (AMQP/JetStream/Pulsar
-    // acks, Pub/Sub ackDeadline, Redis PEL, MQTT persistent sessions).
-    // The second model has no offset to replay, so `replayable` is
+    // acks). The second model has no offset to replay, so `replayable` is
     // honestly false, yet at-least-once holds; it is recognisable here by
-    // checkpoint participation. A source with NEITHER model cannot offer
+    // checkpoint participation, and a record declares it with
+    // OffsetModel::Acknowledgement so the delivery analyser can tell it
+    // from a source that acknowledges at the barrier (Pub/Sub ackDeadline,
+    // Redis PEL, MQTT persistent sessions), which loses a batch when the
+    // checkpoint then fails. A source with NEITHER model cannot offer
     // better than at-most-once on restart.
     if (is_source && !replayable && !checkpoint_integrated &&
         strength(delivery) > strength(DeliveryGuarantee::AtMostOnce)) {
@@ -144,6 +149,14 @@ std::vector<std::string> ConnectorCapabilities::self_check() const {
             name +
             ": a source that neither replays from an offset nor defers acknowledgement to "
             "checkpoint completion cannot offer better than at-most-once on restart");
+    }
+    if (offset_model == OffsetModel::Acknowledgement &&
+        (!is_source || replayable || !checkpoint_integrated)) {
+        problems.emplace_back(
+            name +
+            ": the acknowledgement offset model is a source's that replays nothing itself and "
+            "acknowledges at checkpoint completion, so it needs is_source, replayable=false and "
+            "checkpoint_integrated=true");
     }
     if (!required_options_for_exactly_once.empty() && !claims_exactly_once) {
         problems.emplace_back(name +

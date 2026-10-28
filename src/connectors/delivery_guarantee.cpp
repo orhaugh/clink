@@ -11,6 +11,8 @@ std::string_view to_string(EndToEndGuarantee g) noexcept {
             return "NO_RECOVERY_GUARANTEE";
         case EndToEndGuarantee::AtMostOnceSource:
             return "AT_MOST_ONCE_SOURCE";
+        case EndToEndGuarantee::AtLeastOnceSource:
+            return "AT_LEAST_ONCE_SOURCE";
         case EndToEndGuarantee::StateExactlyOnceOutputAtLeastOnce:
             return "STATE_EXACTLY_ONCE_OUTPUT_AT_LEAST_ONCE";
         case EndToEndGuarantee::EffectivelyOnceRequiresIdempotentKey:
@@ -83,9 +85,21 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
     }
 
     // ---- 3. Sources: can the input be re-read from a recorded position?
+    //
+    // Two no-loss models (see ConnectorCapabilities::self_check): a source
+    // that replays from a position the checkpoint carries, and a source
+    // that keeps no position of its own but acknowledges at checkpoint
+    // completion, so its broker delivers again whatever was not
+    // acknowledged. The first re-reads exactly what the checkpoint missed.
+    // The second can deliver a checkpoint's records twice, when the
+    // process dies between that checkpoint completing and the
+    // acknowledgement reaching the broker, so it caps the job at
+    // at-least-once in step 5b. A source with neither model loses what was
+    // in flight.
     std::size_t source_count = 0;
     bool all_sources_replayable = true;
     std::string weakest_source;
+    std::string redelivered_source;
     for (const auto& c : facts.connectors) {
         if (!c.is_source) {
             continue;
@@ -100,14 +114,24 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
             continue;
         }
         const auto* caps = CapabilityRegistry::instance().find(c.connector_name);
-        if (caps == nullptr || !caps->replayable || !caps->checkpoint_integrated) {
+        if (caps != nullptr && caps->checkpoint_integrated && caps->replayable) {
+            reasons.emplace_back("source '" + c.op_type + "' replays from " +
+                                 std::string(to_string(caps->offset_model)));
+        } else if (caps != nullptr && caps->checkpoint_integrated &&
+                   caps->offset_model == OffsetModel::Acknowledgement) {
+            if (redelivered_source.empty()) {
+                redelivered_source = c.op_type;
+            }
+            reasons.emplace_back(
+                "source '" + c.op_type +
+                "' keeps no position of its own: it acknowledges at checkpoint completion and "
+                "its broker delivers again whatever was not acknowledged, so nothing in flight "
+                "is lost and the records of a checkpoint acknowledged late arrive twice");
+        } else {
             all_sources_replayable = false;
             weakest_source = c.op_type;
             reasons.emplace_back("source '" + c.op_type +
                                  "' cannot be replayed from a checkpointed position");
-        } else {
-            reasons.emplace_back("source '" + c.op_type + "' replays from " +
-                                 std::string(to_string(caps->offset_model)));
         }
     }
     if (source_count == 0) {
@@ -250,6 +274,18 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
     }
     (void)needs_idempotent_key;
 
+    // ---- 5b. A source its broker redelivers caps state and output at
+    // at-least-once: a checkpoint's records can enter the job twice, and
+    // neither durable state nor a transactional sink can tell the second
+    // delivery from the first. A keyed upsert still converges, so the
+    // effectively-once label stands on its own condition.
+    if (!redelivered_source.empty() &&
+        (r.level == EndToEndGuarantee::EndToEndExactlyOnce ||
+         r.level == EndToEndGuarantee::StateExactlyOnceOutputAtLeastOnce)) {
+        r.level = EndToEndGuarantee::AtLeastOnceSource;
+        r.limiting_factor = "source '" + redelivered_source + "'";
+    }
+
     // ---- 6. Determinism. Orthogonal to delivery: a job can commit each
     // record exactly once and still emit DIFFERENT records on replay.
     if (!facts.determinism.deterministic()) {
@@ -377,7 +413,8 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
                                            : (", limited by " + r.limiting_factor)));
         }
         if (want == DeliveryGuarantee::EffectivelyOnceIdempotent &&
-            r.level == EndToEndGuarantee::StateExactlyOnceOutputAtLeastOnce) {
+            (r.level == EndToEndGuarantee::StateExactlyOnceOutputAtLeastOnce ||
+             r.level == EndToEndGuarantee::AtLeastOnceSource)) {
             r.rejections.emplace_back(
                 "requested effectively-once via idempotent upsert, but no sink in this "
                 "pipeline performs keyed upserts");

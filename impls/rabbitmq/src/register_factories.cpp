@@ -43,9 +43,10 @@ void install(clink::plugin::PluginRegistry& reg) {
         .boundedness = clink::connectors::Boundedness::Unbounded,
         // Recovery is broker redelivery of unacked messages - the ack is
         // deferred to checkpoint completion, so nothing acked can be lost,
-        // but there is no client-side offset to replay from.
+        // but there is no client-side offset to replay from, and a
+        // checkpoint acknowledged late is delivered again.
         .replayable = false,
-        .offset_model = clink::connectors::OffsetModel::None,
+        .offset_model = clink::connectors::OffsetModel::Acknowledgement,
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,

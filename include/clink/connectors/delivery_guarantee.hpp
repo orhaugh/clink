@@ -28,6 +28,11 @@ enum class EndToEndGuarantee : std::uint8_t {
     NoRecoveryGuarantee,
     // The source cannot replay, so a restart loses whatever was in flight.
     AtMostOnceSource,
+    // Nothing is lost, but the source keeps no position of its own: it
+    // acknowledges at checkpoint completion and its broker delivers again
+    // whatever was not acknowledged, so a checkpoint's records can enter
+    // the job twice, and state and output are at least once.
+    AtLeastOnceSource,
     // No loss; duplicates reach the sink after a restart.
     StateExactlyOnceOutputAtLeastOnce,
     // Duplicates reach the sink but collapse there, PROVIDED the user's

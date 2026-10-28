@@ -83,6 +83,14 @@ enum class OffsetModel : std::uint8_t {
     Lsn,          // database log sequence number (Postgres CDC)
     Timestamp,    // wall-clock or event-time watermark position
     OpaqueToken,  // vendor cursor the connector round-trips unmodified
+    // No position of its own: the source acknowledges at checkpoint
+    // completion, and the broker keeps, and delivers again after a
+    // failure, whatever was not acknowledged (an AMQP, JetStream or Pulsar
+    // ack). Nothing is lost; the records of a checkpoint acknowledged late
+    // arrive twice. Declared with replayable=false and
+    // checkpoint_integrated=true, and distinct from a source that
+    // acknowledges at the barrier, which keeps OffsetModel::None.
+    Acknowledgement,
 };
 
 [[nodiscard]] std::string_view to_string(OffsetModel m) noexcept;
