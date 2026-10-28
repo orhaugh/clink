@@ -21147,4 +21147,236 @@ TEST(SqlRuntime, ThePartitionedFileSinkWritesOutAtEveryBarrierAndOwnsItsChain) {
     }
 }
 
+// A keyed Row shuffle routes a record by key_group_for_key over the eight bytes
+// of its __key, and the keyed operator it feeds stores the record's state under
+// the canonical key string (each key column's serialize(0) joined on '\x1f', a
+// null or absent column contributing nothing), which the state backend files
+// under key_group_for_key over that string. A restore at parallelism above one
+// keeps only the entries in the subtask's key-group range, so the two groups
+// must be the same number or a plain restart discards most keys' state: with
+// __key a hash of the key, a dispatch job lost two thirds of an interval
+// join's buffers at a worker kill at parallelism three. row_compute_key now
+// writes a token whose bytes hash to the state key's group; this pins it for
+// strings, integers, booleans, nulls, an absent column and a composite key.
+namespace {
+
+std::string canonical_state_key(const Row& row, const std::vector<std::string>& columns) {
+    std::string key;
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        if (c > 0) {
+            key += '\x1f';
+        }
+        auto it = row.values.find(columns[c]);
+        if (it != row.values.end() && !it->second.is_null()) {
+            it->second.serialize_into(key);
+        }
+    }
+    return key;
+}
+
+KeyGroup key_group_of_bytes(std::string_view bytes) {
+    return key_group_for_key(
+        std::span<const std::byte>{reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()});
+}
+
+KeyGroup routing_key_group(std::int64_t key) {
+    return key_group_for_key(
+        std::span<const std::byte>{reinterpret_cast<const std::byte*>(&key), sizeof(key)});
+}
+
+std::shared_ptr<Operator<Row, Row>> build_row_keyer(const std::string& columns) {
+    const auto* f = cluster::OperatorRegistry::default_instance().find_operator(
+        "row_compute_key", std::string{kChannelRow}, std::string{kChannelRow});
+    if (f == nullptr) {
+        return nullptr;
+    }
+    cluster::OperatorBuildContext octx;
+    octx.params["columns"] = columns;
+    octx.parallelism = 2;
+    return std::static_pointer_cast<Operator<Row, Row>>(f->build(octx));
+}
+
+}  // namespace
+
+TEST(SqlRuntime, RowComputeKeyRoutesEachKeyToTheSubtaskThatRestoresItsState) {
+    ensure_sql_installed_once();
+    using clink::config::JsonValue;
+    struct Case {
+        std::string columns;
+        std::vector<Row> rows;
+    };
+    std::vector<Case> cases;
+    {
+        Case single{"zone", {}};
+        for (const char* z : {"lisbon-z12",
+                              "nairobi-z00",
+                              "osaka-z21",
+                              "",
+                              "a\x1f"
+                              "b"}) {
+            Row r;
+            r.values["zone"] = JsonValue{std::string{z}};
+            r.values["x"] = JsonValue{std::int64_t{7}};
+            single.rows.push_back(std::move(r));
+        }
+        for (const std::int64_t n :
+             std::vector<std::int64_t>{0, 1, 1024, -5, 9223372036854775807LL}) {
+            Row r;
+            r.values["zone"] = JsonValue{n};
+            single.rows.push_back(std::move(r));
+        }
+        Row b;
+        b.values["zone"] = JsonValue{true};
+        single.rows.push_back(std::move(b));
+        Row null_key;
+        null_key.values["zone"] = JsonValue{};
+        single.rows.push_back(std::move(null_key));
+        Row absent;
+        absent.values["other"] = JsonValue{std::string{"no key column"}};
+        single.rows.push_back(std::move(absent));
+        cases.push_back(std::move(single));
+    }
+    {
+        Case composite{"order_id,cell,placed_at", {}};
+        for (int i = 0; i < 40; ++i) {
+            Row r;
+            r.values["order_id"] = JsonValue{std::string{"lisbon-o"} + std::to_string(i)};
+            r.values["cell"] = JsonValue{std::string{i % 2 ? "lisbon" : "osaka"}};
+            r.values["placed_at"] = JsonValue{std::int64_t{1784486400000LL + i * 977}};
+            if (i % 7 == 0) {
+                r.values.erase("cell");  // an absent key column
+            }
+            composite.rows.push_back(std::move(r));
+        }
+        cases.push_back(std::move(composite));
+    }
+    for (const auto& c : cases) {
+        auto op = build_row_keyer(c.columns);
+        ASSERT_NE(op, nullptr) << "row_compute_key is not registered";
+        std::vector<std::string> columns;
+        for (std::size_t pos = 0; pos <= c.columns.size();) {
+            auto end = c.columns.find(',', pos);
+            if (end == std::string::npos) {
+                end = c.columns.size();
+            }
+            columns.push_back(c.columns.substr(pos, end - pos));
+            pos = end + 1;
+        }
+        Batch<Row> in;
+        for (const auto& r : c.rows) {
+            in.push(Record<Row>{r});
+        }
+        BoundedChannel<StreamElement<Row>> ch(64);
+        Emitter<Row> em(&ch);
+        op->process(StreamElement<Row>::data(std::move(in)), em);
+        std::vector<Row> out;
+        while (auto el = ch.try_pop()) {
+            if (el->is_data()) {
+                for (const auto& rec : el->as_data()) {
+                    out.push_back(rec.value());
+                }
+            }
+        }
+        ASSERT_EQ(out.size(), c.rows.size()) << c.columns;
+        std::set<std::int64_t> tokens;
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            const auto it = out[i].values.find("__key");
+            ASSERT_NE(it, out[i].values.end()) << c.columns << " row " << i;
+            const std::int64_t token = it->second.as_int();
+            tokens.insert(token);
+            const auto state_kg = key_group_of_bytes(canonical_state_key(c.rows[i], columns));
+            EXPECT_EQ(routing_key_group(token), state_kg)
+                << c.columns << " row " << i << ": the record would route to key group "
+                << routing_key_group(token) << " but its state is filed under " << state_kg;
+            for (std::uint32_t p : {2u, 3u, 4u, 7u}) {
+                EXPECT_EQ(subtask_for_key_group(routing_key_group(token), p),
+                          subtask_for_key_group(state_kg, p))
+                    << c.columns << " row " << i << " at parallelism " << p;
+            }
+        }
+        // Distinct keys spread: the token is a key group, not a constant.
+        EXPECT_GT(tokens.size(), 1u) << c.columns;
+    }
+}
+
+// The columnar keyer appends __key to the Arrow sidecar from the cells and must
+// agree with the row path to the byte, or one shuffle edge would route a key
+// two ways depending on the carrier (columnar_split.hpp).
+TEST(SqlRuntime, ColumnarRowComputeKeyAgreesWithTheRowPath) {
+    ensure_sql_installed_once();
+    using clink::config::JsonValue;
+    arrow::StringBuilder zones;
+    arrow::Int64Builder riders;
+    const std::vector<std::pair<std::string, std::int64_t>> cells = {{"lisbon-z12", 1017},
+                                                                     {"osaka-z00", 3002},
+                                                                     {"nairobi-z21", 2043},
+                                                                     {"", 0},
+                                                                     {"lisbon-z12", 1018}};
+    for (const auto& [z, r] : cells) {
+        ASSERT_TRUE(zones.Append(z).ok());
+        ASSERT_TRUE(riders.Append(r).ok());
+    }
+    ASSERT_TRUE(zones.AppendNull().ok());
+    ASSERT_TRUE(riders.Append(99).ok());
+    std::shared_ptr<arrow::Array> zone_arr, rider_arr;
+    ASSERT_TRUE(zones.Finish(&zone_arr).ok());
+    ASSERT_TRUE(riders.Finish(&rider_arr).ok());
+    auto rb = arrow::RecordBatch::Make(arrow::schema({arrow::field("zone", arrow::utf8()),
+                                                      arrow::field("rider_id", arrow::int64())}),
+                                       static_cast<std::int64_t>(cells.size() + 1),
+                                       {zone_arr, rider_arr});
+    const std::size_t n = static_cast<std::size_t>(rb->num_rows());
+
+    auto op = build_row_keyer("zone,rider_id");
+    ASSERT_NE(op, nullptr);
+    ASSERT_TRUE(op->supports_columnar());
+    BoundedChannel<StreamElement<Row>> ch(64);
+    Emitter<Row> em(&ch);
+    Batch<Row> columnar{rb, n, clink::sql::row_materialize_fn()};
+    ASSERT_TRUE(op->process_columnar(StreamElement<Row>::data(std::move(columnar)), em));
+    auto el = ch.try_pop();
+    ASSERT_TRUE(el.has_value() && el->is_data() && el->as_data().is_columnar());
+    const auto& out_rb = el->as_data().arrow();
+    const int key_idx = out_rb->schema()->GetFieldIndex("__key");
+    ASSERT_GE(key_idx, 0);
+    const auto& keys = static_cast<const arrow::Int64Array&>(*out_rb->column(key_idx));
+
+    // The row path over the same values.
+    auto row_op = build_row_keyer("zone,rider_id");
+    std::vector<Row> rows;
+    for (std::size_t i = 0; i < n; ++i) {
+        Row r;
+        if (!zone_arr->IsNull(static_cast<std::int64_t>(i))) {
+            r.values["zone"] =
+                JsonValue{static_cast<const arrow::StringArray&>(*zone_arr).GetString(
+                    static_cast<std::int64_t>(i))};
+        }
+        r.values["rider_id"] = JsonValue{
+            static_cast<const arrow::Int64Array&>(*rider_arr).Value(static_cast<std::int64_t>(i))};
+        rows.push_back(std::move(r));
+    }
+    Batch<Row> in;
+    for (const auto& r : rows) {
+        in.push(Record<Row>{r});
+    }
+    BoundedChannel<StreamElement<Row>> ch2(64);
+    Emitter<Row> em2(&ch2);
+    row_op->process(StreamElement<Row>::data(std::move(in)), em2);
+    std::vector<std::int64_t> row_keys;
+    while (auto e2 = ch2.try_pop()) {
+        if (e2->is_data()) {
+            for (const auto& rec : e2->as_data()) {
+                row_keys.push_back(rec.value().values.at("__key").as_int());
+            }
+        }
+    }
+    ASSERT_EQ(row_keys.size(), n);
+    for (std::size_t i = 0; i < n; ++i) {
+        EXPECT_EQ(keys.Value(static_cast<std::int64_t>(i)), row_keys[i]) << "row " << i;
+        EXPECT_EQ(routing_key_group(keys.Value(static_cast<std::int64_t>(i))),
+                  key_group_of_bytes(canonical_state_key(rows[i], {"zone", "rider_id"})))
+            << "row " << i;
+    }
+}
+
 }  // namespace clink::sql

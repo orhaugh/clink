@@ -1,6 +1,7 @@
 #include "clink/sql/install.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -11904,6 +11906,69 @@ std::int64_t hash_json_value(const clink::config::JsonValue& v) {
 
 constexpr const char* kRowKeyField = "__key";
 
+// The contract between a keyed Row shuffle and the keyed state it feeds.
+//
+// The shuffle routes a record by key_group_for_key over the eight bytes of its
+// __key. A keyed Row operator stores its state under the record's canonical
+// key string: each key column's serialize(0), joined on '\x1f', a null or
+// absent column contributing nothing (the GROUP BY group key, the window's,
+// DISTINCT's, the joins' single-column key_of_). The state backend files every
+// entry under key_group_for_key over that string's bytes, and a restore at
+// parallelism above one keeps only the entries in the subtask's key-group
+// range. So the record's routing key group and its state key group must be
+// the same number, or a restore discards the state of every key the two
+// hashes disagree on, on a plain restart as much as on a rescale: the
+// dispatch job of a showcase lost two thirds of an interval join's buffered
+// rows at a worker kill with parallelism three, and the state.restore warning
+// counted exactly those entries.
+//
+// row_compute_key therefore does not hash the key into __key. It computes the
+// state key group from the canonical string and writes an int64 whose own
+// eight bytes hash to that group: routing_key_for_group(g) is the smallest
+// non-negative int64 with key_group_for_key(its bytes) == g, found once per
+// process. __key is a routing token with 128 values, not a hash of the key;
+// nothing reads it but the "row_key" extractors below and the columnar split,
+// which hash exactly these eight bytes.
+inline std::int64_t routing_key_for_group(KeyGroup group) {
+    static const std::array<std::int64_t, kNumKeyGroups> table = [] {
+        std::array<std::int64_t, kNumKeyGroups> out{};
+        std::array<bool, kNumKeyGroups> found{};
+        std::size_t remaining = kNumKeyGroups;
+        for (std::int64_t x = 0; remaining > 0; ++x) {
+            const auto g = key_group_for_key(
+                std::span<const std::byte>{reinterpret_cast<const std::byte*>(&x), sizeof(x)});
+            if (!found[g]) {
+                found[g] = true;
+                out[g] = x;
+                --remaining;
+            }
+        }
+        return out;
+    }();
+    return table[group];
+}
+
+// The canonical state key of `row` over `columns`, written into `out`.
+inline void canonical_key_into(const Row& row,
+                               const std::vector<std::string>& columns,
+                               std::string& out) {
+    out.clear();
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        if (c > 0) {
+            out += '\x1f';
+        }
+        auto it = row.values.find(columns[c]);
+        if (it != row.values.end() && !it->second.is_null()) {
+            it->second.serialize_into(out);
+        }
+    }
+}
+
+inline std::int64_t routing_key_of(std::string_view canonical) {
+    return routing_key_for_group(key_group_for_key(std::span<const std::byte>{
+        reinterpret_cast<const std::byte*>(canonical.data()), canonical.size()}));
+}
+
 // The Row sidecar layout the coordinator admitted for this deployment. It
 // stamps `row_layout=2` onto the factories that parse a layout-bearing schema
 // only when every worker hosting the job reads the second layout; without the
@@ -11963,25 +12028,20 @@ public:
         for (const auto& c : columns_) {
             idx.push_back(rb->schema()->GetFieldIndex(c));
         }
+        // The same canonical key the row path builds, straight from the cells
+        // (columnar_group_key_into is character-identical to the row form).
+        std::vector<KeyCol> key_cols;
+        key_cols.reserve(columns_.size());
+        for (const int i : idx) {
+            key_cols.emplace_back(i, i >= 0 ? rb->schema()->field(i)->type() : nullptr);
+        }
         arrow::Int64Builder kb;
         if (!kb.Reserve(n).ok()) {
             return false;
         }
+        std::string scratch;
         for (std::int64_t i = 0; i < n; ++i) {
-            std::uint64_t h = 0xcbf29ce484222325ULL;
-            for (std::size_t c = 0; c < columns_.size(); ++c) {
-                std::uint64_t v = 0;
-                if (idx[c] >= 0) {
-                    auto cell = clink::sql::row_columnar_detail::read_cell(
-                        rb->schema()->field(idx[c])->type(), *rb->column(idx[c]), i);
-                    if (!cell.is_null()) {
-                        v = static_cast<std::uint64_t>(hash_json_value(cell));
-                    }
-                }
-                h ^= v;
-                h *= 0x100000001b3ULL;
-            }
-            kb.UnsafeAppend(static_cast<std::int64_t>(h));
+            kb.UnsafeAppend(routing_key_of(columnar_group_key_into(*rb, key_cols, i, scratch)));
         }
         std::shared_ptr<arrow::Array> karr;
         if (!kb.Finish(&karr).ok()) {
@@ -12008,21 +12068,13 @@ public:
         if (el.is_data()) {
             Batch<Row> b;
             b.reserve(el.as_data().size());
+            thread_local std::string canonical;
             for (const auto& rec : el.as_data()) {
                 const Row& r = rec.value();
                 Row o = r;
-                std::uint64_t h = 0xcbf29ce484222325ULL;
-                for (const auto& col : columns_) {
-                    auto it = r.values.find(col);
-                    const std::uint64_t v =
-                        it != r.values.end()
-                            ? static_cast<std::uint64_t>(hash_json_value(it->second))
-                            : 0ULL;
-                    h ^= v;
-                    h *= 0x100000001b3ULL;
-                }
+                canonical_key_into(r, columns_, canonical);
                 static const clink::config::InternedName kRowKeyName{kRowKeyField};
-                o.values[kRowKeyName] = clink::config::JsonValue{static_cast<std::int64_t>(h)};
+                o.values[kRowKeyName] = clink::config::JsonValue{routing_key_of(canonical)};
                 Record<Row> out_rec(std::move(o));
                 if (const auto ts = rec.event_time(); ts.has_value()) {
                     out_rec.set_event_time(*ts);
@@ -13406,15 +13458,17 @@ void install(clink::plugin::PluginRegistry& reg) {
                 "row_to_json_string");
         });
 
-    // row_compute_key: writes a hash of the named columns into the
-    // synthetic __key field that the "row_key" extractor reads. The
+    // row_compute_key: writes the routing token for the named columns into
+    // the synthetic __key field that the "row_key" extractor reads. The
     // SQL planner emits this Map immediately upstream of every keyed
     // op (window aggregate, interval join) so hash routing partitions
-    // by the SQL key columns at parallelism > 1.
+    // by the SQL key columns at parallelism > 1, and the token is chosen
+    // so the routing key group is the key group of the operator's state
+    // key (see routing_key_for_group).
     //
     // Params:
-    //   columns - CSV list of source column names to hash (multi-key
-    //             grouping concatenates and FNV-hashes each in turn).
+    //   columns - CSV list of source column names, in the order the keyed
+    //             operator builds its state key from them.
     //   column  - single-column shortcut for the common case; equivalent
     //             to columns=<col>.
     reg.register_operator<Row, Row>(
