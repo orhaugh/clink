@@ -7,7 +7,8 @@
 //   insert / update_after  -> SET <key> <json-value>
 //   delete / update_before -> DEL <key>
 //   (a row with no __row_kind is an implicit insert)
-// where <key> = "<key_prefix><pk1>\x1f<pk2>..." (the primary-key tuple, prefixed).
+// where <key> = "<key_prefix><pk1>\x1f<pk2>" (the primary-key tuple, prefixed; a text
+// column is its own characters, a number its digits, columns joined by the separator).
 //
 // Within a flush the changelog is netted by primary key (last op wins), then the
 // surviving SET/DEL commands are pipelined. EFFECTIVELY-ONCE on the keyspace for
@@ -139,15 +140,28 @@ private:
             is_delete = (k == "delete" || k == "update_before");
         }
 
+        // <key_prefix><pk>: a text key is its own characters, a number its
+        // digits, and the columns of a composite key are joined by the unit
+        // separator, so `GET order:lisbon-o00940` finds the row a VARCHAR
+        // primary key wrote. (An earlier form JSON-encoded each column, quotes
+        // included, and ended every key with a separator.)
         std::string key = opts_.key_prefix;
+        bool first = true;
         for (const auto& kc : opts_.key_columns) {
             auto it = obj.find(kc);
             if (it == obj.end() || it->second.is_null()) {
                 throw std::runtime_error(opts_.name + ": changelog row missing primary key '" + kc +
                                          "': " + json);
             }
-            it->second.serialize_into(key);
-            key.push_back('\x1f');
+            if (!first) {
+                key.push_back('\x1f');
+            }
+            first = false;
+            if (it->second.is_string()) {
+                key += it->second.as_string();
+            } else {
+                it->second.serialize_into(key);
+            }
         }
 
         // Store a clean value (drop the synthetic changelog marker).

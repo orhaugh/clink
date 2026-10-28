@@ -52,8 +52,9 @@ std::string row_json(int id, const std::string& val) {
 }
 
 // Every (key, stored-row) pair under `prefix`. The sink's key layout is
-// prefix + <pk values> + 0x1f separators; for the single-int-PK fixture
-// that is prefix + id + 0x1f.
+// prefix + <pk values>, joined by 0x1f for a composite key; for the
+// single-int-PK fixture that is prefix + id. (The trailing-separator strip
+// below tolerates keys an earlier sink wrote.)
 UpsertState rows_under(const std::string& prefix) {
     UpsertState out;
     Connection c{redis_conn()};

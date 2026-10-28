@@ -63,9 +63,11 @@ std::string uniq_prefix() {
     return "clup:" + std::to_string(static_cast<long>(::getpid())) + ":";
 }
 
-// The Redis key the sink writes for a single-int-PK row: prefix + <id> + US.
+// The Redis key the sink writes for a single-int-PK row: prefix + <id>, the
+// digits themselves (a text key is its own characters; the columns of a
+// composite key are joined by the unit separator).
 std::string key_for(const std::string& prefix, int id) {
-    return prefix + std::to_string(id) + std::string(1, '\x1f');
+    return prefix + std::to_string(id);
 }
 
 RedisUpsertSinkOptions opts_for(const std::string& prefix) {
