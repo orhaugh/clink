@@ -250,6 +250,38 @@ TEST(SqlRow, IntegerColumnsTakeTheIntegerAWholeNumeralNames) {
     EXPECT_EQ(r.values.find("absent"), r.values.end());
 }
 
+TEST(SqlRow, NumericTextTakesTheDeclaredNumericType) {
+    // A source that speaks a text protocol delivers every cell as a string:
+    // the MySQL sources hand "2000" for a BIGINT column and "1" for a
+    // TINYINT. The declared type wins, as it does for a whole double, so the
+    // evaluator sums and compares numbers; a token that is not wholly a
+    // number is left as it is.
+    using clink::config::JsonValue;
+    Row r;
+    r.values["n"] = JsonValue{std::string{"2000"}};
+    r.values["neg"] = JsonValue{std::string{"-5"}};
+    r.values["frac"] = JsonValue{std::string{"7.5"}};
+    r.values["word"] = JsonValue{std::string{"abc"}};
+    r.values["empty"] = JsonValue{std::string{""}};
+    r.values["padded"] = JsonValue{std::string{" 7"}};
+    r.values["d"] = JsonValue{std::string{"3.25"}};
+    r.values["dint"] = JsonValue{std::string{"4"}};
+    r.values["dword"] = JsonValue{std::string{"4x"}};
+    coerce_row_integers(r, {"n", "neg", "frac", "word", "empty", "padded"});
+    coerce_row_doubles(r, {"d", "dint", "dword"});
+    EXPECT_TRUE(r.values.at("n").is_integral_number());
+    EXPECT_EQ(r.values.at("n").as_int(), 2000);
+    EXPECT_EQ(r.values.at("neg").as_int(), -5);
+    EXPECT_TRUE(r.values.at("frac").is_string());
+    EXPECT_TRUE(r.values.at("word").is_string());
+    EXPECT_TRUE(r.values.at("empty").is_string());
+    EXPECT_TRUE(r.values.at("padded").is_string());
+    EXPECT_TRUE(r.values.at("d").is_number());
+    EXPECT_DOUBLE_EQ(r.values.at("d").as_number(), 3.25);
+    EXPECT_DOUBLE_EQ(r.values.at("dint").as_number(), 4.0);
+    EXPECT_TRUE(r.values.at("dword").is_string());
+}
+
 TEST(SqlRow, GetStringStringifiesNumbersAndBools) {
     Row r;
     r.values["i"] = clink::config::JsonValue{static_cast<std::int64_t>(100)};

@@ -1,15 +1,19 @@
 #pragma once
 
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <optional>
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "clink/config/decimal.hpp"
@@ -332,6 +336,35 @@ inline void coerce_row_floats(Row& r, const std::vector<std::string>& float_colu
     }
 }
 
+// A numeric text token in a declared numeric column takes the column's type
+// too: a source that speaks a text protocol (the MySQL sources deliver every
+// cell as a string) or a producer that quotes its numbers would otherwise leave
+// a string in a BIGINT column, and the evaluator compares and sums it as text.
+// Only a token that is wholly a number is taken; anything else stays as it is.
+inline std::optional<std::int64_t> whole_integer_token(std::string_view s) {
+    if (s.empty() || s.size() > 20)
+        return std::nullopt;
+    std::int64_t v = 0;
+    const auto* begin = s.data();
+    const auto* end = s.data() + s.size();
+    const auto res = std::from_chars(begin, end, v);
+    if (res.ec != std::errc{} || res.ptr != end)
+        return std::nullopt;
+    return v;
+}
+
+inline std::optional<double> whole_double_token(std::string_view s) {
+    if (s.empty() || s.size() > 64)
+        return std::nullopt;
+    std::string buf(s);
+    char* endp = nullptr;
+    errno = 0;
+    const double d = std::strtod(buf.c_str(), &endp);
+    if (errno != 0 || endp != buf.c_str() + buf.size() || !std::isfinite(d))
+        return std::nullopt;
+    return d;
+}
+
 // Coerce declared DOUBLE columns' integer tokens to double, so a DOUBLE column
 // holds a double whichever way the producer wrote the number.
 //
@@ -344,7 +377,15 @@ inline void coerce_row_floats(Row& r, const std::vector<std::string>& float_colu
 inline void coerce_row_doubles(Row& r, const std::vector<std::string>& double_columns) {
     for (const auto& col : double_columns) {
         auto it = r.values.find(col);
-        if (it == r.values.end() || !it->second.is_integral_number())
+        if (it == r.values.end())
+            continue;
+        if (it->second.is_string()) {
+            if (const auto v = whole_double_token(it->second.as_string()); v.has_value()) {
+                it->second = clink::config::JsonValue{*v};
+            }
+            continue;
+        }
+        if (!it->second.is_integral_number())
             continue;
         it->second = clink::config::JsonValue{static_cast<double>(it->second.as_int())};
     }
@@ -365,7 +406,15 @@ inline void coerce_row_integers(Row& r, const std::vector<std::string>& integer_
     constexpr double kInt64HiExclusive = 9223372036854775808.0;
     for (const auto& col : integer_columns) {
         auto it = r.values.find(col);
-        if (it == r.values.end() || !it->second.is_number() || it->second.is_integral_number())
+        if (it == r.values.end())
+            continue;
+        if (it->second.is_string()) {
+            if (const auto v = whole_integer_token(it->second.as_string()); v.has_value()) {
+                it->second = clink::config::JsonValue{*v};
+            }
+            continue;
+        }
+        if (!it->second.is_number() || it->second.is_integral_number())
             continue;
         const double d = it->second.as_number();
         if (!std::isfinite(d) || d < kInt64Lo || d >= kInt64HiExclusive || d != std::trunc(d))
