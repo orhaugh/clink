@@ -574,7 +574,10 @@ SELECT * FROM ticks MATCH_RECOGNIZE (
 Supported: `PARTITION BY`, a single event-time `ORDER BY`, `MEASURES` with
 `FIRST` / `LAST` / `CLASSIFIER()`, `PATTERN` with the quantifiers `+ * ?`, `{n}`
 and `{n,m}`, per-row `DEFINE` predicates using `PREV(col)`, `ONE ROWS PER MATCH`
-(default) or `ALL ROWS PER MATCH`, and `AFTER MATCH SKIP PAST LAST ROW`.
+(default) or `ALL ROWS PER MATCH`, and `AFTER MATCH SKIP PAST LAST ROW`. A
+pattern's rows are consecutive in the partition: `b{3}` is three rows in a row
+that satisfy `b`, and a row between them that satisfies no variable ends the
+attempt, which then starts again at the next row.
 
 Because `PREV` is NULL on the first row of a partition, start the pattern on an
 anchor variable (`PATTERN (start down+ up)`), not on a `PREV`-conditioned one.

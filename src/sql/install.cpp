@@ -13927,6 +13927,11 @@ void install(clink::plugin::PluginRegistry& reg) {
                 } else if (!(minc == 1 && maxc == 1)) {
                     pattern->times(minc, maxc);
                 }
+                // A pattern variable's rows are consecutive in the partition:
+                // `b{3}` is three bounces in a row, and a row between them that
+                // is not one ends the attempt. The engine's repetition would
+                // otherwise wait through such a row.
+                pattern->consecutive();
             }
 
             // The MR contract is AFTER MATCH SKIP PAST LAST ROW: a completed

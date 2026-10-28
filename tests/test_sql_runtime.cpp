@@ -3352,6 +3352,77 @@ TEST(SqlRuntime, MatchRecognizeMatchesEndToEnd) {
     EXPECT_EQ(static_cast<std::int64_t>(r.values.at("final_price").as_number()), 250);
 }
 
+TEST(SqlRuntime, MatchRecognizeHoldsAPatternVariablesRowsToBeConsecutive) {
+    // b{3} is three rows in a row that satisfy b. A row between them that
+    // satisfies no variable ends the attempt, so over
+    // b a b b b b r b b a there is one match, the third to fifth rows,
+    // and not a match assembled from the first, third and fourth.
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE events (user_id BIGINT, ts BIGINT, status VARCHAR) "
+                          "WITH (connector='file', format='json', path='/tmp/mr_run_ev.ndjson');"
+                          "CREATE TABLE out_mr (user_id BIGINT, first_at BIGINT, last_at BIGINT) "
+                          "WITH (connector='file', format='json', path='/tmp/mr_run_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+
+    auto spec = compile(cat,
+                        "INSERT INTO out_mr SELECT * FROM events MATCH_RECOGNIZE ("
+                        "  PARTITION BY user_id ORDER BY ts"
+                        "  MEASURES FIRST(b.ts) AS first_at, LAST(b.ts) AS last_at"
+                        "  AFTER MATCH SKIP PAST LAST ROW"
+                        "  PATTERN (b{3})"
+                        "  DEFINE b AS status = 'bounced')");
+    std::map<std::string, std::string> params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "match_recognize_row") {
+            params = op.params;
+        }
+    }
+    ASSERT_FALSE(params.empty());
+    const auto* factory = cluster::OperatorRegistry::default_instance().find_operator(
+        "match_recognize_row", std::string{kChannelRow}, std::string{kChannelRow});
+    ASSERT_NE(factory, nullptr);
+    cluster::OperatorBuildContext octx;
+    octx.params = params;
+    auto op = std::static_pointer_cast<Operator<Row, Row>>(factory->build(octx));
+    ASSERT_NE(op, nullptr);
+
+    auto mk = [](std::int64_t ts, const char* status) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(1)};
+        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["status"] = clink::config::JsonValue{std::string{status}};
+        return Record<Row>{std::move(r)};
+    };
+    Dag dag;
+    auto src = std::make_shared<VectorSource<Row>>(std::vector<Record<Row>>{mk(1, "bounced"),
+                                                                            mk(2, "accepted"),
+                                                                            mk(3, "bounced"),
+                                                                            mk(4, "bounced"),
+                                                                            mk(5, "bounced"),
+                                                                            mk(6, "bounced"),
+                                                                            mk(7, "ready"),
+                                                                            mk(8, "bounced"),
+                                                                            mk(9, "bounced"),
+                                                                            mk(10, "accepted")});
+    auto h_src = dag.add_source<Row>(src);
+    auto h_op = dag.add_operator<Row, Row>(h_src, op);
+    auto sink = std::make_shared<CollectingSink<Row>>();
+    dag.add_sink<Row>(h_op, sink);
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    auto out = sink->collected();
+    ASSERT_EQ(out.size(), 1u) << "one run of three consecutive bounces";
+    EXPECT_EQ(static_cast<std::int64_t>(out.front().values.at("first_at").as_number()), 3);
+    EXPECT_EQ(static_cast<std::int64_t>(out.front().values.at("last_at").as_number()), 5);
+}
+
 TEST(SqlRuntime, MatchRecognizePrevInDefineMatchesTheClassicV) {
     // The canonical PREV pattern: a fall then a rise. down rows must be
     // strictly below the PREVIOUS row, up rows strictly above - only

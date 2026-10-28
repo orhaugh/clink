@@ -154,6 +154,14 @@ struct Step {
     IterativePredicate<T> iterative;
     std::uint32_t min_count{1};
     std::uint32_t max_count{1};
+    // When true, the step's repetitions are contiguous: an event that
+    // does not satisfy the step, arriving after the step has captured
+    // one but before it has captured min_count, ends the partial instead
+    // of being skipped. Default relaxed: the repetition waits through
+    // such events (the Flink CEP reading of times(n)). SQL
+    // MATCH_RECOGNIZE's `b{3}` is three consecutive rows, so its lowering
+    // sets this on every step.
+    bool consecutive{false};
     // When true, the quantifier advances as soon as min_count is met
     // - even if the current event would also satisfy this step. Default
     // greedy: keep capturing up to max_count before advancing. Lazy is
@@ -261,6 +269,19 @@ public:
         }
         steps_.back().min_count = min;
         steps_.back().max_count = max;
+        return *this;
+    }
+
+    // Contiguity within the current step's repetitions: an event that
+    // does not satisfy the step, after it has started capturing and
+    // before its minimum is met, ends the partial. Without it the
+    // repetition skips such events. Meaningful on a quantified step; on a
+    // plain step it changes nothing.
+    Pattern<T>& consecutive() {
+        if (steps_.empty()) {
+            throw std::logic_error("Pattern::consecutive called before begin()");
+        }
+        steps_.back().consecutive = true;
         return *this;
     }
 

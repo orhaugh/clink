@@ -163,6 +163,47 @@ TEST(Cep, StrictNextDropsPartialOnNonMatchingEvent) {
     EXPECT_TRUE(sink->collected().empty());
 }
 
+TEST(Cep, ConsecutiveTimesEndsThePartialOnAGapBeforeTheMinimum) {
+    // times(3) is relaxed by default: a non-matching event between two
+    // matching ones is waited through. With .consecutive() the three must
+    // arrive in a row, which is what SQL MATCH_RECOGNIZE's b{3} means: here
+    // only the last three events form a match.
+    Dag dag;
+    auto src = std::make_shared<VectorSource<Event>>(std::vector<Record<Event>>{
+        Record<Event>{Event{0, 1, 1}},   // a bounce
+        Record<Event>{Event{0, 0, 0}},   // a gap: ends the partial
+        Record<Event>{Event{0, 1, 10}},  // three in a row
+        Record<Event>{Event{0, 1, 20}},
+        Record<Event>{Event{0, 1, 30}},
+    });
+    auto h_src = dag.add_source<Event>(src);
+    auto p = Pattern<Event>::begin("b")
+                 .where([](const Event& e) { return e.kind == 1; })
+                 .times(3)
+                 .consecutive();
+    auto op = make_op<int>(
+        p,
+        [](const Event&) -> std::int64_t { return 0; },
+        [](const PatternMatch<Event>& m) -> int {
+            int sum = 0;
+            for (const auto& e : m.at("b")) {
+                sum += e.payload;
+            }
+            return sum;
+        });
+    auto h_op = dag.add_operator<Event, int>(h_src, op);
+    auto sink = std::make_shared<CollectingSink<int>>();
+    dag.add_sink<int>(h_op, sink);
+
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    ASSERT_EQ(sink->collected().size(), 1u);
+    EXPECT_EQ(sink->collected().front(), 60) << "the match is the last three events, not 1, 10, 20";
+}
+
 // Source that emits in three phases so the within() watermark fires
 // BETWEEN the start and the late "would-be end" event, exercising the
 // pruning path deterministically.

@@ -784,9 +784,10 @@ private:
                 }
                 continue;
             }
-            // Quantifier minimum not yet satisfied. Strict Next dies;
-            // FollowedBy waits.
-            if (step.incoming == EdgeKind::Next) {
+            // Quantifier minimum not yet satisfied. Strict Next dies, as
+            // does a consecutive repetition that has started capturing;
+            // FollowedBy, and a relaxed repetition, wait.
+            if (step.incoming == EdgeKind::Next || (step.consecutive && p.current_step_count > 0)) {
                 return StepOutcome::Died;
             }
             return StepOutcome::Keep;
