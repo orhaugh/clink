@@ -3423,6 +3423,123 @@ TEST(SqlRuntime, MatchRecognizeHoldsAPatternVariablesRowsToBeConsecutive) {
     EXPECT_EQ(static_cast<std::int64_t>(out.front().values.at("last_at").as_number()), 5);
 }
 
+TEST(SqlRuntime, MatchRecognizePartitionsByTheKeyNotByItsKeyGroup) {
+    // The keyer in front of the pattern operator stamps each row with a
+    // routing token, one of 128, for the key group of its partition key.
+    // Two partitions whose keys share a key group carry the same token, and
+    // keyed by the token they were one sequence of events: a row of one
+    // ended a run of the other. Keyed by the partition itself, each sees its
+    // own rows only, so two interleaved runs of three bounces are two
+    // alerts.
+    ensure_sql_installed_once();
+
+    Catalog cat;
+    auto ddl =
+        parse(std::string{"CREATE TABLE events (user_id BIGINT, ts BIGINT, status VARCHAR) "
+                          "WITH (connector='file', format='json', path='/tmp/mr_kg_ev.ndjson');"
+                          "CREATE TABLE out_mr (user_id BIGINT, first_at BIGINT, last_at BIGINT) "
+                          "WITH (connector='file', format='json', path='/tmp/mr_kg_out.ndjson')"});
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(ddl.statements[1]));
+    auto spec = compile(cat,
+                        "INSERT INTO out_mr SELECT * FROM events MATCH_RECOGNIZE ("
+                        "  PARTITION BY user_id ORDER BY ts"
+                        "  MEASURES FIRST(b.ts) AS first_at, LAST(b.ts) AS last_at"
+                        "  AFTER MATCH SKIP PAST LAST ROW"
+                        "  PATTERN (b{3})"
+                        "  DEFINE b AS status = 'bounced')");
+    std::map<std::string, std::string> mr_params;
+    for (const auto& op : spec.ops) {
+        if (op.type == "match_recognize_row") {
+            mr_params = op.params;
+        }
+    }
+    ASSERT_FALSE(mr_params.empty());
+    const auto& registry = cluster::OperatorRegistry::default_instance();
+    const auto* mr_factory = registry.find_operator(
+        "match_recognize_row", std::string{kChannelRow}, std::string{kChannelRow});
+    const auto* keyer_factory = registry.find_operator(
+        "row_compute_key", std::string{kChannelRow}, std::string{kChannelRow});
+    ASSERT_NE(mr_factory, nullptr);
+    ASSERT_NE(keyer_factory, nullptr);
+    auto build_keyer = [&] {
+        cluster::OperatorBuildContext kctx;
+        kctx.params["columns"] = "user_id";
+        return std::static_pointer_cast<Operator<Row, Row>>(keyer_factory->build(kctx));
+    };
+    auto mk = [](std::int64_t user, std::int64_t ts, const char* status) {
+        Row r;
+        r.values["user_id"] = clink::config::JsonValue{static_cast<double>(user)};
+        r.values["ts"] = clink::config::JsonValue{static_cast<double>(ts)};
+        r.values["status"] = clink::config::JsonValue{std::string{status}};
+        return Record<Row>{std::move(r)};
+    };
+    auto run_through = [&](std::vector<Record<Row>> rows, bool with_pattern) {
+        Dag dag;
+        auto src = std::make_shared<VectorSource<Row>>(std::move(rows));
+        auto h_src = dag.add_source<Row>(src);
+        auto h_key = dag.add_operator<Row, Row>(h_src, build_keyer());
+        auto sink = std::make_shared<CollectingSink<Row>>();
+        if (with_pattern) {
+            cluster::OperatorBuildContext octx;
+            octx.params = mr_params;
+            auto mr = std::static_pointer_cast<Operator<Row, Row>>(mr_factory->build(octx));
+            auto h_mr = dag.add_operator<Row, Row>(h_key, mr);
+            dag.add_sink<Row>(h_mr, sink);
+        } else {
+            dag.add_sink<Row>(h_key, sink);
+        }
+        JobConfig cfg;
+        cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        exec.run();
+        return sink->collected();
+    };
+
+    // Two users whose partition keys the keyer routes by the same token.
+    // Among the first 129 there are two by the pigeonhole principle.
+    std::vector<Record<Row>> probes;
+    for (std::int64_t user = 1; user <= 129; ++user) {
+        probes.push_back(mk(user, 0, "accepted"));
+    }
+    std::map<std::int64_t, std::int64_t> user_of_token;
+    std::int64_t a = 0;
+    std::int64_t b = 0;
+    for (const auto& row : run_through(std::move(probes), false)) {
+        const auto user = static_cast<std::int64_t>(row.values.at("user_id").as_number());
+        const auto token = row.values.at("__key").as_int();
+        if (auto it = user_of_token.find(token); it != user_of_token.end() && a == 0) {
+            a = it->second;
+            b = user;
+        }
+        user_of_token.emplace(token, user);
+    }
+    ASSERT_NE(a, 0) << "no two of 129 users share a routing token";
+
+    // a bounces three times while b's acceptances fall between, then the
+    // other way round. Each partition's run is unbroken by the other's rows.
+    auto out = run_through({mk(a, 1, "bounced"),
+                            mk(b, 2, "accepted"),
+                            mk(a, 3, "bounced"),
+                            mk(b, 4, "accepted"),
+                            mk(a, 5, "bounced"),
+                            mk(b, 6, "bounced"),
+                            mk(a, 7, "accepted"),
+                            mk(b, 8, "bounced"),
+                            mk(a, 9, "accepted"),
+                            mk(b, 10, "bounced")},
+                           true);
+    std::map<std::int64_t, std::pair<std::int64_t, std::int64_t>> alerts;
+    for (const auto& r : out) {
+        alerts[static_cast<std::int64_t>(r.values.at("user_id").as_number())] = {
+            static_cast<std::int64_t>(r.values.at("first_at").as_number()),
+            static_cast<std::int64_t>(r.values.at("last_at").as_number())};
+    }
+    ASSERT_EQ(out.size(), 2u) << "one run of three bounces per partition";
+    EXPECT_EQ(alerts[a], (std::pair<std::int64_t, std::int64_t>{1, 5}));
+    EXPECT_EQ(alerts[b], (std::pair<std::int64_t, std::int64_t>{6, 10}));
+}
+
 TEST(SqlRuntime, MatchRecognizePrevInDefineMatchesTheClassicV) {
     // The canonical PREV pattern: a fall then a rise. down rows must be
     // strictly below the PREVIOUS row, up rows strictly above - only

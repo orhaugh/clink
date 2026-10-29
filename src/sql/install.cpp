@@ -14008,15 +14008,17 @@ void install(clink::plugin::PluginRegistry& reg) {
                 }
             };
 
-            auto key_fn = [](const Row& r) -> std::int64_t {
-                auto it = r.values.find(kRowKeyField);
-                if (it == r.values.end()) {
-                    return 0;
-                }
-                if (it->second.is_number()) {
-                    return it->second.as_int();  // exact: see the row_key extractor
-                }
-                return hash_json_value(it->second);
+            // The pattern's partition is the row's canonical partition key,
+            // the string every keyed Row operator stores its state under
+            // (see row_compute_key), whose key group is the one the shuffle
+            // routed the row by. It is not the row's __key: that is a routing
+            // token with 128 values, and keying the pattern by it merged every
+            // two partitions whose keys share a key group into one sequence
+            // of events, so a row of one ended a run of the other.
+            auto key_fn = [part_cols](const Row& r) -> std::string {
+                std::string canonical;
+                canonical_key_into(r, part_cols, canonical);
+                return canonical;
             };
 
             if (ctx.param_or("rows_per_match", "one") == "all") {
@@ -14045,12 +14047,12 @@ void install(clink::plugin::PluginRegistry& reg) {
                     }
                     return out_rows;
                 };
-                auto op =
-                    std::make_shared<clink::cep::CepOperator<Row, Row>>(std::move(*pattern),
-                                                                        row_json_codec(),
-                                                                        key_fn,
-                                                                        flat_select,
-                                                                        "match_recognize_row");
+                auto op = std::make_shared<clink::cep::CepOperator<Row, Row, std::string>>(
+                    std::move(*pattern),
+                    row_json_codec(),
+                    key_fn,
+                    flat_select,
+                    "match_recognize_row");
                 // A row at or behind the watermark is late: dropped, as OVER drops it.
                 op->drop_late_records();
                 op->order_by_event_time(event_time_order);
@@ -14080,7 +14082,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 return out;
             };
 
-            auto op = std::make_shared<clink::cep::CepOperator<Row, Row>>(
+            auto op = std::make_shared<clink::cep::CepOperator<Row, Row, std::string>>(
                 std::move(*pattern), row_json_codec(), key_fn, select_fn, "match_recognize_row");
             // A row at or behind the watermark is late: dropped, as OVER drops it.
             op->drop_late_records();

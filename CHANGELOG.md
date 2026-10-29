@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+**`MATCH_RECOGNIZE` partitions by its key, not by the key's routing token.**
+The pattern operator took its partition from the `__key` the keyer writes for
+the shuffle, a routing token with 128 values, so two partitions whose keys
+share a key group were one sequence of events: a row of one ended a run of the
+other, and a pattern across them matched rows of both. The operator is now
+keyed by the partition's canonical key, the string every keyed Row operator
+stores its state under; `CepOperator` takes its key type as a parameter, an
+`int64` for the typed API's extractors as before or a `std::string`. A job
+checkpointed before this restores its held rows and partials under the keys
+they were filed under, and rows that arrive after the restore take their own
+partition.
+
+**A job submitted to a Coordinator arms the flight recorder, and a takeover
+keeps it armed.** `clink run --capture-dir` recorded an embedded run only; the
+same script submitted to a Coordinator recorded nothing. The capture directory
+and the per-epoch cap now ride the submission (`--capture-dir` and
+`--capture-records` on `clink run` with `--coordinator-host` and on
+`clink_submit_sql`, the `capture_dir` and `capture_records` query parameters
+of a submission), and the manifest a takeover rebuilds a job from carries
+them, so a Coordinator failover keeps recording.
+
+**The HTTP polling source's record says it replays from its checkpointed
+cursor.** Its capability record said it kept no cursor and sat outside
+checkpointing, at most once, while its code has checkpointed the cursor and
+re-polled from it since it existed; the record barred a job over the source
+from declaring any guarantee. It now says what the code does, with the
+limitation that an exact replay is the endpoint's to give by honouring an
+exclusive cursor.
+
+**The Redis upsert sink's key is the documented `<key_prefix><pk>`.** It wrote
+the prefix, the primary key's JSON encoding and a `\x1f`, so
+`order:"lisbon-o00940"\x1f` where the page promised `order:lisbon-o00940`. A
+string key is now written as it is and a number as its digits, with `\x1f`
+only between the columns of a composite key.
+
+**A numeric text token takes the declared numeric column's type.** The JSON
+bridge left a numeric string as a string, so a source that speaks a text
+protocol, as both MySQL sources do, put `"2000"` into a `BIGINT` column and
+every sink downstream wrote it as a string. A whole token that parses as the
+column's numeric type now takes it.
+
+**A `MATCH_RECOGNIZE` pattern variable's rows are consecutive.** `b{3}`
+matched three rows satisfying `b` with rows satisfying no variable between
+them, so three bounces across a night were reported where three in a row were
+meant. A row that satisfies no variable now ends an attempt that has started
+capturing a quantified variable; a typed pattern asks for the same with
+`consecutive()`.
+
+**A Top-N statement no longer swallows the next statement's `WHERE`.** The
+binder's record that a Top-N shape had consumed the outer `WHERE` outlived the
+statement, so the next statement of an `EXECUTE STATEMENT SET` after a Top-N
+had its `WHERE` skipped and kept every row. The record is cleared as each
+statement's binding begins.
+
+**A source its broker redelivers is at least once, not at most once.** The
+delivery analyser took the Pulsar, RabbitMQ and NATS sources, which keep no
+position of their own, acknowledge at checkpoint completion and have the
+broker deliver again whatever was not acknowledged, for sources that lose what
+is in flight, and refused a job over them even an `at_least_once` sink. They
+declare the acknowledgement offset model, and a job over them is reported
+`AT_LEAST_ONCE_SOURCE`: nothing in flight is lost, and the records of a
+checkpoint acknowledged late arrive twice.
+
+**A keyed row's state is filed in the key group its rows route to.** The
+keyer hashed the key columns into `__key` and the shuffle routed by that hash,
+while the operator filed the row's state under its canonical key string, which
+the backend hashes to a different key group for most keys; a restore of a
+parallel SQL job kept only the entries in each task's key-group range and
+discarded the rest. `__key` is now a routing token whose own bytes hash to the
+state's key group, so a record and its state land in the same group.
+
 **A query can read a common table expression more than once.** A second
 reference to a CTE was refused with "CTE referenced more than once (not yet
 supported)". The first reference now takes the plan bound with the `WITH`

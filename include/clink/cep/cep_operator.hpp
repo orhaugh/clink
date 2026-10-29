@@ -2,17 +2,22 @@
 
 // CEP operator - NFA-based pattern matcher.
 //
-// CepOperator<T, U> consumes a stream of T, matches a compiled
+// CepOperator<T, U, K> consumes a stream of T, matches a compiled
 // Pattern<T> against the per-key event sequence, and emits U values
 // produced by a user-supplied select function each time a full match
-// is found.
+// is found. K is the key the operator partitions by: an int64 (the
+// default, what the typed API's key extractors return) or a std::string
+// (the SQL frontend's canonical partition key, the string every keyed
+// Row operator stores its state under).
 //
 // Runtime semantics:
 //
 //   * Partial matches are kept per key in
-//       KeyedState<int64_t, vector<PartialMatch<T>>>
+//       KeyedState<K, vector<PartialMatch<T>>>
 //     under the slot "__cep_partials__". One row per user key keeps
-//     routing-by-key correct under parallelism > 1.
+//     routing-by-key correct under parallelism > 1. The key is the
+//     partition itself, never a routing token for it: two partitions
+//     that share a key group are two sequences of events.
 //   * Each PartialMatch tracks its captured events, the current step
 //     it's evaluating against, and the count of captures within that
 //     step (quantifier support: a one_or_more or times(min,max) step
@@ -54,6 +59,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -268,13 +274,26 @@ inline Codec<HeldRecord<T>> held_record_codec(Codec<T> t_codec) {
         }};
 }
 
+// The codec a CepOperator files its keyed state under: the typed API keys
+// by an int64, the SQL frontend by its partition's canonical string.
+template <typename K>
+inline Codec<K> cep_key_codec() {
+    if constexpr (std::is_same_v<K, std::int64_t>) {
+        return int64_codec();
+    } else if constexpr (std::is_same_v<K, std::string>) {
+        return string_codec();
+    } else {
+        static_assert(sizeof(K) == 0, "a CepOperator is keyed by std::int64_t or std::string");
+    }
+}
+
 }  // namespace detail
 
-// CepOperator<T, U>: T-in, U-out NFA-based pattern matcher.
-template <typename T, typename U>
+// CepOperator<T, U, K>: T-in, U-out NFA-based pattern matcher, keyed by K.
+template <typename T, typename U, typename K = std::int64_t>
 class CepOperator final : public Operator<T, U> {
 public:
-    using KeyFn = std::function<std::int64_t(const T&)>;
+    using KeyFn = std::function<K(const T&)>;
     using SelectFn = std::function<U(const PatternMatch<T>&)>;
     // FlatSelect: emit 0..N records per pattern match. Mirrors
     // PatternFlatSelectFunction. Mutually exclusive with SelectFn - a
@@ -406,19 +425,21 @@ public:
             }
             return;
         }
-        state_ = std::make_unique<KeyedState<std::int64_t, std::vector<detail::PartialMatch<T>>>>(
-            rt->template keyed_state<std::int64_t, std::vector<detail::PartialMatch<T>>>(
-                kSlotName, int64_codec(), vector_codec(detail::partial_match_codec<T>(t_codec_))));
+        state_ = std::make_unique<KeyedState<K, std::vector<detail::PartialMatch<T>>>>(
+            rt->template keyed_state<K, std::vector<detail::PartialMatch<T>>>(
+                kSlotName,
+                detail::cep_key_codec<K>(),
+                vector_codec(detail::partial_match_codec<T>(t_codec_))));
         if (order_by_event_time_) {
-            held_ = std::make_unique<KeyedState<std::int64_t, std::vector<detail::HeldRecord<T>>>>(
-                rt->template keyed_state<std::int64_t, std::vector<detail::HeldRecord<T>>>(
+            held_ = std::make_unique<KeyedState<K, std::vector<detail::HeldRecord<T>>>>(
+                rt->template keyed_state<K, std::vector<detail::HeldRecord<T>>>(
                     kHeldSlotName,
-                    int64_codec(),
+                    detail::cep_key_codec<K>(),
                     vector_codec(detail::held_record_codec<T>(t_codec_))));
             // When each key's held records fall due is not checkpointed: it is
             // rebuilt from the held records a restore brought back, which are
             // this subtask's own after a rescale.
-            held_->scan([this](std::int64_t k, const std::vector<detail::HeldRecord<T>>& held) {
+            held_->scan([this](const K& k, const std::vector<detail::HeldRecord<T>>& held) {
                 if (!held.empty()) {
                     due_.emplace(held.front().ts, k);
                 }
@@ -543,7 +564,7 @@ private:
     bool have_wm_{false};
     std::int64_t current_wm_{0};
 
-    std::vector<detail::HeldRecord<T>> load_held_(std::int64_t k) const {
+    std::vector<detail::HeldRecord<T>> load_held_(const K& k) const {
         if (!held_) {
             auto it = held_shadow_.find(k);
             return it == held_shadow_.end() ? std::vector<detail::HeldRecord<T>>{} : it->second;
@@ -551,7 +572,7 @@ private:
         return held_->get(k).value_or(std::vector<detail::HeldRecord<T>>{});
     }
 
-    void save_held_(std::int64_t k, std::vector<detail::HeldRecord<T>> held) {
+    void save_held_(const K& k, std::vector<detail::HeldRecord<T>> held) {
         if (!held_) {
             if (held.empty()) {
                 held_shadow_.erase(k);
@@ -569,7 +590,7 @@ private:
 
     // Hold a record until the watermark passes it, after any of the key's held
     // records at the same time, so arrival order breaks ties.
-    void hold_(std::int64_t k, std::int64_t ts, const T& value) {
+    void hold_(const K& k, std::int64_t ts, const T& value) {
         auto held = load_held_(k);
         if (held.empty() || ts < held.front().ts) {
             if (!held.empty()) {
@@ -591,7 +612,7 @@ private:
     void release_held_(std::int64_t bound, Emitter<U>& out) {
         Batch<U> batch_out;
         while (!due_.empty() && due_.begin()->first <= bound) {
-            const std::int64_t k = due_.begin()->second;
+            const K k = due_.begin()->second;
             due_.erase(due_.begin());
             auto held = load_held_(k);
             const auto end = std::upper_bound(
@@ -614,7 +635,7 @@ private:
         }
     }
 
-    std::vector<detail::PartialMatch<T>> load_partials_(std::int64_t k) const {
+    std::vector<detail::PartialMatch<T>> load_partials_(const K& k) const {
         if (!state_) {
             auto it = shadow_.find(k);
             return it == shadow_.end() ? std::vector<detail::PartialMatch<T>>{} : it->second;
@@ -622,7 +643,7 @@ private:
         return state_->get(k).value_or(std::vector<detail::PartialMatch<T>>{});
     }
 
-    void save_partials_(std::int64_t k, std::vector<detail::PartialMatch<T>> partials) {
+    void save_partials_(const K& k, std::vector<detail::PartialMatch<T>> partials) {
         if (!state_) {
             if (partials.empty()) {
                 shadow_.erase(k);
@@ -795,7 +816,7 @@ private:
         return StepOutcome::Keep;
     }
 
-    void advance_for_key_(std::int64_t k, const Record<T>& rec, Batch<U>& batch_out) {
+    void advance_for_key_(const K& k, const Record<T>& rec, Batch<U>& batch_out) {
         auto partials = load_partials_(k);
         std::vector<detail::PartialMatch<T>> next_partials;
         next_partials.reserve(partials.size() + 1);
@@ -1077,10 +1098,10 @@ private:
         // Walk the slot once: for each key whose partial-list has any
         // expired entries, rewrite it; if the list goes empty, erase.
         // KeyedState forbids mutation during scan, so we buffer first.
-        std::vector<std::pair<std::int64_t, std::vector<detail::PartialMatch<T>>>> updates;
-        std::vector<std::int64_t> to_erase;
+        std::vector<std::pair<K, std::vector<detail::PartialMatch<T>>>> updates;
+        std::vector<K> to_erase;
         std::vector<detail::PartialMatch<T>> expired;
-        state_->scan([&](std::int64_t k, const std::vector<detail::PartialMatch<T>>& partials) {
+        state_->scan([&](const K& k, const std::vector<detail::PartialMatch<T>>& partials) {
             std::vector<detail::PartialMatch<T>> kept;
             kept.reserve(partials.size());
             for (const auto& m : partials) {
@@ -1109,7 +1130,7 @@ private:
         if (!success_batch.empty()) {
             out.emit_data(std::move(success_batch));
         }
-        for (auto k : to_erase) {
+        for (const auto& k : to_erase) {
             state_->erase(k);
         }
         for (auto& [k, kept] : updates) {
@@ -1124,15 +1145,15 @@ private:
     FlatSelectFn flat_select_fn_;
     std::string name_;
 
-    clink::FlatMap<std::int64_t, std::vector<detail::PartialMatch<T>>> shadow_;
-    std::unique_ptr<KeyedState<std::int64_t, std::vector<detail::PartialMatch<T>>>> state_;
+    clink::FlatMap<K, std::vector<detail::PartialMatch<T>>> shadow_;
+    std::unique_ptr<KeyedState<K, std::vector<detail::PartialMatch<T>>>> state_;
 
     // Records held for order_by_event_time(), per key in event-time order, and
     // (earliest held time, key) for every key holding any, so a watermark
     // visits only the keys it releases.
-    clink::FlatMap<std::int64_t, std::vector<detail::HeldRecord<T>>> held_shadow_;
-    std::unique_ptr<KeyedState<std::int64_t, std::vector<detail::HeldRecord<T>>>> held_;
-    std::set<std::pair<std::int64_t, std::int64_t>> due_;
+    clink::FlatMap<K, std::vector<detail::HeldRecord<T>>> held_shadow_;
+    std::unique_ptr<KeyedState<K, std::vector<detail::HeldRecord<T>>>> held_;
+    std::set<std::pair<std::int64_t, K>> due_;
 
     // Optional timed-out side output. timed_out_tag_id_ is just for
     // introspection; the emitter closure (built by with_timed_out_output)

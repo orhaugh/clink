@@ -6,7 +6,8 @@
 // that arrives out of order but ahead of the watermark takes its place in time.
 // These tests pin that order, the tie-break among equal times, the late bound,
 // the end of the input, and that held records and the late bound both survive
-// a checkpoint.
+// a checkpoint, under the integer keys of the typed API and the string keys
+// the SQL frontend partitions by.
 
 #include <cstdint>
 #include <memory>
@@ -55,11 +56,25 @@ int describe(const PatternMatch<Tx>& m) {
     return m.at("c").front().payload * 100 + m.at("d").front().payload;
 }
 
-std::shared_ptr<CepOperator<Tx, int>> make_op(bool event_time_order) {
-    auto op = std::make_shared<CepOperator<Tx, int>>(
+// A record's key as the operator's key type: the typed API keys by an
+// integer, the SQL frontend by its partition's canonical string.
+template <typename K>
+K key_of(const Tx& t);
+template <>
+std::int64_t key_of<std::int64_t>(const Tx& t) {
+    return t.key;
+}
+template <>
+std::string key_of<std::string>(const Tx& t) {
+    return "key-" + std::to_string(t.key);
+}
+
+template <typename K = std::int64_t>
+std::shared_ptr<CepOperator<Tx, int, K>> make_op(bool event_time_order) {
+    auto op = std::make_shared<CepOperator<Tx, int, K>>(
         credit_then_debit(),
         trivial_codec<Tx>(),
-        [](const Tx& t) { return t.key; },
+        [](const Tx& t) { return key_of<K>(t); },
         describe,
         "cep_event_time_order_test");
     op->order_by_event_time(event_time_order);
@@ -68,10 +83,11 @@ std::shared_ptr<CepOperator<Tx, int>> make_op(bool event_time_order) {
 
 // Drives the operator directly, so watermarks, the end of the input and
 // checkpoints fall exactly where a test puts them.
-class Probe {
+template <typename K = std::int64_t>
+class ProbeT {
 public:
-    explicit Probe(bool event_time_order, std::optional<Snapshot> restore_from = std::nullopt)
-        : backend_(std::make_shared<InMemoryStateBackend>()), op_(make_op(event_time_order)) {
+    explicit ProbeT(bool event_time_order, std::optional<Snapshot> restore_from = std::nullopt)
+        : backend_(std::make_shared<InMemoryStateBackend>()), op_(make_op<K>(event_time_order)) {
         op_->set_id(kOp);
         if (restore_from.has_value()) {
             backend_->restore(*restore_from);
@@ -107,7 +123,7 @@ public:
 
 private:
     std::shared_ptr<InMemoryStateBackend> backend_;
-    std::shared_ptr<CepOperator<Tx, int>> op_;
+    std::shared_ptr<CepOperator<Tx, int, K>> op_;
     std::unique_ptr<RuntimeContext> rctx_;
     std::vector<int> emitted_;
     Emitter<int> emitter_{Emitter<int>::Forward{[this](StreamElement<int> e) {
@@ -119,6 +135,8 @@ private:
         return true;
     }}};
 };
+
+using Probe = ProbeT<>;
 
 }  // namespace
 
@@ -202,6 +220,27 @@ TEST(CepEventTimeOrder, HeldRecordsAndTheLateBoundSurviveACheckpoint) {
     after.feed(1, 2, 3, 5);
     after.watermark(20);
     EXPECT_EQ(after.take(), std::vector<int>{102});
+}
+
+TEST(CepEventTimeOrder, StringKeysHoldReleaseAndRestoreAsIntegerKeysDo) {
+    // The SQL frontend keys the operator by its partition's canonical
+    // string. Two keys interleaved in time are held and released apart, in
+    // the order their records fall due, and the held records come back
+    // under their keys from a checkpoint.
+    Snapshot snap;
+    {
+        ProbeT<std::string> before(true);
+        before.feed(1, 1, 1, 10);
+        before.feed(2, 1, 5, 11);
+        before.watermark(11);  // both credits reach their patterns
+        before.feed(2, 2, 6, 19);
+        before.feed(1, 2, 2, 20);  // both debits are held
+        snap = before.checkpoint();
+        EXPECT_TRUE(before.take().empty());
+    }
+    ProbeT<std::string> after(true, std::move(snap));
+    after.watermark(20);
+    EXPECT_EQ(after.take(), (std::vector<int>{506, 102}));
 }
 
 TEST(CepEventTimeOrder, AJobMatchesItsRecordsInEventTimeOrder) {
