@@ -44,6 +44,10 @@ struct Args {
     std::uint64_t restore_from_checkpoint_id = 0;
     std::string alignment;
     std::uint32_t max_restarts = 0;
+    // The flight recorder, for a job that may need replaying: see
+    // docs/internals/fault-tolerance-and-rescale.md.
+    std::string capture_dir;
+    std::uint64_t capture_records = 0;
     bool explain = false;
     std::uint32_t parallelism = 1;  // uniform op parallelism (>1 fans the plan out)
 };
@@ -91,6 +95,11 @@ void print_usage() {
         << "                      align at every fan-in (union, join, keyed exchange, a sink\n"
         << "                      fed by several subtasks), so every checkpoint is a\n"
         << "                      consistent cut, with aligned latency under backpressure.\n"
+        << "  --capture-dir <dir>  Record-capture flight recorder: every single-input operator\n"
+        << "                      writes the input it was handed, per checkpoint epoch, under\n"
+        << "                      this directory, which `clink replay` reproduces an incident\n"
+        << "                      from offline (inspect with `clink capture-cat`).\n"
+        << "  --capture-records <n>  Per-epoch record cap (default 10000).\n"
         << "  --parallelism <n>   Uniform op parallelism (default 1). >1 fans every op out to\n"
         << "  -p <n>              n subtasks; keyed ops hash-partition by key, sources split\n"
         << "                      partitions across subtasks (Kafka needs >= n partitions).\n"
@@ -185,6 +194,18 @@ Args parse_args(int argc, char** argv) {
                 std::cerr << "error: --alignment must be aligned, unaligned or adaptive\n";
                 std::exit(2);
             }
+        } else if (arg == "--capture-dir") {
+            if (++i >= argc) {
+                std::cerr << "error: --capture-dir requires a path\n";
+                std::exit(2);
+            }
+            a.capture_dir = argv[i];
+        } else if (arg == "--capture-records") {
+            if (++i >= argc) {
+                std::cerr << "error: --capture-records requires a number\n";
+                std::exit(2);
+            }
+            a.capture_records = std::stoull(argv[i]);
         } else if (arg == "--parallelism" || arg == "-p") {
             if (++i >= argc) {
                 std::cerr << "error: --parallelism requires a number\n";
@@ -271,6 +292,8 @@ int main(int argc, char** argv) {
                                 .restore_from_checkpoint_id = args.restore_from_checkpoint_id,
                                 .alignment = args.alignment,
                                 .max_restarts_on_worker_loss = args.max_restarts,
+                                .capture_dir = args.capture_dir,
+                                .capture_records = args.capture_records,
                             },
                             std::cout,
                             std::cerr)

@@ -88,8 +88,10 @@ void usage() {
               << "                              reached the end of its input starts over.\n"
               << "  --capture-dir=<dir>         Record-capture flight recorder: tee each\n"
               << "                              operator's input records into per-checkpoint\n"
-              << "                              epoch files under this dir (time-travel\n"
-              << "                              debugging; inspect with clink capture-cat).\n"
+              << "                              epoch files under this dir, embedded or\n"
+              << "                              submitted (time-travel debugging; inspect\n"
+              << "                              with clink capture-cat, replay with clink\n"
+              << "                              replay).\n"
               << "  --capture-records=<n>       Per-epoch record cap (default 10000).\n"
               << "  --catalog-dir=<dir>         Persistent catalog (CREATE TABLE auto-saves).\n"
               << "  --slots=<n>                 In-process Worker slots (default 64).\n"
@@ -253,6 +255,8 @@ int clink_cmd_run_sql(int argc, char** argv) {
                                     .state_backend_uri = args.state_backend,
                                     .checkpoint_dir = args.checkpoint_dir,
                                     .checkpoint_interval_ms = args.checkpoint_interval_ms,
+                                    .capture_dir = args.capture_dir,
+                                    .capture_records = args.capture_records,
                                 },
                                 std::cout,
                                 std::cerr)

@@ -39,6 +39,8 @@ TEST(SubmitCheckpointConfig, EveryDurabilityParameterReachesTheConfig) {
             {"restore_from_checkpoint_id", "17"},
             {"max_restarts_on_worker_loss", "4"},
             {"alignment", "adaptive"},
+            {"capture_dir", "/var/clink/capture"},
+            {"capture_records", "25000"},
         },
         &error);
     ASSERT_TRUE(error.empty()) << error;
@@ -50,6 +52,10 @@ TEST(SubmitCheckpointConfig, EveryDurabilityParameterReachesTheConfig) {
     EXPECT_EQ(ckpt.restore_from_checkpoint_id, 17U);
     EXPECT_EQ(ckpt.max_restarts_on_worker_loss, 4U);
     EXPECT_EQ(ckpt.alignment, CheckpointAlignment::Adaptive);
+    // The flight recorder arms from the same submission: a job that may
+    // need replaying is recorded from its first epoch, not re-run.
+    EXPECT_EQ(ckpt.capture_dir, "/var/clink/capture");
+    EXPECT_EQ(ckpt.capture_records, 25000U);
 }
 
 TEST(SubmitCheckpointConfig, AnEmptyQueryLeavesEveryDefault) {
@@ -119,6 +125,8 @@ TEST(SubmitCheckpointConfig, TheClientSendsWhatTheServerParses) {
                                                    .restore_from_dir = "/var/clink/save",
                                                    .restore_from_checkpoint_id = 17,
                                                    .alignment = "adaptive",
+                                                   .capture_dir = "/var/clink/capture",
+                                                   .capture_records = 25000,
                                                },
                                                out,
                                                err);
@@ -143,6 +151,8 @@ TEST(SubmitCheckpointConfig, TheClientSendsWhatTheServerParses) {
     EXPECT_EQ(ckpt.restore_from_dir, "/var/clink/save");
     EXPECT_EQ(ckpt.restore_from_checkpoint_id, 17U);
     EXPECT_EQ(ckpt.alignment, CheckpointAlignment::Adaptive);
+    EXPECT_EQ(ckpt.capture_dir, "/var/clink/capture");
+    EXPECT_EQ(ckpt.capture_records, 25000U);
 }
 
 TEST(SubmitCheckpointConfig, UnsetClientOptionsSendNoParameters) {
@@ -174,6 +184,8 @@ TEST(SubmitCheckpointConfig, UnsetClientOptionsSendNoParameters) {
     EXPECT_EQ(seen_query.count("checkpoint_interval_ms"), 0U);
     EXPECT_EQ(seen_query.count("alignment"), 0U);
     EXPECT_EQ(seen_query.count("state_backend"), 0U);
+    EXPECT_EQ(seen_query.count("capture_dir"), 0U);
+    EXPECT_EQ(seen_query.count("capture_records"), 0U);
 }
 
 }  // namespace

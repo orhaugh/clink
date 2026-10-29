@@ -3782,6 +3782,71 @@ TEST(CheckpointCompletion, EveryDeployOfARunCarriesTheFloorItsFirstSubmitFixed) 
     std::filesystem::remove_all(root, ec);
 }
 
+// A takeover rebuilds each job's configuration from the manifest the dead
+// leader wrote, and the flight recorder is part of it: an incident across a
+// failover needs the epochs after the restore as much as the ones before,
+// and a job recorded from its submission must not go quiet at the takeover.
+TEST(CheckpointCompletion, ATakeoverKeepsTheFlightRecorderArmed) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_takeover_capture_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    const auto ckpt_dir = root / "ckpt";
+    const auto capture_dir = root / "capture";
+    std::filesystem::create_directories(ha_dir);
+    JobId job_id = 0;
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(a.await_registrations(2s));
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = ckpt_dir.string();
+        ckpt.interval_ms = 600'000;
+        ckpt.capture_dir = capture_dir.string();
+        ckpt.capture_records = 123;
+        job_id = a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        auto first = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(first.has_value());
+        const auto submitted = decode_deploy(*first);
+        EXPECT_EQ(submitted.capture_dir, capture_dir.string());
+        EXPECT_EQ(submitted.capture_records, 123U);
+        // The leader goes before its last worker, so no loss can end the job.
+        a.stop();
+        w.close();
+    }
+    std::optional<DeployMsg> taken_over;
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(b.await_registrations(2s));
+        b.recover_persisted_jobs();
+        if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+            taken_over = decode_deploy(*deploy);
+        }
+        b.stop();
+        w.close();
+    }
+    ASSERT_TRUE(taken_over.has_value()) << "the new leader dropped the job";
+    EXPECT_EQ(taken_over->job_id, job_id);
+    EXPECT_EQ(taken_over->capture_dir, capture_dir.string())
+        << "the takeover deployed with the recorder off: the epochs after the restore go "
+           "unrecorded";
+    EXPECT_EQ(taken_over->capture_records, 123U);
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 // The takeover's protocol trace reports, as `confirmed`, the newest CONFIRMED
 // marker in the job's own directory: what the specification reseeds the
 // confirmed restore point from. A job that has confirmed nothing of its own

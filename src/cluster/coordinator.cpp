@@ -519,6 +519,10 @@ void persist_job_manifest_(const std::string& ha_dir,
     }
     manifest += ",\"max_restarts_on_worker_loss\":" +
                 std::to_string(checkpoint.max_restarts_on_worker_loss);
+    // The flight recorder's directory and cap, so a takeover keeps recording
+    // the epochs after the restore: the ones an incident across it needs.
+    manifest += ",\"capture_dir\":" + q(checkpoint.capture_dir);
+    manifest += ",\"capture_records\":" + std::to_string(checkpoint.capture_records);
     manifest += ",\"plugins\":[";
     for (std::size_t i = 0; i < plugins.size(); ++i) {
         if (i > 0)
@@ -812,6 +816,10 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         }
         ckpt.max_restarts_on_worker_loss =
             static_cast<std::uint32_t>(read_uint_field(body, "max_restarts_on_worker_loss"));
+        // A manifest written before the recorder was persisted has neither
+        // field, and the takeover deploys with capture off, as it did.
+        ckpt.capture_dir = read_string_field(body, "capture_dir");
+        ckpt.capture_records = read_uint_field(body, "capture_records");
         // Pin the recovered job to the backend it ran with BEFORE submit_job
         // re-applies the cluster default: a job persisted with an empty URI
         // (legacy resolution via checkpoint_dir) must not be silently rebound

@@ -64,6 +64,11 @@ namespace clink::cluster {
     parse_int("checkpoint_interval_ms", ckpt.interval_ms);
     parse_int("restore_from_checkpoint_id", ckpt.restore_from_checkpoint_id);
     parse_int("max_restarts_on_worker_loss", ckpt.max_restarts_on_worker_loss);
+    // The flight recorder rides the same config: a job submitted with a
+    // capture directory records every operator's input per epoch, which is
+    // what `clink replay` reproduces an incident from.
+    ckpt.capture_dir = str_param("capture_dir");
+    parse_int("capture_records", ckpt.capture_records);
     if (const auto alignment = str_param("alignment"); !alignment.empty()) {
         if (alignment == "aligned") {
             ckpt.alignment = CheckpointAlignment::Aligned;

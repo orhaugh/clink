@@ -120,6 +120,10 @@ SubmitFn make_http_submit(std::string coordinator_host,
                       std::to_string(checkpoint.max_restarts_on_worker_loss));
         }
         add_param("alignment", checkpoint.alignment);
+        add_param("capture_dir", checkpoint.capture_dir);
+        if (checkpoint.capture_records > 0) {
+            add_param("capture_records", std::to_string(checkpoint.capture_records));
+        }
         auto resp = client.post(path, spec.to_json());
         if (resp.status == 0) {
             err << "error: HTTP transport failure: " << resp.error << "\n";

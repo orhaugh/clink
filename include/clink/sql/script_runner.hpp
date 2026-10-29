@@ -89,6 +89,13 @@ struct SubmitCheckpointOptions {
     // restart_budget_reset_after) forgives the spent budget, so only a burst of
     // failures exhausts it.
     std::uint32_t max_restarts_on_worker_loss{0};
+    // Record-capture flight recorder: the directory every single-input
+    // operator subtask writes its per-epoch input to, and the per-epoch
+    // record cap (zero leaves the built-in default). Empty leaves capture
+    // off. Until these existed the flag reached only the embedded path:
+    // the same script handed to a cluster recorded nothing.
+    std::string capture_dir;
+    std::uint64_t capture_records{0};
 };
 
 // SubmitFn that POSTs the spec JSON to a Coordinator's HTTP submit

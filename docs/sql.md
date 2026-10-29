@@ -31,7 +31,7 @@ to start the standing job. `clink run` executes the whole script embedded in a
 single process. Two flags matter for production runs:
 
 - `--checkpoint-dir <dir>` turns on periodic checkpointing. If the process dies, running the same command again resumes the job from its last checkpoint; `--fresh` starts it over.
-- `--capture-dir <dir>` records the run so it can be replayed deterministically.
+- `--capture-dir <dir>` records the run so it can be replayed deterministically. Both flags also apply to a script submitted to a cluster with `--coordinator-host`, where the Coordinator applies them to the job.
 
 See [Embedded execution](internals/embedded.md) for the full CLI.
 
