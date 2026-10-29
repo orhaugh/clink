@@ -79,15 +79,20 @@ void install(clink::plugin::PluginRegistry& reg) {
         .runtime_dependencies = {"http endpoint"},
         .formats = {"text", "json", "bytes"},
         .boundedness = clink::connectors::Boundedness::Either,
-        // The poll source keeps no cursor the endpoint honours and does
-        // not participate in checkpointing: messages served while the job
-        // is down are gone, so the honest level is at-most-once. The
-        // SINK side posts with retries (at-least-once); the record carries
-        // the weaker end.
-        .replayable = false,
-        .offset_model = clink::connectors::OffsetModel::None,
-        .checkpoint_integrated = false,
-        .delivery = clink::connectors::DeliveryGuarantee::AtMostOnce,
+        // The poll source checkpoints its cursor as operator state and
+        // re-polls from it after a restart (PollingSource), so it replays
+        // from a recorded position: at-least-once, and exact when the
+        // endpoint honours an exclusive cursor, which is the endpoint's
+        // property, not the source's, hence the limitation below. The SINK
+        // side posts with retries and flushes at every barrier
+        // (at-least-once). This record said the source kept no cursor and
+        // sat outside checkpointing, which was never what the code did,
+        // and it barred a job over the source from declaring any
+        // guarantee at all.
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::OpaqueToken,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .auth_methods = {"none", "bearer-token", "headers"},
         .tls = true,
@@ -95,8 +100,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {"poll_interval_ms"},
         .available_in_sql = true,
-        .limitations = {"records between the last poll and a crash can be delivered twice or "
-                        "missed depending on the endpoint's own semantics",
+        .limitations = {"the poll source replays exactly only if the endpoint honours an "
+                        "exclusive cursor and retains what it served; an endpoint that "
+                        "ignores the cursor delivers everything again after a restart",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
