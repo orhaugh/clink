@@ -277,6 +277,11 @@ Everything below is published at
   into a graph through the Neo4j sink, with a windowed fan-in indicator enriched
   from reference device relationships through the Neo4j lookup, a
   Worker kill and an independent check of the graph.
+- [half-time](https://github.com/orhaugh/half-time): a delivery platform on
+  the night of a world final, as eighteen SQL jobs over fifteen systems on
+  one machine, with a Worker kill, a savepoint, a Coordinator failover and
+  a check that holds every store to a model of the night; the flight
+  recorder on a job, and what it found.
 - [Runnable examples](docs/consumer-examples/): every core feature as a
   standalone buildable program, from hello-pipeline to the testing
   framework and state-as-data workflows.
