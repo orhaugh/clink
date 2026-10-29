@@ -245,6 +245,12 @@ public:
     const std::string& runner_role() const noexcept { return runner_role_; }
     std::size_t runner_subtask_idx() const noexcept { return runner_subtask_idx_; }
 
+    // The coordinator's id for the job this operator runs in, zero where no
+    // coordinator assigned one. The protocol trace names a sink's events by
+    // it, which is what separates the jobs of one run's trace.
+    void set_runner_job_id(std::uint64_t job_id) noexcept { runner_job_id_ = job_id; }
+    std::uint64_t runner_job_id() const noexcept { return runner_job_id_; }
+
     // Dead-letter queue seam. The executor hands every subtask one shared DLQ (the
     // default logs bad records; a job may swap in a null or sink-backed one). A
     // connector that must drop a poison record - a source decode failure, a sink
@@ -688,6 +694,7 @@ private:
     std::shared_ptr<std::atomic<std::uint64_t>> drain_at_checkpoint_;
     std::shared_ptr<std::atomic<bool>> stop_requested_;
     CancelSignal cancel_signal_;
+    std::uint64_t runner_job_id_{0};
 };
 
 }  // namespace clink

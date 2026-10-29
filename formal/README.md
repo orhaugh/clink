@@ -17,7 +17,7 @@ scripts/formal-check.sh                    # every model under formal/models/
 scripts/formal-check.sh MC_KafkaSmall      # one model
 scripts/formal-check.sh --mutants          # every mutant under formal/mutants/
 scripts/formal-check.sh --trace traces/    # every recorded protocol trace
-scripts/formal-check.sh --trace /tmp/run   # a run's per-process trace files
+scripts/formal-check.sh --trace /tmp/run   # a run's per-process trace files, job by job
 ```
 
 The script needs a Java 11+ runtime and nothing else. It fetches the TLA+
@@ -60,7 +60,7 @@ while TLC still accepts it.
 | `traces/<run>/*.ndjson` | Recorded runs, validated on every push |
 | `tools.env` | The pinned TLA+ tools and their checksums |
 | `../scripts/formal-check.sh` | Fetch, verify, run, judge |
-| `../scripts/protocol-trace-merge.py` | Merge a run's per-process files into one ordered trace |
+| `../scripts/protocol-trace-merge.py` | Merge a run's per-process files into one ordered trace of one job; `--jobs` lists the jobs a run holds |
 | `../scripts/check-protocol-trace-events.py` | Code, vocabulary and module agree |
 
 ## The model in brief

@@ -200,6 +200,22 @@ TEST_F(ProtocolTraceTest, ACheckpointedRunTellsTheProtocolInTheSpecificationsOrd
     EXPECT_TRUE(source_placed);
     const auto sink = *sinks.begin();
 
+    // The sink's own events name the job, as every coordinator and worker
+    // event does: one run's trace can hold several jobs, and without it the
+    // sinks' events could not be told apart.
+    std::set<std::int64_t> jobs;
+    for (const auto& e : ev) {
+        if (e.event == "Trigger") {
+            jobs.insert(e.num("job"));
+        }
+    }
+    ASSERT_EQ(jobs.size(), 1u);
+    for (const auto& e : ev) {
+        if (e.event.rfind("Sink", 0) == 0 || e.event.rfind("Deliver", 0) == 0) {
+            EXPECT_EQ(e.num("job"), *jobs.begin()) << e.event << " seq " << e.seq;
+        }
+    }
+
     // At least two checkpoints completed and committed during the run, and
     // for each the events come in the specification's order.
     std::vector<std::int64_t> committed;
@@ -250,6 +266,60 @@ TEST_F(ProtocolTraceTest, ACheckpointedRunTellsTheProtocolInTheSpecificationsOrd
             "'" + script.string() + "' --trace '" + (root_ / "trace").string() + "'";
         const int rc = std::system(cmd.c_str());
         EXPECT_EQ(rc, 0) << "the recorded trace is not a behaviour the specification allows";
+    }
+}
+
+// Two jobs through one cluster leave one trace, and it reads as two runs: each
+// job's sink events name that job and its checkpoints, so the trace merger can
+// keep one job's events and the validator can check each job on its own. A
+// sink event that named no job was kept for every job, and a trace of more
+// than one job could not be validated at all.
+TEST_F(ProtocolTraceTest, TwoJobsInOneTraceNameTheirOwnSinksEvents) {
+    keep_trace_for_validator_ = true;  // two complete runs, each from Init
+    std::vector<std::int64_t> ran;
+    {
+        clink::test::TestCluster cluster(options());
+        ran.push_back(static_cast<std::int64_t>(cluster.execute(job(/*count=*/200), 60s)));
+        ran.push_back(static_cast<std::int64_t>(cluster.execute(job(/*count=*/200), 60s)));
+    }
+    ASSERT_NE(ran[0], ran[1]);
+    const auto ev = read_trace(root_ / "trace");
+    ASSERT_FALSE(ev.empty());
+
+    // (job, checkpoint) pairs each job triggered.
+    std::set<std::pair<std::int64_t, std::int64_t>> triggered;
+    for (const auto& e : ev) {
+        if (e.event == "Trigger") {
+            triggered.emplace(e.num("job"), e.num("ckpt"));
+        }
+    }
+    std::map<std::int64_t, int> prepares;
+    for (const auto& e : ev) {
+        if (e.event.rfind("Sink", 0) != 0 && e.event.rfind("Deliver", 0) != 0) {
+            continue;
+        }
+        const auto j = e.num("job");
+        ASSERT_TRUE(j == ran[0] || j == ran[1]) << e.event << " names job " << j;
+        if (e.event == "SinkPrepare" || e.event == "SinkCommit") {
+            EXPECT_TRUE(triggered.count({j, e.num("ckpt")}) == 1)
+                << e.event << " of job " << j << " for checkpoint " << e.num("ckpt")
+                << ", which that job never triggered";
+        }
+        if (e.event == "SinkPrepare") {
+            ++prepares[j];
+        }
+    }
+    EXPECT_GE(prepares[ran[0]], 1) << "the first job's sink prepared nothing";
+    EXPECT_GE(prepares[ran[1]], 1) << "the second job's sink prepared nothing";
+
+    // Optionally model-check each job's run against the specification.
+    if (const char* v = std::getenv("CLINK_TRACE_VALIDATE"); v != nullptr && *v == '1') {
+        const auto script = std::filesystem::path(CLINK_SOURCE_DIR) / "scripts" / "formal-check.sh";
+        const std::string cmd =
+            "'" + script.string() + "' --trace '" + (root_ / "trace").string() + "'";
+        const int rc = std::system(cmd.c_str());
+        EXPECT_EQ(rc, 0) << "a job's run in the shared trace is not a behaviour the "
+                            "specification allows";
     }
 }
 

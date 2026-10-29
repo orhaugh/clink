@@ -188,8 +188,7 @@ public:
         on_open();
         recover_all_();
         if (clink::protocol_trace::enabled()) {
-            clink::protocol_trace::Event("SinkOpens")
-                .u("sub", trace_subtask_())
+            trace_sink_event_(clink::protocol_trace::Event("SinkOpens"))
                 .s("family", "recoverable")
                 .emit();
         }
@@ -225,8 +224,7 @@ public:
         // fork point. Emitted before the persist so a capture that fails after
         // the prepare still shows the prepare the failed ack refers to.
         if (clink::protocol_trace::enabled()) {
-            clink::protocol_trace::Event("SinkPrepare")
-                .u("sub", trace_subtask_())
+            trace_sink_event_(clink::protocol_trace::Event("SinkPrepare"))
                 .u("ckpt", ckpt)
                 .s("family", "recoverable")
                 .b("staged", committable.has_value())
@@ -376,6 +374,16 @@ private:
     std::uint64_t trace_subtask_() const noexcept {
         return this->runtime() != nullptr ? this->runtime()->runner_subtask_idx() : subtask_idx_;
     }
+    // A protocol trace event naming this sink: its job, when a coordinator
+    // assigned one, and its job-global subtask. One run's trace can hold
+    // several jobs, and the job is what tells their sinks' events apart.
+    clink::protocol_trace::Event trace_sink_event_(clink::protocol_trace::Event ev) const {
+        if (this->runtime() != nullptr && this->runtime()->runner_job_id() != 0) {
+            ev.u("job", this->runtime()->runner_job_id());
+        }
+        ev.u("sub", trace_subtask_());
+        return ev;
+    }
 
     static std::string blob_of_(const StateBackend::Value& v) {
         return std::string(reinterpret_cast<const char*>(v.data()), v.size());
@@ -405,8 +413,8 @@ private:
         if (clink::protocol_trace::enabled()) {
             // The dispatch reached this sink: accepted when a prepared handle
             // for the id is held, otherwise consumed without effect.
-            clink::protocol_trace::Event(is_commit ? "DeliverCommit" : "DeliverAbort")
-                .u("sub", trace_subtask_())
+            trace_sink_event_(
+                clink::protocol_trace::Event(is_commit ? "DeliverCommit" : "DeliverAbort"))
                 .u("ckpt", checkpoint_id)
                 .b("accepted", stored.has_value())
                 .emit();
@@ -434,8 +442,7 @@ private:
             commit(committable);
             CLINK_FAULT_POINT(clink::fault::points::kSinkAfterExternalCommit);
             if (clink::protocol_trace::enabled()) {
-                clink::protocol_trace::Event("SinkCommit")
-                    .u("sub", trace_subtask_())
+                trace_sink_event_(clink::protocol_trace::Event("SinkCommit"))
                     .u("ckpt", checkpoint_id)
                     .emit();
             }

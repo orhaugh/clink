@@ -213,7 +213,10 @@ like this:
 `seq` is per process and monotonic, `ts` is microseconds since the Unix
 epoch on that process's clock, and the rest is the event's own. The
 vocabulary is `formal/trace/events.txt`; each event is one step of the
-specification, or a stutter the trace module recognises.
+specification, or a stutter the trace module recognises. Every event names
+its `job`, the sinks' own events included, which read it from the runtime the
+Worker deployed them with; a sink run without a Coordinator has no job to
+name and leaves the field out. The table lists each event's other fields.
 
 | Event | Emitted by | Fields | Specification step |
 |---|---|---|---|
@@ -268,7 +271,11 @@ specification's next-state relation to the recorded events in order. The
 constants are read off the trace: the sinks are the subtasks that prepared
 a transaction, the workers and the source's worker come from `Placement`,
 the checkpoint bound from the highest id seen (a redeploy's next id
-included), the family from the sinks.
+included), the family from the sinks. A run that holds several jobs, as a
+Coordinator running many does, is validated one job at a time: the script
+asks the merger which jobs triggered a checkpoint
+(`scripts/protocol-trace-merge.py --jobs`) and validates each job's events on
+their own, reported as `<run>/job-<id>`.
 The run is accepted when some path through the specification consumes every
 event (hidden steps make the state graph a small tree, and a branch that took
 a hidden step the run did not need dies out without being a verdict); TLC's

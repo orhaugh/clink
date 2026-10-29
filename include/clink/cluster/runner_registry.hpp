@@ -369,6 +369,11 @@ struct RunnerContext {
     // under the exact (role, subtask) slot external clients address.
     // Empty in in-process / legacy paths (operators skip binding).
     std::string runner_role;
+    // The coordinator's id for the job this runner belongs to. Copied onto
+    // JobConfig and from there into each RuntimeContext, where the protocol
+    // trace reads it: a sink's events name their job by it. Zero in
+    // in-process / legacy paths, where no coordinator assigned one.
+    std::uint64_t runner_job_id{0};
 };
 
 // A SubtaskRunner is a type-erased closure that knows the concrete C++

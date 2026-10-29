@@ -116,18 +116,38 @@ if [ "$MODE" = trace ]; then
         fi
     done
     [ ${#runs[@]} -gt 0 ] || { echo "formal-check: no traces found under: $*" >&2; exit 2; }
+    # A run that holds several jobs (one Coordinator, many jobs) is validated
+    # one job at a time: every event names its job, and each job's protocol is
+    # a behaviour of the specification on its own. Such a run becomes one
+    # entry per job; entry i validates trace_runs[i], for job trace_jobs[i]
+    # when that is set.
+    trace_runs=()
+    trace_jobs=()
+    for run in "${runs[@]}"; do
+        jobs_in="$(python3 "$ROOT/scripts/protocol-trace-merge.py" --jobs "$run" 2>/dev/null || true)"
+        if [ "$(printf '%s\n' "$jobs_in" | grep -c .)" -gt 1 ]; then
+            for j in $jobs_in; do
+                trace_runs+=("$run")
+                trace_jobs+=("$j")
+            done
+        else
+            trace_runs+=("$run")
+            trace_jobs+=("")
+        fi
+    done
     # One trace: merge, decide scope, run TLC. Writes $WORK/result-N (the lines to
     # print, in order) and $WORK/status-N (accepted | skipped | failed). Traces run
     # TRACE_JOBS at a time (default 1; the CI job sets it to its core count) and
     # their reports are printed in trace order once all have finished, so the
     # output reads the same at any parallelism.
     validate_one() {
-        local n="$1" run="$2" name merged events start rc secs at line
-        name="$(basename "$run" .ndjson)"
+        local n="$1" run="$2" job="$3" name merged events start rc secs at line
+        name="$(basename "$run" .ndjson)${job:+/job-$job}"
+        echo "$name" >"$WORK/name-$n"
         merged="$WORK/trace-$n.ndjson"
         {
             mkdir -p "$WORK/trace-$n"
-            if ! python3 "$ROOT/scripts/protocol-trace-merge.py" --out "$merged" \
+            if ! python3 "$ROOT/scripts/protocol-trace-merge.py" --out "$merged" ${job:+--job "$job"} \
                     --constants "$WORK/trace-$n/TraceConstants.tla" "$run" 2>"$WORK/merge-$n.log"; then
                 echo "formal-check: trace $name: $(cat "$WORK/merge-$n.log")"
                 echo failed >"$WORK/status-$n"
@@ -184,15 +204,15 @@ if [ "$MODE" = trace ]; then
     }
     jobs_max="${TRACE_JOBS:-1}"
     n=0
-    for run in "${runs[@]}"; do
+    for i in "${!trace_runs[@]}"; do
         n=$((n + 1))
         if [ "$jobs_max" -gt 1 ]; then
             while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$jobs_max" ]; do
                 sleep 1
             done
-            validate_one "$n" "$run" &
+            validate_one "$n" "${trace_runs[$i]}" "${trace_jobs[$i]}" &
         else
-            validate_one "$n" "$run"
+            validate_one "$n" "${trace_runs[$i]}" "${trace_jobs[$i]}"
         fi
     done
     wait
@@ -204,7 +224,7 @@ if [ "$MODE" = trace ]; then
         case "$(cat "$WORK/status-$i" 2>/dev/null)" in
             accepted) accepted=$((accepted + 1)) ;;
             skipped) skipped=$((skipped + 1)) ;;
-            *) failed+=("$(basename "${runs[$((i - 1))]}" .ndjson)") ;;
+            *) failed+=("$(cat "$WORK/name-$i" 2>/dev/null)") ;;
         esac
     done
     if [ ${#failed[@]} -ne 0 ]; then

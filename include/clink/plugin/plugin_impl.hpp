@@ -208,6 +208,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     // external clients address lookups by.
     cfg.runner_role = rctx.runner_role;
     cfg.runner_subtask_idx = rctx.chain.subtask_idx;
+    cfg.runner_job_id = rctx.runner_job_id;
     clink::StateBackendSpec spec;
     spec.uri = rctx.state_backend_uri.empty() ? rctx.checkpoint_dir : rctx.state_backend_uri;
     spec.subtask_idx = rctx.chain.subtask_idx;

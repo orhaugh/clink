@@ -2,6 +2,7 @@
 """Merge protocol trace files into one ordered NDJSON stream for validation.
 
     scripts/protocol-trace-merge.py [--job N] [--out merged.ndjson] PATH...
+    scripts/protocol-trace-merge.py --jobs PATH...
 
 Each PATH is a .ndjson file the engine wrote (CLINK_PROTOCOL_TRACE_DIR) or a
 directory of them: one file per process. Events are ordered by their
@@ -9,11 +10,15 @@ wall-clock timestamp, then by per-process sequence number; on one machine that
 is the causal order, since causally related events from different processes
 are separated by a network round trip. Events carrying a `job` field are kept
 for one job (--job, else the job of the first Trigger seen, else the first job
-seen); events without one (sink-side events know only their subtask) are kept
-as they are, so a directory should hold one job's run.
+seen); events without one are kept as they are. Every event of a run with a
+Coordinator names its job, the sinks' included, so one directory can hold
+several jobs' runs and is read one job at a time. Only a trace written before
+the sinks named their job, or by a sink with no Coordinator, has events
+without one, and such a directory should hold one job's run.
 
-Writes the merged stream and prints a one-line summary. Exit 2 when nothing
-was found.
+Writes the merged stream and prints a one-line summary. --jobs instead prints
+the jobs that triggered a checkpoint, one per line, for a caller that
+validates each. Exit 2 when nothing was found.
 """
 
 from __future__ import annotations
@@ -135,6 +140,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--constants", default=None,
                     help="also write the trace module's constants, derived from the kept events, as a TLA+ module of literals (TraceConstants.tla)")
     ap.add_argument("--out", default="-", help="output file (default stdout)")
+    ap.add_argument("--jobs", action="store_true",
+                    help="print the jobs that triggered a checkpoint, one per line, and nothing else")
     args = ap.parse_args(argv)
 
     events = collect(args.paths)
@@ -142,6 +149,21 @@ def main(argv: list[str]) -> int:
         print("protocol-trace-merge: no events found", file=sys.stderr)
         return 2
     events.sort(key=lambda e: (e["ts"], e.get("proc", ""), e["seq"]))
+
+    if args.jobs:
+        triggered = [e["job"] for e in events if e["event"] == "Trigger" and "job" in e]
+        jobs = sorted(set(triggered))
+        unnamed = sum(1 for e in events if "job" not in e)
+        if len(jobs) > 1 and unnamed:
+            # Written before every event named its job: the jobs cannot be told
+            # apart, so only the one a merge keeps by default is listed, and the
+            # trace is read as it always was.
+            print(f"protocol-trace-merge: {unnamed} event(s) name no job, so the jobs cannot be "
+                  f"told apart; listing job {triggered[0]}, the first to trigger", file=sys.stderr)
+            jobs = [triggered[0]]
+        for j in jobs:
+            print(j)
+        return 0
 
     job = args.job
     if job is None:

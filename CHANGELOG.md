@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A run of many jobs is validated against the specification job by job.**
+A Coordinator running several jobs writes one protocol trace for all of them.
+Every Coordinator and Worker event named its job, but the sinks' own events
+knew only their subtask, so a trace of more than one job could not be
+validated at all. The Worker now hands each runner its job id, which reaches
+every `RuntimeContext` as `runner_job_id()`, and the recoverable two-phase sink
+and the Kafka transactional sink name it on every event.
+`scripts/protocol-trace-merge.py --jobs` lists the jobs a run triggered, and
+`scripts/formal-check.sh --trace` validates a run holding several one job at a
+time. A trace written before this is read as it always was.
+
 **`MATCH_RECOGNIZE` partitions by its key, not by the key's routing token.**
 The pattern operator took its partition from the `__key` the keyer writes for
 the shuffle, a routing token with 128 values, so two partitions whose keys

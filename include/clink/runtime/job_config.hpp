@@ -259,6 +259,13 @@ struct JobConfig {
     // Optional state/allocation limits scoped to stable operator ids. Each
     // domain also charges the shared execution budget.
     std::unordered_map<OperatorId, std::size_t> operator_memory_limits;
+
+    // The coordinator's id for the job this runner belongs to, threaded into
+    // every RuntimeContext beside the runner identity above. The protocol
+    // trace names a sink's events by it, so one run's trace can hold several
+    // jobs and still be read one job at a time. Zero where no coordinator
+    // assigned one (the local executor on its own); the events then name no job.
+    std::uint64_t runner_job_id{0};
 };
 
 }  // namespace clink

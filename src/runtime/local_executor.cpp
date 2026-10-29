@@ -208,6 +208,8 @@ void LocalExecutor::start() {
         if (!config_.runner_role.empty()) {
             contexts_.back()->set_runner_identity(config_.runner_role, config_.runner_subtask_idx);
         }
+        // The job this runner belongs to, for the protocol trace's sink events.
+        contexts_.back()->set_runner_job_id(config_.runner_job_id);
         // Commit receipts (2PC sinks): where executed commits are recorded
         // and the restore point receipts are judged against. Empty dir in
         // in-process / legacy paths keeps the feature off.

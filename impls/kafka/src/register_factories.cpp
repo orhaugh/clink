@@ -572,6 +572,15 @@ public:
     std::uint64_t trace_subtask_() const noexcept {
         return this->runtime() != nullptr ? this->runtime()->runner_subtask_idx() : subtask_idx_;
     }
+    // A protocol trace event naming this sink: its job, when a coordinator
+    // assigned one, and its job-global subtask (see CommittingSink).
+    protocol_trace::Event trace_sink_event_(protocol_trace::Event ev) const {
+        if (this->runtime() != nullptr && this->runtime()->runner_job_id() != 0) {
+            ev.u("job", this->runtime()->runner_job_id());
+        }
+        ev.u("sub", trace_subtask_());
+        return ev;
+    }
 
     void open() override {
         // BEFORE inner_.open(): opening the transactional producer fences
@@ -585,8 +594,8 @@ public:
         std::lock_guard lk(mu_);
         arm_replay_suppression_();
         if (protocol_trace::enabled()) {
-            auto ev = protocol_trace::Event("SinkOpens");
-            ev.u("sub", trace_subtask_()).s("family", "kafka");
+            auto ev = trace_sink_event_(protocol_trace::Event("SinkOpens"));
+            ev.s("family", "kafka");
             // Present only when an unresolved marker above the restore point
             // was found and settled: which checkpoint, and how it ended.
             if (settled_verdict_ != nullptr) {
@@ -706,8 +715,7 @@ public:
         stage_resume_handle_(b.id().value());
         CLINK_FAULT_POINT(clink::fault::points::kSinkAfterPrepare);
         if (protocol_trace::enabled()) {
-            protocol_trace::Event("SinkPrepare")
-                .u("sub", trace_subtask_())
+            trace_sink_event_(protocol_trace::Event("SinkPrepare"))
                 .u("ckpt", b.id().value())
                 .s("family", "kafka")
                 .b("staged", true)
@@ -730,8 +738,7 @@ public:
         const bool accepted = !closed_ && !tearing_down && open_txn_ckpt_.has_value() &&
                               *open_txn_ckpt_ == checkpoint_id;
         if (protocol_trace::enabled()) {
-            protocol_trace::Event("DeliverCommit")
-                .u("sub", trace_subtask_())
+            trace_sink_event_(protocol_trace::Event("DeliverCommit"))
                 .u("ckpt", checkpoint_id)
                 .b("accepted", accepted)
                 .emit();
@@ -779,16 +786,14 @@ public:
         // the broker had already published (the rig-night duplicate).
         inner_.commit_transaction([&] {
             if (protocol_trace::enabled()) {
-                protocol_trace::Event("SinkCommit")
-                    .u("sub", trace_subtask_())
+                trace_sink_event_(protocol_trace::Event("SinkCommit"))
                     .u("ckpt", checkpoint_id)
                     .emit();
             }
             CLINK_FAULT_POINT(clink::fault::points::kSinkBetweenCommitAndReceipt);
             write_commit_receipt_(checkpoint_id, open_txn_wm_);
             if (protocol_trace::enabled()) {
-                protocol_trace::Event("SinkReceipt")
-                    .u("sub", trace_subtask_())
+                trace_sink_event_(protocol_trace::Event("SinkReceipt"))
                     .u("ckpt", checkpoint_id)
                     .emit();
             }
@@ -813,8 +818,7 @@ public:
         const bool accepted = !this->teardown_begun() && open_txn_ckpt_.has_value() &&
                               *open_txn_ckpt_ == checkpoint_id;
         if (protocol_trace::enabled()) {
-            protocol_trace::Event("DeliverAbort")
-                .u("sub", trace_subtask_())
+            trace_sink_event_(protocol_trace::Event("DeliverAbort"))
                 .u("ckpt", checkpoint_id)
                 .b("accepted", accepted)
                 .emit();
