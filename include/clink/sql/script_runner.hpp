@@ -34,6 +34,10 @@ struct ScriptRunOptions {
     bool explain = false;
     // Uniform op parallelism applied to every compiled spec (>1 fans out).
     std::uint32_t parallelism = 1;
+    // Opt-in rescale bounds: [1, max_parallelism] on every operator a live
+    // rescale may resize (declare_rescale_bounds in physical_plan.hpp). 0
+    // declares none, and a job without bounds cannot be rescaled.
+    std::uint32_t max_parallelism = 0;
     // Job-name override for submitted jobs. Empty keeps the per-statement
     // defaults (INSERT: empty; materialized views: mv_<name> / refresh_<name>).
     std::string job_name;

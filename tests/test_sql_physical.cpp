@@ -4090,4 +4090,101 @@ TEST(SqlPhysical, BinaryRegistryFormatsGetTheLosslessBridgeAndRefuseJsonNonFinit
     EXPECT_EQ(bridge->params.at("json_non_finite"), "string");
 }
 
+// --max-parallelism declares [1, N] on the keyed operators whose output is
+// inserts only, and on nothing else. A rescale changes one operator's
+// parallelism, so the edge from it to an operator that did not change becomes
+// round-robin, and a key's rows reach the sink through different subtasks in
+// either order: harmless for a result emitted once, wrong for one revised.
+TEST(SqlPhysical, MaxParallelismDeclaresBoundsOnInsertOnlyKeyedOperatorsOnly) {
+    Catalog cat;
+    register_json(
+        cat, "rb_ev", "(k BIGINT, ts BIGINT, v BIGINT, status VARCHAR)", "event_time_column='ts'");
+    register_json(cat,
+                  "rb_late",
+                  "(k BIGINT, ts BIGINT, v BIGINT)",
+                  "event_time_column='ts', allowed_lateness_ms='5000'");
+    register_json(cat, "rb_other", "(k BIGINT, ts BIGINT, w BIGINT)", "event_time_column='ts'");
+    register_json(cat, "rb_kv", "(k BIGINT, v BIGINT)", "");
+    register_json(cat, "rb_kvw", "(k BIGINT, v BIGINT, w BIGINT)", "");
+    register_json(cat, "rb_mr", "(k BIGINT, first_at BIGINT, last_at BIGINT)", "");
+    struct Case {
+        const char* label;
+        const char* sql;
+        const char* type;
+        bool declared;
+    };
+    const Case cases[] = {
+        {"a tumbling window",
+         "INSERT INTO rb_kv SELECT k, SUM(v) AS v FROM rb_ev GROUP BY TUMBLE(ts, 1000), k",
+         "tumbling_window_row",
+         true},
+        {"a window with allowed lateness, which fires again for a late row",
+         "INSERT INTO rb_kv SELECT k, SUM(v) AS v FROM rb_late GROUP BY TUMBLE(ts, 1000), k",
+         "tumbling_window_row",
+         false},
+        {"an interval join",
+         "INSERT INTO rb_kvw SELECT e.k, e.v, o.w FROM rb_ev e JOIN rb_other o "
+         "ON e.k = o.k AND e.ts BETWEEN o.ts - 50 AND o.ts + 200",
+         "interval_join_row",
+         true},
+        {"MATCH_RECOGNIZE",
+         "INSERT INTO rb_mr SELECT * FROM rb_ev MATCH_RECOGNIZE (PARTITION BY k ORDER BY ts "
+         "MEASURES FIRST(b.ts) AS first_at, LAST(b.ts) AS last_at AFTER MATCH SKIP PAST LAST ROW "
+         "PATTERN (b{3}) DEFINE b AS status = 'bounced')",
+         "match_recognize_row",
+         true},
+        {"DISTINCT", "INSERT INTO rb_kv SELECT DISTINCT k, v FROM rb_ev", "distinct_row", true},
+        {"a GROUP BY, which revises its result",
+         "INSERT INTO rb_kv SELECT k, SUM(v) AS v FROM rb_ev GROUP BY k",
+         "aggregate_row",
+         false},
+    };
+    for (const auto& c : cases) {
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*bind_insert(cat, c.sql)));
+        cluster::apply_job_parallelism(spec, 4);
+        const auto declared = declare_rescale_bounds(spec, 8);
+        const auto* op = find_op(spec, c.type);
+        ASSERT_NE(op, nullptr) << c.label << ": no " << c.type << " in the plan";
+        if (c.declared) {
+            EXPECT_EQ(op->min_parallelism, 1u) << c.label;
+            EXPECT_EQ(op->max_parallelism, 8u) << c.label;
+            EXPECT_EQ(declared, std::vector<std::string>{op->id}) << c.label;
+            EXPECT_TRUE(cluster::is_chain_alone(*op))
+                << c.label << ": a rescalable operator must not share a chain";
+        } else {
+            EXPECT_EQ(op->max_parallelism, 0u) << c.label;
+            EXPECT_TRUE(declared.empty()) << c.label;
+        }
+        for (const auto& other : spec.ops) {
+            if (&other != op) {
+                EXPECT_EQ(other.max_parallelism, 0u)
+                    << c.label << ": " << other.id << " (" << other.type
+                    << ") is not keyed, or is not the operator a rescale may resize";
+            }
+        }
+        EXPECT_NO_THROW(spec.validate())
+            << c.label << ": the declared bounds must hold the graph's "
+            << "invariant min <= parallelism <= max";
+    }
+}
+
+TEST(SqlPhysical, MaxParallelismAboveTheKeyGroupsOrBelowTheParallelismIsRefused) {
+    Catalog cat;
+    register_json(cat, "rr_ev", "(k BIGINT, ts BIGINT, v BIGINT)", "event_time_column='ts'");
+    register_json(cat, "rr_kv", "(k BIGINT, v BIGINT)", "");
+    PhysicalPlanner pp;
+    auto spec = pp.compile(static_cast<const LogicalSink&>(*bind_insert(
+        cat, "INSERT INTO rr_kv SELECT k, SUM(v) AS v FROM rr_ev GROUP BY TUMBLE(ts, 1000), k")));
+    cluster::apply_job_parallelism(spec, 4);
+    auto unchanged = spec;
+    EXPECT_TRUE(declare_rescale_bounds(unchanged, 0).empty()) << "0 declares nothing";
+    EXPECT_THROW((void)declare_rescale_bounds(unchanged, 129), std::invalid_argument)
+        << "a keyed operator's state splits into 128 key groups, so a subtask above that "
+           "would own none";
+    EXPECT_THROW((void)declare_rescale_bounds(unchanged, 2), std::invalid_argument)
+        << "a max below the operator's parallelism breaks min <= parallelism <= max";
+    EXPECT_EQ(declare_rescale_bounds(unchanged, 128).size(), 1u);
+}
+
 }  // namespace clink::sql

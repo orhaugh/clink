@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**A SQL job can be rescaled while it runs.** SQL jobs declared no rescale
+bounds, so a running SQL job could not be resized. `--max-parallelism <n>`
+on `clink run --coordinator-host` and `clink_submit_sql` declares `[1, n]` on
+the keyed stages whose output is inserts only (a window without allowed
+lateness, an interval join, `MATCH_RECOGNIZE`, `DISTINCT`) and names them, and
+`clink rescale-op` then resizes one. Stages that revise what they emitted are
+not declared: a rescale turns the edge out of the resized stage round-robin,
+which would reorder a key's updates on their way to the sink. A declared stage
+is kept alone in its chain (`chain_alone`), because the replan restores each
+new task from its chain head's old block, and a neighbour that changed chains
+was restored from a block it never wrote. Without the flag the plan is
+unchanged. `KafkaWindowRecoveryTest.ASqlWindowRescaledLive*` rescales a SQL
+window from 2 to 4 and back with records arriving across each cut, with and
+without HA, and checks every window against an exact oracle.
+
 **A rescaled job survives a Coordinator failover.** A takeover plans the graph
 the job's HA manifest records, and the manifest kept the graph as submitted,
 so after a rescale the takeover planned the old parallelism against

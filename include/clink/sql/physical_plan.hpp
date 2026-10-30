@@ -2,6 +2,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 #include "clink/cluster/job_graph.hpp"
 #include "clink/sql/catalog.hpp"
@@ -79,6 +80,22 @@ cluster::JobGraphSpec merge_statement_set(std::vector<cluster::JobGraphSpec> spe
 // binder does not emit, such as an inner join straight into the sink-boundary
 // bind, can be checked against the rule directly.
 void enable_columnar_output(cluster::JobGraphSpec& spec);
+
+// Declares the rescale bounds [1, max_parallelism] on every operator of a
+// compiled spec that a live rescale may resize, and returns their ids. Opt-in:
+// clink run --coordinator-host and clink_submit_sql call it for
+// --max-parallelism, and a max of 0 declares nothing. A rescale changes one
+// operator's parallelism, so the edge from it to an operator it feeds becomes
+// round-robin, and a key's rows reach the sink through different subtasks in
+// either order. That is harmless for an operator that emits each result once
+// and wrong for one that revises what it emitted, so only keyed operators whose
+// output is inserts only are declared: the four window kinds without allowed
+// lateness, the interval join, MATCH_RECOGNIZE and DISTINCT. Each is also kept
+// alone in its chain (cluster::kChainAloneParam), so a rescale does not split
+// it from the operators it feeds. Throws std::invalid_argument for a max above
+// the key groups or below an operator's parallelism.
+std::vector<std::string> declare_rescale_bounds(cluster::JobGraphSpec& spec,
+                                                std::uint32_t max_parallelism);
 
 // The Row-channel source factory + build params to scan `table` in process (for
 // ANALYZE, via the SourceFactory registry + LocalExecutor). Mirrors the scan

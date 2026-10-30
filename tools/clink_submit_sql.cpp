@@ -49,7 +49,8 @@ struct Args {
     std::string capture_dir;
     std::uint64_t capture_records = 0;
     bool explain = false;
-    std::uint32_t parallelism = 1;  // uniform op parallelism (>1 fans the plan out)
+    std::uint32_t parallelism = 1;      // uniform op parallelism (>1 fans the plan out)
+    std::uint32_t max_parallelism = 0;  // opt-in rescale bounds (0: none)
 };
 
 void print_usage() {
@@ -104,6 +105,10 @@ void print_usage() {
         << "  -p <n>              n subtasks; keyed ops hash-partition by key, sources split\n"
         << "                      partitions across subtasks (Kafka needs >= n partitions).\n"
         << "                      Assumes a parallelizable plan (the common SQL shapes).\n"
+        << "  --max-parallelism <n>  Declare the job's keyed operators whose output is inserts\n"
+        << "                      only (windows, interval joins, MATCH_RECOGNIZE, DISTINCT)\n"
+        << "                      rescalable up to n, so a live `clink rescale-op` can resize\n"
+        << "                      them; their ids are listed on stderr.\n"
         << "  --explain           Print the LogicalPlan tree instead of the JobGraphSpec JSON.\n";
 }
 
@@ -216,6 +221,16 @@ Args parse_args(int argc, char** argv) {
                 std::cerr << "error: --parallelism must be >= 1\n";
                 std::exit(2);
             }
+        } else if (arg == "--max-parallelism") {
+            if (++i >= argc) {
+                std::cerr << "error: --max-parallelism requires a number\n";
+                std::exit(2);
+            }
+            a.max_parallelism = static_cast<std::uint32_t>(std::stoul(argv[i]));
+            if (a.max_parallelism < 1) {
+                std::cerr << "error: --max-parallelism must be >= 1\n";
+                std::exit(2);
+            }
         } else if (arg == "--explain") {
             a.explain = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -230,6 +245,11 @@ Args parse_args(int argc, char** argv) {
     if (a.file.empty() == a.inline_sql.empty()) {
         std::cerr << "error: exactly one of --file or -e is required\n";
         print_usage();
+        std::exit(2);
+    }
+    if (a.max_parallelism != 0 && a.max_parallelism < a.parallelism) {
+        std::cerr << "error: --max-parallelism (" << a.max_parallelism
+                  << ") is below --parallelism (" << a.parallelism << ")\n";
         std::exit(2);
     }
     return a;
@@ -277,6 +297,7 @@ int main(int argc, char** argv) {
     clink::sql::ScriptRunOptions opts;
     opts.explain = args.explain;
     opts.parallelism = args.parallelism;
+    opts.max_parallelism = args.max_parallelism;
     opts.job_name = args.job_name;
 
     clink::sql::ScriptIO io{&std::cout, &std::cerr};

@@ -77,6 +77,43 @@ sink gives; its guarantee report (`guarantee_reasons` on
 `GET /api/v1/jobs/:id`) gives the guarantee each sink is held to and the one
 its own sources let it give.
 
+### Rescaling a running job
+
+A job submitted to a cluster can have its keyed stages resized while it runs.
+Submit it with `--max-parallelism <n>`, through `clink run --coordinator-host`
+or `clink_submit_sql`, and the stages that can be resized are declared
+rescalable up to `n` and named on stderr by operator id. A stage is then
+resized with `clink rescale-op`, which talks to the Coordinator's control
+port rather than the HTTP port the submission used:
+
+```sh
+clink run pipeline.sql --coordinator-host=10.0.0.5 --coordinator-port=8081 \
+    --checkpoint-dir=/data/ckpt --parallelism=2 --max-parallelism=8
+# rescalable up to parallelism 8: agg_4
+clink rescale-op --job-id=1 --op=agg_4 --parallelism=4 \
+    --coordinator-host=10.0.0.5 --coordinator-port=6123
+```
+
+Only a keyed stage whose output is inserts only is declared: a window without
+allowed lateness, an interval join, `MATCH_RECOGNIZE` and `DISTINCT`. A
+rescale changes one stage's parallelism, so the edge from it to the stage it
+feeds becomes round-robin, and a key's rows reach the sink through different
+subtasks in either order. That is harmless for a result emitted once and wrong
+for one revised later, so a `GROUP BY` without a window, a top-N, a regular
+join and a window with allowed lateness are not declared, and a request to
+rescale one is refused. A declared stage also runs in subtasks of its own,
+apart from the stages it feeds, so that a rescale does not split a chain;
+that costs one hop between them.
+
+A target must be a multiple or a divisor of the stage's current parallelism,
+and at most 128, the key groups its state is split into. The job must
+checkpoint: the resized stage restores its state from the last completed
+checkpoint, and the job replays from there. Without `--max-parallelism`
+nothing is declared and the plan is as it was. The embedded `clink run`
+refuses the flag, since a rescale is the Coordinator's to make. How a rescale
+runs, and how it survives a Coordinator failover, is in
+[Fault tolerance and rescale](internals/fault-tolerance-and-rescale.md#rescale-changing-parallelism-on-a-running-job).
+
 ## Your first pipeline
 
 Read newline-delimited JSON, keep the checkout clicks, write them out:

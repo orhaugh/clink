@@ -6,9 +6,11 @@
 // here can.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -54,6 +56,14 @@ std::filesystem::path node_binary() {
 std::filesystem::path sql_binary() {
 #ifdef CLINK_SUBMIT_SQL_BINARY
     return std::filesystem::path{CLINK_SUBMIT_SQL_BINARY};
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path cli_binary() {
+#ifdef CLINK_CLI_BINARY
+    return std::filesystem::path{CLINK_CLI_BINARY};
 #else
     return {};
 #endif
@@ -3062,5 +3072,196 @@ INSTANTIATE_TEST_SUITE_P(
         }
         return name;
     });
+
+// A SQL window rescaled live, up and then down, with records arriving in the
+// open window across each cut. The job is submitted with --max-parallelism,
+// which declares the window, and only the window, rescalable and names it; the
+// request goes over the real CLI; and each window closed after a rescale is
+// compared with the exact oracle, as the recovery cases above compare theirs.
+// The window state a rescale splits and merges has to move on the same cut as
+// the source offsets, or the open window's count and total change.
+//
+// Under HA a rescale replans, since a takeover plans the manifest's graph and
+// an in-place cutover's layout is not one any plan produces; without HA it may
+// cut over in place, though the window's forward edge to the sink side keeps
+// this job on the replan too. Both are run, and each reports its path.
+void rescale_a_sql_window_live(clink::test::DockerKafka& kafka,
+                               const std::string& input_topic,
+                               const std::string& output_topic,
+                               bool ha) {
+    constexpr int kKeys = 10;
+    constexpr std::int64_t kBase = 1'000'000;
+    constexpr int kLiveCopiesPerKey = 1'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    spec.slots_per_worker = 8;
+    spec.ha = ha;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    if (ha) {
+        ASSERT_TRUE(cluster.start_ha_coordinators(1));
+        ASSERT_TRUE(cluster.start_ha_worker(0));
+        ASSERT_TRUE(cluster.start_ha_worker(1));
+    } else {
+        ASSERT_TRUE(cluster.start_coordinator());
+        ASSERT_TRUE(cluster.start_worker(0));
+        ASSERT_TRUE(cluster.start_worker(1));
+    }
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka.brokers() + "', topic='" + input_topic +
+        "', group_id='window-rescale', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka.brokers() + "', topic='" + output_topic +
+        "', delivery_guarantee='exactly_once', transactional_id='window-rescale'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql",
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "kafka-window-rescale",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "100",
+                              "--parallelism",
+                              "2",
+                              "--max-parallelism",
+                              "4"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+    // The submit names the operators it declared: here the window alone.
+    std::string window_op;
+    {
+        const auto log = submit.read_log();
+        const std::string needle = "rescalable up to parallelism 4: ";
+        const auto at = log.find(needle);
+        ASSERT_NE(at, std::string::npos) << "the submit declared nothing rescalable: " << log;
+        window_op = log.substr(at + needle.size(), log.find('\n', at) - at - needle.size());
+        ASSERT_EQ(window_op.find(','), std::string::npos)
+            << "more than the window was declared rescalable: " << window_op;
+    }
+
+    std::map<WindowKey, Aggregate> expected;
+    for (int window = 0; window < 5; ++window) {
+        const auto start = kBase + (window * 10'000);
+        produce_json(kafka.brokers(), input_topic, window_records(start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            expected[{key, start}] = {2, (2 * key) + 3};
+        }
+    }
+
+    // Window 5 opens, which closes windows 0 to 4.
+    produce_json(kafka.brokers(), input_topic, window_records(kBase + 50'000, kKeys));
+
+    // One rescale, with window `open_start` open and records arriving in it
+    // while the request lands; `close_start` closes it afterwards and opens the
+    // next.
+    std::size_t rescales = 0;
+    auto rescale_across_an_open_window = [&](std::int64_t open_start,
+                                             std::int64_t close_start,
+                                             int target) {
+        const auto confirmed = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+        ASSERT_TRUE(clink::itest::await(
+            [&] { return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") >= confirmed + 3; },
+            30s))
+            << "the open window was not carried through completed commits before the rescale";
+
+        const auto live = sustained_window_records(open_start, kKeys, kLiveCopiesPerKey);
+        std::atomic<std::size_t> produced{0};
+        std::jthread producer(
+            [&] { produce_json_sustained(kafka.brokers(), input_topic, live, produced); });
+        ASSERT_TRUE(clink::itest::await(
+            [&] { return produced.load(std::memory_order_acquire) >= 400; }, 15s))
+            << "the producer did not overlap the rescale";
+
+        const std::string cmd = cli_binary().string() + " rescale-op --job-id=1 --op=" + window_op +
+                                " --parallelism=" + std::to_string(target) +
+                                " --coordinator-host=127.0.0.1 --coordinator-port=" +
+                                std::to_string(cluster.coordinator_port()) + " 2>&1";
+        std::string reply;
+        int status = -1;
+        if (FILE* pipe = ::popen(cmd.c_str(), "r"); pipe != nullptr) {
+            std::array<char, 512> buf{};
+            while (::fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
+                reply += buf.data();
+            }
+            status = ::pclose(pipe);
+        }
+        ASSERT_EQ(status, 0) << "the rescale to " << target << " was refused: " << reply;
+        ++rescales;
+        ASSERT_TRUE(clink::itest::await(
+            [&] {
+                return cluster.count_in_coordinator_log("replanned job_id=1") +
+                           cluster.count_in_coordinator_log("hot cutover complete job_id=1") >=
+                       rescales;
+            },
+            60s))
+            << "the rescale to " << target << " never landed";
+        std::cerr << "RESCALE-PATH to " << target << ": replanned "
+                  << cluster.count_in_coordinator_log("replanned job_id=1")
+                  << ", cut over in place "
+                  << cluster.count_in_coordinator_log("hot cutover complete job_id=1") << "\n";
+        if (ha) {
+            EXPECT_EQ(cluster.count_in_coordinator_log("hot cutover complete job_id=1"), 0u)
+                << "under HA a rescale replans";
+        }
+        producer.join();
+
+        const auto after_rescale = latest_marker(cluster.checkpoint_dir(), "CONFIRMED-");
+        ASSERT_TRUE(clink::itest::await(
+            [&] {
+                return latest_marker(cluster.checkpoint_dir(), "CONFIRMED-") >= after_rescale + 3;
+            },
+            30s))
+            << "the job did not commit at the new parallelism";
+
+        produce_json(kafka.brokers(), input_topic, window_records(close_start, kKeys));
+        for (int key = 0; key < kKeys; ++key) {
+            const auto whole_cycles = kLiveCopiesPerKey / 7;
+            const auto remainder = kLiveCopiesPerKey % 7;
+            const auto live_total = static_cast<std::int64_t>(kLiveCopiesPerKey) * (key + 1) +
+                                    static_cast<std::int64_t>(whole_cycles) * 21 +
+                                    (static_cast<std::int64_t>(remainder) * (remainder - 1)) / 2;
+            expected[{key, open_start}] = {2 + kLiveCopiesPerKey, (2 * key) + 3 + live_total};
+        }
+        const auto got = consume_committed(kafka.brokers(), output_topic, expected.size(), 60s);
+        EXPECT_EQ(parse_output(got), expected)
+            << "the rescale to " << target << " moved the open window's state and the source "
+            << "offsets on different cuts";
+    };
+    rescale_across_an_open_window(kBase + 50'000, kBase + 70'000, 4);
+    if (::testing::Test::HasFatalFailure()) {
+        return;
+    }
+    // Window 7 is open now; scale back down across it.
+    rescale_across_an_open_window(kBase + 70'000, kBase + 90'000, 2);
+}
+
+TEST_F(KafkaWindowRecoveryTest, ASqlWindowRescaledLiveKeepsEveryWindowExact) {
+    rescale_a_sql_window_live(*kafka_, input_topic_, output_topic_, /*ha=*/false);
+}
+
+TEST_F(KafkaWindowRecoveryTest, ASqlWindowRescaledLiveUnderHaKeepsEveryWindowExact) {
+    rescale_a_sql_window_live(*kafka_, input_topic_, output_topic_, /*ha=*/true);
+}
 
 }  // namespace

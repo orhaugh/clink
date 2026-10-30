@@ -58,6 +58,7 @@ struct SqlRunArgs {
     std::string capture_dir;
     std::size_t capture_records = 0;
     std::uint32_t parallelism = 1;
+    std::uint32_t max_parallelism = 0;
     std::size_t slots = 64;
     bool explain = false;
     bool fresh = false;
@@ -73,6 +74,11 @@ void usage() {
               << "\n"
               << "  -e <sql>                    Inline SQL instead of a file.\n"
               << "  --parallelism=<n> | -p <n>  Uniform op parallelism (default 1).\n"
+              << "  --max-parallelism=<n>       With --coordinator-host: declare the job's\n"
+              << "                              keyed operators whose output is inserts only\n"
+              << "                              (windows, interval joins, MATCH_RECOGNIZE,\n"
+              << "                              DISTINCT) rescalable up to <n>, so a live\n"
+              << "                              clink rescale-op can resize them. Lists them.\n"
               << "  --state-backend=<uri>       Per-job state backend URI (e.g.\n"
               << "                              rocksdb:///tmp/state). Default: memory, or\n"
               << "                              file when --checkpoint-dir is set.\n"
@@ -167,6 +173,12 @@ bool parse_args(int argc, char** argv, SqlRunArgs& a) {
                 std::cerr << "error: --parallelism must be >= 1\n";
                 return false;
             }
+        } else if (value_of(i, arg, "--max-parallelism", &v)) {
+            a.max_parallelism = static_cast<std::uint32_t>(std::stoul(v));
+            if (a.max_parallelism < 1) {
+                std::cerr << "error: --max-parallelism must be >= 1\n";
+                return false;
+            }
         } else if (value_of(i, arg, "--slots", &v)) {
             a.slots = static_cast<std::size_t>(std::stoul(v));
         } else if (!arg.starts_with("-") && arg.ends_with(".sql")) {
@@ -180,6 +192,18 @@ bool parse_args(int argc, char** argv, SqlRunArgs& a) {
     if (a.file.empty() == a.inline_sql.empty()) {
         std::cerr << "error: exactly one of <file>.sql or -e is required\n";
         usage();
+        return false;
+    }
+    // A rescale is a Coordinator's operation, and the embedded engine resumes a
+    // job only into the graph its checkpoints were written by.
+    if (a.max_parallelism != 0 && a.coordinator_host.empty() && !a.explain) {
+        std::cerr << "error: --max-parallelism declares bounds for a live rescale on a "
+                     "cluster; submit with --coordinator-host\n";
+        return false;
+    }
+    if (a.max_parallelism != 0 && a.max_parallelism < a.parallelism) {
+        std::cerr << "error: --max-parallelism (" << a.max_parallelism
+                  << ") is below --parallelism (" << a.parallelism << ")\n";
         return false;
     }
     return true;
@@ -241,6 +265,7 @@ int clink_cmd_run_sql(int argc, char** argv) {
         clink::sql::ScriptRunOptions opts;
         opts.explain = args.explain;
         opts.parallelism = args.parallelism;
+        opts.max_parallelism = args.max_parallelism;
         opts.job_name = args.job_name;
         clink::sql::ScriptIO io{&std::cout, &std::cerr};
         auto submit = !args.coordinator_host.empty()

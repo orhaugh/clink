@@ -185,6 +185,21 @@ int run_script(const std::string& sql,
         // forced singletons are left at 1 (see cluster::kForcedSingletonParam).
         auto apply_parallelism = [&](cluster::JobGraphSpec& spec) {
             cluster::apply_job_parallelism(spec, opts.parallelism);
+            // --max-parallelism: the operators a live rescale may resize, named so
+            // a request (clink rescale-op --op <id>) can find them.
+            const auto rescalable = declare_rescale_bounds(spec, opts.max_parallelism);
+            if (!rescalable.empty()) {
+                std::string ids;
+                for (const auto& id : rescalable) {
+                    ids += (ids.empty() ? "" : ", ") + id;
+                }
+                err << "rescalable up to parallelism " << opts.max_parallelism << ": " << ids
+                    << "\n";
+            } else if (opts.max_parallelism != 0) {
+                err << "note: --max-parallelism declared nothing: the job has no keyed operator "
+                       "whose output is inserts only (a window without allowed lateness, an "
+                       "interval join, MATCH_RECOGNIZE, DISTINCT)\n";
+            }
         };
         // SQL-declared UDFs live in the catalog (CREATE FUNCTION registers
         // them there, persisted when the catalog has a dir). A registration

@@ -16,6 +16,7 @@
 #include "clink/cluster/job_graph.hpp"
 #include "clink/config/json.hpp"
 #include "clink/metrics/sql_metrics.hpp"
+#include "clink/runtime/key_groups.hpp"
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/sql/bounded_state.hpp"
 #include "clink/sql/column_lineage.hpp"
@@ -3401,6 +3402,52 @@ cluster::JobGraphSpec merge_statement_set(std::vector<cluster::JobGraphSpec> spe
     share_readers(out);
     propagate_forced_singletons(out);
     return out;
+}
+
+std::vector<std::string> declare_rescale_bounds(cluster::JobGraphSpec& spec,
+                                                std::uint32_t max_parallelism) {
+    std::vector<std::string> declared;
+    if (max_parallelism == 0) {
+        return declared;
+    }
+    if (max_parallelism > kNumKeyGroups) {
+        throw std::invalid_argument("max parallelism " + std::to_string(max_parallelism) +
+                                    " exceeds the " + std::to_string(kNumKeyGroups) +
+                                    " key groups a keyed operator's state is split into");
+    }
+    // Each kind's state is shown to split and merge across a rescale in
+    // tests/test_sql_runtime.cpp (WindowRescale, SqlOperatorRescale). A window
+    // with allowed lateness fires again for a late row, which revises what it
+    // emitted; the interval join's OUTER kinds pad an unmatched row once, at
+    // eviction; MATCH_RECOGNIZE emits a match once; DISTINCT emits a row's first
+    // occurrence.
+    auto emits_inserts_only = [](const cluster::OperatorSpec& op) {
+        const std::string& t = op.type;
+        if (t == "tumbling_window_row" || t == "hopping_window_row" || t == "cumulate_window_row" ||
+            t == "session_window_row") {
+            const auto it = op.params.find("allowed_lateness_ms");
+            return it == op.params.end() || it->second.empty() || it->second == "0";
+        }
+        return t == "interval_join_row" || t == "match_recognize_row" || t == "distinct_row";
+    };
+    for (auto& op : spec.ops) {
+        if (op.key_by.empty() || cluster::is_forced_singleton(op) || !emits_inserts_only(op)) {
+            continue;
+        }
+        if (op.parallelism > max_parallelism) {
+            throw std::invalid_argument("max parallelism " + std::to_string(max_parallelism) +
+                                        " is below the parallelism " +
+                                        std::to_string(op.parallelism) + " of operator '" + op.id +
+                                        "'");
+        }
+        op.min_parallelism = 1;
+        op.max_parallelism = max_parallelism;
+        // Alone in its chain, so a rescale changes its parallelism without
+        // splitting a chain the replan could not restore.
+        op.params[std::string{cluster::kChainAloneParam}] = "true";
+        declared.push_back(op.id);
+    }
+    return declared;
 }
 
 }  // namespace clink::sql

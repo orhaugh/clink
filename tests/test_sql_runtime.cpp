@@ -18717,6 +18717,340 @@ TEST(WindowRescale, ScaleDownMergesOpenWindowsFromEveryParent) {
 }
 
 // ---------------------------------------------------------------------------
+// RESCALE of MATCH_RECOGNIZE and DISTINCT, the single-input operators besides
+// the windows that --max-parallelism declares rescalable
+// (declare_rescale_bounds).
+//
+// The window cases above restore and drain. These also feed rows after the cut,
+// each to the new subtask its routing token routes to, as the keyed shuffle
+// would, because what they answer depends on state the rows before the cut
+// left: a run of bounces straddling the cut matches only if the partition's
+// buffered rows and the pattern's partial run reached the subtask that gets the
+// rest of it, and a row repeated across the cut is dropped only if its first
+// occurrence's marker did. The oracle is one uninterrupted run. A slice missed
+// loses a match or lets a repeat through; a slice restored twice emits a match
+// twice.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using TimedRows = std::vector<std::pair<Row, std::int64_t>>;
+
+struct KeyedOpCase {
+    std::string label;
+    std::string op_type;
+    std::map<std::string, std::string> params;
+    // Rows and their event times in arrival order, either side of the cut, each
+    // stamped with the routing token the planner's keyer gives it.
+    TimedRows before;
+    TimedRows after;
+    // Sent after the rows before the cut, so the state at the cut holds work in
+    // progress as well as buffered rows. 0: none.
+    std::int64_t watermark_before_cut = 0;
+};
+
+// The plan's params for its `op_type` operator, and the columns of the keyer
+// in front of it, which is how the shuffle routes the operator's input.
+std::pair<std::map<std::string, std::string>, std::string> planned_op(Catalog& cat,
+                                                                      const std::string& insert,
+                                                                      const std::string& op_type) {
+    const auto spec = compile(cat, insert.c_str());
+    for (const auto& op : spec.ops) {
+        if (op.type != op_type) {
+            continue;
+        }
+        for (const auto& keyer : spec.ops) {
+            if (!op.inputs.empty() && keyer.id == op.inputs.front() &&
+                keyer.type == "row_compute_key") {
+                return {op.params, keyer.params.at("columns")};
+            }
+        }
+        ADD_FAILURE() << op_type << " is not fed by a row_compute_key";
+        return {op.params, ""};
+    }
+    ADD_FAILURE() << "no " << op_type << " in the plan of " << insert;
+    return {};
+}
+
+// The rows with the routing token the planner's keyer stamps on them.
+TimedRows stamped(const std::string& columns, TimedRows rows) {
+    auto keyer = build_row_op("row_compute_key", {{"columns", columns}});
+    if (keyer == nullptr) {
+        return rows;
+    }
+    Batch<Row> in;
+    for (const auto& [r, ts] : rows) {
+        in.emplace(r, EventTime{ts});
+    }
+    std::vector<Row> out;
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                out.push_back(rec.value());
+            }
+        }
+        return true;
+    });
+    keyer->process(StreamElement<Row>::data(std::move(in)), em);
+    EXPECT_EQ(out.size(), rows.size()) << "the keyer is one row in, one row out";
+    for (std::size_t i = 0; i < rows.size() && i < out.size(); ++i) {
+        rows[i].first.values["__key"] = out[i].values.at("__key");
+    }
+    return rows;
+}
+
+// The subtask of `parallelism` the keyed shuffle routes `r` to.
+std::uint32_t routed_to(const Row& r, std::uint32_t parallelism) {
+    const std::int64_t token = r.values.at("__key").as_int();
+    const auto group = key_group_for_key(
+        std::span<const std::byte>{reinterpret_cast<const std::byte*>(&token), sizeof(token)});
+    return subtask_for_key_group(group, parallelism);
+}
+
+// One subtask of `parallelism`: restore the parents' state narrowed to its key
+// groups (no parents: start empty), take the rows routed to it, then either
+// take the cut (a watermark, then a snapshot into *cut) or drain with the
+// terminal watermark. Returns what it emitted.
+std::multiset<std::string> run_keyed_subtask(const KeyedOpCase& c,
+                                             std::vector<Snapshot> parents,
+                                             std::uint32_t subtask,
+                                             std::uint32_t parallelism,
+                                             const TimedRows& rows,
+                                             Snapshot* cut,
+                                             OperatorId op_id,
+                                             MetricsRegistry& metrics) {
+    std::multiset<std::string> emitted;
+    auto op = build_row_op(c.op_type, c.params);
+    if (op == nullptr) {
+        return emitted;
+    }
+    auto backend = std::make_shared<InMemoryStateBackend>();
+    const auto [first, last] = key_group_range_for_subtask(subtask, parallelism);
+    const KeyGroupRange range{.first = first, .last = last};
+    RuntimeContext ctx{op_id, "op", backend.get(), &metrics};
+    const bool restored = !parents.empty();
+    if (restored) {
+        backend->restore(backend->combine_snapshots(std::move(parents)), range);
+        ctx.set_restore_key_group_range(range);
+    }
+    op->attach_runtime(&ctx);
+    if (restored) {
+        op->restore_timers(*backend, op_id);
+    }
+    op->open();
+    Emitter<Row> em([&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                emitted.insert(canonical(
+                    clink::config::JsonValue{clink::sql::to_json_object(rec.value().values)},
+                    {"__key"}));
+            }
+        }
+        return true;
+    });
+    Batch<Row> b;
+    for (const auto& [r, ts] : rows) {
+        if (routed_to(r, parallelism) == subtask) {
+            b.emplace(r, EventTime{ts});
+        }
+    }
+    if (!b.empty()) {
+        op->process(StreamElement<Row>::data(std::move(b)), em);
+    }
+    if (cut != nullptr) {
+        if (c.watermark_before_cut != 0) {
+            op->process(StreamElement<Row>::watermark(Watermark{EventTime{c.watermark_before_cut}}),
+                        em);
+        }
+        op->snapshot_timers(*backend, op_id);
+        *cut = backend->snapshot(CheckpointId{1});
+    } else {
+        op->process(StreamElement<Row>::watermark(Watermark{EventTime{kRescaleTerminalWm}}), em);
+    }
+    op->close();
+    return emitted;
+}
+
+// The whole run with a cut at `from` subtasks and the rest at `to`, as the
+// union of every subtask's output either side of the cut. `to` subtask i
+// inherits the `from` parents rescale_dispatch assigns it: a slice of one on a
+// scale-up, `from / to` consecutive ones merged on a scale-down.
+std::multiset<std::string> run_across_a_rescale(const KeyedOpCase& c,
+                                                std::uint32_t from,
+                                                std::uint32_t to,
+                                                OperatorId op_id,
+                                                MetricsRegistry& metrics) {
+    std::multiset<std::string> all;
+    std::vector<Snapshot> cuts(from);
+    for (std::uint32_t i = 0; i < from; ++i) {
+        const auto out = run_keyed_subtask(c, {}, i, from, c.before, &cuts[i], op_id, metrics);
+        all.insert(out.begin(), out.end());
+    }
+    for (std::uint32_t i = 0; i < to; ++i) {
+        std::vector<Snapshot> parents;
+        if (to >= from) {
+            parents.push_back(cuts[i / (to / from)]);
+        } else {
+            const std::uint32_t per = from / to;
+            for (std::uint32_t j = 0; j < per; ++j) {
+                parents.push_back(cuts[i * per + j]);
+            }
+        }
+        const auto out =
+            run_keyed_subtask(c, std::move(parents), i, to, c.after, nullptr, op_id, metrics);
+        all.insert(out.begin(), out.end());
+    }
+    return all;
+}
+
+// A deterministic stream: `users` partitions, `per_user` rows each in event-time
+// order, bounced two times in three.
+TimedRows bounce_stream(std::int64_t users, std::int64_t from_ts, std::int64_t to_ts) {
+    TimedRows rows;
+    std::uint64_t lcg = 20261030;
+    for (std::int64_t ts = from_ts; ts <= to_ts; ++ts) {
+        for (std::int64_t user = 1; user <= users; ++user) {
+            lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+            Row r;
+            r.values["user_id"] = clink::config::JsonValue{user};
+            r.values["ts"] = clink::config::JsonValue{ts};
+            r.values["status"] = clink::config::JsonValue{
+                std::string{(lcg >> 33) % 3 == 0 ? "accepted" : "bounced"}};
+            rows.emplace_back(std::move(r), ts);
+        }
+    }
+    return rows;
+}
+
+TimedRows pair_stream(std::uint64_t seed,
+                      std::int64_t n,
+                      std::int64_t keys,
+                      std::int64_t first_ts) {
+    TimedRows rows;
+    std::uint64_t lcg = seed;
+    for (std::int64_t i = 0; i < n; ++i) {
+        lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+        Row r;
+        r.values["k"] = clink::config::JsonValue{static_cast<std::int64_t>((lcg >> 33) % keys)};
+        r.values["v"] = clink::config::JsonValue{static_cast<std::int64_t>((lcg >> 20) % 3)};
+        rows.emplace_back(std::move(r), first_ts + i);
+    }
+    return rows;
+}
+
+std::vector<KeyedOpCase> keyed_op_cases() {
+    std::vector<KeyedOpCase> cases;
+    Catalog cat;
+    auto ddl = parse(
+        std::string{"CREATE TABLE rs_events (user_id BIGINT, ts BIGINT, status VARCHAR) "
+                    "WITH (connector='file', format='json', path='/tmp/rs_events.ndjson', "
+                    "event_time_column='ts');"
+                    "CREATE TABLE rs_alerts (user_id BIGINT, first_at BIGINT, last_at BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/rs_alerts.ndjson');"
+                    "CREATE TABLE rs_pairs (k BIGINT, v BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/rs_pairs.ndjson');"
+                    "CREATE TABLE rs_distinct (k BIGINT, v BIGINT) "
+                    "WITH (connector='file', format='json', path='/tmp/rs_distinct.ndjson')"});
+    for (const auto& st : ddl.statements) {
+        cat.register_table(std::get<ast::CreateTableStmt>(st));
+    }
+    {
+        auto [params, columns] =
+            planned_op(cat,
+                       "INSERT INTO rs_alerts SELECT * FROM rs_events MATCH_RECOGNIZE ("
+                       "  PARTITION BY user_id ORDER BY ts"
+                       "  MEASURES FIRST(b.ts) AS first_at, LAST(b.ts) AS last_at"
+                       "  AFTER MATCH SKIP PAST LAST ROW"
+                       "  PATTERN (b{3})"
+                       "  DEFINE b AS status = 'bounced')",
+                       "match_recognize_row");
+        // Rows up to 20 before the cut, of which those up to 12 are past the
+        // watermark and in the pattern's runs, the rest still held in order.
+        cases.push_back(KeyedOpCase{.label = "MATCH_RECOGNIZE",
+                                    .op_type = "match_recognize_row",
+                                    .params = params,
+                                    .before = stamped(columns, bounce_stream(48, 1, 20)),
+                                    .after = stamped(columns, bounce_stream(48, 21, 40)),
+                                    .watermark_before_cut = 12});
+    }
+    {
+        auto [params, columns] = planned_op(
+            cat, "INSERT INTO rs_distinct SELECT DISTINCT k, v FROM rs_pairs", "distinct_row");
+        cases.push_back(KeyedOpCase{.label = "DISTINCT",
+                                    .op_type = "distinct_row",
+                                    .params = params,
+                                    .before = stamped(columns, pair_stream(7, 300, 64, 1)),
+                                    .after = stamped(columns, pair_stream(11, 300, 64, 301))});
+    }
+    return cases;
+}
+
+}  // namespace
+
+TEST(KeyedOperatorRescale, ScaleUpAndDownKeepEveryResultExactlyOnce) {
+    ensure_sql_installed_once();
+    MetricsRegistry metrics;
+    const OperatorId op_id{9931};
+    for (const auto& c : keyed_op_cases()) {
+        // One subtask throughout, no restore at all, then one with a restore.
+        TimedRows all = c.before;
+        all.insert(all.end(), c.after.begin(), c.after.end());
+        KeyedOpCase straight = c;
+        straight.before.clear();
+        const auto oracle = run_keyed_subtask(straight, {}, 0, 1, all, nullptr, op_id, metrics);
+        ASSERT_FALSE(oracle.empty()) << c.label << ": the uninterrupted run emitted nothing";
+        const auto restored = run_across_a_rescale(c, 1, 1, op_id, metrics);
+        ASSERT_EQ(restored, oracle) << c.label << ": a cut and restore at one subtask changed the "
+                                    << "answer, so a rescale has nothing sound to start from - "
+                                    << describe_row_diff(restored, oracle);
+
+        for (const auto& [from, to] : std::vector<std::pair<std::uint32_t, std::uint32_t>>{
+                 {1, 2}, {1, 4}, {2, 4}, {4, 2}, {4, 1}}) {
+            const auto got = run_across_a_rescale(c, from, to, op_id, metrics);
+            EXPECT_EQ(got, oracle) << c.label << ": " << from << " -> " << to
+                                   << " changed the answer - " << describe_row_diff(got, oracle);
+        }
+    }
+}
+
+// The cases must carry state across the cut for the equality above to mean
+// anything: a match whose run began before the cut and ended after it, and a
+// row after the cut that repeats one from before it.
+TEST(KeyedOperatorRescale, TheCasesCarryStateAcrossTheCut) {
+    ensure_sql_installed_once();
+    for (const auto& c : keyed_op_cases()) {
+        if (c.op_type == "match_recognize_row") {
+            MetricsRegistry metrics;
+            TimedRows all = c.before;
+            all.insert(all.end(), c.after.begin(), c.after.end());
+            KeyedOpCase straight = c;
+            straight.before.clear();
+            std::size_t straddling = 0;
+            for (const auto& row :
+                 run_keyed_subtask(straight, {}, 0, 1, all, nullptr, OperatorId{9932}, metrics)) {
+                const auto js = clink::config::parse(row);
+                if (js.as_object().at("first_at").as_int() <= 20 &&
+                    js.as_object().at("last_at").as_int() > 20) {
+                    ++straddling;
+                }
+            }
+            EXPECT_GT(straddling, 0u) << c.label << ": no run of bounces straddles the cut";
+        } else {
+            std::set<std::string> seen;
+            for (const auto& [r, ts] : c.before) {
+                seen.insert(r.values.at("k").serialize(0) + "/" + r.values.at("v").serialize(0));
+            }
+            std::size_t repeats = 0;
+            for (const auto& [r, ts] : c.after) {
+                repeats +=
+                    seen.count(r.values.at("k").serialize(0) + "/" + r.values.at("v").serialize(0));
+            }
+            EXPECT_GT(repeats, 0u) << c.label << ": no row after the cut repeats one before it";
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MEMORY PER (KEY, WINDOW).
 //
 // A per-group state defect has shipped twice. AggState reached 264 bytes by
