@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**An idle MQTT sink keeps its connection.** A broker drops a client it has
+heard nothing from for one and a half keepalives, and libmosquitto sends the
+keepalive's ping from its network loop, which the sink ran only to flush a
+batch. A sink with nothing to publish was dropped, ninety seconds after its
+last message at the default keepalive, and its next flush failed the job: a
+job whose sink publishes rarely, an alert's, restarted every ninety seconds
+of quiet. A showcase's rider-commands sink was dropped in the first minutes of
+its night, before any battery ran low. Every barrier and every empty flush
+now services the connection without blocking, and a connection that dropped
+while nothing was in flight on it is reconnected before the next batch rather
+than failing the job.
+
 **A SQL job can be rescaled while it runs.** SQL jobs declared no rescale
 bounds, so a running SQL job could not be resized. `--max-parallelism <n>`
 on `clink run --coordinator-host` and `clink_submit_sql` declares `[1, n]` on

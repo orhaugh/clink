@@ -193,6 +193,30 @@ public:
     // when loop() reports the connection was lost.
     int reconnect() { return mosquitto_reconnect(mosq_); }
 
+    // Reconnect a client whose connection dropped, and AWAIT the broker's CONNACK
+    // as the constructor does, so what is published next goes out on a session
+    // the broker accepted. Returns the mosquitto rc: MOSQ_ERR_SUCCESS once
+    // accepted, MOSQ_ERR_CONN_REFUSED if the broker refused, MOSQ_ERR_NO_CONN if
+    // no CONNACK came within `timeout`.
+    int reconnect_and_await(std::chrono::milliseconds timeout) {
+        got_connack_ = false;
+        int rc = mosquitto_reconnect(mosq_);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            return rc;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!got_connack_ && std::chrono::steady_clock::now() < deadline) {
+            rc = mosquitto_loop(mosq_, 100, 1);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                return rc;
+            }
+        }
+        if (!got_connack_) {
+            return MOSQ_ERR_NO_CONN;
+        }
+        return connack_rc_ == 0 ? MOSQ_ERR_SUCCESS : MOSQ_ERR_CONN_REFUSED;
+    }
+
     [[nodiscard]] bool connected() const noexcept { return connected_; }
     struct mosquitto* native() const noexcept { return mosq_; }
 

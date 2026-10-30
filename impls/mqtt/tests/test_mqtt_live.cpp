@@ -261,4 +261,100 @@ TEST(MqttLive, TlsConnectionRoundTrip) {
     EXPECT_EQ(cap.values[0], "hello-tls");
 }
 
+// An MQTT broker drops a client it has heard nothing from for one and a half
+// keepalives, and libmosquitto sends the keepalive's ping from its network
+// loop, which the sink ran only to flush a batch. A sink with nothing to publish
+// was dropped, and its next flush failed the job: a job whose sink publishes
+// rarely restarted every ninety seconds of quiet at the default keepalive.
+//
+// With barriers arriving, as a checkpointing job's do, the sink stays connected
+// however long it idles: the barriers service the connection, and it is never
+// reconnected.
+TEST(MqttLive, AnIdleSinkStaysConnectedAcrossItsBarriers) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    MqttSource src(source_opts(topic));
+    src.open();
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+
+    MqttSinkOptions o;
+    o.conn = mqtt_conn();
+    o.conn.keepalive = 5;  // the broker drops it after 7.5 s of silence
+    o.topic = topic;
+    o.qos = 1;
+    MqttSink sink(std::move(o));
+    sink.open();
+    Batch<std::string> first;
+    first.emplace(R"({"i":0})");
+    sink.on_data(first);
+    sink.flush();
+    // Twelve seconds of nothing to publish, a barrier every half second.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{12};
+    std::uint64_t id = 1;
+    while (std::chrono::steady_clock::now() < until) {
+        sink.on_barrier(clink::CheckpointBarrier{clink::CheckpointId{id++}});
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+    }
+    Batch<std::string> second;
+    second.emplace(R"({"i":1})");
+    sink.on_data(second);
+    ASSERT_NO_THROW(sink.flush()) << "the idle sink's connection did not survive its barriers";
+    EXPECT_EQ(sink.reconnects(), 0u)
+        << "the barriers did not keep the connection alive: the broker dropped it and the "
+           "flush had to reconnect";
+    sink.close();
+
+    Captured cap;
+    drain(src, cap, 2, /*timeout_ms=*/15000);
+    src.close();
+    EXPECT_EQ(cap.values, (std::vector<std::string>{R"({"i":0})", R"({"i":1})"}));
+}
+
+// With no barrier for longer than the keepalive (checkpointing off, or an
+// interval longer than it), the broker drops the idle sink. Nothing was in
+// flight on the connection, so the next batch reconnects and is delivered,
+// rather than failing the job.
+TEST(MqttLive, ASinkDroppedWhileIdleReconnectsForItsNextBatch) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    MqttSource src(source_opts(topic));
+    src.open();
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+
+    MqttSinkOptions o;
+    o.conn = mqtt_conn();
+    o.conn.keepalive = 5;
+    o.topic = topic;
+    o.qos = 1;
+    MqttSink sink(std::move(o));
+    sink.open();
+    Batch<std::string> first;
+    first.emplace(R"({"i":0})");
+    sink.on_data(first);
+    sink.flush();
+    // Past one and a half keepalives with no barrier: the broker drops it. The
+    // source's own produce() keeps its connection alive meanwhile.
+    Captured cap;
+    drain(src, cap, 1, /*timeout_ms=*/15000);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{12};
+    while (std::chrono::steady_clock::now() < until) {
+        auto em = capturing(cap);
+        src.produce(em);
+    }
+    Batch<std::string> second;
+    second.emplace(R"({"i":1})");
+    sink.on_data(second);
+    ASSERT_NO_THROW(sink.flush()) << "a connection dropped while idle failed the next flush";
+    EXPECT_EQ(sink.reconnects(), 1u) << "the broker should have dropped the idle sink once";
+    sink.close();
+
+    drain(src, cap, 2, /*timeout_ms=*/15000);
+    src.close();
+    EXPECT_EQ(cap.values, (std::vector<std::string>{R"({"i":0})", R"({"i":1})"}));
+}
+
 #endif  // CLINK_HAS_MQTT

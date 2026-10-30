@@ -17,6 +17,11 @@
 // duplicates). At qos 0 it is AT-MOST-ONCE: the broker acknowledges nothing, so a
 // message the flush wrote to a connection that then dropped is lost while the
 // checkpoint still completes.
+//
+// CONNECTION: every barrier and every flush with nothing to send services the
+// connection, so the keepalive's ping goes out while the sink is idle; and a
+// connection that dropped while nothing was in flight on it is reconnected
+// before the next batch is published, which loses nothing.
 
 #include <chrono>
 #include <cstddef>
@@ -94,6 +99,7 @@ public:
 
     void flush() override {
         if (pending_.empty()) {
+            keep_alive_();
             return;
         }
         if (conn_ == nullptr) {
@@ -103,6 +109,7 @@ public:
         const std::size_t bytes = pending_bytes_;
         const auto t0 = std::chrono::steady_clock::now();
         try {
+            ensure_connected_();
             outstanding_ = 0;
             for (const auto& rec : pending_) {
                 conn_->publish(opts_.topic, rec.data(), rec.size(), opts_.qos, opts_.retain);
@@ -140,7 +147,41 @@ public:
 
     std::string name() const override { return opts_.name; }
 
+    // How many times the sink reconnected a connection the broker had dropped
+    // while nothing was in flight on it.
+    [[nodiscard]] std::uint64_t reconnects() const noexcept { return reconnects_; }
+
 private:
+    // libmosquitto sends the keepalive's PINGREQ from its loop, and the sink runs
+    // the loop to flush a batch, so a sink with nothing to publish for one and a
+    // half keepalives was disconnected by the broker and failed the job at its
+    // next flush: a job whose sink publishes rarely, an alert's, restarted every
+    // ninety seconds of quiet. Every barrier and every empty flush now services
+    // the connection, without blocking: a ping when one is due, and the broker's
+    // reply.
+    void keep_alive_() {
+        if (conn_ != nullptr) {
+            (void)conn_->loop(0, 1);
+        }
+    }
+
+    // A connection that dropped while the sink was idle (no barrier came within
+    // the keepalive, or the broker restarted) carried nothing in flight, so it
+    // loses nothing: it is reconnected before the batch is published on it, and
+    // only a reconnect that fails fails the job. One service first, so a socket
+    // the broker closed since the last one is seen as closed.
+    void ensure_connected_() {
+        if (conn_->connected() && conn_->loop(0, 1) == MOSQ_ERR_SUCCESS && conn_->connected()) {
+            return;
+        }
+        const int rc = conn_->reconnect_and_await(opts_.conn.connack_timeout);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            throw std::runtime_error(opts_.name +
+                                     ": reconnecting before a flush: " + mosquitto_strerror(rc));
+        }
+        ++reconnects_;
+    }
+
     // Drive the synchronous loop until the batch is durable: for qos > 0 until
     // every PUBLISH is acked (outstanding_ drains via the publish callback); for
     // qos 0 until the socket write buffer is flushed. Bounded by ack_timeout.
@@ -176,6 +217,7 @@ private:
     std::size_t outstanding_{0};  // un-acked publishes in the current flush (qos > 0)
     std::size_t pending_bytes_{0};
     std::chrono::steady_clock::time_point first_buffered_at_{};
+    std::uint64_t reconnects_{0};
 };
 
 }  // namespace clink::mqtt
