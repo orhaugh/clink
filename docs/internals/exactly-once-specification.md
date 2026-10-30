@@ -275,7 +275,10 @@ included), the family from the sinks. A run that holds several jobs, as a
 Coordinator running many does, is validated one job at a time: the script
 asks the merger which jobs triggered a checkpoint
 (`scripts/protocol-trace-merge.py --jobs`) and validates each job's events on
-their own, reported as `<run>/job-<id>`.
+their own, reported as `<run>/job-<id>`. A job whose two-phase sinks are of
+both families, a Kafka transactional sink beside a recoverable one, is
+outside the specification, which models one family per run, and is skipped
+and said so, as a run that rescaled an operator is.
 The run is accepted when some path through the specification consumes every
 event (hidden steps make the state graph a small tree, and a branch that took
 a hidden step the run did not need dies out without being a verdict); TLC's

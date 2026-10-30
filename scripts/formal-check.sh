@@ -164,6 +164,15 @@ if [ "$MODE" = trace ]; then
                 echo skipped >"$WORK/status-$n"
                 return
             fi
+            # A job whose two-phase sinks are of both families, a Kafka
+            # transactional sink beside a recoverable one, is outside it too:
+            # the specification models one family per run (its Recoverable
+            # constant). Skipped, and said so.
+            if [ "$(grep -o '"family":"[a-z]*"' "$merged" | sort -u | wc -l | tr -d ' ')" -gt 1 ]; then
+                echo "formal-check: trace/$name ($events events): SKIPPED, the job commits through sinks of both families; outside the specification, which models one family per run"
+                echo skipped >"$WORK/status-$n"
+                return
+            fi
             echo "formal-check: TLC trace/$name ($events events)"
             start=$(date +%s)
             set +e
