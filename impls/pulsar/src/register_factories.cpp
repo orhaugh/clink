@@ -57,6 +57,10 @@ void install(clink::plugin::PluginRegistry& reg) {
         .available_in_sql = true,
         .limitations = {"publish has no producer dedup: a replayed tail is re-published",
                         "a Shared subscription does not preserve per-key order across consumers",
+                        "a Shared subscription (the default) is replayed by broker redelivery, "
+                        "which can hand a restarted consumer its unacknowledged messages after "
+                        "newer ones; subscription_type='exclusive' replays in topic order from "
+                        "the checkpointed position, at parallelism 1 on a non-partitioned topic",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -64,9 +68,10 @@ void install(clink::plugin::PluginRegistry& reg) {
     using clink::plugin::BuildContext;
 
     // pulsar_source_string: subscribe to a topic, emit each body as a string. At-least-once
-    // (Shared subscription, individual ack at the checkpoint barrier; cursor durable server-side).
-    // Params: service_url (pulsar://localhost:6650), token, topic (required), subscription (clink),
-    //   receiver_queue_size (1000), receive_timeout_ms (1000), batch_size (256).
+    // (individual ack at checkpoint completion; see PulsarSource for the two ways a restart is
+    // replayed). Params: service_url (pulsar://localhost:6650), token, topic (required),
+    //   subscription (clink), subscription_type (shared | exclusive), subscribe_timeout_ms
+    //   (60000), receiver_queue_size (1000), receive_timeout_ms (1000), batch_size (256).
     reg.register_source<std::string>(
         "pulsar_source_string",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
@@ -80,8 +85,19 @@ void install(clink::plugin::PluginRegistry& reg) {
                 std::chrono::milliseconds{ctx.param_int64_or("receive_timeout_ms", 1000)};
             o.max_batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
             o.name = "pulsar_source";
+            o.subscription_type = ctx.param_or("subscription_type", "shared");
+            o.subscribe_timeout =
+                std::chrono::milliseconds{ctx.param_int64_or("subscribe_timeout_ms", 60000)};
             if (o.topic.empty()) {
                 throw std::runtime_error("pulsar_source: 'topic' is required");
+            }
+            // An exclusive subscription has one consumer: a second subtask could never subscribe,
+            // and a restore's seek moves the cursor for every consumer on it.
+            if (o.subscription_type == "exclusive" && ctx.parallelism > 1) {
+                throw std::runtime_error(
+                    "pulsar_source: subscription_type 'exclusive' has a single consumer, so the "
+                    "source must run at parallelism 1, not " +
+                    std::to_string(ctx.parallelism));
             }
             return std::make_shared<PulsarSource>(std::move(o));
         });

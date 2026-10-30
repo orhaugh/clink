@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A Pulsar source can replay a restart in topic order.** The source kept no
+position of its own: a restart was replayed by broker redelivery of what was
+not acknowledged, which the broker can hand a restarted consumer after newer
+messages, so a job matching rows in event-time order needed a watermark lag
+wide enough to take them back in. `subscription_type='exclusive'` makes the
+source the subscription's only consumer: it records the last message emitted
+before each barrier as operator state, and a restore seeks the subscription
+back to it, so the topic is replayed in order from the checkpoint. It needs
+parallelism 1 and a non-partitioned topic. The default, `shared`, is
+unchanged.
+
 **A run of many jobs is validated against the specification job by job.**
 A Coordinator running several jobs writes one protocol trace for all of them.
 Every Coordinator and Worker event named its job, but the sinks' own events

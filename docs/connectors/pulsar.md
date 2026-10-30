@@ -56,6 +56,8 @@ Source (`pulsar_source_string`) options:
 | --- | --- | --- | --- |
 | `topic` | Yes | (none) | Topic to subscribe to. Construction throws if empty. |
 | `subscription` | No | `clink` | Subscription name, shared across parallel subtasks (Shared subscription). |
+| `subscription_type` | No | `shared` | `shared` lets parallel subtasks split the topic, and a restart is replayed by broker redelivery. `exclusive` makes the source the subscription's only consumer and replays a restart in topic order from the checkpointed position (see "Replay after a restart"). `exclusive` needs parallelism 1 and a non-partitioned topic; the factory refuses it above parallelism 1, and `open()` refuses a partitioned topic. |
+| `subscribe_timeout_ms` | No | `60000` | `exclusive` only: how long `open()` keeps retrying a subscription a previous incarnation's consumer still holds, as it can while that incarnation is torn down. |
 | `receiver_queue_size` | No | `1000` | Prefetch size; bounds the held-unacked message buffer. |
 | `receive_timeout_ms` | No | `1000` | Per `produce()` turn receive timeout in milliseconds (cancel latency). |
 | `batch_size` | No | `256` | Maximum messages emitted per `produce()` turn. |
@@ -125,8 +127,14 @@ Through the registry, look up the factories `pulsar_source_string` and `pulsar_s
 
 Both ends are at-least-once.
 
-- Source: messages are received and held. The acknowledge is deferred to checkpoint COMMIT, not the barrier: `snapshot_offset` buckets the messages emitted before each barrier against that checkpoint id, `notify_checkpoint_complete` (driven from the cluster's `CommitCheckpoint` dispatch) queues a committed bucket for ack, and the next `produce()` turn issues `pulsar_consumer_acknowledge` for them - so a message is acked only after the checkpoint that captured it is globally durable. `notify_checkpoint_aborted` frees a bucket without acking, so an aborted checkpoint (or a crash before commit) leaves those messages for redelivery. All pulsar C calls stay on the `produce()` thread. The subscription cursor is durable server-side, so recovery needs no local state (`restore_offset` is a no-op). The default Shared subscription lets parallel subtasks split the topic, each acking only its own messages. The receiver-queue size bounds the held-unacked buffer.
+- Source: messages are received and held. The acknowledge is deferred to checkpoint COMMIT, not the barrier: `snapshot_offset` buckets the messages emitted before each barrier against that checkpoint id, `notify_checkpoint_complete` (driven from the cluster's `CommitCheckpoint` dispatch) queues a committed bucket for ack, and the next `produce()` turn issues `pulsar_consumer_acknowledge` for them - so a message is acked only after the checkpoint that captured it is globally durable. `notify_checkpoint_aborted` frees a bucket without acking, so an aborted checkpoint (or a crash before commit) leaves those messages for redelivery. All pulsar C calls stay on the `produce()` thread. With the default Shared subscription the cursor is durable server-side, so recovery needs no local state (`restore_offset` is a no-op), and parallel subtasks split the topic, each acking only its own messages; an Exclusive subscription also records its position at each barrier and seeks back to it on restore (see "Replay after a restart"). The receiver-queue size bounds the held-unacked buffer.
 - Sink: records are published asynchronously for throughput; `flush()` / `on_barrier()` blocks until the broker has persisted every pending publish, and throws if any send failed so the job replays from the last checkpoint rather than dropping data. Replay can therefore duplicate messages (at-least-once). The SQL planner rejects `exactly_once`: Pulsar producer dedup would need a producer name plus sequence id, which is not wired in v1.
+
+### Replay after a restart
+
+A shared subscription (the default) keeps no position of its own. After a restart the broker delivers again whatever was not acknowledged, when it gets to it, which can be after newer messages, so the replay is complete but not in topic order. A job that matches rows in event-time order over such a source needs a watermark lag wide enough to take the redelivered messages back in.
+
+An exclusive subscription replays in order. At each barrier the source records, as operator state, the id of the last message it emitted before the barrier (`pulsar.position`). A restore reads it back before `open()`, and `open()` seeks the subscription to it: the broker resets the cursor there and delivers everything after it again, in topic order, acknowledged or not (the seek excludes the recorded message itself, libpulsar's default). A message at or before the recorded one that still arrives, which the restored checkpoint already covers, is acknowledged and not emitted. The seek needs the broker to still hold the messages after the recorded one: a restore from the newest checkpoint finds them, because they are acknowledged only once a later checkpoint completes, but a restore from an older point, a savepoint for instance, reaches back past messages a later checkpoint acknowledged, and those are kept only as long as the namespace's retention policy keeps acknowledged messages. `PulsarLive.AnExclusiveSubscriptionReplaysInOrderFromItsCheckpointedPosition` restores from a checkpoint older than the newest acknowledged one and holds the replay to the exact messages after it, in order.
 
 The capability record declares the source's position model as `acknowledgement`, and clink's delivery analyser reports a job over this source as `AT_LEAST_ONCE_SOURCE`: a sink in it may declare `delivery_guarantee='at_least_once'`, and `exactly_once` is refused, because a checkpoint acknowledged late is delivered again.
 
@@ -146,10 +154,12 @@ A factory-registration test (`impls/pulsar/tests/test_factory_registration.cpp`)
 
 Broker-certificate tests (`impls/pulsar/tests/test_pulsar_tls.cpp`) run without a broker too, in any build that finds OpenSSL. They open a sink against a local TLS listener (`tests/test_helpers/tls_handshake_server.hpp`), which counts the handshakes the client completes: libpulsar finishes the handshake before it sends anything, so a refused certificate never completes one. They cover a certificate naming another host (refused by default, with the error), one naming the host, the hostname opt-out, the opt-out still checking the chain, and a missing `tls_ca` file.
 
-A live integration test (`impls/pulsar/tests/test_pulsar_live.cpp`, `PulsarLive.PublishThenConsumeRoundTrip`) drives the sink and source against a real broker. It is skipped unless the environment variable `CLINK_PULSAR_TEST_ENDPOINT` is set to a Pulsar service URL, for example:
+The factory test also holds the exclusive subscription to parallelism 1, and the source's constructor refuses an unknown `subscription_type`.
+
+Live integration tests (`impls/pulsar/tests/test_pulsar_live.cpp`) drive the sink and source against a real broker: `PulsarLive.PublishThenConsumeRoundTrip`, and `PulsarLive.AnExclusiveSubscriptionReplaysInOrderFromItsCheckpointedPosition` (see "Replay after a restart"). They are skipped unless the environment variable `CLINK_PULSAR_TEST_ENDPOINT` is set to a Pulsar service URL, for example:
 
 ```bash
 CLINK_PULSAR_TEST_ENDPOINT=pulsar://localhost:6650 ctest --test-dir build -L pulsar
 ```
 
-The broker auto-creates the topic (`allowAutoTopicCreation`), so no provisioning is needed. The test does not pin a specific broker container image; point `CLINK_PULSAR_TEST_ENDPOINT` at any reachable Pulsar broker (for example a standard `apachepulsar/pulsar` standalone instance).
+The broker auto-creates the topic (`allowAutoTopicCreation`), so no provisioning is needed. The tests do not pin a specific broker container image; point `CLINK_PULSAR_TEST_ENDPOINT` at any reachable Pulsar broker (for example a standard `apachepulsar/pulsar` standalone instance).

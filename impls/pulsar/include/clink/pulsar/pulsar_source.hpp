@@ -11,10 +11,20 @@
 namespace clink::pulsar {
 
 // Apache Pulsar source: subscribes to a topic and emits each message body as a std::string.
-// Delivery is AT-LEAST-ONCE. The subscription cursor is durable server-side, so after a failure
-// Pulsar redelivers everything left unacked (recovery needs no local state - restore_offset is a
-// no-op). A Shared subscription is used by default so parallel subtasks sharing the subscription
-// distribute the topic's messages and each acks only its own.
+// Delivery is AT-LEAST-ONCE, and a restart is replayed in one of two ways:
+//
+//   * A Shared subscription (the default) lets parallel subtasks share it, each acking only its
+//     own messages. The subscription cursor is durable server-side, so after a failure Pulsar
+//     redelivers everything left unacked, and restore_offset is a no-op. The broker hands a
+//     restarted consumer its unacknowledged messages when it gets to them, which can be after
+//     newer ones, so the replay is not in topic order.
+//   * An Exclusive subscription (subscription_type "exclusive") has this subtask as its only
+//     consumer. Each barrier records the id of the last message emitted before it as operator
+//     state, and a restore seeks the subscription back to that message, so the restart replays
+//     the topic in order from the message after it; anything at or before the recorded message
+//     that still arrives is acknowledged and not emitted again. It needs parallelism 1 and a
+//     non-partitioned topic, and the broker must still hold the messages after the recorded one,
+//     which a restore from an older checkpoint (a savepoint, say) can reach back for.
 //
 // The ack is deferred to CHECKPOINT COMMIT, not the barrier. snapshot_offset() buckets the
 // messages emitted before each barrier against that checkpoint id; notify_checkpoint_complete()
@@ -35,6 +45,11 @@ public:
         std::chrono::milliseconds receive_timeout{1000};  // per produce() turn (cancel latency)
         std::size_t max_batch_size{256};                  // messages emitted per produce() turn
         std::string name{"pulsar_source"};
+        // "shared" or "exclusive" (see above).
+        std::string subscription_type{"shared"};
+        // Exclusive only: how long open() keeps trying a subscription a previous incarnation's
+        // consumer still holds, as it can while that incarnation is being torn down.
+        std::chrono::milliseconds subscribe_timeout{60000};
     };
 
     explicit PulsarSource(Options opts);
@@ -49,8 +64,11 @@ public:
     [[nodiscard]] bool is_bounded() const noexcept override { return false; }
 
     // Bucket the messages emitted before this barrier against the checkpoint id (no ack yet).
-    // Runs on the produce() thread (see dag.hpp). Persists nothing - the cursor is server-side.
+    // Runs on the produce() thread (see dag.hpp). An exclusive subscription also records the id of
+    // the last message emitted before the barrier; a shared one persists nothing.
     void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt_id) override;
+    // Exclusive: read back the recorded position, which open() seeks the subscription to. Shared:
+    // a no-op, the broker redelivers.
     bool restore_offset(StateBackend& backend, OperatorId op_id) override;
 
     // Checkpoint committed/aborted (cluster CommitCheckpoint / AbortCheckpoint dispatch thread).
