@@ -173,6 +173,20 @@ if [ "$MODE" = trace ]; then
                 echo skipped >"$WORK/status-$n"
                 return
             fi
+            # A job whose first checkpoint is not 1 is outside it as well: one
+            # submitted with a restore, from a savepoint or another job's
+            # checkpoint, numbers its own from the one after it, and so does a
+            # job whose directory already has ids on record. The specification
+            # starts a job numbering at 1 (Init), and only a Redeploy or a
+            # Renumber moves that, so a first trigger above 1 with neither
+            # before it has no step. Skipped, and said so.
+            first="$(awk '/"event":"(Redeploy|Renumber)"/ { exit }
+                /"event":"Trigger"/ { if (match($0, /"ckpt":[0-9]+/)) print substr($0, RSTART + 7, RLENGTH - 7); exit }' "$merged")"
+            if [ -n "$first" ] && [ "$first" -gt 1 ]; then
+                echo "formal-check: trace/$name ($events events): SKIPPED, the job's first checkpoint is $first (a restore at submit, or ids already on record); outside the specification, whose jobs number from 1"
+                echo skipped >"$WORK/status-$n"
+                return
+            fi
             echo "formal-check: TLC trace/$name ($events events)"
             start=$(date +%s)
             set +e

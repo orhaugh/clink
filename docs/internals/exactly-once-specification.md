@@ -278,7 +278,10 @@ asks the merger which jobs triggered a checkpoint
 their own, reported as `<run>/job-<id>`. A job whose two-phase sinks are of
 both families, a Kafka transactional sink beside a recoverable one, is
 outside the specification, which models one family per run, and is skipped
-and said so, as a run that rescaled an operator is.
+and said so, as a run that rescaled an operator is. So is a job whose first
+checkpoint is not 1: one submitted with a restore, from a savepoint or
+another job's checkpoint, numbers its own from the one after it, and the
+specification starts every job numbering at 1.
 The run is accepted when some path through the specification consumes every
 event (hidden steps make the state graph a small tree, and a branch that took
 a hidden step the run did not need dies out without being a verdict); TLC's
