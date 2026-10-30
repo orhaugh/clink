@@ -412,6 +412,49 @@ TEST(JobPlanner, AdjacentOperatorsAreChainedIntoOneSubtask) {
     EXPECT_TRUE(found_chain);
 }
 
+// An operator a rescale may resize is alone in its chain: chained with a
+// neighbour, a rescale would split it from the neighbour (up) or fuse them
+// again (down), and the replan restores each new task from the chain head's
+// old block only. src -> mulA -> mulB -> mulC -> sink, with mulB alone: mulA
+// and mulC each run in a subtask of their own beside it, where without the
+// param all three share one.
+TEST(JobPlanner, AChainAloneOperatorSharesNoChain) {
+    JobGraphSpec g;
+    g.ops.push_back(OperatorSpec{
+        .type = "int64_range_source",
+        .id = "src",
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"count", "4"}},
+    });
+    for (const auto& [id, input] : std::vector<std::pair<std::string, std::string>>{
+             {"mulA", "src"}, {"mulB", "mulA"}, {"mulC", "mulB"}}) {
+        g.ops.push_back(OperatorSpec{
+            .type = "multiply_int64",
+            .id = id,
+            .inputs = {input},
+            .out_channel = std::string{clink::cluster::kChannelInt64},
+            .params = {{"factor", "2"}},
+        });
+    }
+    g.ops.push_back(OperatorSpec{
+        .type = "file_int64_sink",
+        .id = "snk",
+        .inputs = {"mulC"},
+        .out_channel = std::string{clink::cluster::kChannelInt64},
+        .params = {{"path", "/tmp/x"}},
+    });
+    ASSERT_EQ(plan_job(g, OperatorRegistry::default_instance()).tasks.size(), 3u)
+        << "the premise: without the param the three operators share one chain";
+
+    g.ops[2].params[std::string{clink::cluster::kChainAloneParam}] = "true";
+    const auto plan = plan_job(g, OperatorRegistry::default_instance());
+    ASSERT_EQ(plan.tasks.size(), 5u) << "source, mulA, mulB, mulC and the sink, each on its own";
+    for (const auto& t : plan.tasks) {
+        const auto chain = OperatorChainSpec::from_json(t.extra_config);
+        EXPECT_LE(chain.ops.size(), 1u) << "a subtask still hosts a chain of " << chain.ops.size();
+    }
+}
+
 TEST(JobPlanner, SplitOpEmitsSplitOutputRouting) {
     // src -> splitter (selector_fn=int64_even_odd) -> evens (branch 0)
     //                                              -> odds  (branch 1)

@@ -488,6 +488,11 @@ inline constexpr char kWorkerBeforeCommitDispatch[] = "worker.before_commit_disp
 inline constexpr char kRescaleAfterDrain[] = "rescale.after_drain";
 inline constexpr char kRescaleAfterReplan[] = "rescale.after_replan";
 inline constexpr char kRescaleBeforeFirstCheckpoint[] = "rescale.before_first_checkpoint";
+// Under HA, after a replan has recorded the rescaled graph in the job's manifest,
+// with the graph before it, and before any checkpoint at the new layout can
+// complete: a takeover here restores a checkpoint the graph before wrote, and has
+// to plan that graph.
+inline constexpr char kRescaleAfterManifest[] = "rescale.after_manifest";
 
 // The HOT cutover's own windows (design record 008), one per phase boundary
 // the choreography crosses while the job keeps running: after every arm ack

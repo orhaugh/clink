@@ -53,6 +53,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/job_planner.hpp"
+#include "clink/config/json.hpp"
 
 #include "tests/integration/await_port.hpp"
 #include "tests/integration/cluster_harness.hpp"
@@ -1447,4 +1448,242 @@ TEST_F(HotRescaleTest, AJobWithNoLayoutBearingOperatorCutsOverHotOntoAWorkerAtPr
     // placement rather than one that avoided it.
     EXPECT_TRUE(c.worker(2).log_contains("job_id=1 __clink_subtask["))
         << "no subtask of the job ran on the joined worker";
+}
+
+// ---------------------------------------------------------------------------
+// A rescale under HA, and a Coordinator failover after it.
+//
+// A takeover recovers a job from its HA manifest: it plans the graph recorded
+// there and restores the newest checkpoint on disk, and the restore-layout gate
+// refuses the job when the two disagree, since restoring a checkpoint into
+// another layout hands each subtask the state of whichever operator held its
+// index. The manifest used to record the graph as submitted and nothing after,
+// so a takeover after a rescale planned the old parallelism against
+// checkpoints at the new one, and the job stopped until it was resubmitted.
+//
+// Now, under HA, a rescale replans (a hot cutover appends its subtasks in a
+// layout no plan of the graph produces) and the replan records the rescaled
+// graph in the manifest, with the graph before it and the checkpoint up to
+// which that one wrote. These cases kill the leader either side of the first
+// checkpoint at the new layout and judge the job by its committed output, as
+// the cases above do: the takeover keeps the rescale once a checkpoint at the
+// new layout is on disk, and recovers the job as it was before the rescale
+// while the newest checkpoint is still one the graph before wrote.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class RescaleUnderHaTest : public RescaleExactlyOnceTest {
+protected:
+    static ClusterSpec ha_spec() {
+        auto s = spec();
+        s.ha = true;
+        return s;
+    }
+
+    // The operator's parallelism in the graph the job's HA manifest records,
+    // and whether the manifest also records a graph from before a rescale.
+    struct ManifestView {
+        std::optional<std::uint32_t> parallelism;
+        bool has_prior{false};
+    };
+    static ManifestView manifest_view(Cluster& c, const std::string& op_id) {
+        ManifestView view;
+        std::ifstream in(c.ha_dir() / "jobs" / "1" / "manifest.json");
+        if (!in) {
+            return view;
+        }
+        std::stringstream ss;
+        ss << in.rdbuf();
+        try {
+            const auto manifest = clink::config::parse(ss.str());
+            const auto& m = manifest.as_object();
+            view.has_prior = m.count("prior_graph_json") != 0;
+            const auto graph = clink::config::parse(m.at("graph_json").as_string());
+            for (const auto& op : graph.as_object().at("ops").as_array()) {
+                const auto& o = op.as_object();
+                if (o.at("id").as_string() == op_id) {
+                    view.parallelism = static_cast<std::uint32_t>(o.at("parallelism").as_int());
+                }
+            }
+        } catch (const std::exception&) {
+            // Read while the leader replaces it: the caller retries or fails.
+        }
+        return view;
+    }
+
+    // The newest COMPLETED-N marker of job 1 on disk.
+    static std::uint64_t newest_completed(Cluster& c) {
+        std::uint64_t newest = 0;
+        std::error_code ec;
+        for (const auto& e :
+             std::filesystem::directory_iterator(c.checkpoint_dir() / "_jobs" / "1", ec)) {
+            const auto name = e.path().filename().string();
+            if (name.rfind("COMPLETED-", 0) == 0) {
+                std::uint64_t id = 0;
+                const auto* first = name.data() + 10;
+                if (std::from_chars(first, name.data() + name.size(), id).ec == std::errc{}) {
+                    newest = std::max(newest, id);
+                }
+            }
+        }
+        return newest;
+    }
+
+    // The checkpoint the replan restored from, from the leader's own line.
+    static std::optional<std::uint64_t> replan_restore_point(const Process& p) {
+        const auto log = p.read_log();
+        const std::string needle = "restore_from_checkpoint=";
+        const auto line = log.find("replanned job_id=1");
+        if (line == std::string::npos) {
+            return std::nullopt;
+        }
+        const auto at = log.find(needle, line);
+        if (at == std::string::npos) {
+            return std::nullopt;
+        }
+        std::uint64_t id = 0;
+        const auto* first = log.data() + at + needle.size();
+        if (std::from_chars(first, log.data() + log.size(), id).ec != std::errc{}) {
+            return std::nullopt;
+        }
+        return id;
+    }
+
+    void bring_up_and_rescale(Cluster& c, std::unique_ptr<Process>& sub) {
+        ASSERT_TRUE(c.await_workers_registered(2));
+        sub = submit(c);
+        ASSERT_NE(sub, nullptr);
+        ASSERT_TRUE(clink::itest::await(
+            [&] {
+                return verify_exactly_once(out_dir_, kTotalRecords).total_lines >=
+                       kMinCommittedBefore;
+            },
+            std::chrono::seconds(90)))
+            << "too little committed output before the rescale for a bad restore to show up";
+        std::string out;
+        ASSERT_EQ(rescale_operator(c, "counter", kMaxParallelism, &out), 0)
+            << "the rescale request was refused: " << out;
+    }
+
+    void expect_exactly_once_to_the_end(Cluster& c, const char* scenario) {
+        const bool finished = clink::itest::await(
+            [&] { return verify_exactly_once(out_dir_, kTotalRecords).missing.empty(); },
+            std::chrono::seconds(120));
+        const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+        EXPECT_TRUE(v.duplicated.empty())
+            << scenario << ": records committed MORE than once: " << describe(v);
+        EXPECT_TRUE(v.unexpected.empty())
+            << scenario << ": unexpected output (STATE-MISMATCH = keyed state lost or "
+            << "duplicated): " << describe(v);
+        EXPECT_TRUE(finished) << scenario << ": the job did not finish under the new leader, "
+                              << "so the takeover did not recover it: " << describe(v)
+                              << " [processes: " << c.describe_coordinator_exits() << "]";
+    }
+};
+
+}  // namespace
+
+TEST_F(RescaleUnderHaTest, ATakeoverAfterACheckpointAtTheNewLayoutKeepsTheRescale) {
+    Cluster c(ha_spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_ha_coordinators(2));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.start_ha_worker(1));
+    std::unique_ptr<Process> sub;
+    bring_up_and_rescale(c, sub);
+    if (HasFatalFailure()) {
+        return;
+    }
+    const auto leader = c.current_leader_index();
+    ASSERT_TRUE(leader.has_value());
+    auto& lead = c.ha_coordinator(*leader);
+    ASSERT_TRUE(clink::itest::await([&] { return lead.log_contains("replanned job_id=1"); },
+                                    std::chrono::seconds(60)))
+        << "the rescale never replanned";
+    EXPECT_TRUE(lead.log_contains("the job runs under HA"))
+        << "under HA the rescale replans rather than cutting over in place";
+    const auto through = replan_restore_point(lead);
+    ASSERT_TRUE(through.has_value()) << "no restore point on the replan line";
+    ASSERT_TRUE(clink::itest::await([&] { return newest_completed(c) > *through; },
+                                    std::chrono::seconds(30)))
+        << "no checkpoint completed at the new layout";
+    const auto recorded = manifest_view(c, "counter");
+    EXPECT_EQ(recorded.parallelism, std::optional<std::uint32_t>{kMaxParallelism})
+        << "the manifest does not record the rescaled graph";
+    EXPECT_TRUE(recorded.has_prior) << "the manifest does not record the graph before the rescale";
+
+    ASSERT_TRUE(c.kill_leader_and_await_failover().has_value())
+        << "no standby took over after the leader was killed";
+    expect_exactly_once_to_the_end(c, "takeover after a checkpoint at the new layout");
+    const auto now = c.current_leader_index();
+    ASSERT_TRUE(now.has_value());
+    EXPECT_TRUE(c.ha_coordinator(*now).log_contains("recovered job_id=1"));
+    EXPECT_FALSE(c.ha_coordinator(*now).log_contains("written before its rescale"))
+        << "the newest checkpoint was at the new layout, yet the takeover planned the graph "
+           "before the rescale";
+    EXPECT_EQ(manifest_view(c, "counter").parallelism,
+              std::optional<std::uint32_t>{kMaxParallelism})
+        << "the takeover did not keep the rescale";
+    sub->kill_and_reap();
+}
+
+TEST_F(RescaleUnderHaTest, ATakeoverBeforeAnyCheckpointAtTheNewLayoutRecoversTheJobAsItWas) {
+    Cluster c(ha_spec());
+    ScopedDiagnostics diag(c);
+    // The leader exits the moment the replan has written the manifest, before
+    // the new layout has deployed, let alone checkpointed; the standby is
+    // clean.
+    ASSERT_TRUE(c.start_ha_coordinators(1, {.fault = "rescale.after_manifest=exit:1"}));
+    ASSERT_TRUE(c.start_ha_standby());
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.start_ha_worker(1));
+    std::unique_ptr<Process> sub;
+    bring_up_and_rescale(c, sub);
+    if (HasFatalFailure()) {
+        return;
+    }
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            const auto now = c.current_leader_index();
+            return now.has_value() && *now == 1;
+        },
+        std::chrono::seconds(60)))
+        << "the standby never took over from the leader the fault stopped: "
+        << c.describe_coordinator_exits();
+    EXPECT_TRUE(c.ha_coordinator(0).log_contains("replanned job_id=1"))
+        << "the leader stopped before the replan, so the case did not reach its window";
+    expect_exactly_once_to_the_end(c, "takeover before a checkpoint at the new layout");
+    EXPECT_TRUE(c.ha_coordinator(1).log_contains("written before its rescale"))
+        << "the takeover did not plan the graph that wrote the checkpoint it restored";
+    EXPECT_EQ(manifest_view(c, "counter").parallelism, std::optional<std::uint32_t>{1})
+        << "the recovered job does not run as it did before the rescale";
+    sub->kill_and_reap();
+}
+
+// A second rescale before a checkpoint at the first one's layout is the job's
+// restore point would restore that pre-rescale checkpoint through the first
+// rescale's layout, which did not write it. It is refused until one is.
+TEST_F(RescaleUnderHaTest, ASecondRescaleWaitsForACheckpointAtTheFirstOnesLayout) {
+    Cluster c(ha_spec());
+    ScopedDiagnostics diag(c);
+    // Slow enough that the second request lands before a checkpoint at the
+    // new layout completes.
+    ASSERT_TRUE(c.start_ha_coordinators(1, {.fault = "rescale.after_manifest=delay:3000"}));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.start_ha_worker(1));
+    std::unique_ptr<Process> sub;
+    bring_up_and_rescale(c, sub);
+    if (HasFatalFailure()) {
+        return;
+    }
+    auto& lead = c.ha_coordinator(0);
+    ASSERT_TRUE(clink::itest::await([&] { return lead.log_contains("replanned job_id=1"); },
+                                    std::chrono::seconds(60)));
+    std::string out;
+    const int rc = rescale_operator(c, "counter", 2, &out);
+    EXPECT_NE(rc, 0) << "a second rescale inside the first one's window was accepted: " << out;
+    EXPECT_NE(out.find("taken before its last rescale"), std::string::npos) << out;
+    expect_exactly_once_to_the_end(c, "a second rescale refused inside the first one's window");
+    sub->kill_and_reap();
 }

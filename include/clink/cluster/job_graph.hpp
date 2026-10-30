@@ -145,6 +145,21 @@ struct OperatorSpec {
     return op.params.find(std::string{kForcedSingletonParam}) != op.params.end();
 }
 
+// Param that keeps an operator alone in its chain: nothing is chained into it,
+// and it is chained into nothing. A rescale changes one operator's parallelism,
+// so an operator chained with a neighbour at the same parallelism splits from
+// it on a rescale up and fuses with it again on a rescale back down. The replan
+// restores each new task from one old operator's block, the chain head's, so a
+// neighbour that changes chains is restored from a block it never wrote: a
+// stateless one is refused for want of a snapshot, a two-phase sink loses the
+// transactions it held. SQL's declare_rescale_bounds sets it on every
+// operator it declares rescalable.
+inline constexpr std::string_view kChainAloneParam = "chain_alone";
+
+[[nodiscard]] inline bool is_chain_alone(const OperatorSpec& op) {
+    return op.params.find(std::string{kChainAloneParam}) != op.params.end();
+}
+
 // A SQL-declared scalar function the job's expressions call, shipped with
 // the spec so every Worker can register it at deploy time (the module
 // path in `definitions` is only readable where the CREATE FUNCTION ran).

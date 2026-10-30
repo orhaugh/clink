@@ -1486,6 +1486,15 @@ private:
         };
         std::unordered_map<std::string, StaleBlock> stale_layout_blocks;
         std::uint64_t stale_layout_through{0};
+        // The restore point of the job's last rescale: every checkpoint up to
+        // it was written under the layout before that rescale. Unlike
+        // stale_layout_through it is never cleared, because a tracked job
+        // restores from its newest CONFIRMED checkpoint, which can still be at
+        // or below it after a checkpoint above it has completed. A rescale is
+        // refused while the job's restore point is at or below it: restoring
+        // through the layout of the rescale before would read directories that
+        // layout did not write, and the HA manifest records one prior graph.
+        std::uint64_t last_rescale_through{0};
         // Which operator each deployed task hosts, keyed like task_records
         // ("role:subtask_idx"). Populated at every deploy from the plan. The
         // type lives in rescale_dispatch.hpp with the translation helpers
@@ -2190,8 +2199,11 @@ private:
     //
     // Throws on an unparseable graph, an operator the graph does not contain,
     // or a plan the registries reject - the caller turns that into a failed
-    // rescale rather than a half-deployed job.
-    [[nodiscard]] JobPlan replan_at_new_parallelism_(const JobState& job) const;
+    // rescale rather than a half-deployed job. `graph_out`, when given, receives
+    // the graph the plan was made from: the retained graph at the new
+    // parallelism.
+    [[nodiscard]] JobPlan replan_at_new_parallelism_(const JobState& job,
+                                                     JobGraphSpec* graph_out = nullptr) const;
 
     // Coordinator-driven adaptive rescale dispatch.
     //

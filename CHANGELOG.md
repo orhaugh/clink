@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**A rescaled job survives a Coordinator failover.** A takeover plans the graph
+the job's HA manifest records, and the manifest kept the graph as submitted,
+so after a rescale the takeover planned the old parallelism against
+checkpoints at the new one, the restore-layout check refused the job, and it
+stopped until resubmitted. Under HA a rescale now replans rather than cutting
+over in place, whose appended layout no plan produces, and the replan records
+the rescaled graph in the manifest with the graph before it and the checkpoint
+up to which that one wrote; a takeover plans whichever wrote the checkpoint it
+restores. A second rescale is refused until a checkpoint at the first one's
+layout is the job's restore point. `RescaleUnderHaTest` kills the leader on
+each side of the first checkpoint at the new layout.
+
+**A replan rescale keeps the job's records current.** It did not write the new
+parallelism into the job's retained graph, so a second rescale of another
+operator put the first back to its submitted parallelism. It also kept the
+commit-confirmed sinks' tracked tasks at their old keys, though the replan
+moves them, so after a rescale no commit of a job with a Kafka transactional
+sink was confirmed again. Both now follow the new plan.
+
 **A Pulsar source can replay a restart in topic order.** The source kept no
 position of its own: a restart was replayed by broker redelivery of what was
 not acknowledged, which the broker can hand a restarted consumer after newer

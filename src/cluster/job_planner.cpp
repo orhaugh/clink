@@ -976,6 +976,11 @@ JobPlan plan_job(const JobGraphSpec& graph,
         if (!is_operator_kind(*consumer)) {
             continue;
         }
+        // An operator a rescale may resize is alone in its chain (see
+        // kChainAloneParam): neither extended past nor absorbed.
+        if (is_chain_alone(op) || is_chain_alone(*consumer)) {
+            continue;
+        }
         if (consumer->inputs.size() != 1) {
             continue;
         }

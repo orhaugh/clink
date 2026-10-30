@@ -484,7 +484,9 @@ void persist_job_manifest_(const std::string& ha_dir,
                            const std::vector<PluginBinary>& plugins,
                            const CheckpointConfig& checkpoint,
                            std::uint64_t writer_epoch,
-                           bool requires_commit_confirmation) {
+                           bool requires_commit_confirmation,
+                           const std::string& prior_graph_json = {},
+                           std::uint64_t prior_graph_through = 0) {
     if (ha_dir.empty())
         return;
     const auto store = make_coordination_store(ha_dir);
@@ -523,6 +525,14 @@ void persist_job_manifest_(const std::string& ha_dir,
     // the epochs after the restore: the ones an incident across it needs.
     manifest += ",\"capture_dir\":" + q(checkpoint.capture_dir);
     manifest += ",\"capture_records\":" + std::to_string(checkpoint.capture_records);
+    // A rescaled job: the graph before the rescale, which wrote every
+    // checkpoint up to prior_graph_through. A takeover that restores one of
+    // those plans this graph, since only it lays the checkpoint's directories
+    // out as they were written. Absent when the job has not been rescaled.
+    if (!prior_graph_json.empty()) {
+        manifest += ",\"prior_graph_json\":" + q(prior_graph_json);
+        manifest += ",\"prior_graph_through\":" + std::to_string(prior_graph_through);
+    }
     manifest += ",\"plugins\":[";
     for (std::size_t i = 0; i < plugins.size(); ++i) {
         if (i > 0)
@@ -1063,8 +1073,28 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                                                       : 0;
         std::string recovery_outcome = "recovered";
         bool recovery_ok = true;
+        // A job rescaled under HA: the manifest also names the graph before the
+        // rescale and the checkpoint up to which that graph wrote the job's
+        // checkpoints (persisted at the replan). A takeover that restores one of
+        // those plans that graph, whose layout is the one their directories were
+        // written under; the rescale is lost with the leader, and the job runs
+        // as it did before it.
+        std::string planned_graph_json = graph_json;
+        if (auto prior = read_string_field(body, "prior_graph_json"); !prior.empty()) {
+            const auto through = read_uint_field(body, "prior_graph_through");
+            if (own_restore_point <= through) {
+                log::info("coordinator.ha",
+                          "job_id=" + std::to_string(job_id) + " restores checkpoint " +
+                              std::to_string(own_restore_point) +
+                              ", written before its rescale (the graph after it wrote from "
+                              "checkpoint " +
+                              std::to_string(through + 1) +
+                              "); recovering it with the graph before the rescale");
+                planned_graph_json = std::move(prior);
+            }
+        }
         try {
-            const auto graph = JobGraphSpec::from_json(graph_json);
+            const auto graph = JobGraphSpec::from_json(planned_graph_json);
             // Use submit_job (creates a fresh JobState). Keep the
             // job_id alignment: advance next_job_id_ past this one so
             // the submit reuses it.
@@ -3591,6 +3621,20 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
                 "no checkpoint has completed yet for this job; the rescale would have no "
                 "state to restore from. Retry once one has landed");
         }
+        // The restore point a restart would use (restart_job_locked_): a tracked
+        // job's newest confirmed checkpoint, otherwise its newest completed one.
+        // While it was written before the last rescale, a second rescale would
+        // restore it through the first rescale's layout, which did not write it.
+        if (const auto restore_point = job.confirm_task_keys.empty()
+                                           ? job.latest_completed_checkpoint_id
+                                           : job.latest_confirmed_checkpoint_id;
+            job.last_rescale_through != 0 && restore_point <= job.last_rescale_through) {
+            return refuse("this job's restore point is still checkpoint " +
+                          std::to_string(restore_point) +
+                          ", taken before its last rescale; a rescale is accepted once a "
+                          "checkpoint at the current layout is the restore point. Retry after "
+                          "the next checkpoint");
+        }
         // Capacity for the growth. Scale-down always fits. The deployed tasks
         // still hold their slots now and free them during the drain, so only
         // the net increase has to be available.
@@ -3821,6 +3865,17 @@ bool Coordinator::try_begin_hot_cutover_locked_(JobState& job,
                                                 std::string& reason) {
     if (!cfg_.hot_rescale_enabled) {
         reason = "hot rescale disabled by configuration";
+        return false;
+    }
+    // A takeover plans the graph the HA manifest records, and the planner lays
+    // every operator out in one contiguous block, in graph order. A hot cutover
+    // appends the new subtasks past the deployed allocation instead, a layout
+    // no plan of the graph produces, so a takeover after it could not restore
+    // the job's checkpoints. Under HA the rescale replans.
+    if (!ha_dir_.empty()) {
+        reason =
+            "the job runs under HA, whose takeover plans the manifest's graph, and a hot "
+            "cutover's appended layout is not one any plan of it produces";
         return false;
     }
     if (job.hot_cutover.has_value()) {
@@ -4489,6 +4544,7 @@ void Coordinator::hot_cutover_complete_locked_(JobState& job,
     job.stale_layout_blocks[hot.op_id] =
         JobState::StaleBlock{.base = hot.old_block_base, .parallelism = hot.old_parallelism};
     job.stale_layout_through = hot.cutover_checkpoint;
+    job.last_rescale_through = hot.cutover_checkpoint;
 
     log::info("coordinator.rescale",
               "hot cutover complete job_id=" + std::to_string(job.id) + " op_id=" + hot.op_id +
@@ -7621,7 +7677,8 @@ void Coordinator::retire_previous_session_subtasks_(const std::string& worker_id
     }
 }
 
-JobPlan Coordinator::replan_at_new_parallelism_(const JobState& job) const {
+JobPlan Coordinator::replan_at_new_parallelism_(const JobState& job,
+                                                JobGraphSpec* graph_out) const {
     if (job.graph_json.empty()) {
         throw std::runtime_error(
             "rescale: this job has no retained graph, so it cannot be replanned");
@@ -7645,6 +7702,9 @@ JobPlan Coordinator::replan_at_new_parallelism_(const JobState& job) const {
             it->min_parallelism = std::min(it->min_parallelism, new_p);
             it->max_parallelism = std::max(it->max_parallelism, new_p);
         }
+    }
+    if (graph_out != nullptr) {
+        *graph_out = graph;
     }
     // Plan with the job's OWN registries when it has a bundle: a plugin job's
     // operator types live in the bundle's view, not the default instance, and
@@ -7716,10 +7776,11 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     const bool is_replan_rescale = !job.pending_op_parallelism.empty();
     std::unordered_map<std::string, JobState::TaskOpIdentity> new_op_identity;
     std::unordered_map<std::string, std::uint32_t> new_op_parallelism;
+    JobGraphSpec replanned_graph;
     if (is_replan_rescale) {
         JobPlan new_plan;
         try {
-            new_plan = replan_at_new_parallelism_(job);
+            new_plan = replan_at_new_parallelism_(job, &replanned_graph);
         } catch (const std::exception& e) {
             // The job has already drained by the time this runs, so there is
             // nothing to fall back to: report the failure rather than leave it
@@ -7758,6 +7819,18 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
                 new_op_identity[key] = JobState::TaskOpIdentity{
                     .op_id = t.op_id, .subtask_idx_in_op = t.subtask_idx_in_op};
                 ++new_op_parallelism[t.op_id];
+            }
+        }
+        // The tracked tasks are where the commit-confirmed sinks run, and the
+        // replan moves them: every operator after the rescaled one shifts its
+        // block. Left at the submitted plan's keys, every checkpoint after a
+        // rescale waited for confirmations from tasks that no longer existed,
+        // and no commit was confirmed again, so the job's restore point stayed
+        // where the rescale left it.
+        job.confirm_task_keys.clear();
+        for (const auto& t : new_plan.tasks) {
+            if (t.needs_commit_confirmation) {
+                job.confirm_task_keys.insert(t.role + ":" + std::to_string(t.subtask_idx));
             }
         }
     }
@@ -8368,8 +8441,47 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
             }
         }
         job.stale_layout_through = job.latest_completed_checkpoint_id;
+        job.last_rescale_through = job.stale_layout_through;
         job.pending_op_parallelism.clear();
         job.pre_rescale_op_parallelism.clear();
+        // The retained graph is what a later replan and a takeover plan from, so
+        // the new parallelism lives there, as the hot cutover writes it. Without
+        // this a second rescale replanned the first operator at its submitted
+        // parallelism.
+        //
+        // Under HA the manifest records it too, with the graph before it, which
+        // wrote every checkpoint up to the restore point: a takeover before a
+        // checkpoint at the new layout completes restores one of those and has
+        // to plan the graph that laid its directories out. Written here, under
+        // the lock and before any frame of the new layout leaves, as the
+        // RESTORED record is; a write that fails leaves the manifest at the
+        // graph before, and a takeover after a checkpoint at the new layout then
+        // refuses the job rather than restore it into the wrong operators.
+        const std::string prior_graph_json = job.graph_json;
+        job.graph_json = replanned_graph.to_json();
+        if (!ha_dir_.empty()) {
+            auto manifest_checkpoint = job.checkpoint;
+            manifest_checkpoint.run_checkpoint_floor = job.run_checkpoint_floor;
+            try {
+                persist_job_manifest_(ha_dir_,
+                                      job.id,
+                                      job.graph_json,
+                                      job.plugins,
+                                      manifest_checkpoint,
+                                      epoch(),
+                                      !job.confirm_task_keys.empty(),
+                                      prior_graph_json,
+                                      job.last_rescale_through);
+            } catch (const std::exception& e) {
+                log::error("coordinator.rescale",
+                           "job_id=" + std::to_string(job.id) +
+                               " could not record the rescaled graph in the HA manifest (" +
+                               e.what() +
+                               "); a takeover after a checkpoint at the new layout will refuse "
+                               "to recover the job until it is resubmitted");
+            }
+            CLINK_FAULT_POINT(clink::fault::points::kRescaleAfterManifest);
+        }
     }
 
     // 7. Build Deploy frames + claim slots; return for caller to send.
