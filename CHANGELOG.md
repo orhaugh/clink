@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A compiled job submitted without waiting reports success.** `clink run
+--job` exited 8, the code for a wait that ran out, whenever the job had not
+completed. With `--wait-timeout-s=0` it does not wait at all, so every such
+submit exited 8, even with the job accepted and running, and a script could
+tell the outcome only from the reply. It now exits 0 once the coordinator
+accepts the job, and still 8 when the coordinator refuses it. A submit that
+waits is judged as before.
+`JobPluginE2E.ASubmitThatDoesNotWaitSucceedsOnceTheJobIsAccepted` submits a
+streaming job with no Worker registered, which is refused, and again with two,
+which is accepted and keeps running.
+
 **A job module can register its own operators before its first fluent call.**
 A module links its own copy of clink, and its registries held no built-in
 channel types until a fluent call such as `source<T>` registered them. A

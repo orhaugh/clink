@@ -314,6 +314,8 @@ A client does not run `clink_node`. It links `clink::application::JobSubmitter` 
 5. if `wait_for_completion`, waits for `JobCompleted` (bounded by `wait_timeout`, default 60 s),
 6. closes the connection and returns a `SubmitResult`.
 
+`clink run --job=<path.so>` is this client. It waits `--wait-timeout-s` (default 30 s) for the job to complete, and exits 8 when the coordinator refuses the job or the wait runs out, and 9 when the job completes with errors. A streaming job never completes: `--wait-timeout-s=0` skips the wait, and the command exits 0 once the coordinator has accepted the job, with the job id in its reply.
+
 If the client connection drops while the job is still running, the coordinator clears the job's `notify_client_conn` pointer and the job continues; only the ability to push `JobCompleted` back is lost. `list_jobs()` uses the same `HelloClient`-then-request pattern and returns both running and recently-completed jobs (`completion_signalled` distinguishes them).
 
 On the coordinator side, `handle_submit_` decodes the message, allocates a per-job `JobBundle`, writes each plugin to the coordinator's local cache and `dlopen`s it into the bundle (so the planner can see plugin-defined op types), optionally rejects on a state schema-evolution incompatibility, then calls `submit_job(...)` which plans the graph and dispatches `Deploy` messages. Job planning and slot assignment are covered in [./jobs-and-scheduling.md](./jobs-and-scheduling.md).

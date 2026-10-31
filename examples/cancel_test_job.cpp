@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <thread>
 
 #include "clink/api/builtin_connectors.hpp"
@@ -57,6 +58,15 @@ std::chrono::milliseconds tick_from_env() {
     return std::chrono::milliseconds{20};
 }
 
+// Where the sink writes. A test that runs beside the ones watching the default
+// path names its own, so its job's output cannot stand in for theirs.
+std::string sink_path_from_env() {
+    if (const char* p = std::getenv("CLINK_CANCEL_SINK_PATH"); p != nullptr && *p != '\0') {
+        return p;
+    }
+    return "/tmp/clink_cancel_test_sink";
+}
+
 void define_job(clink::api::Pipeline& pipeline) {
     const auto tick = tick_from_env();
 
@@ -80,7 +90,7 @@ void define_job(clink::api::Pipeline& pipeline) {
 
     pipeline.source<std::int64_t>(src)
         .map<std::int64_t>([](const std::int64_t& v) { return v + 1; })
-        .sink(clink::api::FileInt64Sink::builder().path("/tmp/clink_cancel_test_sink").build());
+        .sink(clink::api::FileInt64Sink::builder().path(sink_path_from_env()).build());
 }
 
 }  // namespace cancel_test

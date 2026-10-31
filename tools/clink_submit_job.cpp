@@ -70,6 +70,10 @@ void usage() {
         << "EMBEDDED in this process (no cluster), or submits it to a coordinator when\n"
         << "--coordinator-host/--coordinator-port are given.\n"
         << "\n"
+        << "--wait-timeout-s=N waits up to N seconds (default 30) for the job to complete\n"
+        << "and exits non-zero if it does not. A streaming job never completes: submit it\n"
+        << "with --wait-timeout-s=0, which exits 0 once the coordinator accepts the job.\n"
+        << "\n"
         << "State backend selection:\n"
         << "  --state-backend=memory           in-memory keyed state (default; no persistence)\n"
         << "  --state-backend=file[:<path>]    file-backed (default path: /var/lib/clink/state)\n"
@@ -245,6 +249,12 @@ int clink_cmd_run(int argc, char** argv) {
     // moot, but keep the bookkeeping tidy.
     ::dlclose(handle);
 
+    // A submission that was told not to wait (--wait-timeout-s=0) has done its
+    // job once the coordinator accepts it: a streaming job never completes, so
+    // judging it by completion failed every such submit that succeeded.
+    if (opts.wait_timeout.count() <= 0) {
+        return result.ok ? 0 : 8;
+    }
     if (!result.completed) {
         return 8;
     }

@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <signal.h>
 #include <spawn.h>
 #include <string>
@@ -34,6 +35,7 @@
 #include <gtest/gtest.h>
 #include <sys/wait.h>
 
+#include "clink/application/job_submitter.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
@@ -66,6 +68,14 @@ std::filesystem::path submit_binary_path() {
 std::filesystem::path canonical_job_path() {
 #ifdef CLINK_CANONICAL_JOB_PATH
     return std::filesystem::path{CLINK_CANONICAL_JOB_PATH};
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path cancel_test_job_path() {
+#ifdef CLINK_CANCEL_TEST_JOB_PATH
+    return std::filesystem::path{CLINK_CANCEL_TEST_JOB_PATH};
 #else
     return {};
 #endif
@@ -246,4 +256,128 @@ TEST(JobPluginE2E, CanonicalPipelineRunsAcrossSeparateProcesses) {
     std::sort(values.begin(), values.end());
     EXPECT_EQ(values, (std::vector<std::int64_t>{40, 80}));
     std::filesystem::remove(out_path);
+}
+
+// A submit told not to wait (--wait-timeout-s=0) succeeds once the coordinator
+// accepts the job. It exited 8, the code for a wait that expired, whenever the
+// job had not completed, and a streaming job never does, so every such submit
+// of one reported a failure. A refused submit still exits non-zero.
+// cancel_test_job runs until it is cancelled.
+TEST(JobPluginE2E, ASubmitThatDoesNotWaitSucceedsOnceTheJobIsAccepted) {
+    const auto node = node_binary_path();
+    if (!std::filesystem::exists(node)) {
+        GTEST_SKIP() << "clink_node not built";
+    }
+    const auto submit = submit_binary_path();
+    if (!std::filesystem::exists(submit)) {
+        GTEST_SKIP() << "clink_submit_job not built";
+    }
+    const auto job_so = cancel_test_job_path();
+    if (!std::filesystem::exists(job_so)) {
+        GTEST_SKIP() << "cancel_test_job.so not built";
+    }
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto tag = std::to_string(::getpid());
+    // The job's own sink path: the cancel and HTTP tests watch the default one.
+    // Unset when the test ends, so a test after it in this process gets that
+    // default again.
+    const auto sink_path = tmp / ("clink_jpe2e_nowait_sink_" + tag);
+    std::filesystem::remove(sink_path);
+    ::setenv("CLINK_CANCEL_SINK_PATH", sink_path.c_str(), 1);
+    struct SinkPathOff {
+        ~SinkPathOff() { ::unsetenv("CLINK_CANCEL_SINK_PATH"); }
+    } sink_path_off;
+    ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
+
+    const auto coordinator_port = probe_free_port();
+    const auto coordinator_log = tmp / ("clink_jpe2e_nowait_coordinator_" + tag + ".log");
+    std::filesystem::remove(coordinator_log);
+    const pid_t coordinator_pid = clink::itest::spawn_logged(
+        {"clink_node", "--role=coordinator", "--port=" + std::to_string(coordinator_port)},
+        node,
+        coordinator_log);
+    ASSERT_GT(coordinator_pid, 0);
+    ASSERT_TRUE(clink::itest::await_port_accepting(coordinator_port))
+        << "the coordinator never accepted on its control port";
+
+    // Runs the submitter without a wait and returns what it printed.
+    const auto submit_without_waiting = [&](const std::string& what, int& exit_code) {
+        const auto out = tmp / ("clink_jpe2e_nowait_" + what + "_" + tag + ".out");
+        std::filesystem::remove(out);
+        const pid_t pid = spawn_proc({"clink_submit_job",
+                                      "--job=" + job_so.string(),
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port),
+                                      "--wait-timeout-s=0",
+                                      "--name=nowait-" + what},
+                                     submit,
+                                     out);
+        if (pid <= 0 || !wait_for(pid, 30s, exit_code)) {
+            kill_quietly(pid);
+            exit_code = -1;
+        }
+        std::ifstream in(out);
+        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::filesystem::remove(out);
+        return body;
+    };
+
+    // No Worker has registered yet, so there are no slots and the coordinator
+    // refuses the job outright.
+    int refused_exit = -1;
+    const auto refused = submit_without_waiting("refused", refused_exit);
+
+    std::vector<pid_t> workers;
+    for (int i = 1; i <= 2; ++i) {
+        workers.push_back(spawn_proc({"clink_node",
+                                      "--role=worker",
+                                      "--id=worker-jpe2e-nowait-" + std::to_string(i),
+                                      "--coordinator-host=127.0.0.1",
+                                      "--coordinator-port=" + std::to_string(coordinator_port)},
+                                     node));
+        ASSERT_GT(workers.back(), 0);
+    }
+    const bool registered = clink::itest::await_log_matches(coordinator_log, " slots=", 2);
+
+    int accepted_exit = -1;
+    const auto accepted = registered ? submit_without_waiting("accepted", accepted_exit) : "";
+    std::uint64_t job_id = 0;
+    if (const auto pos = accepted.find("\"job_id\":"); pos != std::string::npos) {
+        job_id = std::strtoull(accepted.c_str() + pos + 9, nullptr, 10);
+    }
+
+    // The job outlives its submitter: it runs, its sink opening its file, and
+    // the coordinator still holds it as not completed.
+    const auto sink_opened = [&] {
+        std::error_code ec;
+        return std::filesystem::exists(sink_path, ec);
+    };
+    const bool running = job_id != 0 && clink::itest::await_condition(sink_opened);
+    clink::application::JobSubmitter client("127.0.0.1", coordinator_port);
+    std::optional<clink::application::JobListing> listed;
+    for (const auto& j : client.list_jobs().jobs) {
+        if (j.job_id == job_id) {
+            listed = j;
+        }
+    }
+
+    kill_quietly(coordinator_pid);
+    for (auto pid : workers) {
+        kill_quietly(pid);
+    }
+    std::filesystem::remove(coordinator_log);
+    std::filesystem::remove(sink_path);
+
+    EXPECT_NE(refused_exit, 0) << "a refused submit exited 0: " << refused;
+    EXPECT_NE(refused.find("\"ok\":false"), std::string::npos) << refused;
+
+    ASSERT_TRUE(registered) << "not both Workers registered with the coordinator";
+    EXPECT_EQ(accepted_exit, 0) << "an accepted submit that did not wait exited " << accepted_exit
+                                << ": " << accepted;
+    EXPECT_NE(accepted.find("\"ok\":true"), std::string::npos) << accepted;
+    EXPECT_NE(accepted.find("\"completed\":false"), std::string::npos) << accepted;
+    ASSERT_GT(job_id, 0U) << "the submit printed no job id: " << accepted;
+    EXPECT_TRUE(running) << "the accepted job never opened its sink";
+    ASSERT_TRUE(listed.has_value()) << "the coordinator does not list job " << job_id;
+    EXPECT_FALSE(listed->completion_signalled) << "the streaming job ended";
 }
