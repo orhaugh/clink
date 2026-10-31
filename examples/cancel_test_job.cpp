@@ -17,7 +17,6 @@
 
 #include "clink/api/builtin_connectors.hpp"
 #include "clink/api/pipeline.hpp"
-#include "clink/cluster/built_in_factories.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
@@ -61,14 +60,11 @@ std::chrono::milliseconds tick_from_env() {
 void define_job(clink::api::Pipeline& pipeline) {
     const auto tick = tick_from_env();
 
-    // Manually-registered sources via pipeline.registry().register_source<T>
-    // need the built-in channel types in TypeRegistry first - the
-    // template body looks up channel_for_typeid(typeid(T).name()),
-    // which is empty until ensure_built_ins_registered has populated
-    // "int64" and "string". The fluent shortcuts (from_elements, map,
-    // etc.) call this internally; manual registration paths must too.
-    clink::cluster::ensure_built_ins_registered();
-
+    // Registered on the built-in int64 channel type ahead of any fluent call,
+    // and without registering the built-ins first: CLINK_REGISTER_JOB does
+    // that before define_job runs. This job is the check that it does
+    // (PluginLoader.AJobModuleRegistersOnTheBuiltInTypesAheadOfItsFluentCalls).
+    //
     // Register the slow source factory in this job's bundle. The .so
     // dlopened on the coordinator and each worker re-runs this build_fn and
     // re-registers - the per-job-bundle scoping keeps the

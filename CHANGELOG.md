@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**A job module can register its own operators before its first fluent call.**
+A module links its own copy of clink, and its registries held no built-in
+channel types until a fluent call such as `source<T>` registered them. A
+`build_fn` that registered an operator, a source or a key extractor on `int64`
+or `string` through `pipeline.registry()` before that call failed with "T not
+registered", so the job could not be submitted, and every module that did this
+had to call `ensure_built_ins_registered()` first itself.
+`CLINK_REGISTER_JOB` now registers the built-in types before `build_fn` runs.
+`PluginLoader.AJobModuleRegistersOnTheBuiltInTypesAheadOfItsFluentCalls`
+loads a job that registers its source that way, both as the submitter does and
+into a job's bundle.
+
 **An idle MQTT sink keeps its connection.** A broker drops a client it has
 heard nothing from for one and a half keepalives, and libmosquitto sends the
 keepalive's ping from its network loop, which the sink ran only to flush a

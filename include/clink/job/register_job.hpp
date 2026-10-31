@@ -75,6 +75,7 @@
 #include <string>
 
 #include "clink/api/pipeline.hpp"
+#include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/state/schema_version.hpp"
@@ -104,10 +105,19 @@ struct JobBuilderState {
 // Implementation detail: runs build_fn under call_once, captures the
 // graph JSON or the error message. Called by both the plugin-register
 // entry point and clink_job_build so they share the gate.
+//
+// The build writes to this module's own registries: the module links its own
+// copy of clink, so the host's built-in channel types are not in them. They
+// are registered here before build_fn runs, so build_fn can register its own
+// operators, sources and key extractors on int64 and string through
+// pipeline.registry() before its first fluent call. Otherwise only a fluent
+// call registers them, and a registration ahead of the first one throws "T
+// not registered".
 template <typename BuildFn>
 inline void ensure_built(JobBuilderState& state, BuildFn&& build_fn) {
     std::call_once(state.flag, [&state, build_fn = std::forward<BuildFn>(build_fn)]() mutable {
         try {
+            ::clink::cluster::ensure_built_ins_registered();
             auto env = ::clink::api::Pipeline::create();
             build_fn(env);
             state.graph_json = env.graph().to_json();
@@ -152,6 +162,10 @@ inline std::string register_into(::clink::plugin::PluginRegistry& registry, Buil
 //            .sink(FileInt64Sink::builder().path("/tmp/out").build());
 //     }
 //     CLINK_REGISTER_JOB("my-job", "1.0", "demo", define_job);
+//
+// The built-in channel types (int64, string) are registered before build_fn
+// runs, so it may register its own operators on them through env.registry()
+// without registering the built-ins itself.
 //
 #define CLINK_REGISTER_JOB(job_name, job_version, job_description, build_fn)                     \
     CLINK_DECLARE_PLUGIN(job_name, job_version, job_description);                                \

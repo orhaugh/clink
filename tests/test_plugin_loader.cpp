@@ -38,6 +38,14 @@ std::filesystem::path schema_evo_job_path() {
 #endif
 }
 
+std::filesystem::path cancel_test_job_path() {
+#ifdef CLINK_CANCEL_TEST_JOB_PATH
+    return std::filesystem::path{CLINK_CANCEL_TEST_JOB_PATH};
+#else
+    return {};
+#endif
+}
+
 std::filesystem::path mismatched_fingerprint_plugin_path() {
 #ifdef CLINK_MISMATCHED_FINGERPRINT_PLUGIN_PATH
     return std::filesystem::path{CLINK_MISMATCHED_FINGERPRINT_PLUGIN_PATH};
@@ -377,6 +385,51 @@ TEST(PluginLoader, JobPluginReregistersInlineFactoriesIntoEveryBundle) {
     bundle_b.retain_plugin(std::move(b.plugin));
     EXPECT_NE(bundle_b.runner_registry().find_source(source.type, source.out_channel), nullptr)
         << "CLINK_REGISTER_JOB must rebuild inline factories into each isolated bundle";
+}
+
+// A job's build_fn may register its own operators on clink's built-in channel
+// types ahead of its fluent calls, without registering the built-ins itself:
+// CLINK_REGISTER_JOB registers them in the module before build_fn runs, and
+// the module links its own copy of clink, so nothing the host registered can
+// stand in. cancel_test_job registers its source that way. Without the macro's
+// registration its build threw "T not registered", so the job could be neither
+// loaded here nor submitted by `clink run --job`.
+TEST(PluginLoader, AJobModuleRegistersOnTheBuiltInTypesAheadOfItsFluentCalls) {
+    const auto path = cancel_test_job_path();
+    if (!std::filesystem::exists(path)) {
+        GTEST_SKIP() << "cancel_test_job not built";
+    }
+    auto& loader = clink::cluster::PluginLoader::default_instance();
+    clink::cluster::JobBundle bundle;
+    auto preg = bundle.as_plugin_registry();
+    auto loaded = loader.load_into(path.string(), preg);
+    ASSERT_TRUE(loaded.ok) << loaded.error;
+    void* handle = loaded.plugin.dl_handle;
+    bundle.retain_plugin(std::move(loaded.plugin));
+
+    // The submitter's call: no host registry, the module's own registries only.
+    using RegisterFn = int (*)(void*, char*, std::size_t);
+    RegisterFn plugin_register = nullptr;
+    void* register_symbol = ::dlsym(handle, "clink_plugin_register");
+    ASSERT_NE(register_symbol, nullptr);
+    std::memcpy(&plugin_register, &register_symbol, sizeof(plugin_register));
+    char err[1024]{};
+    ASSERT_EQ(plugin_register(nullptr, err, sizeof(err)), 0) << err;
+
+    using JobBuildFn = int (*)(const char**, std::size_t*);
+    JobBuildFn job_build = nullptr;
+    void* build_symbol = ::dlsym(handle, "clink_job_build");
+    ASSERT_NE(build_symbol, nullptr);
+    std::memcpy(&job_build, &build_symbol, sizeof(job_build));
+    const char* graph_data = nullptr;
+    std::size_t graph_size = 0;
+    ASSERT_EQ(job_build(&graph_data, &graph_size), 0);
+    const auto graph = clink::cluster::JobGraphSpec::from_json({graph_data, graph_size});
+    ASSERT_FALSE(graph.ops.empty());
+    const auto& source = graph.ops.front();
+    EXPECT_EQ(source.type, "cancel_test.slow_source");
+    EXPECT_NE(bundle.runner_registry().find_source(source.type, source.out_channel), nullptr)
+        << "the job's own source did not reach its bundle";
 }
 
 TEST(PluginLoader, MissingFileFailsCleanly) {
