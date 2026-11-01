@@ -42,6 +42,9 @@ struct WorkerSummary {
 // state lives in JobDetail.
 struct JobSummary {
     JobId id{0};
+    // The name the job was submitted with (JobGraphSpec::name), empty for an
+    // unnamed job.
+    std::string name;
     std::size_t expected_completion{0};
     std::size_t completed_count{0};
     bool completion_signalled{false};
@@ -89,6 +92,9 @@ struct SubtaskErrorRecord {
 // Heavy per-job detail returned by GET /api/v1/jobs/:id.
 struct JobDetail {
     JobId id{0};
+    // The name the job was submitted with (JobGraphSpec::name), empty for an
+    // unnamed job.
+    std::string name;
     std::size_t expected_completion{0};
     std::size_t completed_count{0};
     bool completion_signalled{false};

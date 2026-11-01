@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+**The job list and a job's page name the job.** `GET /api/v1/jobs` and
+`GET /api/v1/jobs/:id` reported a job only by its number, although the
+coordinator keeps the name each job was submitted with and its lineage events
+carry it, so a console over a cluster of many jobs could not tell them apart.
+Both now carry `name`. It adds a field to `JobSummary` and `JobDetail` in
+`snapshots.hpp`, a header on the plugin ABI surface, so the fingerprint
+rotates and job modules are rebuilt against this release.
+`HttpSubmit.PostJobsAcceptsSoAndReturnsJobId` checks the name an upload gave.
+
 ## v0.13.1 (November 2026)
 
 A fix for restoring a savepoint into the disaggregated backend, which started

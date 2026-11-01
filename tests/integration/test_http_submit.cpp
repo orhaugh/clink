@@ -333,6 +333,10 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
     const auto list = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs");
     EXPECT_EQ(list.status, 200);
     EXPECT_NE(list.body.find("\"id\":1"), std::string::npos) << "jobs list: " << list.body;
+    // The name the job was uploaded with is in the list and on its page, so a
+    // console can tell one job from another without opening each.
+    EXPECT_NE(list.body.find("\"name\":\"test-upload\""), std::string::npos)
+        << "jobs list: " << list.body;
 
     // The job detail must report the checkpoint configuration the job is RUNNING
     // with. Until this was added, a job's recovery behaviour - whether it
@@ -342,6 +346,8 @@ TEST(HttpSubmit, PostJobsAcceptsSoAndReturnsJobId) {
     // submitted it, which is the first question a recovery incident asks.
     const auto detail = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1");
     EXPECT_EQ(detail.status, 200);
+    EXPECT_NE(detail.body.find("\"name\":\"test-upload\""), std::string::npos)
+        << "job detail: " << detail.body;
     for (const auto* field : {"\"checkpoint_dir\"",
                               "\"checkpoint_interval_ms\"",
                               "\"state_backend_uri\"",

@@ -2802,6 +2802,7 @@ std::vector<JobSummary> Coordinator::snapshot_jobs() const {
     for (const auto& [id, job] : jobs_) {
         JobSummary s;
         s.id = id;
+        s.name = job->name;
         s.expected_completion = job->expected_completion;
         s.completed_count = job->completed_count;
         s.completion_signalled = job->completion_signalled;
@@ -2825,6 +2826,7 @@ std::optional<JobDetail> Coordinator::snapshot_job(JobId job_id) const {
     const auto& job = *it->second;
     JobDetail d;
     d.id = job_id;
+    d.name = job.name;
     d.expected_completion = job.expected_completion;
     d.completed_count = job.completed_count;
     d.completion_signalled = job.completion_signalled;
