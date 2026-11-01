@@ -1,6 +1,26 @@
 # Changelog
 
-## Unreleased
+## v0.13.0 (November 2026)
+
+Running jobs are safer to resize and recover. A SQL job declares the keyed
+stages it can rescale while it runs, a rescaled job survives a Coordinator
+failover, a replan keeps the job's records current, and a parallel SQL job's
+state lands in the key group its rows route to, so a restart no longer
+discards most of it. `MATCH_RECOGNIZE` keys by its partition, requires a
+quantified variable's rows to be consecutive and, ordered by event time,
+matches in that order and drops late rows. SQL reads a common table expression
+more than once, takes a subquery on either side of a join, runs an `OVER`
+aggregate over a derived table, accepts a boolean column as a condition and a
+`RANGE` offset past 32 bits, reads a Kafka table once per job, and holds each
+sink of a statement set to its own guarantee. Paths that wrote the wrong value
+are fixed: the Redis upsert sink's keys, a numeric string bound for a numeric
+column, a union's second query, and the statement after a Top-N. A Pulsar
+source can replay in topic order, an idle MQTT sink keeps its connection, the
+PostgreSQL and MySQL sinks write timestamps as timestamps, and a lookup keeps
+reading while a watermark waits. A submitted job can arm the flight recorder,
+a run of many jobs is validated against the exactly-once specification job by
+job, and a cancel reaches every subtask. The plugin ABI fingerprint rotates and
+some outputs change; see Compatibility below.
 
 **A compiled job submitted without waiting reports success.** `clink run
 --job` exited 8, the code for a wait that ran out, whenever the job had not
@@ -321,6 +341,45 @@ a table that declares none is still held to the strongest the job declares, so
 a set that leaves a weaker table undeclared is refused as before. The job is
 reported as what its weakest sink gives, and its `guarantee_reasons` name each
 sink's guarantee.
+
+**Compatibility.**
+
+- Fifteen headers on the plugin ABI surface changed, so the plugin ABI
+  fingerprint rotates: rebuild job modules against this release. A cluster
+  refuses a module built against an earlier one at submission and names the
+  headers that differ. The cluster wire protocol is unchanged, so v0.12.2 and
+  v0.13.0 nodes interoperate.
+- Checkpoints and savepoints from v0.12.2 restore, and no state format
+  changed. A parallel SQL job's state was always filed under its key; only the
+  routing moved, to match it. A `MATCH_RECOGNIZE` job restored from an earlier
+  checkpoint keeps the rows and partial matches it held under their old keys,
+  and rows that arrive after the restore take their own partition's.
+- `MATCH_RECOGNIZE` results can differ: a quantified variable's rows must be
+  consecutive, so `b{3}` is three rows in a row, and with `ORDER BY` on the
+  table's event-time column rows are matched in event-time order and a row at
+  or behind the watermark is dropped as late.
+- Some outputs change where they were wrong. A whole numeric string bound for
+  a numeric column arrives as a number, so sinks behind a text-protocol
+  source, both MySQL sources among them, write numbers where they wrote
+  strings. A `UNION ALL` whose second query names its columns differently
+  fills them by position, where it wrote NULL. The statement after a Top-N
+  statement in a set filters by its `WHERE` again.
+- The Redis upsert sink writes a key as `<key_prefix><pk>`, a string as it is
+  and a number as its digits, where it wrote the primary key's JSON encoding
+  followed by `\x1f`. This release does not overwrite keys an earlier one
+  wrote: delete or rename them.
+- The PostgreSQL and MySQL sinks write a `TIMESTAMP` column as a timestamp in
+  UTC. A column declared `TIMESTAMP` but stored in a `bigint` should be
+  declared `BIGINT` to keep receiving epoch milliseconds.
+- Under HA an operator rescale replans the job rather than cutting over in
+  place, and a second rescale is refused until a checkpoint at the first one's
+  layout is the job's restore point.
+- A job over the Pulsar, RabbitMQ or NATS source is reported
+  `AT_LEAST_ONCE_SOURCE` and may declare `at_least_once`, which was refused. A
+  statement set is reported as what its weakest sink gives, with a reason per
+  sink.
+- `clink run --job --wait-timeout-s=0` exits 0 once the coordinator accepts
+  the job, where it exited 8.
 
 ## v0.12.2 (October 2026)
 
