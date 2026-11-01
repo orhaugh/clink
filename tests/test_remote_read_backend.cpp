@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -777,4 +778,107 @@ TEST(RemoteReadBackend, PoolExportCarriesLiveStamps) {
     const auto fp = ref.restored_state_fingerprint(OperatorId{6}, "rr_pool_slot");
     ASSERT_TRUE(fp.has_value());
     EXPECT_EQ(*fp, 0x1111222233334444ULL);
+}
+
+// A snapshot that carries its own state - a savepoint authored offline, or a
+// checkpoint another backend took - is state this pool has never held. Pointing
+// cold reads at its checkpoint id read every key as absent with no error, so a
+// job restored from it on disagg-local:// started empty. The restore loads the
+// bytes instead, and the first checkpoint after it commits them, so a later
+// restore from the pool sees them too.
+TEST(RemoteReadBackend, ARestoreLoadsASnapshotThatCarriesItsOwnState) {
+    const OperatorId op{31};
+    InMemoryStateBackend written_elsewhere;
+    written_elsewhere.put(op, sv("a"), sv("1"));
+    written_elsewhere.put(op, sv("b"), sv("2"));
+    const Snapshot seeded = written_elsewhere.snapshot(CheckpointId{7});
+    ASSERT_FALSE(seeded.bytes.empty());
+
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    RemoteReadBackend b(pool);
+    b.restore(seeded);
+    ASSERT_TRUE(b.get(op, sv("a")).has_value()) << "the snapshot's state was not loaded";
+    EXPECT_EQ(to_string(*b.get(op, sv("a"))), "1");
+    EXPECT_EQ(to_string(*b.get(op, sv("b"))), "2");
+
+    b.put(op, sv("c"), sv("3"));
+    const Snapshot marker = b.snapshot(CheckpointId{8});
+    EXPECT_TRUE(marker.bytes.empty()) << "a pool-backed snapshot is a marker";
+    RemoteReadBackend later(pool);
+    later.restore(marker);
+    ASSERT_TRUE(later.get(op, sv("a")).has_value())
+        << "the first checkpoint after the restore did not commit the loaded state";
+    EXPECT_EQ(to_string(*later.get(op, sv("a"))), "1");
+    EXPECT_EQ(to_string(*later.get(op, sv("b"))), "2");
+    EXPECT_EQ(to_string(*later.get(op, sv("c"))), "3");
+}
+
+// The loaded entries are in no pool until that checkpoint, so eviction must
+// keep them: an evicted one would read back from checkpoint 0, as absent. Once
+// the checkpoint commits them they are evictable and read back from the pool.
+TEST(RemoteReadBackend, LoadedStateStaysHotUntilTheFirstCheckpointCommitsIt) {
+    const OperatorId op{32};
+    InMemoryStateBackend written_elsewhere;
+    for (int i = 0; i < 50; ++i) {
+        written_elsewhere.put(op, "key-" + std::to_string(i), "value-" + std::to_string(i));
+    }
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    RemoteReadBackend b(pool, /*io_threads=*/1, /*hot_max_bytes=*/64);
+    b.restore(written_elsewhere.snapshot(CheckpointId{3}));
+    for (int i = 0; i < 50; ++i) {
+        const auto v = b.get(op, "key-" + std::to_string(i));
+        ASSERT_TRUE(v.has_value()) << "key-" << i << " was evicted before it was durable";
+        EXPECT_EQ(to_string(*v), "value-" + std::to_string(i));
+    }
+    EXPECT_EQ(b.hot_evictions(), 0u);
+
+    b.snapshot(CheckpointId{4});
+    EXPECT_GT(b.hot_evictions(), 0u) << "the committed entries should be evictable";
+    for (int i = 0; i < 50; ++i) {
+        const auto v = b.get(op, "key-" + std::to_string(i));
+        ASSERT_TRUE(v.has_value()) << "key-" << i << " did not read back from the pool";
+        EXPECT_EQ(to_string(*v), "value-" + std::to_string(i));
+    }
+}
+
+// A rescaled subtask restoring a snapshot that carries its state keeps only its
+// own key groups, as it does restoring from the pool. The stamps the
+// shape-fingerprint gate reads come with the state.
+TEST(RemoteReadBackend, ALoadedSnapshotKeepsOnlyItsKeyGroupsAndItsStamps) {
+    const OperatorId op{33};
+    InMemoryStateBackend written_elsewhere;
+    written_elsewhere.put(op, std::string("\x01") + "mine", sv("kept"));
+    written_elsewhere.put(op, std::string("\x05") + "theirs", sv("dropped"));
+    StateVersionMap versions;
+    versions.set(op, "rr.seeded", 2, "seeded_slot");
+    written_elsewhere.set_state_versions(versions);
+    written_elsewhere.record_state_fingerprint(op, "seeded_slot", 0x5555666677778888ULL);
+
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    RemoteReadBackend b(pool);
+    b.restore(written_elsewhere.snapshot(CheckpointId{9}), KeyGroupRange{KeyGroup{0}, KeyGroup{3}});
+    ASSERT_TRUE(b.get(op, std::string("\x01") + "mine").has_value());
+    EXPECT_FALSE(b.get(op, std::string("\x05") + "theirs").has_value())
+        << "an entry outside the subtask's key groups was restored";
+    EXPECT_EQ(b.restored_state_versions().pack(), versions.pack());
+    const auto fp = b.restored_state_fingerprint(op, "seeded_slot");
+    ASSERT_TRUE(fp.has_value());
+    EXPECT_EQ(*fp, 0x5555666677778888ULL);
+}
+
+// A marker names a checkpoint and carries nothing else. If the pool does not
+// hold that checkpoint, every key would read as absent, and a job would carry
+// on as if it had never run. disagg-local:// keeps its pool in the memory of
+// the process that wrote it, so its checkpoint restored in a new process is
+// exactly this; the restore fails instead.
+TEST(RemoteReadBackend, ARestoreOfACheckpointThePoolNeverHeldIsRefused) {
+    auto pool = std::make_shared<InMemoryRemotePool>();
+    RemoteReadBackend b(pool);
+    Snapshot marker;
+    marker.checkpoint_id = CheckpointId{5};
+    EXPECT_THROW(b.restore(marker), std::runtime_error);
+
+    // Checkpoint 0 names no checkpoint: nothing to restore, nothing to refuse.
+    Snapshot none;
+    EXPECT_NO_THROW(b.restore(none));
 }

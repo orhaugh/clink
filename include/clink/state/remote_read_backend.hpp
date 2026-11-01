@@ -56,6 +56,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>  // sysconf, for the heap-fraction hot-tier default
@@ -549,13 +550,34 @@ public:
             hot_.restore(snap, kg_filter);
             return;
         }
-        // Rescale / cross-location: let the pool materialise the restored
-        // checkpoint under this subtask's own location first (merge the parent
-        // checkpoints, key-group-filter to `kg_filter`, relocate objects, write
-        // the merged manifest as cp-restore_cp). A no-op for same-location
-        // same-parallelism restore. After this, cold reads + the first
-        // incremental commit work against this subtask's own prefix.
-        pool_->prepare_restore(snap.checkpoint_id, kg_filter);
+        // This backend's own snapshot is a marker: the checkpoint id, with the
+        // bytes in the pool. A snapshot that carries bytes was written somewhere
+        // else (a savepoint authored offline, or another backend's checkpoint),
+        // so its state is in those bytes and this pool has never held it.
+        // Pointing cold reads at its id would read every key as absent, so it
+        // is loaded instead, below.
+        const bool carries_state = !snap.bytes.empty();
+        if (!carries_state) {
+            // A marker this pool does not hold reads as empty state, which is
+            // indistinguishable from a first run. disagg-local:// keeps its pool
+            // in the memory of the process that wrote it, so a restore in any
+            // other process lands here.
+            if (snap.checkpoint_id.value() != 0 && !pool_->holds_checkpoint(snap.checkpoint_id)) {
+                throw std::runtime_error(
+                    "remote-read restore: checkpoint " +
+                    std::to_string(snap.checkpoint_id.value()) +
+                    " is not in this backend's pool and the snapshot carries no state of its "
+                    "own (disagg-local:// keeps its pool in the memory of the process that "
+                    "wrote it); refusing to restore it as empty state");
+            }
+            // Rescale / cross-location: let the pool materialise the restored
+            // checkpoint under this subtask's own location first (merge the parent
+            // checkpoints, key-group-filter to `kg_filter`, relocate objects, write
+            // the merged manifest as cp-restore_cp). A no-op for same-location
+            // same-parallelism restore. After this, cold reads + the first
+            // incremental commit work against this subtask's own prefix.
+            pool_->prepare_restore(snap.checkpoint_id, kg_filter);
+        }
         // Drop any stale hot-tier entries before repointing at the new
         // checkpoint. A fresh backend has an empty hot tier (the production
         // path), so this is a no-op there; it makes restore() self-consistent
@@ -565,8 +587,6 @@ public:
         lru_.clear();
         index_.clear();
         hot_bytes_ = 0;
-        last_ckpt_.store(snap.checkpoint_id.value(), std::memory_order_relaxed);
-        last_captured_ = snap.checkpoint_id.value();  // next delta inherits from here
         dirty_.clear();
         deleted_.clear();
         // Drop any in-flight async-persist bookkeeping: a restore reseeds the
@@ -575,6 +595,24 @@ public:
         pending_.clear();
         persisting_dirty_.clear();
         persisting_deleted_.clear();
+        if (carries_state) {
+            // The snapshot's entries become writes: hot, and dirty so eviction
+            // keeps them until the first checkpoint after the restore commits
+            // them to the pool. That commit has an empty base, because the pool
+            // holds none of them, and no read goes cold before it.
+            hot_.restore(snap, kg_filter);
+            for (const auto& op : hot_.operator_ids()) {
+                hot_.scan(op, [&](KeyView k, ValueView v) {
+                    dirty_.emplace(op.value(), std::string(k));
+                    touch_(op, k, v.size());
+                });
+            }
+            last_ckpt_.store(0, std::memory_order_relaxed);
+            last_captured_ = 0;
+            return;
+        }
+        last_ckpt_.store(snap.checkpoint_id.value(), std::memory_order_relaxed);
+        last_captured_ = snap.checkpoint_id.value();  // next delta inherits from here
     }
 
     void purge_checkpoint(CheckpointId id) override {

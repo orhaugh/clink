@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+**A savepoint restores into the disaggregated backend.** `disagg-local://`,
+the backend `LocalSubmitter::submit(env)` picks by default, and
+`remote-read://` restore lazily: their own snapshot only names a checkpoint in
+their pool, and cold reads fetch from it. A snapshot that carries its own
+state, such as a savepoint written with `state_processor::Savepoint` or a
+checkpoint another backend took, names a checkpoint the pool never held, so
+every key read as absent and the job started empty, with no error. The restore
+now loads such a snapshot's entries, keeps them in the hot tier until the
+first checkpoint commits them to the pool, and refuses a checkpoint its pool
+does not hold instead of reading it as empty, which is what restoring a
+`disagg-local://` checkpoint in another process did.
+`RemoteReadBackend.ARestoreLoadsASnapshotThatCarriesItsOwnState` and
+`LocalSubmitter.ASeededSavepointRestoresIntoTheDisaggregatedBackend` restore a
+seeded savepoint; `ARestoreOfACheckpointThePoolNeverHeldIsRefused` pins the
+refusal.
+
 ## v0.13.0 (November 2026)
 
 Running jobs are safer to resize and recover. A SQL job declares the keyed

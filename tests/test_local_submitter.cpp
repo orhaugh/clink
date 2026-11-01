@@ -29,6 +29,7 @@
 #include "clink/runtime/output_tag.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/state/state_backend_factory.hpp"
 #include "clink/state_processor/savepoint.hpp"
 
 using namespace clink;
@@ -702,6 +703,51 @@ TEST(LocalSubmitter, UidPinsTheOperatorIdSoSeededStateRestores) {
     auto lines = read_lines(out_path);
     std::sort(lines.begin(), lines.end());
     // key=1 continues from the seeded 100: 101, 104, 109. key=0 starts empty: 2, 6.
+    ASSERT_EQ(lines.size(), 5u);
+    EXPECT_EQ(lines[0], "101") << "the seeded value must be visible to the operator";
+    EXPECT_EQ(lines[1], "104");
+    EXPECT_EQ(lines[2], "109");
+    EXPECT_EQ(lines[3], "2");
+    EXPECT_EQ(lines[4], "6");
+
+    std::filesystem::remove(out_path);
+}
+
+// The same seeded savepoint, restored into disagg-local://, the backend
+// LocalSubmitter::submit(env) picks by default. Its own checkpoints are markers
+// for state held in its pool, and a savepoint carries its state in its bytes;
+// the restore pointed the operator at a checkpoint id the pool never held, so
+// every key read as absent and the sums started from zero, with no error.
+TEST(LocalSubmitter, ASeededSavepointRestoresIntoTheDisaggregatedBackend) {
+    cluster::ensure_built_ins_registered();
+    const auto out_path =
+        std::filesystem::temp_directory_path() / "clink_local_submitter_disagg_restore.txt";
+    std::filesystem::remove(out_path);
+
+    constexpr std::uint64_t kCheckpointId = 7;
+    auto savepoint = clink::state_processor::Savepoint::create();
+    savepoint
+        .keyed_state<std::int64_t, std::int64_t>(clink::operator_id_from_uid("running-sum"),
+                                                 "sum",
+                                                 clink::int64_codec(),
+                                                 clink::int64_codec())
+        .put(1, 100);
+
+    auto env = Pipeline::create();
+    env.source<std::int64_t>(IntRangeSource::builder().count(5).start(1).build())
+        .key_by([](const std::int64_t& v) { return v % 2; })
+        .process<std::int64_t>(std::make_shared<RunningSumFn>())
+        .uid("running-sum")
+        .sink(FileInt64Sink::builder().path(out_path.string()).build());
+
+    JobConfig cfg;
+    cfg.state_backend =
+        clink::StateBackendFactory::default_instance().build({.uri = "disagg-local://"}).backend;
+    cfg.restore_from = savepoint.snapshot(clink::CheckpointId{kCheckpointId});
+    cluster::LocalSubmitter::submit(env, std::move(cfg));
+
+    auto lines = read_lines(out_path);
+    std::sort(lines.begin(), lines.end());
     ASSERT_EQ(lines.size(), 5u);
     EXPECT_EQ(lines[0], "101") << "the seeded value must be visible to the operator";
     EXPECT_EQ(lines[1], "104");

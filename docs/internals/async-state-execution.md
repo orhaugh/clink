@@ -158,7 +158,7 @@ The `disagg-local://` scheme is registered in `src/state/state_backend_factory.c
 - **Eviction never loses state.** Only clean (already-durable) keys are evicted; dirty and deleted keys stay hot until the next checkpoint commits them. The pinned-skip scan is bounded, so the hot tier may transiently exceed its budget when its LRU tail is all-pinned.
 - **Per-backend budgeting.** `default_remote_hot_max_bytes()` is per keyed-operator subtask. A node running many keyed operators with the default can oversubscribe RAM; per-operator or global budgeting is a deferred follow-on, and a caller can pass an explicit `hot_max_bytes` to bound it.
 - **HTTP client limits.** `HttpPool` does not support chunked transfer-encoding, TLS, HTTP/2, or DNS resolution, and fast-fails past the connection cap.
-- **`disagg-local://` is not durable.** Its pool is process RAM, so there is no cross-process failover or rescale and no remote-IO latency to overlap; it exists to make the async/disaggregated path reachable for correctness coverage without an object store. The throughput win needs the real S3-backed `remote-read://` tier.
+- **`disagg-local://` is not durable.** Its pool is process RAM, so there is no cross-process failover or rescale (its checkpoint restored in another process is refused, not read as empty) and no remote-IO latency to overlap; it exists to make the async/disaggregated path reachable for correctness coverage without an object store. The throughput win needs the real S3-backed `remote-read://` tier.
 
 ## Related
 

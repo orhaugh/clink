@@ -96,6 +96,12 @@ public:
     // already exists under this subtask's prefix and cold reads are lazy).
     virtual void prepare_restore(CheckpointId /*restore_cp*/, const KeyGroupRange& /*kg*/) {}
 
+    // Whether checkpoint `id` is in this pool, so RemoteReadBackend::restore()
+    // can refuse a checkpoint it would otherwise read as empty. A pool that
+    // cannot tell cheaply answers true (the default) and leaves its reads to
+    // report what is missing.
+    [[nodiscard]] virtual bool holds_checkpoint(CheckpointId /*id*/) const { return true; }
+
     // State-as-data: enumerate EVERY (op, key, value) of committed
     // checkpoint `id` - the primitive behind exporting the disaggregated
     // tier as an open dataset (RemoteReadBackend::export_arrow_snapshot
@@ -165,6 +171,11 @@ public:
     void purge(CheckpointId id) override {
         std::lock_guard<std::mutex> lk(mu_);
         ckpts_.erase(id.value());
+    }
+
+    [[nodiscard]] bool holds_checkpoint(CheckpointId id) const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return ckpts_.count(id.value()) != 0;
     }
 
     void scan_checkpoint(CheckpointId id, const ScanVisitor& visit) const override {
