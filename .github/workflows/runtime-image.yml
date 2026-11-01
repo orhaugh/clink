@@ -368,6 +368,69 @@ jobs:
             fi
           done
 
+      - name: A Coordinator serves the console the image carries
+        # The image ships the console at /usr/local/share/clink/console and a
+        # Coordinator finds it beside its binary. Proof on the published
+        # image: / is the console's index.html, the cluster reports its
+        # engine version, and with a token the console's own files still load
+        # while the API refuses a request without the token.
+        run: |
+          set -euo pipefail
+          ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          await() {
+            for _ in $(seq 1 60); do
+              curl -s -o /dev/null "$1" && return 0
+              sleep 1
+            done
+            echo "::error::$1 never answered"; exit 1
+          }
+          docker run -d --name console-open -p 18081:8081 "${ref}" \
+            --role=coordinator --port=6123 --http-port=8081 --http-bind=0.0.0.0
+          await http://127.0.0.1:18081/api/v1/health
+          curl -fsS http://127.0.0.1:18081/ | grep -qi '<!doctype html>' \
+            || { echo "::error::/ is not the console"; docker logs console-open; exit 1; }
+          curl -fsS http://127.0.0.1:18081/jobs/1 | grep -qi '<!doctype html>'
+          curl -fsS http://127.0.0.1:18081/api/v1/cluster | grep -q '"version":"' \
+            || { echo "::error::the cluster reports no engine version"; exit 1; }
+          docker rm -f console-open > /dev/null
+
+          docker run -d --name console-token -p 18082:8081 -e CLINK_AUTH_TOKEN=smoke "${ref}" \
+            --role=coordinator --port=6123 --http-port=8081 --http-bind=0.0.0.0
+          await http://127.0.0.1:18082/
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18082/api/v1/cluster)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer smoke' \
+                  http://127.0.0.1:18082/api/v1/cluster)" = 200
+          docker rm -f console-token > /dev/null
+          echo "the console is served, and behind a token only the API asks for it"
+
+      - name: The quickstart runs against this image
+        # The README's second command: a cluster of three nodes from this
+        # image, a streaming job and a bounded SQL job submitted for you.
+        run: |
+          set -euo pipefail
+          ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          cd examples/quickstart
+          CLINK_IMAGE="${ref}" docker compose -f compose.yml up -d
+          for _ in $(seq 1 120); do
+            [ "$(docker inspect -f '{{.State.Status}}' clink-quickstart-submit-1)" = exited ] && break
+            sleep 1
+          done
+          docker logs clink-quickstart-submit-1
+          ok=0
+          for _ in $(seq 1 60); do
+            jobs="$(curl -fsS http://127.0.0.1:8081/api/v1/jobs || true)"
+            if echo "${jobs}" | python3 -c '
+          import json, sys
+          jobs = {j["id"]: j.get("status") for j in json.load(sys.stdin)["jobs"]}
+          sys.exit(0 if jobs.get(1) == "RUNNING" and jobs.get(2) == "COMPLETED_OK" else 1)
+          '; then ok=1; break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8081/ | grep -qi '<!doctype html>'
+          CLINK_IMAGE="${ref}" docker compose -f compose.yml down -v
+          [ "${ok}" = 1 ] || { echo "::error::the quickstart's jobs did not reach RUNNING and COMPLETED_OK: ${jobs}"; exit 1; }
+
       - name: Apply the moving tags
         # Last, so :latest, :<version> and :main move only once the smoke,
         # architecture, tutorial and one-command checks above have passed

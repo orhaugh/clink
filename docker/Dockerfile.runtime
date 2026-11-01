@@ -151,6 +151,10 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
     # consumer checkout builds a submittable .so in seconds - no second
     # toolchain image, no in-container engine rebuild.
     && cmake --install build > /dev/null \
+    # The ops console, at the version and sha256 pinned in scripts/console.env:
+    # clink_node finds /usr/local/share/clink/console beside its binary and
+    # serves it on a coordinator's HTTP port.
+    && scripts/fetch-console.sh /usr/local \
     && rm -rf build
 
 WORKDIR /var/lib/clink

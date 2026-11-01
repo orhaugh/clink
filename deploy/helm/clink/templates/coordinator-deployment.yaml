@@ -64,6 +64,9 @@ spec:
             {{- end }}
             - --http-port={{ .Values.coordinator.httpPort }}
             - --http-bind=0.0.0.0
+            {{- if not .Values.coordinator.console }}
+            - --no-console
+            {{- end }}
             {{- if .Values.coordinator.stateBackend }}
             - --state-backend={{ .Values.coordinator.stateBackend }}
             {{- end }}

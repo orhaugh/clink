@@ -130,4 +130,30 @@ inline HttpResponse serve_static_file(const std::filesystem::path& canonical_roo
     return resp;
 }
 
+// The console a packaged clink ships beside its binaries: `<prefix>/bin/clink_node`
+// serves `<prefix>/share/clink/console` (the SDK tarball, the runtime image's
+// /usr/local). Empty when that directory has no index.html, as in a build tree.
+inline std::filesystem::path console_beside(const std::filesystem::path& executable) {
+    if (executable.empty()) {
+        return {};
+    }
+    auto dir = executable.parent_path().parent_path() / "share" / "clink" / "console";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(dir / "index.html", ec)) {
+        return {};
+    }
+    return dir;
+}
+
+// Whether a request can only be for a mounted console's own files: a GET or
+// HEAD outside the JSON API and the metrics endpoint. Those files hold no
+// cluster data, so a node that requires a token serves them without one; the
+// console then asks for the token and sends it on every API call.
+inline bool is_console_file_request(std::string_view method, std::string_view path) {
+    if (method != "GET" && method != "HEAD") {
+        return false;
+    }
+    return !path.starts_with("/api/") && path != "/api" && !path.starts_with("/metrics");
+}
+
 }  // namespace clink::http

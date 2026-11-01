@@ -109,6 +109,7 @@ struct HttpServer::Impl {
     bool cors_enabled{false};
     std::string cors_origin;
     std::string auth_token;
+    std::function<bool(std::string_view, std::string_view)> auth_exempt;
 
     // Wrap a clink Handler so it adapts to httplib's signature
     // (void(const Request&, Response&)) with structured exception
@@ -238,6 +239,11 @@ void HttpServer::enable_cors(const std::string& allow_origin) {
     impl_->cors_origin = allow_origin;
 }
 
+void HttpServer::set_auth_exempt(
+    std::function<bool(std::string_view method, std::string_view path)> exempt) {
+    impl_->auth_exempt = std::move(exempt);
+}
+
 void HttpServer::set_auth_token(const std::string& token) {
     // Config only; the combined pre-routing handler is installed at start().
     impl_->auth_token = token;
@@ -250,10 +256,13 @@ namespace {
 // short-circuited (and never requires auth, since browsers do not send
 // credentials on preflight); then, if a token is configured, any request
 // without a matching `Authorization: Bearer <token>` is answered 401 before its
-// handler runs.
-auto make_pre_routing(bool cors, std::string origin, std::string token) {
-    return [cors, origin = std::move(origin), token = std::move(token)](const httplib::Request& req,
-                                                                        httplib::Response& res) {
+// handler runs, unless the exemption predicate lets it through.
+auto make_pre_routing(bool cors,
+                      std::string origin,
+                      std::string token,
+                      std::function<bool(std::string_view, std::string_view)> exempt) {
+    return [cors, origin = std::move(origin), token = std::move(token), exempt = std::move(exempt)](
+               const httplib::Request& req, httplib::Response& res) {
         if (cors) {
             res.set_header("Access-Control-Allow-Origin", origin);
             res.set_header("Vary", "Origin");
@@ -269,7 +278,8 @@ auto make_pre_routing(bool cors, std::string origin, std::string token) {
             }
             return httplib::Server::HandlerResponse::Unhandled;
         }
-        if (!token.empty() && req.get_header_value("Authorization") != ("Bearer " + token)) {
+        if (!token.empty() && !(exempt && exempt(req.method, req.path)) &&
+            req.get_header_value("Authorization") != ("Bearer " + token)) {
             res.status = 401;
             res.set_header("WWW-Authenticate", "Bearer");
             res.set_content("{\"error\":\"unauthorized\"}", "application/json");
@@ -286,8 +296,8 @@ std::uint16_t HttpServer::start(const std::string& host, std::uint16_t port) {
     }
     // Install the combined CORS + auth pre-routing handler (if either is set).
     if (impl_->cors_enabled || !impl_->auth_token.empty()) {
-        impl_->server.set_pre_routing_handler(
-            make_pre_routing(impl_->cors_enabled, impl_->cors_origin, impl_->auth_token));
+        impl_->server.set_pre_routing_handler(make_pre_routing(
+            impl_->cors_enabled, impl_->cors_origin, impl_->auth_token, impl_->auth_exempt));
     }
     // bind_to_any_port returns the OS-picked port when port==0; bind
     // ours otherwise. Bound port lookup matches the request - we read

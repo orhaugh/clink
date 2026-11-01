@@ -7,7 +7,7 @@ Watch them come up:
 
   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
 
-Open the dashboard / HTTP API (port-forward the Coordinator):
+Open the ops console and the HTTP API (port-forward the Coordinator):
 
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "clink.coordinator.fullname" . }} {{ .Values.coordinator.httpPort }}:{{ .Values.coordinator.httpPort }}
   # then: open http://localhost:{{ .Values.coordinator.httpPort }}

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+**Every release carries the ops console, and a Coordinator serves it.** The
+console lives in its own repository and reached users only through a separate
+image, which paired it with clink 0.4.0, so a user who downloaded clink found
+an API and no console. The SDK tarball and the runtime image now carry
+clink-fe's console at `share/clink/console`, installed by
+`scripts/fetch-console.sh` at the version and sha256 pinned in
+`scripts/console.env`, and a coordinator with an HTTP port serves the console
+it finds beside its own binary at `/`. `--http-static-dir=<dir>` still serves
+another bundle and `--no-console` serves none; the Helm chart's
+`coordinator.console` maps to it. `/api/v1/cluster` reports the engine
+`version`, which the console shows beside its own.
+`StaticFiles.TheConsoleBesideTheBinaryIsFoundFromItsExecutable` covers the
+lookup, and the runtime-image workflow checks that each image serves it.
+
+**A node that requires a token serves the console's own files without it.**
+With `CLINK_AUTH_TOKEN` set, every request needed `Authorization: Bearer`, the
+console's page and scripts included, which a browser cannot send when it loads
+a page, so a console behind a token never loaded. The files of a mounted
+console (a GET or HEAD outside `/api/` and `/metrics`) are now served without
+the token: they hold no cluster data. The console asks for the token and sends
+it on every API call, which still requires it. `HttpServer::set_auth_exempt`
+carries the rule; `HttpAuth.AnExemptRequestIsServedWithoutTheToken` and
+`StaticFilesAuth.OnlyRequestsForTheConsolesFilesAreExempt` pin it.
+
+**A quickstart starts a cluster with its console.**
+`examples/quickstart/compose.yml` runs a Coordinator, two Workers and two
+jobs, one streaming and one bounded, from the published image, with the
+console on `localhost:8081`. The README's second step points at it, and the
+runtime-image workflow runs it against each new image.
+
 **The job list and a job's page name the job.** `GET /api/v1/jobs` and
 `GET /api/v1/jobs/:id` reported a job only by its number, although the
 coordinator keeps the name each job was submitted with and its lineage events

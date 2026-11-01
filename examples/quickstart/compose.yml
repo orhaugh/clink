@@ -1,0 +1,101 @@
+# clink quickstart: a Coordinator serving the ops console, two Workers, and two
+# jobs submitted for you - one that runs until you stop it and one that
+# finishes. Nothing to build: every service runs the published runtime image.
+#
+#   docker compose -f compose.yml up
+#   open http://localhost:8081
+#
+# `docker compose -f compose.yml down` stops and removes everything. The
+# console and the API listen on this machine's loopback address only: the
+# cluster takes no token here, so it is not for a shared network (set
+# CLINK_AUTH_TOKEN on the nodes for that; the console asks for the token).
+name: clink-quickstart
+
+x-clink: &clink
+  image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.14.0}
+
+services:
+  coordinator:
+    <<: *clink
+    command:
+      - --role=coordinator
+      - --port=6123
+      - --bind-host=0.0.0.0
+      - --advertise-host=coordinator
+      - --http-port=8081
+      - --http-bind=0.0.0.0
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/api/v1/health >/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  worker1:
+    <<: *clink
+    command:
+      - --role=worker
+      - --id=worker-1
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker1
+      - --slots=8
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      # The data-plane bridges between subtasks bind 127.0.0.1 unless told
+      # otherwise; a peer in the other Worker's container needs this one.
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  worker2:
+    <<: *clink
+    command:
+      - --role=worker
+      - --id=worker-2
+      - --coordinator-host=coordinator
+      - --coordinator-port=6123
+      - --data-host=worker2
+      - --slots=8
+      - --http-port=8082
+      - --http-bind=0.0.0.0
+    environment:
+      # The data-plane bridges between subtasks bind 127.0.0.1 unless told
+      # otherwise; a peer in the other Worker's container needs this one.
+      CLINK_DATA_BIND_HOST: 0.0.0.0
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  # One-shot: once both Workers have registered, submit a streaming job (the
+  # bundled demo job, which ticks every 100 ms and never ends) and a bounded
+  # SQL job over a file the image carries. Re-runs on every `up`.
+  submit:
+    <<: *clink
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 60); do
+          cap=$$(curl -sf http://coordinator:8081/api/v1/cluster | sed -n 's/.*"total_slot_capacity":\([0-9]*\).*/\1/p')
+          [ "$${cap:-0}" -ge 16 ] && break
+          sleep 1
+        done
+        curl -sf -F job_so=@/opt/clink/jobs/rescale_test_job.so -F job_name=demo-stream \
+          http://coordinator:8081/api/v1/jobs && echo
+        cat <<'SQL' | curl -sf -X POST --data-binary @- \
+          'http://coordinator:8081/api/v1/jobs/sql?mode=submit&name=readings-by-region' && echo
+        CREATE TABLE readings (ts BIGINT, region VARCHAR, device VARCHAR, reading DOUBLE)
+          WITH (connector = 'file', format = 'json', path = '/opt/clink/examples/sql/events.ndjson');
+        CREATE TABLE per_region (region VARCHAR, readings BIGINT, peak DOUBLE)
+          WITH (connector = 'blackhole', format = 'json');
+        INSERT INTO per_region
+        SELECT region, COUNT(*) AS readings, MAX(reading) AS peak FROM readings GROUP BY region;
+        SQL
+        echo "submitted: open http://localhost:8081"
+    restart: "no"

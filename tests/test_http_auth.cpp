@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <vector>
 
@@ -150,6 +151,39 @@ TEST(HttpAuth, TokenGateRejectsUnauthenticatedAndAllowsBearer) {
         const auto r = c.get("/ping");
         EXPECT_EQ(r.status, 200) << r.body;
         EXPECT_EQ(r.body, "pong");
+    }
+
+    server.stop();
+}
+
+// A node serving a console with a token set lets the console's own files
+// through, so a browser can load the page that asks for the token; the API
+// behind it still answers 401 without the token and 200 with it.
+TEST(HttpAuth, AnExemptRequestIsServedWithoutTheToken) {
+    HttpServer server;
+    server.get("/api/v1/ping", pong);
+    server.get("/index.html", pong);
+    server.set_auth_token("s3cret");
+    server.set_auth_exempt([](std::string_view method, std::string_view path) {
+        return method == "GET" && !path.starts_with("/api/");
+    });
+    const std::uint16_t port = server.start("127.0.0.1", 0);
+
+    {
+        HttpClient c("127.0.0.1", port);
+        const auto r = c.get("/index.html");
+        EXPECT_EQ(r.status, 200) << r.body;
+    }
+    {
+        HttpClient c("127.0.0.1", port);
+        const auto r = c.get("/api/v1/ping");
+        EXPECT_EQ(r.status, 401) << r.body;
+    }
+    {
+        HttpClient c("127.0.0.1", port);
+        c.set_bearer_token("s3cret");
+        const auto r = c.get("/api/v1/ping");
+        EXPECT_EQ(r.status, 200) << r.body;
     }
 
     server.stop();

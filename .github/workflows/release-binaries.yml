@@ -3,8 +3,10 @@
 #
 # WHAT THE ARTEFACT IS: a relocatable SDK prefix - bin/ (clink, clink_node,
 # clink_submit_sql), lib/ (the clink static libs AND the pinned Arrow/Parquet
-# shared libraries), include/ (clink + Arrow headers) and lib/cmake/ (the
-# clink + Arrow package configs) - tarred with a version-named top directory.
+# shared libraries), include/ (clink + Arrow headers), lib/cmake/ (the
+# clink + Arrow package configs) and share/clink/console (the ops console,
+# which clink_node serves on a coordinator's HTTP port) - tarred with a
+# version-named top directory.
 # Extract it anywhere, point CMAKE_PREFIX_PATH at it, and both the CLI and
 # find_package(clink) work. Binaries carry an $ORIGIN/../lib rpath, so the
 # bundle resolves its own libraries wherever it lands.
@@ -91,6 +93,12 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="${RUNNER_TEMP}/stage"
           cmake --build build --parallel "$(nproc)"
           cmake --install build
+
+      - name: Bundle the pinned console into the prefix
+        # clink-fe's release asset at the version and sha256 pinned in
+        # scripts/console.env, at share/clink/console, where clink_node finds
+        # it beside its binaries and serves it on a coordinator's HTTP port.
+        run: scripts/fetch-console.sh "${RUNNER_TEMP}/stage"
 
       - name: Bundle the pinned toolchain into the prefix
         # The Arrow/Parquet shared libraries the binaries link, plus the

@@ -81,6 +81,19 @@ mounting it:
 docker run --rm -v "$PWD:/work" ghcr.io/orhaugh/clink-runtime:latest run /work/mine.sql
 ```
 
+To watch a cluster instead, start the quickstart: a Coordinator, two
+Workers and two jobs, with the ops console on the Coordinator's port.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/orhaugh/clink/main/examples/quickstart/compose.yml
+docker compose -f compose.yml up        # then open http://localhost:8081
+```
+
+The console ships inside every clink release (the runtime image and the
+SDK), and a Coordinator serves it beside its JSON API. Its source is
+[clink-fe](https://github.com/orhaugh/clink-fe); the quickstart is in
+[examples/quickstart](examples/quickstart/).
+
 Want to build something real? Follow the
 [Kafka to clink to ClickHouse tutorial](https://orhaugh.github.io/clink/tutorials/kafka-to-clickhouse/):
 one `docker compose up` gives you a broker, a database and a small clink

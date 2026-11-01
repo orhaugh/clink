@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace clink::http {
 
@@ -138,6 +139,14 @@ public:
     // always allowed through so a browser can present credentials on the real
     // request.
     void set_auth_token(const std::string& token);
+
+    // Let a request the predicate accepts through without the token. The
+    // coordinator exempts a mounted console's own files, which hold no cluster
+    // data, so a browser can load the page that then asks for the token and
+    // sends it on every API call. Consulted only when a token is set. Call
+    // before start().
+    void set_auth_exempt(
+        std::function<bool(std::string_view method, std::string_view path)> exempt);
 
     // Start listening on `host`:`port`. Spawns a background thread to
     // run the accept loop. Returns the actually-bound port (matches

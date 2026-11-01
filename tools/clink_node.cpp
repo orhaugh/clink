@@ -47,6 +47,9 @@
 #include <vector>
 
 #include <sys/resource.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/ha_coordinator.hpp"
@@ -383,6 +386,7 @@ void write_worker_summary(clink::http::JsonWriter& w, const clink::cluster::Work
 
 void write_cluster(clink::http::JsonWriter& w, const clink::cluster::ClusterSnapshot& s) {
     w.begin_object();
+    w.kv("version", clink::plugin::kClinkVersion);
     w.kv("bind_host", s.bind_host);
     w.kv("advertise_host", s.advertise_host);
     w.kv("control_port", s.control_port);
@@ -1965,6 +1969,27 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
     return false;
 }
 
+// This process's own executable, symlinks resolved, so a packaged install
+// finds what it ships beside its binaries wherever it was unpacked. Empty
+// where the platform does not say.
+std::filesystem::path self_executable() {
+    std::error_code ec;
+#if defined(__APPLE__)
+    std::uint32_t size = 0;
+    ::_NSGetExecutablePath(nullptr, &size);
+    std::string buf(size, '\0');
+    if (::_NSGetExecutablePath(buf.data(), &size) != 0) {
+        return {};
+    }
+    auto exe = std::filesystem::canonical(std::filesystem::path{buf.c_str()}, ec);
+#elif defined(__linux__)
+    auto exe = std::filesystem::canonical("/proc/self/exe", ec);
+#else
+    std::filesystem::path exe;
+#endif
+    return ec ? std::filesystem::path{} : exe;
+}
+
 // Build the logging config from --log-* flags. Defaults reproduce the
 // pre-spdlog behaviour: info level, console (stderr) on, no file sink. The
 // log level resolves --log-level, then the CLINK_LOG_LEVEL env, then "info".
@@ -2963,7 +2988,18 @@ int run_coordinator(int argc, char** argv) {
         // in registration order, so the catch-all can never shadow an
         // /api/v1 or /metrics route. Worker HTTP servers don't mount this -
         // the coordinator is the single human-facing entry point.
-        const std::string http_static_dir = get_arg(argc, argv, "http-static-dir", "");
+        // A packaged clink ships the console beside its binaries
+        // (<prefix>/share/clink/console), and serves it unless told where
+        // another one is or told to serve none.
+        std::string http_static_dir = get_arg(argc, argv, "http-static-dir", "");
+        if (has_flag(argc, argv, "no-console")) {
+            http_static_dir.clear();
+        } else if (http_static_dir.empty()) {
+            if (const auto beside = clink::http::console_beside(self_executable());
+                !beside.empty()) {
+                http_static_dir = beside.string();
+            }
+        }
         if (!http_static_dir.empty()) {
             std::error_code static_ec;
             const auto static_root = std::filesystem::weakly_canonical(
@@ -2987,6 +3023,11 @@ int run_coordinator(int argc, char** argv) {
             };
             http_srv->get("/", static_handler);
             http_srv->get("/*", static_handler);
+            // With CLINK_AUTH_TOKEN set, the console's own files are served
+            // without it: they hold no cluster data, and a browser cannot add
+            // the header when it loads a page. The console asks for the token
+            // and sends it on every API call, which still requires it.
+            http_srv->set_auth_exempt(clink::http::is_console_file_request);
             std::cout << "coordinator serving console from " << static_root.string() << "\n";
         } else {
             // No console mounted: `/` answers with a signpost rather than a
@@ -2994,10 +3035,11 @@ int run_coordinator(int argc, char** argv) {
             http_srv->get("/", [](const clink::http::HttpRequest&) {
                 clink::metrics::http::request_seen();
                 clink::http::HttpResponse resp;
-                resp.body = R"json({"service":"clink coordinator","api":"/api/v1",)json"
-                            R"json("metrics":"/metrics","console":"serve a built console )json"
-                            R"json(same-origin with --http-static-dir=<dir>; )json"
-                            R"json(see https://github.com/orhaugh/clink-fe"})json";
+                resp.body =
+                    R"json({"service":"clink coordinator","api":"/api/v1",)json"
+                    R"json("metrics":"/metrics","console":"none installed beside )json"
+                    R"json(this binary; serve a built one with --http-static-dir=<dir>, )json"
+                    R"json(see https://github.com/orhaugh/clink-fe"})json";
                 return resp;
             });
         }
@@ -3640,7 +3682,11 @@ int main(int argc, char** argv) {
                 << "  --http-static-dir=<dir>      Serve a built console bundle (e.g. clink-fe's "
                    "dist/) same-origin at '/', beside the JSON API. Coordinator only;\n"
                    "                               SPA deep links fall back to index.html. Unset "
-                   "= '/' answers with a JSON signpost.\n"
+                   "= the console installed beside\n"
+                   "                               this binary (<prefix>/share/clink/console), "
+                   "else '/' answers with a JSON signpost.\n"
+                << "  --no-console                 Serve no console, not even an installed or "
+                   "named one.\n"
                 << "  --metrics-disk-path=<path>   Report disk usage for this filesystem as the "
                    "'checkpoint' volume in /metrics (coordinator defaults to --ha-dir).\n"
                 << "\n"

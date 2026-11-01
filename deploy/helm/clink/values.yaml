@@ -33,6 +33,9 @@ coordinator:
   # leader election is a documented follow-on - see ha below). Pinned to 1.
   controlPort: 6123
   httpPort: 8081
+  # Serve the ops console the image carries at / on the HTTP port, beside the
+  # API. false passes --no-console and / answers with a JSON signpost.
+  console: true
   service:
     # ClusterIP keeps the dashboard in-cluster. Use NodePort/LoadBalancer (or an
     # Ingress) to expose http externally; the control port should stay internal.
