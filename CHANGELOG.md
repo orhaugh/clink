@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.13.1 (November 2026)
+
+A fix for restoring a savepoint into the disaggregated backend, which started
+the job with empty state and no error. There are no state-format, API or
+wire-protocol changes, and the plugin ABI fingerprint is unchanged, so job
+modules built against v0.13.0 load as they are. Restoring a `disagg-local://`
+checkpoint in a process other than the one that wrote it now fails instead of
+starting empty (see the entry).
 
 **A savepoint restores into the disaggregated backend.** `disagg-local://`,
 the backend `LocalSubmitter::submit(env)` picks by default, and
