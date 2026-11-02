@@ -41,9 +41,23 @@ if(TARGET clink::schema_registry)
     endif()
 endif()
 clink_set_warnings(clink_kafka_tests)
+# The live suites start a Redpanda container each (tests/integration/
+# docker_kafka.hpp) and skip without Docker. Under ctest --parallel several
+# started at once and ran past the 30 s the other cases get, so they hold one
+# lock and the time a container start takes. scripts/docker-suites-live.sh
+# runs them from the binary, outside ctest.
+set(_kafka_live_suites
+    "TxnResumeLive.*:TxnResumeSaslLive.*:KafkaTxnEndOfInputLive.*:KafkaRegistryFormatsLive.*")
 gtest_discover_tests(clink_kafka_tests
     DISCOVERY_MODE PRE_TEST
+    TEST_FILTER "-${_kafka_live_suites}"
     PROPERTIES TIMEOUT 30 LABELS kafka
+)
+gtest_discover_tests(clink_kafka_tests
+    DISCOVERY_MODE PRE_TEST
+    TEST_FILTER "${_kafka_live_suites}"
+    TEST_LIST clink_kafka_live_tests_list
+    PROPERTIES TIMEOUT 180 LABELS kafka RESOURCE_LOCK clink_kafka_docker_broker
 )
 
 # docker_kafka.hpp (the shared Redpanda fixture) lives under tests/integration/.
