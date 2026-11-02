@@ -18,6 +18,7 @@
 #include "clink/runtime/log_buffer.hpp"
 
 #include "built_in_file_sinks.hpp"
+#include "quiet_replacements.hpp"
 
 namespace clink::cluster {
 
@@ -39,7 +40,12 @@ namespace {
 // per process, though: a job module that registers the same factories again on
 // every submit took twelve lines a submit to say the same thing, and the first
 // line already says what a repeat would.
+thread_local bool t_quiet_replacements = false;
+
 void note_replacement(const char* kind, const std::string& type) {
+    if (t_quiet_replacements) {
+        return;
+    }
     static std::mutex noted_mu;
     static std::set<std::string> noted;
     {
@@ -55,6 +61,15 @@ void note_replacement(const char* kind, const std::string& type) {
 }
 
 }  // namespace
+
+detail::QuietBuiltInReplacements::QuietBuiltInReplacements() noexcept
+    : previous_(t_quiet_replacements) {
+    t_quiet_replacements = true;
+}
+
+detail::QuietBuiltInReplacements::~QuietBuiltInReplacements() {
+    t_quiet_replacements = previous_;
+}
 
 void OperatorRegistry::register_source(std::string type, SourceFactory f) {
     std::lock_guard lock(mu_);

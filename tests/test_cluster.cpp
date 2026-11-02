@@ -13,6 +13,8 @@
 #include <dlfcn.h>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -40,6 +42,7 @@
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
@@ -785,6 +788,36 @@ TEST(Cluster, DeployToWorkerWithoutRoleHandlerReportsError) {
 
     worker.stop();
     coordinator.stop();
+}
+
+// A stopped worker does not warn that its control session ended. stop() shuts
+// the connection down itself, and a reader blocked on it took that for the
+// coordinator closing it: "control session ended" at warn on every clean
+// shutdown, the last line of every `clink run`. Whether the reader is blocked
+// on the socket or between frames when stop() lands is a race, so the test
+// stops several workers; before the fix nearly every one of them warned.
+TEST(Cluster, AStoppedWorkerDoesNotWarnThatItsSessionEnded) {
+    const auto warnings = [] {
+        int n = 0;
+        for (const auto& r :
+             clink::LogBuffer::global().tail(1000, "warn", 0, "worker.connection")) {
+            n += r.message.find("control session ended") != std::string::npos ? 1 : 0;
+        }
+        return n;
+    };
+    for (int i = 0; i < 5; ++i) {
+        const std::string id = "stopping-worker-" + std::to_string(i);
+        Coordinator coordinator;
+        const std::uint16_t coordinator_port = coordinator.start();
+        coordinator.expect_workers({id});
+        Worker worker(id, "127.0.0.1");
+        worker.connect_to_coordinator("127.0.0.1", coordinator_port);
+        ASSERT_TRUE(coordinator.await_registrations(2s));
+        const int before = warnings();
+        worker.stop();
+        EXPECT_EQ(warnings(), before) << id << " warned that the session it ended was lost";
+        coordinator.stop();
+    }
 }
 
 // Two workers both fail their tasks (throw). coordinator collects both errors and

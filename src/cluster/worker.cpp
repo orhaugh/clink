@@ -701,7 +701,13 @@ void Worker::signal_disconnect_(const std::string& reason) {
             expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return;
     }
-    log::warn("worker.connection", "control session ended: " + reason);
+    // stop() shuts the connection down itself, which the reader takes for the
+    // coordinator closing it: a session this worker ended, not one it lost.
+    if (stop_.load(std::memory_order_acquire)) {
+        log::info("worker.connection", "control session closed: the worker is stopping");
+    } else {
+        log::warn("worker.connection", "control session ended: " + reason);
+    }
     {
         std::lock_guard lock(mu_);
         for (auto& [_, pt] : pending_) {

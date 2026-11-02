@@ -177,6 +177,21 @@ carried. Covered by
 `ConnectorManifestGate.TheSqlFrontendDeclaresTheConnectorsItRegisters` and
 `GuaranteeGateTest.ARecordNameMatchesOpTypesOnlyUpToAWordBoundary`.
 
+**A clean shutdown no longer warns of a lost control session, and starting a
+process no longer logs twelve replaced factories.** Every `clink run` ended
+with `control session ended: coordinator closed the connection` at warn
+level, as did every Worker that was stopped: `stop()` shuts the control
+connection down itself, and the reader took that for the Coordinator closing
+it. A stopping Worker now logs `control session closed: the worker is
+stopping` at info, and a session that ends any other way still warns. The core
+built-ins register twice in every process, through `OperatorRegistry`'s own
+set and then the plugin API, and each of the twelve was reported as a
+replacement at start-up; that replacement is no longer reported, while a
+plugin's override of a built-in still is. Covered by
+`Cluster.AStoppedWorkerDoesNotWarnThatItsSessionEnded`,
+`OperatorRegistry.AReplacementInsideTheBuiltInsScopeIsNotReported` and
+`OperatorRegistry.RegisteringTheBuiltInsReportsNoReplacement`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

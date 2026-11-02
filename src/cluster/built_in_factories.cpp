@@ -36,6 +36,7 @@
 #include "clink/runtime/logging.hpp"
 
 #include "built_in_file_sinks.hpp"
+#include "quiet_replacements.hpp"
 
 namespace clink::cluster {
 
@@ -379,8 +380,13 @@ void ensure_built_ins_registered() {
         auto& rr = RunnerRegistry::default_instance();
         auto& sr = SelectorRegistry::default_instance();
         clink::plugin::PluginRegistry reg(tr, rr, sr);
-        register_built_ins_via_plugin_api(reg);
-        register_builtin_joins(rr);
+        {
+            // These replace OperatorRegistry's own built-ins of the same
+            // names, which tells nobody anything.
+            detail::QuietBuiltInReplacements quiet;
+            register_built_ins_via_plugin_api(reg);
+            register_builtin_joins(rr);
+        }
         // Declare what these connectors can actually do, from the same
         // call that makes them usable. Registered-but-undeclared is the
         // state that let free-text delivery claims drift from the code.

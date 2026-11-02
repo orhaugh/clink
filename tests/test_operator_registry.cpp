@@ -15,10 +15,13 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/log_buffer.hpp"
+
+#include "src/cluster/quiet_replacements.hpp"
 
 using namespace clink;
 using namespace clink::cluster;
@@ -137,4 +140,57 @@ TEST(OperatorRegistry, AReplacedFactoryIsLoggedOnceNotOnEveryRegistration) {
     another.register_source("twice_registered_src", factory());
     another.register_source("twice_registered_src", factory());
     EXPECT_EQ(replaced_lines(), 1) << "the same replacement was logged again";
+}
+
+// clink's built-ins register the same factories twice, through
+// OperatorRegistry's own set and then the plugin API, and every process logged
+// that as twelve replacements. Inside the scope the built-ins register in, a
+// replacement goes unreported; an override outside it, a plugin's, still is.
+TEST(OperatorRegistry, AReplacementInsideTheBuiltInsScopeIsNotReported) {
+    const auto factory = [] {
+        return SourceFactory{
+            .out = std::string{clink::cluster::kChannelInt64},
+            .build = [](const OperatorBuildContext&) -> std::shared_ptr<void> {
+                return std::static_pointer_cast<void>(std::make_shared<VectorSource<std::int64_t>>(
+                    std::vector<Record<std::int64_t>>{}));
+            },
+        };
+    };
+    const auto replaced_lines = [] {
+        int n = 0;
+        for (const auto& r : clink::LogBuffer::global().tail(4000, "info")) {
+            if (r.message.find("factory for 'quietly_replaced_src' was already registered") !=
+                std::string::npos) {
+                ++n;
+            }
+        }
+        return n;
+    };
+    OperatorRegistry reg;
+    {
+        clink::cluster::detail::QuietBuiltInReplacements quiet;
+        reg.register_source("quietly_replaced_src", factory());
+        reg.register_source("quietly_replaced_src", factory());
+    }
+    EXPECT_EQ(replaced_lines(), 0) << "a replacement inside the scope was reported";
+    reg.register_source("quietly_replaced_src", factory());
+    EXPECT_EQ(replaced_lines(), 1) << "an override outside the scope went unreported";
+}
+
+TEST(OperatorRegistry, RegisteringTheBuiltInsReportsNoReplacement) {
+    ensure_built_ins_registered();
+    // A sample of the twelve the two built-in sets share.
+    const std::vector<std::string> built_ins = {"int64_range_source",
+                                                "string_lines_source",
+                                                "file_line_sink",
+                                                "collecting_int64_sink",
+                                                "identity_int64",
+                                                "even_filter_int64"};
+    for (const auto& r : clink::LogBuffer::global().tail(4000, "info", 0, "registry.replace")) {
+        for (const auto& name : built_ins) {
+            if (r.message.find("'" + name + "'") != std::string::npos) {
+                ADD_FAILURE() << "registering the built-ins reported: " << r.message;
+            }
+        }
+    }
 }
