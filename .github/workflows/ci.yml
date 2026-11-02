@@ -685,6 +685,16 @@ jobs:
     timeout-minutes: 270
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        # Two whole state-space searches side by side keep their disk queues
+        # under /tmp, on the root disk, and some runner images leave too little
+        # of it: a run died at 42 million states with "No space left on device".
+        # These three directories are the standard reclaim and the job uses none
+        # of them; the tool cache, where setup-java installs, stays.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h /
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -702,8 +712,14 @@ jobs:
             echo "formal/mutants/expected.txt records no accepted mutant; nothing to run"
             exit 0
           fi
+          # No TLC checkpoints: each one copies the disk queue, and a search that
+          # fails is rerun from the start in any case.
           # shellcheck disable=SC2086 # one argument per mutant, on purpose
-          CHECK_JOBS=2 TLC_WORKERS=2 TLC_HEAP=6g ./scripts/formal-check.sh --mutants $accepted
+          CHECK_JOBS=2 TLC_WORKERS=2 TLC_HEAP=6g TLC_EXTRA="-checkpoint 0" \
+            ./scripts/formal-check.sh --mutants $accepted
+      - name: Disk after the searches
+        if: always()
+        run: df -h /
 
   formal-mutant-id-reuse:
     name: The id-reuse mutant of the exactly-once specification is refuted
