@@ -149,6 +149,18 @@ since only the v0.8.0 text sink needed it. ClickHouse moves from 25.3 to
 the tutorial-portability rig. The tutorial now needs a runtime image from
 v0.11.0 or later, and `run.sh` fails its sink check on an older one.
 
+**A Coordinator or Worker writes its log where `--log-file` says, at the level
+`--log-level` says.** Registering the linked connectors configured logging
+from the environment before the daemon configured its own, and the daemon's
+configuration was then ignored, with a warning on every start that logging had
+been initialised twice. Since v0.3.0 every `--log-*` flag went unread:
+`--log-file` wrote nothing and `--log-level` had no effect, though
+`CLINK_LOG_LEVEL` did. A daemon now configures its logging before anything
+registers. Its sinks stay synchronous by default, as they have run in every
+release, so a killed process loses no line it logged: `--log-async` now
+defaults to `false`, and `--log-async=true` turns asynchronous logging on.
+Covered by `HttpObservability.DaemonsLogToLogFileAtLogLevel`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

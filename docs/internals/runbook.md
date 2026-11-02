@@ -21,7 +21,10 @@ logged with the job id and the reason: `awaiting_restart (attempt N/M)`,
 `worker lost`, `replanned job_id=...`, `refusing to rewrite active-leader.json`. If
 the log is silent about a job that is misbehaving, that silence is itself the
 finding - it means the coordinator did not observe the event, which is a different
-class of problem from handling it badly.
+class of problem from handling it badly. A daemon logs to stderr, and also to a
+rolling, zstd-compressed file when started with `--log-file=<path>`; `--log-level`
+sets the level, `info` by default, and `clink_node --help` lists the other logging
+flags.
 
 ---
 

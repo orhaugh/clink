@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <signal.h>
 #include <spawn.h>
 #include <string>
@@ -400,4 +402,80 @@ TEST(HttpObservability, JobSubmissionBumpsCoordinatorCounters) {
     }
 
     kill_quietly(submit_pid);
+}
+
+// The --log-* flags reach a daemon's logging. Registering the linked impls
+// configures logging from the environment when nothing has yet, and a
+// daemon's own configuration came after it and was ignored: no --log-file,
+// the default level whatever --log-level said, and a warning on every start
+// that logging was initialised twice.
+TEST(HttpObservability, DaemonsLogToLogFileAtLogLevel) {
+    const auto node = node_binary_path();
+    if (!std::filesystem::exists(node)) {
+        GTEST_SKIP() << "clink_node not built";
+    }
+    const auto dir =
+        std::filesystem::temp_directory_path() / ("clink_log_flags_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto coordinator_log = dir / "coordinator.log";
+    const auto worker_log = dir / "worker.log";
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream in(path);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+
+    Cluster c;
+    c.coordinator_control_port = probe_free_port();
+    c.coordinator_http_port = probe_free_port();
+    c.coordinator_pid = spawn_proc({"clink_node",
+                                    "--role=coordinator",
+                                    "--port=" + std::to_string(c.coordinator_control_port),
+                                    "--http-port=" + std::to_string(c.coordinator_http_port),
+                                    "--http-bind=127.0.0.1",
+                                    "--log-level=warn",
+                                    "--log-file=" + coordinator_log.string()},
+                                   node);
+    ASSERT_GT(c.coordinator_pid, 0);
+    ASSERT_TRUE(await_http_ready(c.coordinator_http_port, 5s));
+    const auto worker_http_port = probe_free_port();
+    const pid_t worker =
+        spawn_proc({"clink_node",
+                    "--role=worker",
+                    "--id=worker-log-1",
+                    "--coordinator-host=127.0.0.1",
+                    "--coordinator-port=" + std::to_string(c.coordinator_control_port),
+                    "--http-port=" + std::to_string(worker_http_port),
+                    "--http-bind=127.0.0.1",
+                    "--log-file=" + worker_log.string()},
+                   node);
+    ASSERT_GT(worker, 0);
+    c.worker_pids.push_back(worker);
+    ASSERT_TRUE(await_http_ready(worker_http_port, 5s));
+
+    // The Worker, at the default level, writes its info lines to its file.
+    EXPECT_TRUE(
+        clink::itest::await_log_matches(worker_log, "[node.allocator] [info] allocator:", 1, 10s))
+        << "worker log:\n"
+        << read(worker_log);
+
+    // Losing the Worker is a warning the Coordinator writes after its own
+    // start-up lines. Logging is synchronous, so once the warning is in the
+    // file, every info line logged before it would be too, had --log-level
+    // not dropped it.
+    kill_quietly(worker);
+    c.worker_pids.clear();
+    ASSERT_TRUE(
+        clink::itest::await_log_matches(coordinator_log, "worker lost: worker-log-1", 1, 20s))
+        << "coordinator log:\n"
+        << read(coordinator_log);
+    const auto coordinator_text = read(coordinator_log);
+    EXPECT_EQ(coordinator_text.find("[info]"), std::string::npos)
+        << "an info line under --log-level=warn:\n"
+        << coordinator_text;
+    EXPECT_EQ(coordinator_text.find("called more than once"), std::string::npos)
+        << coordinator_text;
+    EXPECT_EQ(read(worker_log).find("called more than once"), std::string::npos)
+        << read(worker_log);
+    std::filesystem::remove_all(dir);
 }

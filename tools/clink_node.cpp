@@ -2005,8 +2005,10 @@ std::filesystem::path self_executable() {
 }
 
 // Build the logging config from --log-* flags. Defaults reproduce the
-// pre-spdlog behaviour: info level, console (stderr) on, no file sink. The
-// log level resolves --log-level, then the CLINK_LOG_LEVEL env, then "info".
+// pre-spdlog behaviour: info level, console (stderr) on, no file sink, and
+// synchronous sinks, so a line is written before the call that logs it
+// returns and a killed process loses none. The log level resolves
+// --log-level, then the CLINK_LOG_LEVEL env, then "info".
 clink::logging::LoggingConfig make_logging_config(int argc, char** argv, std::string node_name) {
     clink::logging::LoggingConfig cfg;
     cfg.node_name = std::move(node_name);
@@ -2037,7 +2039,7 @@ clink::logging::LoggingConfig make_logging_config(int argc, char** argv, std::st
     cfg.compress_rotated = get_arg(argc, argv, "log-compress", "true") != "false";
     cfg.zstd_level = static_cast<int>(num("log-zstd-level", 3));
     cfg.console = !has_flag(argc, argv, "log-no-console");
-    cfg.async = get_arg(argc, argv, "log-async", "true") != "false";
+    cfg.async = get_arg(argc, argv, "log-async", "false") != "false";
     return cfg;
 }
 
@@ -2081,10 +2083,9 @@ std::unique_ptr<clink::metrics::OtlpHttpExporter> make_otlp_exporter(
 }
 
 int run_coordinator(int argc, char** argv) {
-    // Initialise logging before anything emits. Configures console + optional
-    // rolling (zstd-compressed) file sink + the /api/v1/logs ring; all
-    // clink::log calls and the daemon diagnostics below route through it.
-    clink::logging::init(make_logging_config(argc, argv, "coordinator"));
+    // main() configured logging from the --log-* flags before registering
+    // anything: console, the optional rolling (zstd-compressed) file sink and
+    // the /api/v1/logs ring.
 #ifdef CLINK_HAS_HTTP
     clink::metrics::init_coordinator_metrics();
     clink::metrics::init_checkpoint_metrics();
@@ -3157,8 +3158,6 @@ int run_worker(int argc, char** argv) {
         std::cerr << "worker requires --id\n";
         return 1;
     }
-    // Initialise logging now that the id is known (root logger %n = worker@<id>).
-    clink::logging::init(make_logging_config(argc, argv, "worker@" + worker_id));
     std::unique_ptr<clink::cluster::HaCoordinator> ha_discovery;
     if (!etcd_endpoints.empty() || !ha_dir.empty()) {
         if (!etcd_endpoints.empty()) {
@@ -3687,7 +3686,8 @@ int main(int argc, char** argv) {
                 << "  --log-compress=true|false    zstd-compress rotated segments "
                    "(default true).\n"
                 << "  --log-zstd-level=<1..19>     zstd compression level (default 3).\n"
-                << "  --log-async=true|false       Async logging (default true).\n"
+                << "  --log-async=true|false       Async logging (default false: a "
+                   "line is written before the call returns).\n"
                 << "  --log-no-console             Disable the console (stderr) sink.\n"
                 << "\n"
                 << "HTTP flags:\n"
@@ -3712,11 +3712,21 @@ int main(int argc, char** argv) {
                 << "  --help       Print this message and exit.\n";
             return 0;
         }
+        // Logging before anything registers: registering the linked impls
+        // configures logging from the environment when nothing has yet, and
+        // a logging::init after that is ignored, which left a daemon's
+        // --log-* flags unread.
+        const auto role = get_arg(argc, argv, "role");
+        if (role == "coordinator") {
+            clink::logging::init(make_logging_config(argc, argv, "coordinator"));
+        } else if (role == "worker") {
+            clink::logging::init(
+                make_logging_config(argc, argv, "worker@" + get_arg(argc, argv, "id")));
+        }
         install_linked_impls();
         // Install before any role thread spawns, so SIGTERM/SIGINT
         // arrived at any point catches an idempotent flag flip.
         install_shutdown_signal_handler();
-        const auto role = get_arg(argc, argv, "role");
         if (role == "coordinator" || role == "worker") {
             const int rc =
                 role == "coordinator" ? run_coordinator(argc, argv) : run_worker(argc, argv);
