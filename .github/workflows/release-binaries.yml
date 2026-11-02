@@ -17,16 +17,22 @@
 # Debian trixie, whose glibc floor would exclude 24.04 hosts (the same
 # constraint that keeps Linux wheels opt-in; see wheels.yml).
 #
-# SCOPE, deliberate: the dependency-free impl set. SQL, file/parquet I/O,
-# RocksDB state, HTTP, TLS, WebSocket, Avro, vector search - everything that
-# needs no external client library or object-store SDK. The Arrow inside is
-# built WITHOUT the object-store filesystems (s3://, gs://, abfs://) because
-# those drag in an aws-sdk the runner does not have and the bundle could not
-# honestly ship; iceberg-cpp cannot link against a no-S3 Arrow, so the
-# Iceberg impl is skipped too (its CMake gate now says so). Broker connectors
-# (Kafka, Pulsar, ...) would each pin a client .so the consumer must also
-# have - out of scope for a portable bundle. Anything beyond this scope is a
-# from-source build, where every impl is available.
+# SCOPE, deliberate: SQL, file/parquet I/O, RocksDB state, HTTP, TLS,
+# WebSocket, WebHDFS, Neo4j and vector search, which need no external client
+# library, plus PostgreSQL, whose libpq5 is the one library the bundle needs
+# from the host beyond a stock Ubuntu 24.04 (OpenSSL, zlib, zstd and
+# libstdc++ are in the base system). The Arrow inside is built WITHOUT the
+# object-store filesystems (s3://, gs://, abfs://) because those drag in an
+# aws-sdk the runner does not have and the bundle could not honestly ship;
+# iceberg-cpp cannot link against a no-S3 Arrow, so the Iceberg impl is
+# skipped too (its CMake gate says so). Broker connectors (Kafka, Pulsar,
+# ...) would each pin a client .so the consumer must also have - out of
+# scope for a portable bundle - and the runner has no AvroCpp, so the Avro
+# format is not in it either. An impl left to AUTO joins the bundle whenever
+# the runner has its library, and brings that library's host dependency
+# with it; the stock-Ubuntu step below fails the release if that happens.
+# Anything beyond this scope is a from-source build, where every impl is
+# available.
 #
 # TRIGGERS: a release tag uploads the artefact to that release. A manual
 # dispatch is the dry run - identical build and smoke, uploaded as a
@@ -61,7 +67,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake build-essential g++-14 git curl ca-certificates pkg-config \
             libssl-dev libcurl4-openssl-dev libsqlite3-dev libxml2-dev \
-            libzstd-dev zlib1g-dev
+            libzstd-dev zlib1g-dev libpq-dev
 
       - name: Restore the pinned toolchain
         id: deps-cache
@@ -82,6 +88,8 @@ jobs:
         # extracted. CMAKE_INSTALL_RPATH_USE_LINK_PATH (set by the project)
         # additionally appends the runner's absolute dep paths - dangling on
         # a consumer machine and harmless, since the $ORIGIN entry wins.
+        # PostgreSQL is asked for by name rather than left to AUTO, so the
+        # bundle's scope does not follow what the runner image carries.
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -89,6 +97,7 @@ jobs:
             -DCLINK_BUILD_TESTS=OFF \
             -DCLINK_BUILD_EXAMPLES=OFF \
             -DCLINK_WITH_ICEBERG=OFF \
+            -DCLINK_WITH_POSTGRES=ON \
             -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib' \
             -DCMAKE_INSTALL_PREFIX="${RUNNER_TEMP}/stage"
           cmake --build build --parallel "$(nproc)"
@@ -181,6 +190,44 @@ jobs:
           cmake --build build --parallel "$(nproc)" > /dev/null
           ./build/consumer
           echo 'consumer smoke OK'
+
+      - name: The SDK runs on a stock Ubuntu 24.04
+        # The runner carries far more than a user's host, so the smoke test
+        # above cannot see a library the bundle expects from the system. Run
+        # the CLI and a Coordinator in a stock ubuntu:24.04 with only libpq5
+        # added, the one prerequisite the release names: a library or symbol
+        # missing there fails the release.
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/stock-ubuntu.sh" <<'SH'
+          set -euo pipefail
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends libpq5 > /dev/null
+          missing="$(for f in /sdk/bin/* /sdk/lib/libclink.so; do ldd -r "$f" 2>&1 | grep -E 'not found|undefined symbol' | sed "s|^|$f: |" || true; done)"
+          if [ -n "$missing" ]; then
+            echo "a stock Ubuntu 24.04 with libpq5 lacks what the SDK needs:" >&2
+            echo "$missing" >&2
+            exit 1
+          fi
+          cd /tmp
+          printf '{"u":"a","v":3}\n{"u":"b","v":4}\n{"u":"a","v":5}\n' > orders.ndjson
+          CLINK_LOG_LEVEL=warn /sdk/bin/clink run -e "
+            CREATE TABLE t (u VARCHAR, v BIGINT) WITH (connector='file', format='json', path='orders.ndjson');
+            CREATE TABLE o (u VARCHAR, total BIGINT) WITH (connector='file', format='json', path='out.ndjson');
+            INSERT INTO o SELECT u, SUM(v) AS total FROM t GROUP BY u"
+          grep -q '"total":8' out.ndjson
+          /sdk/bin/clink --capabilities > capabilities.txt
+          grep -qw postgres capabilities.txt
+          /sdk/bin/clink_node --role=coordinator --port=6123 --http-port=8081 > coordinator.log 2>&1 &
+          get() { exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET %s HTTP/1.0\r\n\r\n' "$1" >&3 && cat <&3; }
+          for _ in $(seq 1 60); do get /api/v1/health > /dev/null 2>&1 && break; sleep 1; done
+          get / > root.http || { cat coordinator.log >&2; exit 1; }
+          head -1 root.http | grep -q ' 200 ' || { head -20 root.http >&2; exit 1; }
+          echo 'stock Ubuntu 24.04 smoke OK'
+          SH
+          docker run --rm -v "${RUNNER_TEMP}/clink-sdk:/sdk:ro" \
+            -v "${RUNNER_TEMP}/stock-ubuntu.sh:/stock-ubuntu.sh:ro" \
+            ubuntu:24.04 bash /stock-ubuntu.sh
 
       - name: Pack
         id: pack

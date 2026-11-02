@@ -17,7 +17,9 @@ at any parallelism, and in the typed API a timer that reads `current_key()`
 needs a timer key decoder. A cluster that asks for a token works with the token
 on every node, as the quickstart advises; before, the Coordinator's own reads of
 its Workers were refused. The Kafka to ClickHouse tutorial runs on the native
-sink and ClickHouse 26.8, and needs a runtime image from v0.11.0 or later.
+sink and ClickHouse 26.8, and needs a runtime image from v0.11.0 or later. The
+SDK tarball needs `libpq5` on the host, as earlier tarballs did without saying
+so, and is now checked on a stock Ubuntu 24.04.
 
 **A source whose input does not divide between subtasks is read once at any
 parallelism.** A file, a query's result, an Iceberg snapshot, an endpoint
@@ -281,6 +283,21 @@ only those: `HttpClient::present_cluster_token()` never sends it to a metrics
 collector or a lineage endpoint. A Worker that refuses the Coordinator's token
 is reported as a 502 that says so. Covered by
 `HttpObservability.TheCoordinatorPresentsTheClusterTokenToItsWorkers`.
+
+**The SDK tarball names what it needs from the host, and is checked on a stock
+Ubuntu 24.04.** The tarball was described as needing nothing beyond a stock
+Ubuntu 24.04, but its build turns on every connector whose library the build
+machine has, and that machine has PostgreSQL's client library. So every tarball
+back to v0.10.0 at least includes the PostgreSQL connector and needs `libpq5` on
+the host; without it, no binary in the tarball starts. Its smoke test ran on the
+build machine, so it never noticed. The build now asks for the PostgreSQL
+connector by name, `libpq5` is documented as the tarball's one host
+prerequisite (`apt-get install libpq5` on Ubuntu 24.04; see
+`docs/connectors/postgres.md`), and a release step runs the CLI and a
+Coordinator in a stock `ubuntu:24.04` with only that package added, so a
+library or symbol the host lacks fails the release. Nor does the tarball carry
+the Avro format, which the release that introduced it listed; the workflow now
+says so. The runtime image and the wheels are unaffected.
 
 ## v0.14.1 (November 2026)
 
