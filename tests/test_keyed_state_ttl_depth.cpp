@@ -107,8 +107,37 @@ TEST(KeyedStateTtlDepth, NothingExpiresBeforeTheFirstWatermarkByDefault) {
         << "state was expired against a watermark that has not arrived";
     EXPECT_FALSE(s.has_watermark());
 
+    // Event time starts here, and the entry gets its full TTL from it: the first
+    // watermark must not be the moment that expires everything written before it.
     s.advance_watermark(1'000'000);
-    EXPECT_FALSE(s.get(1).has_value()) << "once event time exists, the entry must expire";
+    EXPECT_TRUE(s.get(1).has_value())
+        << "an entry written before event time existed expired at the first watermark";
+    s.advance_watermark(1'000'001);
+    EXPECT_FALSE(s.get(1).has_value()) << "once its TTL has run, the entry must expire";
+}
+
+// The case that cost data: a job starts, writes state, and only then sees its
+// first watermark, an epoch timestamp. Stamped from zero, every one of those
+// entries had a deadline in 1970 and the first watermark expired them all, on
+// the read path, in a scan and in the cleanup sweep alike.
+TEST(KeyedStateTtlDepth, EntriesWrittenBeforeTheFirstWatermarkLiveTheirTtlFromIt) {
+    constexpr std::int64_t kFirst = 1'700'000'000'000;
+    InMemoryStateBackend b;
+    auto s = slot(b, event_time(1000ms));
+    s.put(1, "a");
+    s.put(2, "b");
+    s.advance_watermark(kFirst);
+
+    EXPECT_TRUE(s.get(1).has_value());
+    std::size_t seen = 0;
+    s.scan([&](const std::int64_t&, const std::string&) { ++seen; });
+    EXPECT_EQ(seen, 2u) << "a scan skipped entries that had a full TTL left";
+
+    s.advance_watermark(kFirst + 999);
+    EXPECT_EQ(s.cleanup_all(), 0u) << "the sweep removed entries that had TTL left";
+    s.advance_watermark(kFirst + 1000);
+    EXPECT_EQ(s.cleanup_all(), 2u) << "once the TTL has run from the first watermark, both go";
+    EXPECT_FALSE(s.get(2).has_value());
 }
 
 TEST(KeyedStateTtlDepth, ExpireBeforeFirstWatermarkIsOptInAndDoesWhatItSays) {

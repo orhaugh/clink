@@ -48,6 +48,13 @@ interval join showed 0 in against 1.6 million out. Each input's batches now
 count in the operator's `records_in_total`, as a one-input operator's do.
 Covered by `OperatorMetrics.ATwoInputOperatorCountsTheRecordsOfBothInputs`.
 
+**Keyed state written before the first watermark keeps its event-time TTL.** An
+entry written before event time existed was stamped from zero, so its deadline
+fell in 1970 and the first watermark expired everything written before it, on
+reads, scans and the cleanup sweep alike. It now gets its full TTL from the
+first watermark, as SQL state already does. Covered by
+`KeyedStateTtlDepth.EntriesWrittenBeforeTheFirstWatermarkLiveTheirTtlFromIt`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

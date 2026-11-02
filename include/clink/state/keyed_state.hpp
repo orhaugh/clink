@@ -318,7 +318,7 @@ public:
                     return;
                 }
                 const auto expire_at = read_i64_le_(v_bytes_ptr);
-                if (now_opt.has_value() && expire_at <= *now_opt) {
+                if (now_opt.has_value() && expired_at_(expire_at, *now_opt)) {
                     return;  // expired; skip silently (purged on next get())
                 }
                 v_bytes_ptr += 8;
@@ -350,6 +350,11 @@ public:
     // resurrect state that had already expired, so a regression is ignored
     // rather than applied.
     void advance_watermark(std::int64_t watermark_ms) noexcept {
+        if (!this->has_watermark_) {
+            // Event time starts here: an entry written before it counts its
+            // TTL from this watermark (kPreClockStamp).
+            this->first_watermark_ms_ = watermark_ms;
+        }
         if (!this->has_watermark_ || watermark_ms > this->watermark_ms_) {
             this->watermark_ms_ = watermark_ms;
             this->has_watermark_ = true;
@@ -427,7 +432,7 @@ public:
             bytes += key.size() + v.size();
             if (v.size() >= 8) {
                 const auto expire_at = read_i64_le_(v.data());
-                if (expire_at <= *now) {
+                if (this->expired_at_(expire_at, *now)) {
                     doomed.push_back(key);
                 } else {
                     ++live;
@@ -627,7 +632,10 @@ private:
                 const auto expire_at =
                     read_i64_le_(reinterpret_cast<const std::byte*>(value.data()));
                 if (event_time) {
-                    return have_wm && expire_at <= wm;
+                    // A pre-clock entry's deadline runs from the first watermark,
+                    // which this snapshot of the clock may predate: keep it, and
+                    // leave it to the read path and the sweep.
+                    return have_wm && expire_at != kPreClockStamp && expire_at <= wm;
                 }
                 const auto now = clock != nullptr
                                      ? clock()
@@ -657,17 +665,28 @@ private:
         return watermark_ms_;
     }
 
-    // The stamp to write for an entry created or refreshed now. Falls back
-    // to the wall clock when event time is not yet established, so the
-    // entry gets a sane absolute expiry rather than one relative to zero
-    // (which would place it in 1970 and make it instantly dead).
+    // The stamp an entry written before event time exists carries. It has no
+    // clock to be measured from yet, so it gets its full TTL from the first
+    // watermark (expired_at_). Stamping it from zero instead placed its
+    // deadline in 1970, so the first real watermark expired every entry
+    // written before it. A real stamp is a time plus a positive TTL and can
+    // never equal this.
+    static constexpr std::int64_t kPreClockStamp = std::numeric_limits<std::int64_t>::min();
+
+    // The stamp to write for an entry created or refreshed now: kPreClockStamp
+    // when event time is not yet established, which is the only time the
+    // slot's domain has no clock.
     [[nodiscard]] std::int64_t expire_at_() const {
         const auto now = now_for_ttl_();
-        const auto base =
-            now.has_value()
-                ? *now
-                : (ttl_.domain == TtlTimeDomain::EventTime ? std::int64_t{0} : now_ms_());
-        return base + ttl_.ttl.count();
+        return now.has_value() ? *now + ttl_.ttl.count() : kPreClockStamp;
+    }
+
+    // Whether a stamp has passed at `now`, in this slot's domain.
+    [[nodiscard]] bool expired_at_(std::int64_t expire_at, std::int64_t now) const noexcept {
+        if (expire_at == kPreClockStamp) {
+            return first_watermark_ms_ + ttl_.ttl.count() <= now;
+        }
+        return expire_at <= now;
     }
 
     // True when `expire_at` is in the past for this slot's domain. False
@@ -675,7 +694,7 @@ private:
     // against a clock that has not started.
     [[nodiscard]] bool is_expired_(std::int64_t expire_at) const {
         const auto now = now_for_ttl_();
-        return now.has_value() && expire_at <= *now;
+        return now.has_value() && expired_at_(expire_at, *now);
     }
 
     // "<slot>|" - the marker that identifies a key as belonging to this
@@ -716,6 +735,7 @@ private:
     // to record that it purged something.
     std::int64_t watermark_ms_{0};
     bool has_watermark_{false};
+    std::int64_t first_watermark_ms_{0};  // when event time started (kPreClockStamp)
     mutable TtlStats stats_{};
     // Resume point for incremental cleanup, so successive bounded sweeps
     // walk the whole slot instead of re-scanning its front.
