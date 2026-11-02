@@ -213,6 +213,16 @@ default is now named after the remote location, which carries the job's
 `_state/<id>` prefix. Covered by
 `S3RocksdbSchemes.TwoJobsWithoutALocalRootKeepTheirOwnWorkingDb`.
 
+**A job that ended under an earlier Coordinator is still listed after a
+takeover.** `GET /api/v1/jobs` and `GET /api/v1/jobs/:id` read only the jobs
+the Coordinator had run itself, so after a failover every finished job
+vanished from the listing and the console, and its id answered 404, although
+the new leader had read each one's record back from `<ha_dir>/history/`. Both
+now fall back to that record, which also keeps the job's name and the
+checkpoint a graceful stop ended it at, so a stopped job still reads as
+stopped; a record written by an earlier release lists them as empty and 0.
+Covered by `Cluster.AJobThatEndedUnderAnEarlierCoordinatorIsStillListed`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

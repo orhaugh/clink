@@ -407,6 +407,8 @@ void persist_history_record_(const std::string& ha_dir,
     auto q = [](const std::string& s) { return js_quote(s); };
     std::string body;
     body += "{\"job_id\":" + std::to_string(rec.job_id);
+    body += ",\"name\":" + q(rec.name);
+    body += ",\"stopped_at_checkpoint_id\":" + std::to_string(rec.stopped_at_checkpoint_id);
     body += ",\"status\":" + q(rec.status);
     body += ",\"errors\":[";
     for (std::size_t i = 0; i < rec.errors.size(); ++i) {
@@ -1398,6 +1400,8 @@ void Coordinator::reload_history_from_disk_() {
         rec.job_id = static_cast<JobId>(read_uint_field(body, "job_id"));
         if (rec.job_id == 0)
             continue;
+        rec.name = read_string_field(body, "name");
+        rec.stopped_at_checkpoint_id = read_uint_field(body, "stopped_at_checkpoint_id");
         rec.status = read_string_field(body, "status");
         rec.errors = read_string_array_field(body, "errors");
         rec.restart_attempts =
@@ -2795,10 +2799,36 @@ std::string job_status_string(bool completion_signalled, bool cancel_requested, 
     return std::string{to_string(JobTerminalStatus::CompletedOk)};
 }
 
+// A terminal job this Coordinator knows only from its history record: one that
+// ended under an earlier Coordinator, read back from the HA dir at takeover.
+// The record keeps what the listing needs, though not the job's tasks, graph
+// or checkpoint configuration.
+namespace {
+
+bool record_cancelled(const CompletedJobRecord& rec) {
+    return rec.status == "cancelled";
+}
+
+}  // namespace
+
 std::vector<JobSummary> Coordinator::snapshot_jobs() const {
     std::vector<JobSummary> out;
     std::lock_guard lock(mu_);
     out.reserve(jobs_.size());
+    for (const auto& rec : history_) {
+        if (jobs_.count(rec.job_id) != 0) {
+            continue;
+        }
+        JobSummary s;
+        s.id = rec.job_id;
+        s.name = rec.name;
+        s.stopped_at_checkpoint_id = rec.stopped_at_checkpoint_id;
+        s.completion_signalled = true;
+        s.cancel_requested = record_cancelled(rec);
+        s.error_count = rec.errors.size();
+        s.status = job_status_string(true, s.cancel_requested, !rec.errors.empty());
+        out.push_back(std::move(s));
+    }
     for (const auto& [id, job] : jobs_) {
         JobSummary s;
         s.id = id;
@@ -2815,6 +2845,9 @@ std::vector<JobSummary> Coordinator::snapshot_jobs() const {
         s.guarantee_limiting_factor = job->guarantee_limiting_factor;
         out.push_back(std::move(s));
     }
+    std::sort(out.begin(), out.end(), [](const JobSummary& a, const JobSummary& b) {
+        return a.id < b.id;
+    });
     return out;
 }
 
@@ -2822,6 +2855,21 @@ std::optional<JobDetail> Coordinator::snapshot_job(JobId job_id) const {
     std::lock_guard lock(mu_);
     auto it = jobs_.find(job_id);
     if (it == jobs_.end()) {
+        for (const auto& rec : history_) {
+            if (rec.job_id != job_id) {
+                continue;
+            }
+            JobDetail d;
+            d.id = rec.job_id;
+            d.name = rec.name;
+            d.stopped_at_checkpoint_id = rec.stopped_at_checkpoint_id;
+            d.completion_signalled = true;
+            d.cancel_requested = record_cancelled(rec);
+            d.errors = rec.errors;
+            d.latest_completed_checkpoint_id = rec.latest_completed_checkpoint_id;
+            d.status = job_status_string(true, d.cancel_requested, !rec.errors.empty());
+            return d;
+        }
         return std::nullopt;
     }
     const auto& job = *it->second;
@@ -9409,6 +9457,8 @@ void Coordinator::signal_job_completion_locked_(JobState& job) {
     {
         CompletedJobRecord rec;
         rec.job_id = job.id;
+        rec.name = job.name;
+        rec.stopped_at_checkpoint_id = job.stopped_at_checkpoint_id;
         rec.status = status;
         rec.errors = job.errors;
         rec.restart_attempts = job.restarts_total;

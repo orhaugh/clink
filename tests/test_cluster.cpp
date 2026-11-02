@@ -11,6 +11,7 @@
 #include <libproc.h>
 #endif
 #include <dlfcn.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -1088,6 +1089,98 @@ TEST(Cluster, HistoryServerPersistsAcrossRestart) {
         coordinator2.stop();
     }
 
+    std::filesystem::remove_all(ha_dir);
+}
+
+// A job that ended under an earlier Coordinator is known to the next one only
+// from its history record. GET /api/v1/jobs listed only live job states, so
+// after a takeover every finished job vanished from the listing and its id
+// answered 404. Both now fall back to the record, which keeps the job's name
+// and the checkpoint a graceful stop ended it at; a record written before
+// those were kept lists them as empty and 0.
+TEST(Cluster, AJobThatEndedUnderAnEarlierCoordinatorIsStillListed) {
+    ensure_built_ins_registered();
+    const auto ha_dir = std::filesystem::temp_directory_path() /
+                        ("clink-history-listed-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(ha_dir);
+
+    JobId ran = 0;
+    std::string ran_status;
+    {
+        Coordinator coordinator;
+        coordinator.set_ha_dir(ha_dir.string());
+        const auto port = coordinator.start();
+        coordinator.expect_workers({"worker-listed"});
+        Worker::Config worker_cfg;
+        worker_cfg.slot_count = 4;
+        Worker worker("worker-listed", "127.0.0.1", worker_cfg);
+        worker.connect_to_coordinator("127.0.0.1", port);
+        ASSERT_TRUE(coordinator.await_registrations(2s));
+
+        JobGraphSpec g;
+        g.name = "listed-after-takeover";
+        OperatorSpec src;
+        src.type = "int64_range_source";
+        src.id = "src";
+        src.parallelism = 1;
+        src.out_channel = std::string{kChannelInt64};
+        src.params = {{"count", "3"}};
+        g.ops.push_back(src);
+        OperatorSpec snk;
+        snk.type = "collecting_int64_sink";
+        snk.id = "snk";
+        snk.inputs = {"src"};
+        snk.parallelism = 1;
+        snk.out_channel = std::string{kChannelInt64};
+        g.ops.push_back(snk);
+        ran = coordinator.submit_job(g, OperatorRegistry::default_instance());
+        ASSERT_TRUE(coordinator.await_job_completion(ran, 10s));
+        for (const auto& j : coordinator.snapshot_jobs()) {
+            if (j.id == ran) {
+                ran_status = j.status;
+            }
+        }
+        ASSERT_FALSE(ran_status.empty());
+        worker.stop();
+        coordinator.stop();
+    }
+    // Two records as an earlier release, or an earlier stop, left them.
+    {
+        std::ofstream(ha_dir / "history" / "900041.json")
+            << R"({"job_id":900041,"name":"stopped-one","stopped_at_checkpoint_id":7,)"
+               R"("status":"ok","errors":[],"restart_attempts":0,)"
+               R"("latest_completed_checkpoint_id":7,"duration_ms":10,)"
+               R"("completed_at_unix_seconds":100,"coordinator_epoch":0})";
+        std::ofstream(ha_dir / "history" / "900042.json")
+            << R"({"job_id":900042,"status":"cancelled","errors":[],"restart_attempts":0,)"
+               R"("latest_completed_checkpoint_id":0,"duration_ms":10,)"
+               R"("completed_at_unix_seconds":101,"coordinator_epoch":0})";
+    }
+
+    Coordinator next;
+    next.set_ha_dir(ha_dir.string());
+    std::map<JobId, JobSummary> listed;
+    for (auto& j : next.snapshot_jobs()) {
+        listed[j.id] = j;
+    }
+    ASSERT_EQ(listed.count(ran), 1U) << "the job the earlier Coordinator ran is not listed";
+    EXPECT_EQ(listed[ran].name, "listed-after-takeover");
+    EXPECT_EQ(listed[ran].status, ran_status);
+    ASSERT_EQ(listed.count(900041), 1U);
+    EXPECT_EQ(listed[900041].name, "stopped-one");
+    EXPECT_EQ(listed[900041].stopped_at_checkpoint_id, 7U);
+    EXPECT_EQ(listed[900041].status, ran_status) << "a stop completes as running out does";
+    ASSERT_EQ(listed.count(900042), 1U);
+    EXPECT_EQ(listed[900042].name, "");
+    EXPECT_TRUE(listed[900042].cancel_requested);
+
+    const auto detail = next.snapshot_job(ran);
+    ASSERT_TRUE(detail.has_value()) << "the job's id answers nothing";
+    EXPECT_EQ(detail->name, "listed-after-takeover");
+    EXPECT_EQ(detail->status, ran_status);
+    EXPECT_TRUE(detail->completion_signalled);
+    EXPECT_FALSE(next.snapshot_job(JobId{900043}).has_value());
+    next.stop();
     std::filesystem::remove_all(ha_dir);
 }
 

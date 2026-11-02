@@ -152,6 +152,12 @@ struct PlacementWorker {
 // emitted by signal_job_completion_locked_).
 struct CompletedJobRecord {
     JobId job_id{};
+    // The name the job was submitted with, and the checkpoint a graceful stop
+    // ended it at (0 when it was not stopped), so that a job a later
+    // Coordinator knows only from this record still lists as it did. Empty and
+    // 0 in a record written before they were kept.
+    std::string name;
+    std::uint64_t stopped_at_checkpoint_id{};
     std::string status;
     std::vector<std::string> errors;
     std::uint32_t restart_attempts{};
