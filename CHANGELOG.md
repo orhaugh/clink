@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.14.1 (November 2026)
+
+A packaging fix: the SDK tarball carries the ops console, which v0.14.0's
+lacked. The engine is unchanged and so is the plugin ABI fingerprint, so job
+modules built against v0.14.0 load as they are. There are no state-format,
+API or wire-protocol changes.
 
 **The SDK tarball carries the ops console.** v0.14.0's
 `clink-v0.14.0-linux-x86_64-ubuntu24.04.tar.gz` shipped without it: the
