@@ -25,21 +25,18 @@ CREATE TABLE readings (
     watermark_lag_ms  = '3000'
 );
 
--- Sink: one row per (sensor, window), inserted as JSONEachRow into the
--- ClickHouse table created by clickhouse-init.sql, through the text sink, the
--- SQL default. A new table should prefer insert_format = 'native', the typed
--- native sink (docs/connectors/clickhouse.md, "Choosing a sink"); adding it to
--- the WITH clause below runs this pipeline on it. Delivery to ClickHouse is
--- at-least-once: rows written after the last completed checkpoint are
--- written again after a recovery, which is why that table is a
--- ReplacingMergeTree keyed by (sensor_id, window_start).
---
--- batch_rows='1' inserts each row as soon as the window fires. Eight rows
--- every ten seconds is nothing to batch, and it matters for correctness on
--- clink 0.8.0, whose ClickHouse sink flushes its buffer on a row-count or
--- time trigger rather than at the checkpoint barrier: a row still buffered
--- when the Worker dies is only safe if it had already been inserted. From
--- 0.9.0 the sink flushes at every barrier and the option is a plain tuning knob.
+-- Sink: one row per (sensor, window), into the ClickHouse table created by
+-- clickhouse-init.sql. format = 'json' declares a table of typed columns, and
+-- insert_format = 'native' writes them through the native sink: it checks the
+-- server and the table when it opens, converts each value into its column's
+-- type, and sends typed blocks over ClickHouse's native protocol. An INSERT
+-- closes batch_interval_ms (one second by default) after its first row, and
+-- at every checkpoint barrier, so a window's row is in ClickHouse about a
+-- second after the window fires. Delivery to ClickHouse is at-least-once:
+-- rows written after the last completed checkpoint are written again after a
+-- recovery, which is why that table is a ReplacingMergeTree keyed by
+-- (sensor_id, window_start). docs/connectors/clickhouse.md, "Choosing a
+-- sink", compares this sink with the text sink, the SQL default.
 CREATE TABLE sensor_window_stats (
     sensor_id    VARCHAR,
     window_start BIGINT,
@@ -57,7 +54,7 @@ CREATE TABLE sensor_window_stats (
     table     = 'sensor_window_stats',
     user      = 'clink',
     password  = 'clink',
-    batch_rows = '1'
+    insert_format = 'native'
 );
 
 -- The standing job. A window fires once the watermark passes its end, so the

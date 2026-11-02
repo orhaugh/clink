@@ -131,20 +131,21 @@ CREATE TABLE sensor_window_stats (
     table     = 'sensor_window_stats',
     user      = 'clink',
     password  = 'clink',
-    batch_rows = '1'
+    insert_format = 'native'
 );
 ```
 
-This table writes through the JSONEachRow text sink, the SQL default for a
-ClickHouse table, which the tutorial keeps so that it runs on every published
-image. For a table of your own, add `insert_format = 'native'`: the typed
-native sink checks the server and the target table before it writes and
-converts every value into its column's type, and
+`format = 'json'` declares a table of typed columns, and
+`insert_format = 'native'` picks the sink that writes them: the native sink,
+which sends typed blocks over ClickHouse's native protocol. It converts every
+value into its column's type and never casts one silently, so a reading count
+too large for the table's `UInt32` column fails the job, naming the column,
+rather than wrapping. An INSERT closes a second after its first row, and at
+every checkpoint barrier, so a window's row reaches ClickHouse about a second
+after the window fires.
 [Choosing a sink](../connectors/clickhouse.md#choosing-a-sink) sets out what
-it guarantees and what it refuses. Add it here to run this pipeline on the
-native sink; `run.sh` checks that the sink the pipeline asks for is the one
-that ran. Either sink is at-least-once, and either must be the only sink on
-its chain.
+it guarantees and what it refuses, beside the text sink that a ClickHouse
+table gets when it leaves `insert_format` out.
 
 And the query that connects them:
 
@@ -176,6 +177,36 @@ curl -s localhost:8081/api/v1/jobs
 ```json
 {"jobs":[{"id":1,"status":"RUNNING","error_count":0, ...}]}
 ```
+
+The sink has already been to ClickHouse. When it opened, before any data
+moved, it read the server's version and settings and the table's definition,
+and it logged what it found:
+
+```bash
+docker compose logs worker | grep 'clickhouse native sink open'
+```
+
+```
+clickhouse native sink open: subtask=0/1 factory=clickhouse_native_sink
+  mode=append delivery=at_least_once table=`default`.`sensor_window_stats`
+  engine=ReplacingMergeTree server=26.8.15 (tested) ...
+  dedup_window=non_replicated_deduplication_window=1000 (table)
+  async_insert=0 (table setting) columns=7 omitted=2 ...
+```
+
+`(tested)` means the server is on a ClickHouse line the native sink is tested
+against. `dedup_window` and `async_insert` both say they come from the table:
+the `SETTINGS` clause in `clickhouse-init.sql` sets them. `async_insert=0`
+means the table takes each INSERT synchronously; the sink refuses a table
+that does not. The deduplication
+window keeps a log of recent INSERTs, so an INSERT the sink resends after a
+failure that left it in doubt is dropped rather than landing twice.
+`omitted=2` counts the table's columns the pipeline does not write,
+`inserted_at` and `window_start_ts`, which ClickHouse fills itself. A table
+the sink could not write to safely would have been refused at this point,
+with a code and the fix;
+[What it checks at open](../connectors/clickhouse.md#what-it-checks-at-open)
+lists the checks.
 
 ## Stream the readings in
 
@@ -222,13 +253,12 @@ finished. It is a stream; it does not intend to.
 !!! note "If nothing appears"
     `curl -s localhost:8081/api/v1/jobs/1/operators` names the stage that is
     stuck in one line per operator: `records_out` of zero at
-    `kafka_source_string` means nothing is being read from Kafka. There is a
-    known intermittent where a fresh stack's source assigns its partition and
-    then reads nothing, silently
-    ([issue #8](https://github.com/orhaugh/clink/issues/8), fixed in
-    v0.9.0; a v0.8.0 image can still hit it);
-    `docker compose restart worker` clears it, and the aggregates stay exact
-    because nothing had been consumed yet.
+    `kafka_source_string` means nothing is being read from Kafka, and
+    non-zero everywhere but the sink means ClickHouse is not taking the
+    rows. A sink that refused to open says why in the Worker log, with a
+    code: `docker compose logs worker | grep -E 'clickhouse\.[a-z_]+'`, and
+    [Refusals and how to fix them](../connectors/clickhouse.md#refusals-and-how-to-fix-them)
+    gives the fix for each.
 
 ## Break it
 
@@ -322,10 +352,10 @@ on it outright rather than pretending), and ClickHouse offers no transaction
 for an INSERT to enlist in.
 
 The run above shows no duplicates, and that deserves an explanation rather
-than credit: with `batch_rows='1'` each fired window is in ClickHouse
-immediately, and a checkpoint completes at most two seconds later, so the
-gap between "row inserted" and "insert covered by a checkpoint" is thin, and
-this kill missed it. The verifier counts every window's copies on every run
+than credit: a fired window's row is in ClickHouse within about a second,
+and a checkpoint completes at most two seconds later, so the gap between
+"row inserted" and "insert covered by a checkpoint" is thin, and this kill
+missed it. The verifier counts every window's copies on every run
 and asserts they are identical whenever they appear; the contract stays
 at-least-once whether or not a particular kill exercises it.
 
@@ -334,7 +364,9 @@ ordered by `(sensor_id, window_start)`: duplicates with the same key collapse
 when ClickHouse merges parts, and `SELECT ... FINAL` collapses them at read
 time. Deduplicating on a key the sink cannot help repeating is the ordinary
 way to consume an at-least-once stream, and the pipeline gives you an exact
-key to do it on.
+key to do it on. The table's deduplication window does not do this job: it
+drops an INSERT sent twice, and a replay after a restart is a new INSERT
+carrying the same rows.
 
 The Coordinator states this itself at submission time, before any data moves:
 
@@ -344,7 +376,7 @@ docker compose logs coordinator | grep guarantee
 
 ```
 [coordinator.guarantee] job delivery guarantee:
-  STATE_EXACTLY_ONCE_OUTPUT_AT_LEAST_ONCE (limited by sink 'clickhouse_sink')
+  STATE_EXACTLY_ONCE_OUTPUT_AT_LEAST_ONCE (limited by sink 'clickhouse_native_sink')
 ```
 
 If you need exactly-once output end to end, the sink has to be able to

@@ -19,6 +19,8 @@
 #   CLINK_HTTP_PORT       Coordinator HTTP API      default 8081
 #   CLICKHOUSE_HTTP_PORT  ClickHouse HTTP interface default 8123
 # CLINK_IMAGE picks a different clink image (default: the published :latest).
+# pipeline.sql writes through the native ClickHouse sink, which runtime images
+# carry from v0.11.0; run.sh checks that the sink that ran is that one.
 
 services:
   kafka:
@@ -66,7 +68,8 @@ services:
     restart: "no"
 
   clickhouse:
-    image: clickhouse/clickhouse-server:25.3
+    # A line the native sink is tested on, pinned by digest.
+    image: clickhouse/clickhouse-server:26.8@sha256:3043f691ec1a847f38b446ff43708893fcbf9815bd9bd88c0f84bfe064ce852f
     environment:
       # The image restricts its passwordless `default` user to localhost, so
       # the pipeline connects as this network-reachable user instead

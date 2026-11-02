@@ -602,7 +602,7 @@ sink.open();
 // sink.on_data(batch); sink.flush(); sink.close();
 ```
 
-SQL reaches the native sink through `insert_format='native'`, and C++ through the typed helper in [C++: typed structs](#c-typed-structs). The source side is reached through the registered factories (`clickhouse_row_source`, `clickhouse_text_source`, `clickhouse_source`), each requiring a `query`.
+SQL reaches the native sink through `insert_format='native'`, and C++ through the typed helper in [C++: typed structs](#c-typed-structs). The [Kafka to ClickHouse tutorial](../tutorials/kafka-to-clickhouse.md) is a worked SQL example: a windowed pipeline into a `ReplacingMergeTree` on 26.8, with the Worker killed mid-stream and every window checked afterwards. The source side is reached through the registered factories (`clickhouse_row_source`, `clickhouse_text_source`, `clickhouse_source`), each requiring a `query`.
 
 ## Delivery semantics
 

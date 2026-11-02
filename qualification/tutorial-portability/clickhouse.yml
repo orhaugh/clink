@@ -11,7 +11,8 @@
 # rig-only variant.
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:25.3
+    # The tutorial's own line, a native sink tested line, pinned by digest.
+    image: clickhouse/clickhouse-server:26.8@sha256:3043f691ec1a847f38b446ff43708893fcbf9815bd9bd88c0f84bfe064ce852f
     container_name: tut-clickhouse
     restart: "no"
     environment:

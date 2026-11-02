@@ -7,6 +7,14 @@
 -- and `SELECT ... FROM sensor_window_stats FINAL` collapses them at read time.
 -- inserted_at is not something clink writes; it records when each row
 -- arrived, which is how a re-inserted row is told apart from the original.
+--
+-- async_insert = 0 because the native sink refuses a table that takes
+-- inserts asynchronously (clickhouse.target_async_insert), a path on which
+-- the server can lose rows it has acknowledged; set on the table, it holds
+-- whatever the server's default. non_replicated_deduplication_window keeps a
+-- log of recent INSERTs, so one the sink resends after a failure that left it
+-- in doubt is dropped rather than landing twice. A replay after a recovery is
+-- new INSERTs, which the log does not drop; the key collapses those.
 CREATE TABLE IF NOT EXISTS sensor_window_stats
 (
     sensor_id       String,
@@ -20,4 +28,5 @@ CREATE TABLE IF NOT EXISTS sensor_window_stats
     window_start_ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(window_start)
 )
 ENGINE = ReplacingMergeTree
-ORDER BY (sensor_id, window_start);
+ORDER BY (sensor_id, window_start)
+SETTINGS async_insert = 0, non_replicated_deduplication_window = 1000;

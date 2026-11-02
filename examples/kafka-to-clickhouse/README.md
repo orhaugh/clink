@@ -62,8 +62,8 @@ starts clean.
 | File | What it is |
 |---|---|
 | `docker-compose.yml` | Kafka, ClickHouse, a clink Coordinator and Worker, and two one-shot containers: topic creation and pipeline submission |
-| `pipeline.sql` | The pipeline: a Kafka source, a ClickHouse sink, and one `INSERT INTO ... SELECT` with a tumbling event-time window |
-| `clickhouse-init.sql` | Creates `sensor_window_stats` as a `ReplacingMergeTree` keyed by `(sensor_id, window_start)` |
+| `pipeline.sql` | The pipeline: a Kafka source, a ClickHouse table written through the native sink, and one `INSERT INTO ... SELECT` with a tumbling event-time window |
+| `clickhouse-init.sql` | Creates `sensor_window_stats` as a `ReplacingMergeTree` keyed by `(sensor_id, window_start)`, with the `async_insert = 0` and deduplication window the native sink checks for when it opens |
 | `scripts/workload.py` | The workload's single definition: eight sensors, deterministic readings, and the expected window aggregates |
 | `scripts/produce_events.py` | Streams the readings into Kafka through the broker container's console producer |
 | `scripts/verify.py` | Recomputes the expectation from `workload.py` and compares it with ClickHouse |
@@ -100,9 +100,9 @@ re-aggregated without being lost or double-counted.
 emitted after the last completed checkpoint is emitted again after the
 restart, so a window can appear in the table twice with identical values.
 `verify.py` counts every window's copies, asserts they agree, and reports
-how many were duplicated (often none here: with `batch_rows='1'` a fired
-window is in ClickHouse immediately and covered by a checkpoint within two
-seconds, so the vulnerable gap is thin). clink's ClickHouse
+how many were duplicated (often none here: a fired window is in ClickHouse
+within about a second and covered by a checkpoint at most two seconds later,
+so the vulnerable gap is thin). clink's ClickHouse
 sink has no two-phase commit - the SQL planner rejects
 `delivery_guarantee='exactly_once'` on it - which is why the table is a
 `ReplacingMergeTree`: duplicates collapse by key on merge, and
@@ -111,7 +111,7 @@ submission time:
 
 ```
 [coordinator.guarantee] job delivery guarantee:
-  STATE_EXACTLY_ONCE_OUTPUT_AT_LEAST_ONCE (limited by sink 'clickhouse_sink')
+  STATE_EXACTLY_ONCE_OUTPUT_AT_LEAST_ONCE (limited by sink 'clickhouse_native_sink')
 ```
 
 For exactly-once output end to end, use a sink that can commit with the
@@ -193,11 +193,7 @@ docker compose logs coordinator | grep 'job delivery guarantee'
 docker compose logs worker | grep -E 'clickhouse native sink|clickhouse\.[a-z_]+'
 ```
 
-One known intermittent: on a freshly created stack the Kafka source can
-assign its partition and then read nothing at all - every `records_out`
-stays 0 with no error anywhere
-([issue #8](https://github.com/orhaugh/clink/issues/8), fixed in v0.9.0;
-a v0.8.0 image can still hit it under a loaded host).
-`docker compose restart worker` clears it; the job then consumes everything
-from the beginning, exactly once into its aggregates, because nothing had
-been read yet.
+The native sink is in runtime images from v0.11.0, and the stack runs
+ClickHouse 26.8, a line the sink is tested on. With `CLINK_IMAGE` set to an
+older image, `run.sh` fails its sink check rather than passing on another
+sink.

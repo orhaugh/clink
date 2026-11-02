@@ -138,6 +138,17 @@ sinks, whose streams cannot abort, delete the object, and the WebHDFS sink
 uploads nothing. Covered by `ParquetConnector.ACancelledSinkLeavesNoFileBehind`
 and `WebHdfsParquetSink.ACancelledSinkUploadsNothing`.
 
+**The Kafka to ClickHouse tutorial writes through the native sink, on
+ClickHouse 26.8.** Its table sets `insert_format = 'native'`, the sink a new
+table should use, and the walkthrough reads the report the sink logs when it
+opens. The init script gives the table `async_insert = 0`, which the native
+sink requires, and a deduplication window, so an INSERT resent after a
+failure that left it in doubt does not land twice; `batch_rows = '1'` goes,
+since only the v0.8.0 text sink needed it. ClickHouse moves from 25.3 to
+26.8, a line the sink is tested on, pinned by digest, in the tutorial and in
+the tutorial-portability rig. The tutorial now needs a runtime image from
+v0.11.0 or later, and `run.sh` fails its sink check on an older one.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's
