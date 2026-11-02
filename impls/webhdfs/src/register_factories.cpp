@@ -14,6 +14,7 @@
 #include "clink/connectors/webhdfs_parquet_source.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/webhdfs/install.hpp"
 
@@ -184,7 +185,10 @@ std::shared_ptr<Source<T>> make_source(const clink::plugin::BuildContext& ctx,
     }
     typename WebHdfsParquetSource<T>::Options opts;
     apply_common_params(ctx, opts);
-    return std::make_shared<WebHdfsParquetSource<T>>(std::move(opts), std::move(batcher));
+    // One file does not divide between subtasks (a directory does).
+    return clink::read_on_first_subtask<T>(
+        ctx.subtask_idx,
+        std::make_shared<WebHdfsParquetSource<T>>(std::move(opts), std::move(batcher)));
 }
 
 }  // namespace

@@ -22,6 +22,7 @@
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/gcs/install.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
 namespace clink::gcs {
@@ -142,7 +143,9 @@ void register_gcs_parquet_source(clink::plugin::PluginRegistry& reg,
             if (opts.key.empty()) {
                 throw std::runtime_error(name + ": 'key' or 'prefix' is required");
             }
-            return std::make_shared<ParquetGcsSource<T>>(std::move(opts), batcher);
+            // One object does not divide between subtasks (a prefix does).
+            return clink::read_on_first_subtask<T>(
+                ctx.subtask_idx, std::make_shared<ParquetGcsSource<T>>(std::move(opts), batcher));
         });
 }
 

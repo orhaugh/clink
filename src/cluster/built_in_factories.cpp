@@ -99,8 +99,10 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
                 }
                 start = pos + 1;
             }
-            return std::make_shared<VectorSource<std::string>>(std::move(records),
-                                                               "string_lines_source");
+            return read_on_first_subtask<std::string>(
+                ctx.subtask_idx,
+                std::make_shared<VectorSource<std::string>>(std::move(records),
+                                                            "string_lines_source"));
         });
 
     // ---- Sinks ----
@@ -188,7 +190,10 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
                         path, ctx.subtask_idx, ctx.parallelism, batcher, factory_name)) {
                     return dir;
                 }
-                return std::make_shared<ParquetSource<T>>(path, batcher, factory_name);
+                // One file does not divide between subtasks (a directory or prefix does).
+                return read_on_first_subtask<T>(
+                    ctx.subtask_idx,
+                    std::make_shared<ParquetSource<T>>(path, batcher, factory_name));
             });
     };
     register_local_parquet_source.template operator()<std::int64_t>("parquet_int64_source",
@@ -296,7 +301,9 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
 
     // ---- Real text-based connectors --------------------------------------
     //
-    // file_text_source: reads one record per line from a path. params:
+    // file_text_source: reads one record per line from a path, on the first
+    // subtask only: one file does not divide between subtasks, and at a
+    // parallelism above 1 each would read it whole (read_on_first_subtask). params:
     //   path (required): filesystem path to read.
     //   batch_size (default 256): records per produce() batch.
     //
@@ -311,8 +318,10 @@ void register_built_ins_via_plugin_api(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error("file_text_source: 'path' param is required");
             }
             const auto batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
-            return std::make_shared<FileSource<std::string>>(
-                path, string_text_format(), batch_size, "file_text_source");
+            return read_on_first_subtask<std::string>(
+                ctx.subtask_idx,
+                std::make_shared<FileSource<std::string>>(
+                    path, string_text_format(), batch_size, "file_text_source"));
         });
 
     reg.register_sink<std::string>(

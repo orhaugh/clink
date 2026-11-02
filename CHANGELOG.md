@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+**A source whose input does not divide between subtasks is read once at any
+parallelism.** A file, a query's result, an Iceberg snapshot, an endpoint
+polled over HTTP, a single Parquet object and the nexmark generator were read
+in full by every subtask, so a job at parallelism N emitted each record N
+times: a SQL `GROUP BY` over a file at parallelism 2 summed every row twice.
+The first subtask now reads, and every other one runs an idle stand-in with the
+source's name and boundedness (`read_on_first_subtask` in
+`source_operator.hpp`): a bounded one ends at once, and an unbounded one marks
+itself idle, so it never holds back event time where the subtasks' streams
+meet. This covers `file_text_source`, `file_json_source`, the single-file and
+single-object Parquet sources (local, S3, GCS, Azure and WebHDFS), the
+ClickHouse, PostgreSQL and MySQL query sources, `iceberg_row_source`,
+`http_poll_source`, `queryable_state_row_source`, `nexmark_source`,
+`string_lines_source`, and the PostgreSQL CDC sources outside SQL, where a
+second subtask contended for the replication slot. Sources that divide their
+input already (Kafka, Kinesis, a Parquet directory or prefix, RabbitMQ,
+Pub/Sub, NATS JetStream) are unchanged. The ClickHouse and PostgreSQL string
+sources now report themselves bounded, as their row variants do, so the
+runtime treats a job reading them as bounded. Covered by `FirstSubtaskReads.*`,
+`RealConnectorFactories.FileTextSourceAtParallelismTwoWritesEachLineOnce` and
+`EmbeddedEngine.AFileSourceAtParallelismTwoReadsEachRowOnce`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

@@ -41,6 +41,12 @@ In `clink --capabilities` these appear under four connector identities: `file`,
 `file_2pc`, `parquet` and `parquet_2pc` (the 2PC records carry the
 exactly-once declaration; the plain ones are at-least-once).
 
+A `file` source reads its path, one file or a directory, on subtask 0 alone,
+whatever the job's parallelism, and its other subtasks read nothing, since the
+input does not divide between them. A `parquet` source does the same with one
+file; given a directory of parts or a `prefix`, it divides the files between
+its subtasks.
+
 ## Configuration
 
 Options are read from `BuildContext` params in `src/cluster/built_in_factories.cpp` (the `file`/`parquet` source/sink factories) and `src/sql/install.cpp` (the row-channel factories). On the SQL path they are the `WITH (...)` properties.

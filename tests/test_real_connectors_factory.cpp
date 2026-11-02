@@ -9,16 +9,23 @@
 // out is what makes clink_core_tests link against clink::core
 // only - no impl dependency leaks into the core build.
 
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/job_graph.hpp"
+#include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/runner_registry.hpp"
+#include "clink/cluster/worker.hpp"
 #include "clink/connectors/file_sink.hpp"
 #include "clink/connectors/file_source.hpp"
 #include "clink/connectors/text_format.hpp"
@@ -109,6 +116,72 @@ TEST(RealConnectorFactories, FileTextSourceFactoryBuildsAndRuns) {
     EXPECT_EQ(seen, (std::vector<std::string>{"one", "two", "three"}));
 
     std::filesystem::remove(in_path);
+}
+
+// One file does not divide between subtasks. At parallelism 2 the first subtask
+// reads it and the second runs an idle stand-in, so each line reaches the sink
+// once; each subtask used to read the whole file, and the job wrote it twice.
+TEST(RealConnectorFactories, FileTextSourceAtParallelismTwoWritesEachLineOnce) {
+    ensure_built_ins_registered();
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink_file_source_p2_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto in_path = dir / "in.txt";
+    const auto out_path = dir / "out.txt";
+    {
+        std::ofstream f(in_path);
+        f << "alpha\nbeta\ngamma\n";
+    }
+
+    Coordinator coordinator;
+    const std::uint16_t port = coordinator.start();
+    coordinator.expect_workers({"worker-file-p2"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 4;
+    Worker worker("worker-file-p2", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(std::chrono::seconds{2}));
+
+    JobGraphSpec g;
+    OperatorSpec src;
+    src.id = "src";
+    src.type = "file_text_source";
+    src.parallelism = 2;
+    src.out_channel = std::string{kChannelString};
+    src.params = {{"path", in_path.string()}};
+    g.ops.push_back(src);
+    OperatorSpec snk;
+    snk.id = "snk";
+    snk.type = "file_text_sink";
+    snk.parallelism = 2;
+    snk.out_channel = std::string{kChannelString};
+    snk.inputs = {"src"};
+    snk.params = {{"path", out_path.string()}};
+    g.ops.push_back(snk);
+
+    const auto job_id = coordinator.submit_job(g,
+                                               OperatorRegistry::default_instance(),
+                                               std::vector<PluginBinary>{},
+                                               CheckpointConfig{},
+                                               nullptr);
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, std::chrono::seconds{10}));
+    EXPECT_TRUE(coordinator.job_errors(job_id).empty());
+
+    // The sink writes one file per subtask: path.0 and path.1.
+    std::vector<std::string> lines;
+    for (const char* suffix : {".0", ".1"}) {
+        std::ifstream in(out_path.string() + suffix);
+        for (std::string line; std::getline(in, line);) {
+            lines.push_back(line);
+        }
+    }
+    std::sort(lines.begin(), lines.end());
+    EXPECT_EQ(lines, (std::vector<std::string>{"alpha", "beta", "gamma"}));
+
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove_all(dir);
 }
 
 }  // namespace

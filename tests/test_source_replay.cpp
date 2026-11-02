@@ -564,3 +564,68 @@ TEST(SourceReplay, GeneratorSourceRestoreReturnsFalseWhenNoStateSaved) {
                              /*bounded=*/true);
     EXPECT_FALSE(src.restore_offset(backend, OperatorId{99}));
 }
+
+// read_on_first_subtask: a source whose input does not divide between subtasks
+// is read by the first subtask only. Every other subtask runs a stand-in with
+// the source's name and boundedness that reads nothing and keeps nothing.
+namespace {
+// Every element a produce() call left in the channel, in order.
+std::vector<StreamElement<int>> drain_all(BoundedChannel<StreamElement<int>>& ch) {
+    std::vector<StreamElement<int>> out;
+    while (auto elem = ch.try_pop()) {
+        out.push_back(std::move(*elem));
+    }
+    return out;
+}
+}  // namespace
+
+TEST(FirstSubtaskReads, TheFirstSubtaskRunsTheSourceItself) {
+    auto real = std::make_shared<VectorSource<int>>(
+        std::vector<Record<int>>{Record<int>{1}, Record<int>{2}}, "real_source");
+    EXPECT_EQ(read_on_first_subtask<int>(0, real), real);
+}
+
+TEST(FirstSubtaskReads, ABoundedSourcesOtherSubtasksEndAtOnceHavingReadNothing) {
+    auto real = std::make_shared<VectorSource<int>>(
+        std::vector<Record<int>>{Record<int>{1}, Record<int>{2}}, "real_source");
+    auto stand_in = read_on_first_subtask<int>(1, real);
+    ASSERT_NE(stand_in, real);
+    EXPECT_EQ(stand_in->name(), "real_source");
+    EXPECT_TRUE(stand_in->is_bounded()) << "a bounded job must still read as bounded";
+
+    auto ch = std::make_shared<BoundedChannel<StreamElement<int>>>(8);
+    Emitter<int> em(ch.get());
+    EXPECT_FALSE(stand_in->produce(em)) << "an empty input ends at once";
+    const auto elems = drain_all(*ch);
+    ASSERT_EQ(elems.size(), 1u) << "no records, only the end of event time";
+    ASSERT_TRUE(elems[0].is_watermark());
+    EXPECT_EQ(elems[0].as_watermark(), Watermark::max());
+
+    // Nothing to restore into the subtask that reads, after a rescale.
+    InMemoryStateBackend backend;
+    stand_in->snapshot_offset(backend, OperatorId{7}, CheckpointId{1});
+    EXPECT_TRUE(InMemoryStateBackend::operator_state_keys(backend.export_arrow_snapshot()).empty());
+}
+
+TEST(FirstSubtaskReads, AnUnboundedSourcesOtherSubtasksIdleUntilCancelled) {
+    auto real = std::make_shared<GeneratorSource<int>>(
+        []() -> std::optional<Record<int>> { return Record<int>{1}; },
+        "endless_source",
+        /*bounded=*/false);
+    auto stand_in = read_on_first_subtask<int>(2, real);
+    EXPECT_EQ(stand_in->name(), "endless_source");
+    EXPECT_FALSE(stand_in->is_bounded());
+
+    auto ch = std::make_shared<BoundedChannel<StreamElement<int>>>(8);
+    Emitter<int> em(ch.get());
+    EXPECT_TRUE(stand_in->produce(em));
+    EXPECT_TRUE(stand_in->produce(em));
+    const auto elems = drain_all(*ch);
+    ASSERT_EQ(elems.size(), 1u) << "one idle marker, announced once, and no records";
+    ASSERT_TRUE(elems[0].is_watermark());
+    EXPECT_TRUE(elems[0].as_watermark().is_idle())
+        << "an idle input never holds back event time where the subtasks' streams meet";
+
+    stand_in->cancel();
+    EXPECT_FALSE(stand_in->produce(em));
+}

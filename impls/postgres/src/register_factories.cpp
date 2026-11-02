@@ -382,6 +382,9 @@ public:
         return inner_.restore_offset(backend, op_id);
     }
 
+    // A query's result is finite: bounded, as the row source it wraps says.
+    [[nodiscard]] bool is_bounded() const noexcept override { return inner_.is_bounded(); }
+
     std::string name() const override { return json_ ? "postgres_source" : "postgres_text_source"; }
 
 private:
@@ -815,7 +818,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (opts.query.empty()) {
                 throw std::runtime_error("postgres_row_source: 'query' is required");
             }
-            return std::make_shared<PostgresSource>(std::move(opts));
+            return clink::read_on_first_subtask<PostgresRow>(
+                ctx.subtask_idx, std::make_shared<PostgresSource>(std::move(opts)));
         });
 
     // postgres_cdc_event_source: subscribe to a logical replication
@@ -827,7 +831,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         "postgres_cdc_event_source",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<CdcEvent>> {
             auto cfg = cdc_config(ctx, "postgres_cdc_event_source", /*sql_contract=*/false);
-            return std::make_shared<PostgresCdcSource>(std::move(cfg.source));
+            return clink::read_on_first_subtask<CdcEvent>(
+                ctx.subtask_idx, std::make_shared<PostgresCdcSource>(std::move(cfg.source)));
         });
 
     // postgres_cdc_text_source: subscribe to a logical replication slot
@@ -836,7 +841,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         "postgres_cdc_text_source",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             auto cfg = cdc_config(ctx, "postgres_cdc_text_source", /*sql_contract=*/false);
-            return std::make_shared<StringPostgresCdcSource>(std::move(cfg.source));
+            return clink::read_on_first_subtask<std::string>(
+                ctx.subtask_idx, std::make_shared<StringPostgresCdcSource>(std::move(cfg.source)));
         });
 
     // postgres_cdc_source: the SQL frontend's CDC source (connector='postgres',
@@ -849,8 +855,10 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_source<std::string>(
         "postgres_cdc_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             auto cfg = cdc_config(ctx, "postgres_cdc_source", /*sql_contract=*/true);
-            return std::make_shared<StringPostgresCdcSource>(
-                std::move(cfg.source), /*json=*/true, std::move(cfg.encoders), cfg.indexed);
+            return clink::read_on_first_subtask<std::string>(
+                ctx.subtask_idx,
+                std::make_shared<StringPostgresCdcSource>(
+                    std::move(cfg.source), /*json=*/true, std::move(cfg.encoders), cfg.indexed));
         });
 
     // postgres_cdc_table: the branch a row of a source capturing several
@@ -887,8 +895,10 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (opts.query.empty()) {
                 throw std::runtime_error("postgres_text_source: 'query' is required");
             }
-            return std::make_shared<StringPostgresSource>(std::move(opts),
-                                                          ctx.param_or("delim", "|"));
+            return clink::read_on_first_subtask<std::string>(
+                ctx.subtask_idx,
+                std::make_shared<StringPostgresSource>(std::move(opts),
+                                                       ctx.param_or("delim", "|")));
         });
 
     // postgres_source (M3): the same SELECT, but each row is a JSON object keyed by
@@ -907,7 +917,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (opts.query.empty()) {
                 throw std::runtime_error("postgres_source: 'query' is required");
             }
-            return std::make_shared<StringPostgresSource>(std::move(opts), "|", /*json=*/true);
+            return clink::read_on_first_subtask<std::string>(
+                ctx.subtask_idx,
+                std::make_shared<StringPostgresSource>(std::move(opts), "|", /*json=*/true));
         });
 
     // postgres_sink (M4): batched multi-row INSERT of JSON-object rows. At-least-

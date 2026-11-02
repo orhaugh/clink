@@ -76,7 +76,8 @@ Options: `coordinator_port` (required - the Coordinator's HTTP port), `job_id`
 (required), `coordinator_host` (default `127.0.0.1`), `role` (default the generic
 subtask role), `slot` (default `agg`), `limit` (default 100000, the
 route's cap), `batch_size` (default 256). The snapshot is taken once, at
-the first produce; `truncated` results are cut at `limit`. Delivery is a
+the first produce, by subtask 0 alone, so the other subtasks of a parallel job
+read nothing; `truncated` results are cut at `limit`. Delivery is a
 bounded read of a moving target - consistent per subtask scan, not a
 global point-in-time snapshot. Declared `DOUBLE`, `REAL`, `BIGINT` and
 `INTEGER` columns decode as they do off the JSON bridges: a served value is

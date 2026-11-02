@@ -90,6 +90,8 @@ Source: the `mysql_sink` lambda in `impls/mysql/src/register_factories.cpp` and 
 | `jitter_frac` | No | `0` | Fractional jitter applied to the poll interval. |
 | `bounded` / `mode` | No | `false` | `bounded='true'` or `mode='snapshot'` reads the table once and then finishes, rather than tailing it forever. |
 
+Only subtask 0 polls the table, whatever the job's parallelism; the other subtasks read nothing.
+
 Source: the `mysql_source` lambda in `impls/mysql/src/register_factories.cpp` and `MysqlPollOptions` in `impls/mysql/include/clink/mysql/mysql_source.hpp`.
 
 ### `mysql_cdc_source` (binlog CDC)

@@ -55,6 +55,8 @@ fire mid-stream if you want the window compute inside the measured body.
   (`nexmark_type=...`). Every instance runs the same seeded stream and advances
   over every event, so foreign keys (an auction's `seller`, a bid's `auction`)
   resolve across the tables.
+  At a parallelism above 1 only subtask 0 of each table generates, since every
+  subtask would run the same seeded stream.
 - **Sink**: a `connector='blackhole'` discard sink so sink I/O does not distort
   throughput (the runner still counts records).
 - **Runner**: the in-process cluster from the SQL runtime tests; the bounded

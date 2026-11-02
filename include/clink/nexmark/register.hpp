@@ -80,7 +80,7 @@ inline void register_nexmark_factories(clink::plugin::PluginRegistry& reg,
             cfg.type_filter = t == "person" ? 0 : t == "auction" ? 1 : t == "bid" ? 2 : -1;
             auto gen = std::make_shared<NexmarkGenerator>(cfg);
             const bool bounded = cfg.events_num > 0;
-            return std::make_shared<GeneratorSource<Row>>(
+            auto source = std::make_shared<GeneratorSource<Row>>(
                 [gen, marks, warmed = false]() mutable -> std::optional<Record<Row>> {
                     auto rec = gen->next();
                     if (marks) {
@@ -97,6 +97,9 @@ inline void register_nexmark_factories(clink::plugin::PluginRegistry& reg,
                 },
                 "nexmark_source",
                 bounded);
+            // One seeded sequence: every subtask would generate the same events, so
+            // the first one generates them.
+            return read_on_first_subtask<Row>(ctx.subtask_idx, std::move(source));
         });
     // The SAME BlackholeRowSink the SQL factories register, not a FunctionSink.
     // Factory registration is latest-wins and clink_node installs the SQL factories

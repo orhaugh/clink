@@ -107,6 +107,9 @@ public:
         return inner_.restore_offset(backend, op_id);
     }
 
+    // A query's result is finite: bounded, as the row source it wraps says.
+    [[nodiscard]] bool is_bounded() const noexcept override { return inner_.is_bounded(); }
+
     std::string name() const override {
         return json_ ? "clickhouse_source" : "clickhouse_text_source";
     }
@@ -285,7 +288,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         "clickhouse_row_source",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<ClickHouseRow>> {
             auto opts = parse_source_options(ctx, "clickhouse_row_source");
-            return std::make_shared<ClickHouseSource>(std::move(opts));
+            return clink::read_on_first_subtask<ClickHouseRow>(
+                ctx.subtask_idx, std::make_shared<ClickHouseSource>(std::move(opts)));
         });
 
     // clickhouse_text_source: same SELECT as clickhouse_row_source but
@@ -297,7 +301,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             auto opts = parse_source_options(ctx, "clickhouse_text_source");
             const auto delim = ctx.param_or("delim", "|");
-            return std::make_shared<StringClickHouseSource>(std::move(opts), delim);
+            return clink::read_on_first_subtask<std::string>(
+                ctx.subtask_idx, std::make_shared<StringClickHouseSource>(std::move(opts), delim));
         });
 
     // clickhouse_source (M2): the same SELECT, but each row is a JSON object keyed
@@ -307,7 +312,9 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_source<std::string>(
         "clickhouse_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             auto opts = parse_source_options(ctx, "clickhouse_source");
-            return std::make_shared<StringClickHouseSource>(std::move(opts), "|", /*json=*/true);
+            return clink::read_on_first_subtask<std::string>(
+                ctx.subtask_idx,
+                std::make_shared<StringClickHouseSource>(std::move(opts), "|", /*json=*/true));
         });
 
     // clickhouse_native_sink and its clickhouse_native record. A build whose

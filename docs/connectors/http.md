@@ -126,7 +126,7 @@ Pushes batched records as gauge samples to a Prometheus Pushgateway. This sink d
 
 ### `http_poll_source`
 
-GETs a JSON REST endpoint on an interval and emits the array elements, with a checkpointed cursor. This source does not use `batch_records` / `batch_bytes` / `dlq` / `linger_ms`.
+GETs a JSON REST endpoint on an interval and emits the array elements, with a checkpointed cursor. Only subtask 0 polls, whatever the job's parallelism; the other subtasks read nothing. This source does not use `batch_records` / `batch_bytes` / `dlq` / `linger_ms`.
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |

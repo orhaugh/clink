@@ -142,6 +142,54 @@ TEST(EmbeddedEngine, BoundedFileToFilePipelineRuns) {
     fs::remove(out_path);
 }
 
+// A file does not divide between subtasks: at parallelism 2 the first subtask
+// reads it, so each row is summed once. Each subtask used to read the whole
+// file, and every total came out doubled (94 and 50).
+TEST(EmbeddedEngine, AFileSourceAtParallelismTwoReadsEachRowOnce) {
+    const auto tag = std::to_string(::getpid());
+    const auto in_path = fs::temp_directory_path() / ("clink_embed_p2_in_" + tag + ".ndjson");
+    const auto out_path = fs::temp_directory_path() / ("clink_embed_p2_out_" + tag + ".ndjson");
+    const auto sub_out = [&](const char* suffix) { return fs::path{out_path.string() + suffix}; };
+    fs::remove(in_path);
+    fs::remove(sub_out(".0"));
+    fs::remove(sub_out(".1"));
+    write_orders(in_path);
+
+    clink::embed::EngineOptions opts;
+    opts.parallelism = 2;
+    std::ostringstream err;
+    opts.err = &err;
+    clink::embed::EmbeddedEngine engine{std::move(opts)};
+    const std::string script =
+        orders_ddl(in_path) +
+        "CREATE TABLE out_t (uid BIGINT, total BIGINT) "
+        "WITH (connector='file', format='json', path='" +
+        out_path.string() +
+        "');"
+        "INSERT INTO out_t SELECT user_id AS uid, SUM(amount) AS total FROM orders "
+        "GROUP BY user_id";
+    ASSERT_EQ(engine.execute_script(script), 0) << err.str();
+    ASSERT_TRUE(engine.await_all()) << err.str();
+
+    // The sink writes one file per subtask. A key's running total only grows, so
+    // its largest value is the answer.
+    std::map<std::int64_t, std::int64_t> final_by_uid;
+    for (const char* suffix : {".0", ".1"}) {
+        for (const auto& l : read_lines(sub_out(suffix))) {
+            auto js = clink::config::parse(l);
+            ASSERT_TRUE(js.is_object()) << l;
+            const auto uid = static_cast<std::int64_t>(js.at("uid").as_number());
+            const auto total = static_cast<std::int64_t>(js.at("total").as_number());
+            final_by_uid[uid] = std::max(final_by_uid[uid], total);
+        }
+    }
+    EXPECT_EQ(final_by_uid[1], 47);
+    EXPECT_EQ(final_by_uid[2], 25);
+    fs::remove(in_path);
+    fs::remove(sub_out(".0"));
+    fs::remove(sub_out(".1"));
+}
+
 TEST(EmbeddedEngine, BareSelectPrintsRowsToStdout) {
     const auto in_path = fs::temp_directory_path() / "clink_embed_sel_in.ndjson";
     const auto cap_path = fs::temp_directory_path() / "clink_embed_sel_stdout.txt";

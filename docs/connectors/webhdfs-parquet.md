@@ -58,7 +58,7 @@ Notes:
 
 - The source accepts `base_url`, `path`, `user`, `delegation_token`, `verify_tls`, `connect_timeout_ms` and `rw_timeout_ms`. `permission` applies to the sink only.
 - The sink's `Options` struct also carries a `compression` field defaulting to `parquet::Compression::ZSTD`; this is not parsed from `BuildContext` and so is fixed to the default through the factory path.
-- A sink's `path` is an HDFS directory. Each subtask writes part files named `sub<N>-<run>-<seq>.parquet` into it, so parallel subtasks and successive runs never write the same file (`make_sink` in `register_factories.cpp`). Read them back with a source on the same `path` (a `path` naming a directory reads every part in it) or with `prefix`. A relative path is taken from the HDFS root.
+- A sink's `path` is an HDFS directory. Each subtask writes part files named `sub<N>-<run>-<seq>.parquet` into it, so parallel subtasks and successive runs never write the same file (`make_sink` in `register_factories.cpp`). Read them back with a source on the same `path` (a `path` naming a directory reads every part in it) or with `prefix`. A source whose `path` names one file reads it on subtask 0 alone, whatever the job's parallelism. A relative path is taken from the HDFS root.
 
 ## SQL usage
 

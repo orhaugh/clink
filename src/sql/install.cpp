@@ -54,6 +54,7 @@
 #include "clink/operators/predicate_operand_exprs.hpp"
 #include "clink/operators/scalar_function_registry.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
 #include "clink/operators/udf_language_registry.hpp"
 #include "clink/operators/watermark_assigner_operator.hpp"
 #include "clink/queryable_state/registry.hpp"
@@ -12786,15 +12787,17 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             const auto limit = ctx.param_int64_or("limit", 100'000);
             const auto batch_size = ctx.param_int64_or("batch_size", 256);
-            return std::make_shared<QueryableStateSource>(
-                std::move(coordinator_host),
-                static_cast<std::uint16_t>(coordinator_port),
-                std::move(job_id),
-                std::move(role),
-                std::move(slot),
-                static_cast<std::size_t>(limit),
-                static_cast<std::size_t>(batch_size),
-                declared_numeric_columns(parse_row_schema(ctx.param_or("schema_columns"))));
+            return read_on_first_subtask<Row>(
+                ctx.subtask_idx,
+                std::make_shared<QueryableStateSource>(
+                    std::move(coordinator_host),
+                    static_cast<std::uint16_t>(coordinator_port),
+                    std::move(job_id),
+                    std::move(role),
+                    std::move(slot),
+                    static_cast<std::size_t>(limit),
+                    static_cast<std::size_t>(batch_size),
+                    declared_numeric_columns(parse_row_schema(ctx.param_or("schema_columns")))));
         });
 
     // file_json_source: read NDJSON, emit one Row per line. When `path` names a
@@ -12802,6 +12805,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     // stable filename order, so a partitioned / full-refresh materialized-view backing
     // (a directory of files) can be read straight back into a downstream query. A plain
     // file path keeps the single-file FileSource.
+    // Either is read on the first subtask only: at a parallelism above 1 each subtask
+    // would read all of it (read_on_first_subtask).
     //   path (required): filesystem path (a file, or a directory to read wholesale)
     //   batch_size (default 256): lines per produce() batch
     reg.register_source<Row>(
@@ -12842,11 +12847,15 @@ void install(clink::plugin::PluginRegistry& reg) {
                 parse_row_schema(ctx.param_or("schema_columns")));
             std::error_code dir_ec;
             if (std::filesystem::is_directory(path, dir_ec)) {
-                return std::make_shared<DirectoryFileSource<Row>>(
-                    path, std::move(format), batch_size, "file_json_source");
+                return read_on_first_subtask<Row>(
+                    ctx.subtask_idx,
+                    std::make_shared<DirectoryFileSource<Row>>(
+                        path, std::move(format), batch_size, "file_json_source"));
             }
-            return std::make_shared<FileSource<Row>>(
-                path, std::move(format), batch_size, "file_json_source");
+            return read_on_first_subtask<Row>(
+                ctx.subtask_idx,
+                std::make_shared<FileSource<Row>>(
+                    path, std::move(format), batch_size, "file_json_source"));
         });
 
     // ---- Sinks ----
@@ -12993,8 +13002,11 @@ void install(clink::plugin::PluginRegistry& reg) {
                                                              "parquet_row_source")) {
                 return dir;
             }
-            return std::make_shared<ParquetSource<Row>>(
-                path, make_row_columnar_arrow_batcher(std::move(cols)), "parquet_row_source");
+            // One file does not divide between subtasks (a directory or prefix does).
+            return read_on_first_subtask<Row>(
+                ctx.subtask_idx,
+                std::make_shared<ParquetSource<Row>>(
+                    path, make_row_columnar_arrow_batcher(std::move(cols)), "parquet_row_source"));
         });
 
     // parquet_row_sink: write Rows as one typed Parquet file per subtask.

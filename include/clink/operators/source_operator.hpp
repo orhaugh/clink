@@ -1,8 +1,10 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -285,5 +287,59 @@ private:
     std::uint64_t emitted_{0};
     std::uint64_t pending_skip_{0};
 };
+
+// What a subtask other than the first runs in place of a source whose input does
+// not divide between subtasks (see read_on_first_subtask). It reads nothing and
+// keeps no offset, so a rescale has nothing of it to restore into the subtask
+// that reads. It carries the real source's name and boundedness: a bounded one
+// ends at once, as an empty input would, so a bounded job still completes; an
+// unbounded one declares itself idle, so it never holds back event time where
+// the subtasks' streams meet, and waits to be cancelled.
+template <typename T>
+class IdleSubtaskSource final : public Source<T> {
+public:
+    IdleSubtaskSource(std::string name, bool bounded) : name_(std::move(name)), bounded_(bounded) {}
+
+    [[nodiscard]] bool is_bounded() const noexcept override { return bounded_; }
+
+    bool produce(Emitter<T>& out) override {
+        if (this->cancelled()) {
+            return false;
+        }
+        if (bounded_) {
+            out.emit_watermark(Watermark::max());
+            return false;
+        }
+        if (!announced_idle_) {
+            out.emit_watermark(Watermark::idle());
+            announced_idle_ = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        return !this->cancelled();
+    }
+
+    std::string name() const override { return name_; }
+
+private:
+    std::string name_;
+    bool bounded_;
+    bool announced_idle_{false};
+};
+
+// For a source whose input does not divide between subtasks: one file, one
+// query's result, one endpoint polled, one generated sequence. At parallelism N
+// every subtask would read all of it and the job would emit each record N
+// times, so the first subtask reads and every other one runs an
+// IdleSubtaskSource. A source that divides its input itself (Kafka partitions,
+// the objects under a prefix, a queue or durable consumer the subtasks share)
+// does not take this.
+template <typename T>
+std::shared_ptr<Source<T>> read_on_first_subtask(std::uint32_t subtask_idx,
+                                                 std::shared_ptr<Source<T>> source) {
+    if (subtask_idx == 0) {
+        return source;
+    }
+    return std::make_shared<IdleSubtaskSource<T>>(source->name(), source->is_bounded());
+}
 
 }  // namespace clink

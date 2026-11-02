@@ -19,6 +19,7 @@
 #include "clink/connectors/parquet_rolling_sink.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
 namespace clink::azure {
@@ -119,7 +120,9 @@ void register_azure_parquet_source(clink::plugin::PluginRegistry& reg,
             if (opts.key.empty()) {
                 throw std::runtime_error(name + ": 'key' or 'prefix' is required");
             }
-            return std::make_shared<ParquetAzureSource<T>>(std::move(opts), batcher);
+            // One blob does not divide between subtasks (a prefix does).
+            return clink::read_on_first_subtask<T>(
+                ctx.subtask_idx, std::make_shared<ParquetAzureSource<T>>(std::move(opts), batcher));
         });
 }
 

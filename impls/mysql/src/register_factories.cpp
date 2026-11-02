@@ -16,6 +16,7 @@
 #include "clink/mysql/mysql_sink.hpp"
 #include "clink/mysql/mysql_source.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
 namespace clink::mysql {
@@ -210,7 +211,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.bounded =
                 ctx.param_or("bounded", "") == "true" || ctx.param_or("mode", "") == "snapshot";
             o.name = "mysql_source";
-            return make_mysql_poll_source(o);
+            return clink::read_on_first_subtask<std::string>(ctx.subtask_idx,
+                                                             make_mysql_poll_source(o));
         });
 
     // mysql_cdc_source: binlog CDC. Streams row-level changes from the master's

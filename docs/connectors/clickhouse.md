@@ -132,7 +132,7 @@ Tolerated keys are accepted and ignored, because the SQL planner, the materialis
 
 ### Sources (`clickhouse_row_source`, `clickhouse_text_source`, `clickhouse_source`)
 
-All three sources share the same option parser.
+All three sources share the same option parser. Only subtask 0 runs the query, whatever the job's parallelism: one result does not divide between subtasks, so the others read nothing.
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |

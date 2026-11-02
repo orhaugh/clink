@@ -20,6 +20,7 @@
 #include "clink/connectors/s3_sink_2pc.hpp"
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/s3/install.hpp"
 
@@ -293,7 +294,10 @@ void install(clink::plugin::PluginRegistry& reg) {
                     opts.endpoint_override = endpoint;
                 }
                 opts.allow_anonymous = anon;
-                return std::make_shared<ParquetS3Source<T>>(std::move(opts), batcher);
+                // One object does not divide between subtasks (a prefix does).
+                return clink::read_on_first_subtask<T>(
+                    ctx.subtask_idx,
+                    std::make_shared<ParquetS3Source<T>>(std::move(opts), batcher));
             });
     };
 

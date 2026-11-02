@@ -22,6 +22,7 @@
 #include "clink/http_connector/pubsub.hpp"
 #include "clink/http_connector/token_source.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 
 namespace clink::http_connector {
@@ -494,7 +495,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.retry_base_backoff =
                 std::chrono::milliseconds{ctx.param_int64_or("retry_base_backoff_ms", 200)};
             o.name = "http_poll_source";
-            return make_http_poll_source(std::move(o));
+            return clink::read_on_first_subtask<std::string>(ctx.subtask_idx,
+                                                             make_http_poll_source(std::move(o)));
         });
 
     // pubsub_sink: publish batched records to a Google Cloud Pub/Sub topic via the

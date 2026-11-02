@@ -11,6 +11,7 @@
 #include "clink/iceberg/iceberg_row_source.hpp"
 #include "clink/iceberg/install.hpp"
 #include "clink/operators/sink_operator.hpp"
+#include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
@@ -213,7 +214,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             o.columns = std::move(cols);
             o.name = "iceberg_row_source";
-            return make_iceberg_row_source(std::move(o));
+            return clink::read_on_first_subtask<Row>(ctx.subtask_idx,
+                                                     make_iceberg_row_source(std::move(o)));
         });
 }
 

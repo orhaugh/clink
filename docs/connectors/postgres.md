@@ -52,7 +52,11 @@ cmake --build build -j
 | `batch_size` | No | `256` | Rows emitted per `produce()` call. |
 | `delim` | No | `\|` | `postgres_text_source` only: separator used to join column values into one string. |
 
+Only subtask 0 runs the query, whatever the job's parallelism: one result does not divide between subtasks, so the others read nothing.
+
 ### CDC source (`postgres_cdc_source`, `postgres_cdc_text_source`, `postgres_cdc_event_source`)
+
+A replication slot has one reader, so only subtask 0 streams and other subtasks are dormant. SQL plans the source on one subtask in any case.
 
 Every option is checked when the job is built: a value outside an option's domain (`create_slot='yes'`, `snapshot_mode='always'`) is refused with the option named, rather than read as its default. Several defaults depend on `changelog_mode`, which selects the [SQL CDC contract](#capturing-a-table-cdc) and is accepted by `postgres_cdc_source` only.
 
