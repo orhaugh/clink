@@ -129,8 +129,30 @@ S3Cfg parse_cfg(const std::string& base) {
     return c;
 }
 
+// Without local=, the working root sits below the temp directory under the
+// remote location's own name. The Coordinator gives each job its own prefix
+// (_state/<id>), so two jobs on one Worker no longer open one working DB; a
+// fixed root put every job's subtask 0 in the same directory. A "." or ".."
+// in the location stays a name and never steps out of the root.
 fs::path local_root(const S3Cfg& c) {
-    return c.local.empty() ? (fs::temp_directory_path() / "clink-forst-s3") : fs::path(c.local);
+    if (!c.local.empty()) {
+        return fs::path(c.local);
+    }
+    fs::path root = fs::temp_directory_path() / "clink-forst-s3";
+    const std::string location = c.bucket + "/" + c.prefix;
+    for (std::size_t start = 0; start <= location.size();) {
+        const auto slash = location.find('/', start);
+        const std::string part =
+            location.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (!part.empty()) {
+            root /= (part == "." || part == "..") ? "_" + part : part;
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return root;
 }
 
 std::string subtask_prefix(const S3Cfg& c, std::uint32_t subtask) {

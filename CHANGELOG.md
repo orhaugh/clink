@@ -203,6 +203,16 @@ check's limit, past `request_timeout_ms`, which bounds them; every read after
 the first answer carries `server_timeout_s`. Covered by
 `Neo4jLookup.AFirstReadSlowerThanServerTimeoutIsAnsweredAndLaterReadsKeepTheLimit`.
 
+**Two jobs on one Worker no longer share an S3 composition's working
+directory.** `s3+rocksdb://`, `changelog+s3+rocksdb://`, `changelog+s3://` and
+the ForSt S3 compositions keep their working database in `local=` when it is
+given, and otherwise in one fixed directory below the temp directory. The
+Coordinator namespaces the location and `local=` by job, but not that default,
+so two jobs' subtask 0 on one Worker opened the same working database. The
+default is now named after the remote location, which carries the job's
+`_state/<id>` prefix. Covered by
+`S3RocksdbSchemes.TwoJobsWithoutALocalRootKeepTheirOwnWorkingDb`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

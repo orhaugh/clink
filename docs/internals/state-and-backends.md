@@ -121,7 +121,7 @@ Rescale partitioning lives in `key_groups.hpp`. Every keyed record is bucketed i
 
 ### Where a job's state lives
 
-The `uri` a cluster subtask's backend is built from is its job's own state root, not the configured base. The coordinator composes it (`job_state_root`, `include/clink/cluster/state_location.hpp`) as `<base>/_state/<job id>`, where `<base>` is the job's `state_backend_uri`, or its `checkpoint_dir` when it names none, and sends it in `DeployMsg::state_backend_uri`. The segment goes into the URI's location, before any `?query`, and into its `local=` parameter; a URI naming no location (`memory://`, `changelog://`, `disagg-local://`) is sent as it is. A file-backed job checkpointing into `/ckpt` therefore writes:
+The `uri` a cluster subtask's backend is built from is its job's own state root, not the configured base. The coordinator composes it (`job_state_root`, `include/clink/cluster/state_location.hpp`) as `<base>/_state/<job id>`, where `<base>` is the job's `state_backend_uri`, or its `checkpoint_dir` when it names none, and sends it in `DeployMsg::state_backend_uri`. The segment goes into the URI's location, before any `?query`, and into its `local=` parameter; a URI naming no location (`memory://`, `changelog://`, `disagg-local://`) is sent as it is. An S3 composition given no `local=` keeps its working directory below the temp directory under the location's own name, `<tmp>/clink-rocksdb-s3/<bucket>/<prefix>` (or `clink-forst-s3`), so that is per job too. A file-backed job checkpointing into `/ckpt` therefore writes:
 
 | Path | What |
 | --- | --- |

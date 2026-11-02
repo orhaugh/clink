@@ -62,6 +62,43 @@ TEST(S3RocksdbSchemes, AllThreeRegisteredAndConstruct) {
     }
 }
 
+// Without local=, the working root is named after the remote location, which
+// the Coordinator makes per job (_state/<id>). Under the fixed temp root it
+// replaced, two jobs' subtask 0 on one Worker opened the same working DB: the
+// second open failed on RocksDB's lock, or read the first job's state once it
+// had closed. A ".." in the location stays below the root.
+TEST(S3RocksdbSchemes, TwoJobsWithoutALocalRootKeepTheirOwnWorkingDb) {
+    auto& f = StateBackendFactory::default_instance();
+    const std::string bucket = "c3probe" + std::to_string(::getpid());
+    const auto root = std::filesystem::temp_directory_path() / "clink-rocksdb-s3";
+    const std::string dead = "?endpoint=http://127.0.0.1:1&region=us-east-1";
+    const auto spec = [&](const std::string& prefix) {
+        StateBackendSpec s;
+        s.uri = "s3+rocksdb://" + bucket + "/" + prefix + dead;
+        s.subtask_idx = 0;
+        return s;
+    };
+    const std::string k = "k";
+    {
+        auto one = f.build(spec("_state/1"));
+        auto two = f.build(spec("_state/2"));
+        ASSERT_TRUE(one.backend != nullptr && two.backend != nullptr);
+        one.backend->put(OperatorId{1}, sv(k), sv(std::string{"job 1"}));
+        two.backend->put(OperatorId{1}, sv(k), sv(std::string{"job 2"}));
+        EXPECT_EQ(to_string(*one.backend->get(OperatorId{1}, sv(k))), "job 1");
+        EXPECT_EQ(to_string(*two.backend->get(OperatorId{1}, sv(k))), "job 2");
+        EXPECT_TRUE(std::filesystem::exists(root / bucket / "_state" / "1"));
+        EXPECT_TRUE(std::filesystem::exists(root / bucket / "_state" / "2"));
+
+        auto up = f.build(spec("../escape"));
+        ASSERT_TRUE(up.backend != nullptr);
+        EXPECT_TRUE(std::filesystem::exists(root / bucket / "_.." / "escape"));
+        EXPECT_FALSE(std::filesystem::exists(root / "escape"));
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(root / bucket, ec);
+}
+
 // Live: s3+rocksdb checkpoint uploads to object storage and restores into a
 // fresh backend (fresh local dir) that pulls the checkpoint back from S3.
 TEST(S3RocksdbSchemes, S3RocksdbRoundTripAgainstLiveEndpoint) {
