@@ -31,10 +31,11 @@
 //   * Non-flexible protocol versions are spoken except where none exists:
 //     DescribeTransactions v0 (KIP-664, flexible-only) is the one compact
 //     exchange, used to disambiguate a fenced EndTxn - the staged epoch
-//     comes from librdkafka's periodic statistics while the broker bumps
-//     the epoch on every commit, so a mid-run handle is chronically one
-//     commit stale and a COMMITTED transaction reads as fenced. A broker
-//     that has dropped the spoken versions gets Unsupported, not a guess.
+//     comes from librdkafka's periodic statistics, and a broker that bumps
+//     the epoch as each transaction ends (Redpanda; Apache Kafka under
+//     transaction version 2, KIP-890) leaves a mid-run handle one commit
+//     stale, so a COMMITTED transaction reads as fenced. A broker that has
+//     dropped the spoken versions gets Unsupported, not a guess.
 //   * Transport is the engine's own Connection seam, so a fake broker tests
 //     the full path byte-for-byte and TLS can slot in via the factory.
 //
@@ -306,11 +307,11 @@ struct ApiVersionsResponse {
 // DescribeTransactions v0 (KIP-664; flexible/compact encoding - the one
 // place this module speaks it). The QUERY the resume path needs when
 // EndTxn answers INVALID_PRODUCER_EPOCH: the staged handle's epoch comes
-// from librdkafka's PERIODIC statistics callback while the broker bumps
-// the producer epoch on every commit, so a handle staged mid-run is
-// chronically one commit stale and a legitimately committed transaction
-// reads as fenced. The transaction's actual state answers what the fenced
-// EndTxn cannot: CompleteCommit with our producer id = the commit landed.
+// from librdkafka's PERIODIC statistics callback, and a broker that bumps
+// the producer epoch as each transaction ends (Redpanda; Apache Kafka under
+// transaction version 2, KIP-890) leaves a handle staged mid-run one commit
+// stale, so a legitimately committed transaction reads as fenced. The transaction's actual state
+// answers what the fenced EndTxn cannot: CompleteCommit with our producer id = the commit landed.
 [[nodiscard]] std::vector<std::byte> describe_transactions_request_v0(std::int32_t correlation_id,
                                                                       const std::string& txn_id);
 

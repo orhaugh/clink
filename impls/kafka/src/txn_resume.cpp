@@ -942,16 +942,22 @@ ResumeOutcome resume_commit(const std::string& bootstrap_host,
         if (retriable(*code)) {
             continue;
         }
-        // A fenced EndTxn is ambiguous BY CONSTRUCTION: the staged epoch
-        // comes from librdkafka's periodic statistics callback while the
-        // broker bumps the producer epoch on every commit, so a handle
-        // staged mid-run is chronically one commit stale and a COMMITTED
-        // transaction reads as fenced (qual01-20260818d: 4,560 duplicates
-        // from exactly this misreading). The transaction's actual state
-        // disambiguates. CompleteCommit under our producer id with an
-        // epoch at or above the staged one is the commit landing; this is
-        // sound because every resolution walk runs before anything
-        // redeploys, so no successor can have produced that state.
+        // A fenced EndTxn can be ambiguous: the staged epoch comes from
+        // librdkafka's periodic statistics callback, and a broker that
+        // bumps the producer epoch as each transaction ends leaves a handle
+        // staged mid-run one commit stale, so a COMMITTED transaction reads
+        // as fenced (qual01-20260818d: 4,560 duplicates from exactly this
+        // misreading). Redpanda, where QUAL-01 found it, bumps at every
+        // commit, as Apache Kafka does under transaction version 2
+        // (KIP-890) for a client that uses it; under version 1 it does not.
+        // The transaction's actual state disambiguates. CompleteCommit under
+        // our producer id with an epoch at or above the staged one is the
+        // commit landing, whether or not the broker bumped the epoch; this
+        // is sound because every resolution walk runs before anything
+        // redeploys, so no successor can have produced that state. A commit
+        // that rotated the producer id, its epoch exhausted under version 2,
+        // does not match and is refused: a bounded replay, never a false
+        // commit.
         if ((*code == 47 /*INVALID_PRODUCER_EPOCH*/ || *code == 90 /*PRODUCER_FENCED*/) &&
             av.describe_transactions.has_value() && av.describe_transactions->min <= 0) {
             std::string dt_detail;
