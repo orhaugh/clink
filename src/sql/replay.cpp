@@ -185,10 +185,35 @@ EpochReplay EpochReplay::load(const ReplayRequest& request) {
     }
     const auto subdir = op_dir / ("subtask-" + std::to_string(r.info_.subtask));
 
-    // The op spec + the epoch's event stream.
+    // The op spec + the epoch's event stream. "final" is the tail after the
+    // last real checkpoint, which the capture writes as final.cap only when no
+    // barrier covered it, in a run that takes no checkpoints. A checkpointed
+    // bounded run's final checkpoint carries a real id, so its tail is the
+    // highest epoch-<N>.cap, and "final" replays that epoch as N.
     r.info_.spec = read_op_spec(subdir / "op.json");
-    const bool is_final = request.epoch == "final";
-    const auto cap_path = subdir / (is_final ? "final.cap" : ("epoch-" + request.epoch + ".cap"));
+    std::string epoch = request.epoch;
+    if (epoch == "final" && !fs::exists(subdir / "final.cap")) {
+        std::uint64_t last = 0;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(subdir, ec)) {
+            const auto name = entry.path().filename().string();
+            const std::string head = "epoch-";
+            const std::string tail = ".cap";
+            if (name.size() <= head.size() + tail.size() || name.rfind(head, 0) != 0 ||
+                name.compare(name.size() - tail.size(), tail.size(), tail) != 0) {
+                continue;
+            }
+            const auto digits = name.substr(head.size(), name.size() - head.size() - tail.size());
+            if (digits.find_first_not_of("0123456789") == std::string::npos) {
+                last = std::max<std::uint64_t>(last, std::stoull(digits));
+            }
+        }
+        if (last > 0) {
+            epoch = std::to_string(last);
+        }
+    }
+    const bool is_final = epoch == "final";
+    const auto cap_path = subdir / (is_final ? "final.cap" : ("epoch-" + epoch + ".cap"));
     r.info_.capture_path = cap_path.string();
     auto cap_bytes = read_bytes_file(cap_path);
 
@@ -218,8 +243,8 @@ EpochReplay EpochReplay::load(const ReplayRequest& request) {
         if (request.state_from.has_value()) {
             r.state_id_ = *request.state_from;
         } else if (!is_final) {
-            const auto epoch = std::stoull(request.epoch);
-            r.state_id_ = epoch > 0 ? epoch - 1 : 0;
+            const auto n = std::stoull(epoch);
+            r.state_id_ = n > 0 ? n - 1 : 0;
         } else {
             throw std::runtime_error("epoch 'final' requires an explicit state_from checkpoint id");
         }
@@ -264,8 +289,8 @@ EpochReplay EpochReplay::load(const ReplayRequest& request) {
     if (request.state_from.has_value()) {
         r.state_id_ = *request.state_from;
     } else if (!is_final) {
-        const auto epoch = std::stoull(request.epoch);
-        r.state_id_ = epoch > 0 ? epoch - 1 : 0;
+        const auto n = std::stoull(epoch);
+        r.state_id_ = n > 0 ? n - 1 : 0;
     } else {
         throw std::runtime_error("epoch 'final' requires an explicit state_from checkpoint id");
     }

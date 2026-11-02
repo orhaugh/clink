@@ -235,6 +235,15 @@ with such a source; one that builds the sink directly is now warned, naming
 both. Covered by
 `ConnectorCapabilityTest.AnAcknowledgingSourceBesideAnUnconfirmedCommitIsWarnedAbout`.
 
+**`clink replay --epoch=final` replays the last epoch of a checkpointed run.** A
+bounded run's tail is covered by its final checkpoint, which carries a real
+id, so its capture holds `epoch-<N>.cap` files and no `final.cap`, and
+`--epoch=final` failed with `cannot open .../final.cap`. When there is no
+`final.cap` it now replays the highest epoch, as naming that epoch does;
+`final.cap`, the tail of a run that took no checkpoints, still takes
+`--state-from`. Covered by
+`ReplayCli.EpochFinalReplaysTheLastEpochOfACheckpointedRun`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

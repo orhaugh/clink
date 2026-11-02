@@ -5,7 +5,9 @@
 // (b) --verify to pass (two runs byte-identical). This is the
 // executable form of docs/internals/replay-determinism.md.
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -273,6 +275,88 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
 // factory"; the replay path now registers the impl operators exactly as `clink run`
 // does, so the whole-job sweep reconstructs and verifies the impl operator with NO
 // plugin. Literal 2-D vectors keep the job dependency-free (no embedding model).
+// --epoch=final names the run's last epoch. A checkpointed bounded run's tail
+// is covered by its final checkpoint, which carries a real id, so the capture
+// holds epoch files and no final.cap, and --epoch=final failed for want of
+// one; it now replays the highest epoch, as naming that epoch does.
+TEST(ReplayCli, EpochFinalReplaysTheLastEpochOfACheckpointedRun) {
+    const std::string cli = CLINK_CLI_BINARY;
+    const auto dir = fs::temp_directory_path() / "clink_replay_cli_final";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    {
+        std::ofstream in(dir / "in.jsonl");
+        in << R"({"usr":"alice","ts":100,"amount":10})" << "\n"
+           << R"({"usr":"bob","ts":700,"amount":7})" << "\n"
+           << R"({"usr":"alice","ts":1200,"amount":100})" << "\n";
+    }
+    {
+        std::ofstream sql(dir / "job.sql");
+        sql << "CREATE TABLE evt (usr TEXT, ts BIGINT, amount BIGINT) WITH (connector='file', "
+               "format='json', path='"
+            << (dir / "in.jsonl").string() << "', event_time_column='ts');\n"
+            << "CREATE TABLE totals (usr TEXT, total BIGINT) WITH (connector='file', "
+               "format='json', path='"
+            << (dir / "out.jsonl").string() << "');\n"
+            << "INSERT INTO totals SELECT usr, SUM(amount) AS total FROM evt "
+               "GROUP BY TUMBLE(ts, 1000), usr;\n";
+    }
+    const auto run = run_captured(cli, dir);
+    ASSERT_EQ(run.exit_code, 0) << run.output;
+
+    std::string window_op;
+    std::uint64_t last_epoch = 0;
+    for (const auto& entry : fs::directory_iterator(dir / "capture")) {
+        const auto subtask = entry.path() / "subtask-1";
+        if (!fs::exists(subtask / "op.json")) {
+            continue;
+        }
+        auto js = clink::config::parse(read_file(subtask / "op.json"));
+        if (!js.is_object() || !js.at("op_type").is_string() ||
+            js.at("op_type").as_string() != "tumbling_window_row") {
+            continue;
+        }
+        window_op = entry.path().filename().string().substr(3);  // strip "op-"
+        EXPECT_FALSE(fs::exists(subtask / "final.cap")) << "the final checkpoint covered the tail";
+        for (const auto& f : fs::directory_iterator(subtask)) {
+            const auto name = f.path().filename().string();
+            if (name.rfind("epoch-", 0) == 0 && name.size() > 10) {
+                last_epoch = std::max<std::uint64_t>(last_epoch,
+                                                     std::stoull(name.substr(6, name.size() - 10)));
+            }
+        }
+    }
+    ASSERT_FALSE(window_op.empty()) << "no tumbling_window_row capture found";
+    ASSERT_GT(last_epoch, 0U);
+
+    const auto rows = [](const std::string& output) {
+        std::vector<std::string> out;
+        std::istringstream is(output);
+        std::string line;
+        bool in_body = false;
+        while (std::getline(is, line)) {
+            if (line == "---") {
+                in_body = !in_body;
+                continue;
+            }
+            if (in_body && !line.empty() && line.front() == '{') {
+                out.push_back(line);
+            }
+        }
+        return out;
+    };
+    const std::string base = cli + " replay --capture-dir=" + (dir / "capture").string() +
+                             " --checkpoint-dir=" + (dir / "ckpt").string() + " --op=" + window_op +
+                             " --max-rows=0";
+    const auto final_replay = run_cmd(base + " --epoch=final");
+    ASSERT_EQ(final_replay.exit_code, 0) << final_replay.output;
+    const auto numbered = run_cmd(base + " --epoch=" + std::to_string(last_epoch));
+    ASSERT_EQ(numbered.exit_code, 0) << numbered.output;
+    EXPECT_FALSE(rows(numbered.output).empty()) << numbered.output;
+    EXPECT_EQ(rows(final_replay.output), rows(numbered.output)) << final_replay.output;
+    fs::remove_all(dir);
+}
+
 TEST(ReplayCli, ImplOperatorJobReplaysWithoutAPlugin) {
     const std::string cli = CLINK_CLI_BINARY;
     const auto dir = fs::temp_directory_path() / "clink_replay_cli_impl";
