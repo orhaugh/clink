@@ -24,8 +24,9 @@
 
 namespace clink::cluster {
 
-// Read the restore savepoint's stored version map (subtask 0's snapshot
-// under <restore_from_dir>/0/checkpoint-<id>.snap) and ask each job .so,
+// Read the restore savepoint's stored version map (subtask 0's snapshot, where
+// the restore reads it: <state root>/v<generation>/0/checkpoint-<id>.snap, the
+// root and generation the checkpoint's marker records) and ask each job .so,
 // .so-side (where its StateMigrationRegistry lives), whether it can
 // migrate that map to its expected versions.
 //

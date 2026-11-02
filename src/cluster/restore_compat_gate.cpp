@@ -13,6 +13,7 @@
 #include "clink/cluster/state_location.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend.hpp"
+#include "clink/state/state_backend_factory.hpp"
 #include "clink/state/state_migration_on_restore.hpp"
 
 namespace clink::cluster {
@@ -28,12 +29,31 @@ struct StoredStamps {
 };
 
 // Read subtask 0's snapshot bytes and recover its packed stamps. nullopt on
-// any failure (missing file, I/O, decode) so the gate degrades to "could not
-// check" rather than a false block.
+// any failure (missing file, I/O, decode, a state root that is not a local file
+// path) so the gate degrades to "could not check" rather than a false block.
+//
+// The snapshot is read where the restore itself reads it: under the state root
+// the checkpoint's marker records, at <root>/v<generation>/0 (state_location.hpp).
+// This used to read <restore_from_dir>/0, a layout from before generations and
+// before state was namespaced by job, so it found nothing and let every restore
+// through unchecked.
 std::optional<StoredStamps> read_stored_stamps(const std::string& restore_from_dir,
                                                std::uint64_t checkpoint_id) {
     namespace fs = std::filesystem;
-    const fs::path path = fs::path{restore_from_dir} / "0" /
+    RestoreSource source;
+    try {
+        source = resolve_restore_source(restore_from_dir, checkpoint_id);
+    } catch (...) {
+        return std::nullopt;
+    }
+    std::string root = source.state_root;
+    if (const auto sep = root.find("://"); sep != std::string::npos) {
+        if (root.compare(0, sep, "file") != 0) {
+            return std::nullopt;
+        }
+        root.erase(0, sep + 3);
+    }
+    const fs::path path = fs::path{clink::state_dir_for(root, source.generation, 0)} /
                           ("checkpoint-" + std::to_string(checkpoint_id) + ".snap");
     std::error_code ec;
     if (!fs::exists(path, ec) || ec) {

@@ -88,6 +88,15 @@ registration, so a job module that registers its factories on each submit no
 longer logs twelve lines a submit. Covered by
 `OperatorRegistry.AReplacedFactoryIsLoggedOnceNotOnEveryRegistration`.
 
+**The restore compatibility gate reads the checkpoint it guards.** At submit
+and at takeover the Coordinator checks a restore's stored state versions and
+shapes against the job's binary, from subtask 0's snapshot. It looked for that
+snapshot at `<restore dir>/0/`, a layout from before generations and before
+state was namespaced by job, found nothing and let every restore through
+unchecked, leaving the refusal to the Worker after deploy. It now resolves the
+snapshot as the restore does, from the checkpoint's COMPLETED marker. Covered by
+`RestoreCompatGate.*`, which now write the layout a job writes.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

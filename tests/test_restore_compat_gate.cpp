@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/restore_compat_gate.hpp"
+#include "clink/cluster/state_location.hpp"
 #include "clink/core/fields.hpp"
 #include "clink/core/types.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
@@ -55,9 +56,10 @@ const char* schema_evo_job_path() {
 #endif
 }
 
-// Write a savepoint stamped with `versions` to <dir>/0/checkpoint-1.snap
-// (the layout the file backend restores from for subtask 0). Returns the
-// restore dir.
+// Write checkpoint 1 of job 7, stamped with `versions`, as a job writes it today:
+// the COMPLETED marker in <dir>/_jobs/7 names the state root _state/7, and
+// subtask 0's snapshot is at <dir>/_state/7/v1/0/checkpoint-1.snap. Returns the
+// checkpoint directory.
 std::filesystem::path write_savepoint(const clink::StateVersionMap& versions,
                                       const std::string& tag,
                                       const clink::StateFingerprintMap& fingerprints = {}) {
@@ -66,7 +68,11 @@ std::filesystem::path write_savepoint(const clink::StateVersionMap& versions,
     auto dir =
         fs::temp_directory_path() / ("restore_compat_gate_" + tag + "_" + std::to_string(getpid()) +
                                      "_" + std::to_string(counter.fetch_add(1)));
-    fs::create_directories(dir / "0");
+    const auto subtask_dir = dir / "_state" / "7" / "v1" / "0";
+    fs::create_directories(subtask_dir);
+    fs::create_directories(dir / "_jobs" / "7");
+    std::ofstream(dir / "_jobs" / "7" / "COMPLETED-1")
+        << clink::cluster::completed_marker_body(7, 1, 1, {0}, "_state/7");
 
     clink::InMemoryStateBackend backend;
     backend.put(clink::operator_id_from_uid("counter-op"), "k", std::string_view{"v"});
@@ -74,7 +80,7 @@ std::filesystem::path write_savepoint(const clink::StateVersionMap& versions,
     backend.set_state_fingerprints(fingerprints);
     auto snap = backend.snapshot(clink::CheckpointId{1});
 
-    std::ofstream f(dir / "0" / "checkpoint-1.snap", std::ios::binary);
+    std::ofstream f(subtask_dir / "checkpoint-1.snap", std::ios::binary);
     if (!snap.bytes.empty()) {
         f.write(reinterpret_cast<const char*>(snap.bytes.data()),
                 static_cast<std::streamsize>(snap.bytes.size()));
@@ -142,6 +148,26 @@ TEST(RestoreCompatGate, UndeclaredShapeChangeIsRejected) {
     EXPECT_FALSE(reject.empty());
     EXPECT_NE(reject.find("changed shape"), std::string::npos) << reject;
     EXPECT_NE(reject.find("counter_slot"), std::string::npos) << reject;
+    std::filesystem::remove_all(dir);
+}
+
+// The restore can also name a job's marker directory rather than the checkpoint
+// directory; the gate reads the same snapshot either way, as the restore does.
+TEST(RestoreCompatGate, AJobsMarkerDirectoryIsGatedLikeItsCheckpointDirectory) {
+    if (schema_evo_job_path() == nullptr) {
+        GTEST_SKIP() << "schema_evo_test_job .so not built";
+    }
+    clink::StateVersionMap versions;
+    versions.set(clink::operator_id_from_uid("counter-op"), "counter", 3);
+    clink::StateFingerprintMap fps;
+    fps.set(clink::operator_id_from_uid("counter-op"),
+            "counter_slot",
+            clink::fields_fingerprint_v<GateEvoOtherShape>);
+    auto dir = write_savepoint(versions, "fp_mismatch_jobs_dir", fps);
+
+    const auto reject = clink::cluster::check_restore_compatibility_via_plugins(
+        {schema_evo_job_path()}, (dir / "_jobs" / "7").string(), 1);
+    EXPECT_NE(reject.find("changed shape"), std::string::npos) << reject;
     std::filesystem::remove_all(dir);
 }
 
