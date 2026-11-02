@@ -242,14 +242,16 @@ public:
 
 #else  // !CLINK_FAULT_INJECTION
 
-// Compiled out. `(void)0` in a value context still needs to yield an
-// Outcome for the sites that read one, so use a default-constructed
-// (fired == false) temporary; the optimiser removes it entirely.
+// Compiled out. A site that reads the outcome needs one, so the point is still a
+// call that returns a default (fired == false) Outcome, and the optimiser removes
+// it entirely. A call rather than a bare temporary: a temporary used as a
+// statement is an unused value, which warned (-Wunused-value) in every consumer
+// build that compiled an inline header with a fault point in it.
 inline Outcome reach(std::string_view) noexcept {
     return Outcome{};
 }
 
-#define CLINK_FAULT_POINT(name) (::clink::fault::Outcome{})
+#define CLINK_FAULT_POINT(name) ::clink::fault::reach(name)
 #define CLINK_FAULT_ENABLED 0
 
 #endif  // CLINK_FAULT_INJECTION

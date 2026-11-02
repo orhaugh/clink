@@ -74,6 +74,12 @@ the certificate's DNS names with a wildcard only as a whole left-most label and
 an address against its IP entries. Covered by
 `TlsSocketConnect.SniCarriesAHostNameAndNeverAnAddress` and `WsClientTls.*`.
 
+**A consumer build no longer warns about fault points.** With fault injection
+compiled out, `CLINK_FAULT_POINT` expanded to a bare temporary, an unused value
+wherever it stood as a statement, so every consumer that compiled an inline
+clink header with a fault point in it saw `-Wunused-value`. It is now a call to
+the inline `reach`, which the optimiser removes as before.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's
