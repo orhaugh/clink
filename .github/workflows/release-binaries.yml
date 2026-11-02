@@ -94,12 +94,6 @@ jobs:
           cmake --build build --parallel "$(nproc)"
           cmake --install build
 
-      - name: Bundle the pinned console into the prefix
-        # clink-fe's release asset at the version and sha256 pinned in
-        # scripts/console.env, at share/clink/console, where clink_node finds
-        # it beside its binaries and serves it on a coordinator's HTTP port.
-        run: scripts/fetch-console.sh "${RUNNER_TEMP}/stage"
-
       - name: Bundle the pinned toolchain into the prefix
         # The Arrow/Parquet shared libraries the binaries link, plus the
         # headers and CMake configs a find_package(clink) consumer needs
@@ -113,6 +107,14 @@ jobs:
           # Prune pieces a consumer never needs from the bundle.
           rm -rf "$stage/lib/pkgconfig" "$stage/share" || true
 
+      - name: Bundle the pinned console into the prefix
+        # clink-fe's release asset at the version and sha256 pinned in
+        # scripts/console.env, at share/clink/console, where clink_node finds
+        # it beside its binaries and serves it on a coordinator's HTTP port.
+        # After the prune above, which removes share/ whole: v0.14.0's
+        # tarball shipped without the console because it ran before it.
+        run: scripts/fetch-console.sh "${RUNNER_TEMP}/stage"
+
       - name: Smoke test from a clean directory
         # The artefact must work where nothing else does: move it, clear the
         # toolchain from the environment, run SQL through the CLI, and build
@@ -121,6 +123,9 @@ jobs:
           set -euo pipefail
           mv "${RUNNER_TEMP}/stage" "${RUNNER_TEMP}/clink-sdk"
           sdk="${RUNNER_TEMP}/clink-sdk"
+          # The console a Coordinator serves from beside its binary.
+          [ -f "$sdk/share/clink/console/index.html" ] \
+            || { echo "the SDK carries no console at share/clink/console" >&2; exit 1; }
           cd "${RUNNER_TEMP}"
 
           echo '== CLI'

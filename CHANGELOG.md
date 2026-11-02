@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**The SDK tarball carries the ops console.** v0.14.0's
+`clink-v0.14.0-linux-x86_64-ubuntu24.04.tar.gz` shipped without it: the
+release workflow installed the console at `share/clink/console` and then,
+bundling the toolchain, pruned `share/` whole, so a Coordinator run from the
+SDK served its JSON signpost instead. The runtime image was not affected. The
+console now goes in after the prune, and the tarball's smoke test fails when
+`share/clink/console/index.html` is missing.
+
 ## v0.14.0 (November 2026)
 
 Every release carries the ops console. The SDK tarball and the runtime image
