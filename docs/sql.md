@@ -248,6 +248,12 @@ sees them, so several aliases resolve to the same type.
 | `TIME` | time of day |
 | `BYTEA` | binary |
 
+A `DOUBLE` or `REAL` value can be NaN or an infinity. A JSON source reads the
+strings `"NaN"`, `"Infinity"` and `"-Infinity"` in such a column as those values,
+which are what a sink with `json_non_finite = 'string'` writes, so clink's output
+reads back as written; any other text stays text. Division by zero yields NULL
+for floating-point operands too: `x / 0.0` is NULL, not an infinity or NaN.
+
 Composite and array types (available as column types):
 
 | SQL spelling | Meaning |

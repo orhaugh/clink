@@ -320,6 +320,35 @@ TEST(AvroFormat, NonFiniteDoublesEncodeAsTheirIeeeValues) {
     }
 }
 
+// The decoder keeps a NaN or an infinity. The JSON it writes carries the internal
+// form, which clink's parser reads back as the same double, so a clink-to-clink
+// round trip through the registry keeps them; they used to decode as null.
+TEST(AvroFormat, NonFiniteDoublesDecodeToTheSameValue) {
+    using L = std::numeric_limits<double>;
+    Fixture fx;
+    constexpr const char* kSchema =
+        R"({"type":"record","name":"Px","fields":[{"name":"px","type":"double"},)"
+        R"({"name":"r","type":"float"}]})";
+    const auto id = fx.reg.add("nf-decode-value", "AVRO", kSchema);
+    const auto schema = avro::compileJsonSchemaFromString(kSchema);
+    auto dec = fx.decoder();
+    const auto same = [](double got, double want) {
+        return std::isnan(want) ? std::isnan(got) : got == want;
+    };
+    for (const double x : {L::quiet_NaN(), L::infinity(), -L::infinity()}) {
+        avro::GenericDatum d(schema);
+        auto& r = d.value<avro::GenericRecord>();
+        r.field("px").value<double>() = x;
+        r.field("r").value<float>() = static_cast<float>(x);
+        const auto json = dec->to_json(frame(id, encode_datum(d)));
+        const auto v = clink::config::parse(json);
+        ASSERT_TRUE(v.at("px").is_number()) << json;
+        ASSERT_TRUE(v.at("r").is_number()) << json;
+        EXPECT_TRUE(same(v.at("px").as_number(), x)) << json;
+        EXPECT_TRUE(same(v.at("r").as_number(), x)) << json;
+    }
+}
+
 }  // namespace
 }  // namespace clink::schema_registry
 

@@ -282,6 +282,37 @@ TEST(SqlRow, NumericTextTakesTheDeclaredNumericType) {
     EXPECT_TRUE(r.values.at("dword").is_string());
 }
 
+TEST(SqlRow, NonFiniteTextTakesTheDeclaredFloatingType) {
+    // The json_non_finite='string' form a JSON sink writes reads back as the value
+    // it names in a DOUBLE or REAL column, so clink's own output round-trips;
+    // strtod's laxer spellings stay text, as any other word does. A REAL column
+    // also takes numeric text, at float precision, as a DOUBLE column does.
+    using clink::config::JsonValue;
+    Row r;
+    for (const std::string c : {"d", "f"}) {
+        r.values[c + "_nan"] = JsonValue{std::string{"NaN"}};
+        r.values[c + "_inf"] = JsonValue{std::string{"Infinity"}};
+        r.values[c + "_ninf"] = JsonValue{std::string{"-Infinity"}};
+        r.values[c + "_lax"] = JsonValue{std::string{"nan"}};
+    }
+    r.values["f_text"] = JsonValue{std::string{"0.1"}};
+    r.values["f_huge"] = JsonValue{std::string{"1e300"}};
+    coerce_row_doubles(r, {"d_nan", "d_inf", "d_ninf", "d_lax"});
+    coerce_row_floats(r, {"f_nan", "f_inf", "f_ninf", "f_lax", "f_text", "f_huge"});
+    for (const std::string c : {"d", "f"}) {
+        ASSERT_TRUE(r.values.at(c + "_nan").is_number()) << c;
+        EXPECT_TRUE(std::isnan(r.values.at(c + "_nan").as_number())) << c;
+        ASSERT_TRUE(r.values.at(c + "_inf").is_number()) << c;
+        EXPECT_EQ(r.values.at(c + "_inf").as_number(), HUGE_VAL) << c;
+        ASSERT_TRUE(r.values.at(c + "_ninf").is_number()) << c;
+        EXPECT_EQ(r.values.at(c + "_ninf").as_number(), -HUGE_VAL) << c;
+        EXPECT_TRUE(r.values.at(c + "_lax").is_string()) << c;
+    }
+    ASSERT_TRUE(r.values.at("f_text").is_number());
+    EXPECT_EQ(r.values.at("f_text").as_number(), static_cast<double>(0.1f));
+    EXPECT_TRUE(r.values.at("f_huge").is_string()) << "past float's range: left as it is";
+}
+
 TEST(SqlRow, GetStringStringifiesNumbersAndBools) {
     Row r;
     r.values["i"] = clink::config::JsonValue{static_cast<std::int64_t>(100)};

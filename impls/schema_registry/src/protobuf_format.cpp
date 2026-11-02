@@ -245,14 +245,12 @@ JsonValue scalar_to_json(const pb::Message& msg,
             }
             return JsonValue{static_cast<std::int64_t>(u)};
         }
-        case pb::FieldDescriptor::CPPTYPE_DOUBLE: {
-            const double v = rep ? r.GetRepeatedDouble(msg, &f, index) : r.GetDouble(msg, &f);
-            return std::isfinite(v) ? JsonValue{v} : JsonValue{};
-        }
-        case pb::FieldDescriptor::CPPTYPE_FLOAT: {
-            const double v = rep ? r.GetRepeatedFloat(msg, &f, index) : r.GetFloat(msg, &f);
-            return std::isfinite(v) ? JsonValue{v} : JsonValue{};
-        }
+        // A NaN or an infinity stays the value it is, as in the Avro decoder.
+        case pb::FieldDescriptor::CPPTYPE_DOUBLE:
+            return JsonValue{rep ? r.GetRepeatedDouble(msg, &f, index) : r.GetDouble(msg, &f)};
+        case pb::FieldDescriptor::CPPTYPE_FLOAT:
+            return JsonValue{static_cast<double>(rep ? r.GetRepeatedFloat(msg, &f, index)
+                                                     : r.GetFloat(msg, &f))};
         case pb::FieldDescriptor::CPPTYPE_BOOL:
             return JsonValue{rep ? r.GetRepeatedBool(msg, &f, index) : r.GetBool(msg, &f)};
         case pb::FieldDescriptor::CPPTYPE_ENUM: {

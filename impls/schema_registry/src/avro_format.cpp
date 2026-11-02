@@ -92,14 +92,14 @@ JsonValue datum_to_json(const avro::GenericDatum& d) {
                     return JsonValue{v};
             }
         }
-        case avro::AVRO_FLOAT: {
-            const double v = d.value<float>();
-            return std::isfinite(v) ? JsonValue{v} : JsonValue{};
-        }
-        case avro::AVRO_DOUBLE: {
-            const double v = d.value<double>();
-            return std::isfinite(v) ? JsonValue{v} : JsonValue{};
-        }
+        // A NaN or an infinity stays the value it is: the row text carries it in
+        // the internal form, which reads back as the same double, and a sink
+        // writes it as its json_non_finite option says. It used to become null
+        // here, so a registry round trip through clink lost it.
+        case avro::AVRO_FLOAT:
+            return JsonValue{static_cast<double>(d.value<float>())};
+        case avro::AVRO_DOUBLE:
+            return JsonValue{d.value<double>()};
         case avro::AVRO_STRING:
             return JsonValue{d.value<std::string>()};
         case avro::AVRO_BYTES: {

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -319,23 +320,6 @@ inline void requantise_row_decimals(Row& r, const std::map<std::string, int>& de
     }
 }
 
-// Coerce declared FLOAT (float32) columns through float, so a REAL column carries
-// the precision its declared width can actually hold.
-//
-// This is what lets the columnar decoder handle FLOAT at all: it appends to a
-// FloatBuilder and reads back (double)(float)v, so the row decoder has to round
-// the same way or the two carriers differ on the same input. Applied at ingestion
-// only; a value already at float precision is unchanged by construction.
-inline void coerce_row_floats(Row& r, const std::vector<std::string>& float_columns) {
-    for (const auto& col : float_columns) {
-        auto it = r.values.find(col);
-        if (it == r.values.end() || !it->second.is_number())
-            continue;
-        it->second = clink::config::JsonValue{
-            static_cast<double>(static_cast<float>(it->second.as_number()))};
-    }
-}
-
 // A numeric text token in a declared numeric column takes the column's type
 // too: a source that speaks a text protocol (the MySQL sources deliver every
 // cell as a string) or a producer that quotes its numbers would otherwise leave
@@ -365,6 +349,63 @@ inline std::optional<double> whole_double_token(std::string_view s) {
     return d;
 }
 
+// The three strings a JSON sink's json_non_finite='string' form writes for a NaN
+// or an infinity, read back as the value they stand for, so that output
+// round-trips through clink. Only those exact spellings: strtod's laxer "nan" and
+// "inf" stay text, as any other word does.
+inline std::optional<double> non_finite_token(std::string_view s) noexcept {
+    if (s == "NaN") {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (s == "Infinity") {
+        return std::numeric_limits<double>::infinity();
+    }
+    if (s == "-Infinity") {
+        return -std::numeric_limits<double>::infinity();
+    }
+    return std::nullopt;
+}
+
+// A text cell in a declared DOUBLE or REAL column that holds a number: a whole
+// numeric token, or one of the non-finite spellings above.
+inline std::optional<double> numeric_text_token(std::string_view s) {
+    if (const auto v = whole_double_token(s); v.has_value()) {
+        return v;
+    }
+    return non_finite_token(s);
+}
+
+// Coerce declared FLOAT (float32) columns through float, so a REAL column carries
+// the precision its declared width can actually hold.
+//
+// This is what lets the columnar decoder handle FLOAT at all: it appends to a
+// FloatBuilder and reads back (double)(float)v, so the row decoder has to round
+// the same way or the two carriers differ on the same input. Applied at ingestion
+// only; a value already at float precision is unchanged by construction.
+// A text cell holding a number (numeric_text_token) takes the column's type as in
+// a DOUBLE column; one past float's range stays as it is. The columnar decoder
+// declines every text cell in a REAL column, so the row decode alone decides it.
+inline void coerce_row_floats(Row& r, const std::vector<std::string>& float_columns) {
+    for (const auto& col : float_columns) {
+        auto it = r.values.find(col);
+        if (it == r.values.end())
+            continue;
+        if (it->second.is_string()) {
+            const auto v = numeric_text_token(it->second.as_string());
+            if (v.has_value() &&
+                (!std::isfinite(*v) ||
+                 std::fabs(*v) <= static_cast<double>(std::numeric_limits<float>::max()))) {
+                it->second = clink::config::JsonValue{static_cast<double>(static_cast<float>(*v))};
+            }
+            continue;
+        }
+        if (!it->second.is_number())
+            continue;
+        it->second = clink::config::JsonValue{
+            static_cast<double>(static_cast<float>(it->second.as_number()))};
+    }
+}
+
 // Coerce declared DOUBLE columns' integer tokens to double, so a DOUBLE column
 // holds a double whichever way the producer wrote the number.
 //
@@ -380,7 +421,7 @@ inline void coerce_row_doubles(Row& r, const std::vector<std::string>& double_co
         if (it == r.values.end())
             continue;
         if (it->second.is_string()) {
-            if (const auto v = whole_double_token(it->second.as_string()); v.has_value()) {
+            if (const auto v = numeric_text_token(it->second.as_string()); v.has_value()) {
                 it->second = clink::config::JsonValue{*v};
             }
             continue;

@@ -381,6 +381,41 @@ TEST(ProtobufFormat, NonFiniteDoublesEncodeAsTheirIeeeValues) {
     EXPECT_EQ(null_r, 0.0);
 }
 
+// As the Avro decoder: a NaN or an infinity decodes to the same double, in the
+// internal form clink's parser reads back, where it used to decode as null.
+TEST(ProtobufFormat, NonFiniteDoublesDecodeToTheSameValue) {
+    using L = std::numeric_limits<double>;
+    Fixture fx;
+    constexpr const char* kPx = R"(syntax = "proto3";
+package px;
+message Px {
+  double px = 1;
+  float r = 2;
+}
+)";
+    const auto id = fx.reg.add("nf-decode-value", "PROTOBUF", kPx);
+    Compiled ref(kPx);
+    auto dec = fx.decoder();
+    const auto same = [](double got, double want) {
+        return std::isnan(want) ? std::isnan(got) : got == want;
+    };
+    for (const double x : {L::quiet_NaN(), L::infinity(), -L::infinity()}) {
+        auto msg = ref.make("Px");
+        const auto* r = msg->GetReflection();
+        const auto* d = msg->GetDescriptor();
+        r->SetDouble(msg.get(), d->FindFieldByName("px"), x);
+        r->SetFloat(msg.get(), d->FindFieldByName("r"), static_cast<float>(x));
+        std::string bytes;
+        ASSERT_TRUE(msg->SerializeToString(&bytes));
+        const auto json = dec->to_json(frame(id, std::vector<std::int32_t>{0}, bytes));
+        const auto v = clink::config::parse(json);
+        ASSERT_TRUE(v.at("px").is_number()) << json;
+        ASSERT_TRUE(v.at("r").is_number()) << json;
+        EXPECT_TRUE(same(v.at("px").as_number(), x)) << json;
+        EXPECT_TRUE(same(v.at("r").as_number(), x)) << json;
+    }
+}
+
 }  // namespace
 }  // namespace clink::schema_registry
 

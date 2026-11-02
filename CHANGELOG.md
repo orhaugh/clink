@@ -55,6 +55,16 @@ reads, scans and the cleanup sweep alike. It now gets its full TTL from the
 first watermark, as SQL state already does. Covered by
 `KeyedStateTtlDepth.EntriesWrittenBeforeTheFirstWatermarkLiveTheirTtlFromIt`.
 
+**NaN and the infinities survive a round trip through clink.** A JSON source
+kept the strings `"NaN"`, `"Infinity"` and `"-Infinity"`, which a sink with
+`json_non_finite = 'string'` writes, as text in a `DOUBLE` or `REAL` column, so
+`d + 1` gave NULL. They now read as the values they name, and a `REAL` column
+takes numeric text as a `DOUBLE` column does. The Avro and Protobuf decoders
+read NaN and the infinities as NULL; they now keep them. `docs/sql.md` records
+that division by zero yields NULL for floating-point operands too. Covered by
+`SqlRow.NonFiniteTextTakesTheDeclaredFloatingType` and both registry formats'
+`NonFiniteDoublesDecodeToTheSameValue`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's
