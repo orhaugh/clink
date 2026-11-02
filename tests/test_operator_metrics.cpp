@@ -234,3 +234,48 @@ TEST(OperatorMetrics, AWindowCountsAndReportsRecordsWithNoEventTime) {
     }
     EXPECT_EQ(warnings, 1) << "the first untimed record is logged, the rest are only counted";
 }
+
+namespace {
+// Forwards both inputs unchanged, for counting what a two-input operator sees.
+class ForwardBothInputs final : public CoOperator<std::int64_t, std::int64_t, std::int64_t> {
+public:
+    void process_element1(const StreamElement<std::int64_t>& e,
+                          Emitter<std::int64_t>& out) override {
+        out.emit_data(e.as_data());
+    }
+    void process_element2(const StreamElement<std::int64_t>& e,
+                          Emitter<std::int64_t>& out) override {
+        out.emit_data(e.as_data());
+    }
+};
+}  // namespace
+
+// A two-input operator counts what reaches it on either input, as a one-input
+// operator does. It used to report records out and none in: an interval join
+// showed 0 records in against 1.6 million out.
+TEST(OperatorMetrics, ATwoInputOperatorCountsTheRecordsOfBothInputs) {
+    Dag dag;
+    const auto records = [](std::int64_t n) {
+        std::vector<Record<std::int64_t>> v;
+        for (std::int64_t i = 0; i < n; ++i) {
+            v.emplace_back(Record<std::int64_t>{i});
+        }
+        return v;
+    };
+    auto left =
+        dag.add_source<std::int64_t>(std::make_shared<VectorSource<std::int64_t>>(records(3)));
+    auto right =
+        dag.add_source<std::int64_t>(std::make_shared<VectorSource<std::int64_t>>(records(5)));
+    auto op = std::make_shared<ForwardBothInputs>();
+    auto joined = dag.add_co_operator<std::int64_t, std::int64_t, std::int64_t>(left, right, op);
+    dag.add_sink<std::int64_t>(joined, std::make_shared<CollectingSink<std::int64_t>>());
+
+    const auto in_name = clink::metrics::op_metric_name("records_in_total", op->id().value());
+    const auto before = counter_value(in_name);
+    JobConfig cfg;
+    cfg.metrics = &MetricsRegistry::global();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    EXPECT_EQ(counter_value(in_name) - before, 8u);
+}

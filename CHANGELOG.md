@@ -42,6 +42,12 @@ explicit 1 is kept. Covered by `KeyedProcessFunction.*` in
 `OperatorMetrics.AWindowCountsAndReportsRecordsWithNoEventTime` and
 `PipelineParallelism.AnExplicitParallelismOfOneIsKept`.
 
+**A two-input operator counts what reaches it.** Interval joins, co-operators
+and broadcast connects reported records out and no records in: a half-time
+interval join showed 0 in against 1.6 million out. Each input's batches now
+count in the operator's `records_in_total`, as a one-input operator's do.
+Covered by `OperatorMetrics.ATwoInputOperatorCountsTheRecordsOfBothInputs`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

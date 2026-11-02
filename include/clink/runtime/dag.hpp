@@ -2602,6 +2602,8 @@ public:
 
             auto handle_left = [&](const StreamElement<A>& el) {
                 if (el.is_data()) {
+                    clink::metrics::op::records_in_inc(
+                        ctx.metrics(), id.value(), el.as_data().size());
                     for (const auto& rec : el.as_data()) {
                         const A& v = rec.value();
                         const EventTime t = rec.event_time().value_or(EventTime{0});
@@ -2659,6 +2661,8 @@ public:
 
             auto handle_right = [&](const StreamElement<B>& el) {
                 if (el.is_data()) {
+                    clink::metrics::op::records_in_inc(
+                        ctx.metrics(), id.value(), el.as_data().size());
                     for (const auto& rec : el.as_data()) {
                         const B& v = rec.value();
                         const EventTime t = rec.event_time().value_or(EventTime{0});
@@ -2985,6 +2989,8 @@ public:
 
             auto handle_brod = [&](const StreamElement<Brod>& el) {
                 if (el.is_data()) {
+                    clink::metrics::op::records_in_inc(
+                        ctx.metrics(), id.value(), el.as_data().size());
                     std::vector<Out> emitted;
                     for (const auto& rec : el.as_data()) {
                         process_broadcast(rec.value(), state, emitted);
@@ -3011,6 +3017,8 @@ public:
 
             auto handle_main = [&](const StreamElement<Main>& el) {
                 if (el.is_data()) {
+                    clink::metrics::op::records_in_inc(
+                        ctx.metrics(), id.value(), el.as_data().size());
                     std::vector<Out> emitted;
                     for (const auto& rec : el.as_data()) {
                         process_main(rec.value(), state, emitted);
@@ -3459,6 +3467,10 @@ public:
 
             auto handle_left = [&](const StreamElement<In1>& el) {
                 if (el.is_data()) {
+                    // Counted as the single-input runner counts, per input: a two-input
+                    // operator reported records out and no records in.
+                    clink::metrics::op::records_in_inc(
+                        ctx.metrics(), id.value(), el.as_data().size());
                     if (aec) {
                         op->process_async1(el, out_emitter, *aec);
                         if (do_coalesce) {  // ASYNC-10: batch this input's reads -> one get_many
@@ -3490,6 +3502,8 @@ public:
             };
             auto handle_right = [&](const StreamElement<In2>& el) {
                 if (el.is_data()) {
+                    clink::metrics::op::records_in_inc(
+                        ctx.metrics(), id.value(), el.as_data().size());
                     if (aec) {
                         op->process_async2(el, out_emitter, *aec);
                         if (do_coalesce) {  // ASYNC-10: batch this input's reads -> one get_many
