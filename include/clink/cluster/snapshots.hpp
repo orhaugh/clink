@@ -45,6 +45,10 @@ struct JobSummary {
     // The name the job was submitted with (JobGraphSpec::name), empty for an
     // unnamed job.
     std::string name;
+    // The checkpoint a graceful stop (Coordinator::stop_job) ended the job at, 0
+    // for a job that was not stopped. status alone reads COMPLETED_OK for a
+    // stopped job, the same as one that ran out of input.
+    std::uint64_t stopped_at_checkpoint_id{0};
     std::size_t expected_completion{0};
     std::size_t completed_count{0};
     bool completion_signalled{false};
@@ -95,6 +99,8 @@ struct JobDetail {
     // The name the job was submitted with (JobGraphSpec::name), empty for an
     // unnamed job.
     std::string name;
+    // As JobSummary::stopped_at_checkpoint_id.
+    std::uint64_t stopped_at_checkpoint_id{0};
     std::size_t expected_completion{0};
     std::size_t completed_count{0};
     bool completion_signalled{false};

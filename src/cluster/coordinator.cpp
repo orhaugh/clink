@@ -2803,6 +2803,7 @@ std::vector<JobSummary> Coordinator::snapshot_jobs() const {
         JobSummary s;
         s.id = id;
         s.name = job->name;
+        s.stopped_at_checkpoint_id = job->stopped_at_checkpoint_id;
         s.expected_completion = job->expected_completion;
         s.completed_count = job->completed_count;
         s.completion_signalled = job->completion_signalled;
@@ -2827,6 +2828,7 @@ std::optional<JobDetail> Coordinator::snapshot_job(JobId job_id) const {
     JobDetail d;
     d.id = job_id;
     d.name = job.name;
+    d.stopped_at_checkpoint_id = job.stopped_at_checkpoint_id;
     d.expected_completion = job.expected_completion;
     d.completed_count = job.completed_count;
     d.completion_signalled = job.completion_signalled;
@@ -4992,6 +4994,7 @@ StopJobAckMsg Coordinator::stop_job(JobId job_id, std::chrono::milliseconds time
         ack.message = "the job stopped with errors: " + job.errors.front();
         return ack;
     }
+    job.stopped_at_checkpoint_id = ack.savepoint_checkpoint_id;
     ack.ok = true;
     ack.message = "stopped at checkpoint " + std::to_string(ack.savepoint_checkpoint_id);
     log::info("coordinator.stop",

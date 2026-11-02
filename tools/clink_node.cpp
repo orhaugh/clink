@@ -407,6 +407,7 @@ void write_job_summary(clink::http::JsonWriter& w, const clink::cluster::JobSumm
     w.begin_object();
     w.kv("id", j.id);
     w.kv("name", j.name);
+    w.kv("stopped_at_checkpoint_id", j.stopped_at_checkpoint_id);
     w.kv("expected_completion", j.expected_completion);
     w.kv("completed_count", j.completed_count);
     w.kv("completion_signalled", j.completion_signalled);
@@ -422,6 +423,7 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
     w.begin_object();
     w.kv("id", j.id);
     w.kv("name", j.name);
+    w.kv("stopped_at_checkpoint_id", j.stopped_at_checkpoint_id);
     w.kv("expected_completion", j.expected_completion);
     w.kv("completed_count", j.completed_count);
     w.kv("completion_signalled", j.completion_signalled);

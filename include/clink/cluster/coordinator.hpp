@@ -1294,6 +1294,9 @@ private:
         // it to surface "cancelled by client" instead of the bare
         // SubtaskFinished error messages.
         bool cancel_requested{false};
+        // The checkpoint a clean stop_job ended the job at; 0 unless it was stopped.
+        // Reported so a stopped job reads as stopped, not as one that finished.
+        std::uint64_t stopped_at_checkpoint_id{0};
         // A graceful stop is in progress: the subtasks have been told to stop
         // producing and run their end-of-input path. Deliberately not
         // cancel_requested, which decides the REPORTED OUTCOME - a job that

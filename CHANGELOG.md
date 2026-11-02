@@ -105,6 +105,12 @@ restore it was taken for found nothing. It now checks the marker and refuses
 otherwise. Covered by
 `CheckpointCompletion.ASavepointWhoseCheckpointFailedIsNotReportedTakenAfterTheRewind`.
 
+**A stopped job reads as stopped.** A job ended by a graceful stop at a
+savepoint reported `COMPLETED_OK`, the same as one that ran out of input. Job
+summaries and details now carry `stopped_at_checkpoint_id`, the checkpoint the
+stop ended at, and the console shows such a job as Stopped. The status values
+and the wire protocol are unchanged.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's
