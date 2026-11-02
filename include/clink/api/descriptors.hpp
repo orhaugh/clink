@@ -22,14 +22,14 @@ struct SourceDescriptor {
     std::string op_type;
     std::string channel_type;
     std::map<std::string, std::string> params;
-    std::uint32_t parallelism{1};
+    std::uint32_t parallelism{0};  // 0: the pipeline's default; any other value pins it
 };
 
 struct SinkDescriptor {
     std::string op_type;
     std::string channel_type;
     std::map<std::string, std::string> params;
-    std::uint32_t parallelism{1};
+    std::uint32_t parallelism{0};  // 0: the pipeline's default; any other value pins it
 };
 
 struct OperatorDescriptor {
@@ -37,7 +37,7 @@ struct OperatorDescriptor {
     std::string in_channel_type;
     std::string out_channel_type;
     std::map<std::string, std::string> params;
-    std::uint32_t parallelism{1};
+    std::uint32_t parallelism{0};  // 0: the pipeline's default; any other value pins it
 };
 
 }  // namespace clink::api

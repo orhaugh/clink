@@ -21,6 +21,7 @@
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/local_executor.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
 using namespace clink;
@@ -190,4 +191,46 @@ TEST(OperatorMetrics, AccumulatorMergesAcrossSubtasksForSameOpId) {
     clink::RuntimeContext c3(op, "acc_op", nullptr, nullptr);
     c3.accumulator("widgets").add(100);
     EXPECT_EQ(reg.gauge(name).value() - before, 6);
+}
+
+// A window places a record by its event time, so one sent without a timestamp
+// falls in no window. Such records used to vanish with nothing said: the window
+// fired empty and the job reported nothing. Each now counts in the operator's
+// records_dropped_total, and the first one an operator meets is logged.
+TEST(OperatorMetrics, AWindowCountsAndReportsRecordsWithNoEventTime) {
+    Dag dag;
+    std::vector<Record<std::int64_t>> records;
+    for (std::int64_t i = 1; i <= 3; ++i) {
+        records.emplace_back(Record<std::int64_t>{i});  // no event time
+    }
+    auto src = std::make_shared<VectorSource<std::int64_t>>(std::move(records));
+    auto window = std::make_shared<
+        api::detail::KeyedTumblingWindowAggregateOperator<std::int64_t, std::int64_t>>(
+        [](const std::int64_t& v) { return v; },
+        [] { return std::int64_t{0}; },
+        [](const std::int64_t& acc, const std::int64_t& v) { return acc + v; },
+        10ms,
+        "untimed_window");
+    auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+    auto h0 = dag.add_source<std::int64_t>(src);
+    auto h1 = dag.add_operator<std::int64_t, std::int64_t>(h0, window);
+    dag.add_sink<std::int64_t>(h1, sink);
+
+    const auto dropped_name =
+        clink::metrics::op_metric_name("records_dropped_total", window->id().value());
+    const auto dropped_before = counter_value(dropped_name);
+    JobConfig cfg;
+    cfg.metrics = &MetricsRegistry::global();
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+
+    EXPECT_TRUE(sink->collected().empty());
+    EXPECT_EQ(counter_value(dropped_name) - dropped_before, 3u);
+    int warnings = 0;
+    for (const auto& r : clink::LogBuffer::global().tail(2000, "warn")) {
+        if (r.message.find("a record with no event time reached a window") != std::string::npos) {
+            ++warnings;
+        }
+    }
+    EXPECT_EQ(warnings, 1) << "the first untimed record is logged, the rest are only counted";
 }

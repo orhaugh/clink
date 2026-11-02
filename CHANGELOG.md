@@ -24,6 +24,24 @@ runtime treats a job reading them as bounded. Covered by `FirstSubtaskReads.*`,
 `RealConnectorFactories.FileTextSourceAtParallelismTwoWritesEachLineOnce` and
 `EmbeddedEngine.AFileSourceAtParallelismTwoReadsEachRowOnce`.
 
+**The typed API no longer runs a timer under another key, drops untimestamped
+records without a word, or overrides an explicit parallelism of 1.**
+`current_key()` in `on_timer` was the key of whichever record came last, so a
+timer read and wrote another key's state unless the operator had a timer key
+decoder, which the fluent `process` overloads could not take. They now take one
+(`process(fn, key_fn, timer_key_fn)` and `process(fn, timer_key_fn)`), and
+without one `current_key()` in `on_timer` throws and names the fix; an
+`on_timer` that never asks for the key runs as before. A window left out a
+record with no event time, one sent with `collect` rather than
+`collect_with_timestamp`, and said nothing: the window fired empty. Each one now
+counts in the operator's `records_dropped_total`, and the first one each window
+meets is logged. A descriptor or window handle that asked for parallelism 1 ran
+at the pipeline's default, because 1 also meant unset; unset is now 0, so an
+explicit 1 is kept. Covered by `KeyedProcessFunction.*` in
+`test_process_function.cpp`,
+`OperatorMetrics.AWindowCountsAndReportsRecordsWithNoEventTime` and
+`PipelineParallelism.AnExplicitParallelismOfOneIsKept`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

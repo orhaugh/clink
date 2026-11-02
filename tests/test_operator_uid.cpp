@@ -14,13 +14,16 @@
 //     OperatorSpec.uid, and pipeline rejects
 //     duplicates with a precise diagnostic.
 
+#include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "clink/api/builtin_connectors.hpp"
 #include "clink/api/pipeline.hpp"
 #include "clink/core/codec.hpp"
 #include "clink/operators/process_function.hpp"
@@ -302,8 +305,8 @@ TEST(OperatorRescaleBounds, TheDocumentedInvariantsAreRejectedAtConstruction) {
 // parallelism 4 and scale it down: it started at 1 instead, and the rescale was
 // refused as a no-op.
 //
-// Every attach point in the fluent API applies the pipeline default with the
-// idiom `desc.parallelism > 1 ? desc.parallelism : default_parallelism()`.
+// Every attach point in the fluent API applies the pipeline default when its
+// descriptor or window handle left the parallelism unset (0).
 // Eight KeyedDataStream methods - process, process_async, connect,
 // connect_process and their overloads - set op.key_by and went straight to
 // append_op without it, so a keyed operator ran at parallelism 1 regardless of
@@ -374,4 +377,40 @@ TEST(PipelineParallelism, AnOperatorThatAsksForItsOwnParallelismKeepsIt) {
         }
     }
     EXPECT_TRUE(found);
+}
+
+TEST(PipelineParallelism, AnExplicitParallelismOfOneIsKept) {
+    // 1 is a request like any other: only an unset parallelism (0) takes the
+    // pipeline default. 1 used to be the unset value too, so a source or a window
+    // asked to stay on one subtask ran at the default instead.
+    using namespace clink::api;
+    using namespace std::chrono_literals;
+    auto env = Pipeline::create();
+    env.set_parallelism(4);
+    auto single = env.source<std::int64_t>(
+        IntRangeSource::builder().count(10).parallelism(1).build(), "single-src");
+    auto spread =
+        env.source<std::int64_t>(IntRangeSource::builder().count(10).build(), "default-src");
+    single.key_by([](const std::int64_t& v) { return v % 2; })
+        .tumbling_window(10ms)
+        .parallelism(1)
+        .aggregate<std::int64_t>(
+            [] { return std::int64_t{0}; },
+            [](const std::int64_t& acc, const std::int64_t& v) { return acc + v; },
+            "single-window");
+    spread.key_by([](const std::int64_t& v) { return v % 2; })
+        .tumbling_window(10ms)
+        .aggregate<std::int64_t>(
+            [] { return std::int64_t{0}; },
+            [](const std::int64_t& acc, const std::int64_t& v) { return acc + v; },
+            "default-window");
+
+    std::map<std::string, std::uint32_t> parallelism_by_id;
+    for (const auto& op : env.graph().ops) {
+        parallelism_by_id[op.id] = op.parallelism;
+    }
+    EXPECT_EQ(parallelism_by_id.at("single-src"), 1u);
+    EXPECT_EQ(parallelism_by_id.at("single-window"), 1u);
+    EXPECT_EQ(parallelism_by_id.at("default-src"), 4u);
+    EXPECT_EQ(parallelism_by_id.at("default-window"), 4u);
 }

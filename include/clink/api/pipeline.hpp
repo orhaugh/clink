@@ -185,18 +185,18 @@ public:
     // Internal: append an OperatorSpec built by a DataStream<T> method
     // and return the assigned op id. Public so DataStream<T> can call
     // it; not intended for direct user use.
-    std::string append_op(cluster::OperatorSpec op) {
+    std::string append_op(cluster::OperatorSpec op, bool parallelism_pinned = false) {
         if (op.id.empty()) {
             op.id = "op_" + std::to_string(graph_.ops.size());
         } else if (used_ids_.count(op.id) != 0) {
             throw std::runtime_error("Pipeline: duplicate operator id '" + op.id + "'");
         }
         // Apply the pipeline default to any operator that did not ask for a
-        // parallelism of its own. Treating 1 as "did not ask" is the convention
-        // every attach point in this file already follows (`desc.parallelism > 1
-        // ? desc.parallelism : default_parallelism()`); doing it here as well
-        // means an attach point that forgets the idiom still honours
-        // set_parallelism.
+        // parallelism of its own. A descriptor or window handle that set one
+        // (any value above 0, 1 included) resolves it at its attach point and
+        // passes parallelism_pinned, so an explicit 1 stays 1; otherwise a
+        // parallelism of 1 or less reads as "did not ask", so an attach point that
+        // forgets to resolve it still honours set_parallelism.
         //
         // Eight of them had forgotten it: every KeyedDataStream::process,
         // process_async, connect and connect_process overload set op.key_by and
@@ -204,7 +204,7 @@ public:
         // no matter what the job asked for. A keyed operator is the kind you
         // most want to scale, so set_parallelism(4) looked like it worked while
         // the job's only stateful operator stayed single.
-        if (op.parallelism <= 1) {
+        if (!parallelism_pinned && op.parallelism <= 1) {
             op.parallelism = default_parallelism_;
         }
         used_ids_.insert(op.id);
@@ -427,6 +427,22 @@ private:
 
 namespace detail {
 
+// A window places a record by its event time, so one that carries none (sent
+// with collect rather than collect_with_timestamp, or from a source that stamps
+// nothing) falls in no window and is left out. Left out silently, the window
+// fires empty and nothing says why, so each one counts in the operator's
+// records_dropped_total and the first one an operator meets is logged.
+inline void note_untimed_record(RuntimeContext* rt, std::uint64_t op_id, bool& warned) {
+    clink::metrics::op::records_dropped_inc(rt != nullptr ? rt->metrics() : nullptr, op_id);
+    if (!warned && rt != nullptr) {
+        rt->log_warn(
+            "a record with no event time reached a window and was left out: a window places "
+            "records by their event time. Send it with collect_with_timestamp, or assign "
+            "timestamps before the window. Later ones count in records_dropped_total.");
+        warned = true;
+    }
+}
+
 // Helper operator used by KeyedDataStream<T>::reduce(). Maintains a
 // per-key running aggregate in T-shape (no pair<K, T> conversion) and
 // emits the latest accumulator on every input, matching // keyedStream.reduce(ReduceFunction).
@@ -486,9 +502,8 @@ private:
 // watermark, windows with `start + size <= watermark` fire (one Agg
 // record per matured (key, window)) and are dropped from state.
 //
-// Records without event-time are silently skipped - matches the
-// existing SlidingWindowOperator's behaviour. Future revision can plug
-// in processing-time fallback / configurable trigger / allowed-lateness.
+// A record without event-time falls in no window and is left out, counted
+// and logged once (note_untimed_record).
 template <typename T, typename Agg>
 class KeyedSlidingWindowAggregateOperator final : public Operator<T, Agg> {
 public:
@@ -522,7 +537,8 @@ public:
             Batch<Agg> refires;
             for (const auto& rec : element.as_data()) {
                 if (!rec.event_time().has_value()) {
-                    continue;  // event-time required; skip records without it
+                    note_untimed_record(this->runtime(), this->id().value(), warned_untimed_);
+                    continue;
                 }
                 const std::int64_t t = rec.event_time()->millis();
                 const std::int64_t k = key_fn_(rec.value());
@@ -610,6 +626,7 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    bool warned_untimed_{false};  // note_untimed_record warns once
     struct StateKey {
         std::int64_t key;
         std::int64_t window_start;
@@ -1086,6 +1103,7 @@ public:
             Batch<Agg> refires;
             for (const auto& rec : element.as_data()) {
                 if (!rec.event_time().has_value()) {
+                    note_untimed_record(this->runtime(), this->id().value(), warned_untimed_);
                     continue;
                 }
                 const std::int64_t t = rec.event_time()->millis();
@@ -1156,6 +1174,7 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    bool warned_untimed_{false};  // note_untimed_record warns once
     struct StateKey {
         std::int64_t key;
         std::int64_t window_start;
@@ -1224,6 +1243,7 @@ public:
             Batch<Agg> refires;
             for (const auto& rec : element.as_data()) {
                 if (!rec.event_time().has_value()) {
+                    note_untimed_record(this->runtime(), this->id().value(), warned_untimed_);
                     continue;
                 }
                 const std::int64_t t = rec.event_time()->millis();
@@ -1290,6 +1310,7 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    bool warned_untimed_{false};  // note_untimed_record warns once
     struct Session {
         std::int64_t start{0};
         std::int64_t end{0};
@@ -1393,6 +1414,7 @@ public:
             Batch<Out> refires;
             for (const auto& rec : element.as_data()) {
                 if (!rec.event_time().has_value()) {
+                    note_untimed_record(this->runtime(), this->id().value(), warned_untimed_);
                     continue;
                 }
                 const std::int64_t t = rec.event_time()->millis();
@@ -1459,6 +1481,7 @@ public:
     std::string name() const override { return name_; }
 
 private:
+    bool warned_untimed_{false};  // note_untimed_record warns once
     struct Session {
         std::int64_t start{0};
         std::int64_t end{0};
@@ -1796,8 +1819,9 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = desc.channel_type.empty() ? ChannelName<T>::get() : desc.channel_type;
         op.params = std::move(desc.params);
-        op.parallelism = (desc.parallelism > 1) ? desc.parallelism : env_->default_parallelism();
-        env_->append_op(std::move(op));
+        const bool parallelism_pinned = desc.parallelism > 0;
+        op.parallelism = parallelism_pinned ? desc.parallelism : env_->default_parallelism();
+        env_->append_op(std::move(op), parallelism_pinned);
     }
 
     // Attach a human-readable display name to the most-recent op
@@ -1907,15 +1931,30 @@ public:
     DataStream<U> process(std::shared_ptr<KeyedProcessFunction<K, T, U>> fn,
                           std::function<K(const T&)> key_fn,
                           std::string id = {}) {
+        return process<K, U>(std::move(fn),
+                             std::move(key_fn),
+                             std::function<K(const std::string&)>{},
+                             std::move(id));
+    }
+
+    // As above, with `timer_key_fn` turning a timer's key back into K, so that
+    // current_key() in on_timer is the key the timer was registered for: register
+    // each per-key timer under a string it decodes. Without a decoder (the overload
+    // above) the timer's key is unknown and current_key() in on_timer throws.
+    template <typename K, typename U>
+    DataStream<U> process(std::shared_ptr<KeyedProcessFunction<K, T, U>> fn,
+                          std::function<K(const T&)> key_fn,
+                          std::function<K(const std::string&)> timer_key_fn,
+                          std::string id = {}) {
         cluster::ensure_built_ins_registered();
         const std::string op_type = env_->mint_inline_op_type("keyed_process_typed");
         auto& reg = env_->registry();
         reg.template register_operator<T, U>(
             op_type,
-            [fn, key_fn, op_type](
+            [fn, key_fn, timer_key_fn, op_type](
                 const clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
                 return std::make_shared<clink::detail::KeyedProcessFunctionAdapter<K, T, U>>(
-                    fn, key_fn, /*timer_key_fn=*/nullptr, op_type);
+                    fn, key_fn, timer_key_fn, op_type);
             });
         cluster::OperatorSpec op;
         op.id = std::move(id);
@@ -1964,11 +2003,25 @@ public:
     // Inline KeyedProcessFunction transform. Mirrors
     // keyedStream.process(new KeyedProcessFunction<>...). This overload
     // uses the int64 extractor already registered via .key_by(...) -
-    // current_key() inside process_element / on_timer returns int64.
+    // current_key() inside process_element returns the int64 key; inside
+    // on_timer it is the timer's key only with a timer key decoder (the
+    // overload below), and throws without one.
     // For typed (non-int64) keys, use the overload above that takes
     // an explicit K-returning extractor.
     template <typename U>
     DataStream<U> process(std::shared_ptr<KeyedProcessFunction<std::int64_t, T, U>> fn,
+                          std::string id = {}) {
+        return process<U>(
+            std::move(fn), std::function<std::int64_t(const std::string&)>{}, std::move(id));
+    }
+
+    // As above, with `timer_key_fn` turning a timer's key back into the int64 key,
+    // so that current_key() in on_timer is the key the timer was registered for:
+    // for a timer registered under std::to_string(current_key()), pass
+    // [](const std::string& k) { return std::stoll(k); }.
+    template <typename U>
+    DataStream<U> process(std::shared_ptr<KeyedProcessFunction<std::int64_t, T, U>> fn,
+                          std::function<std::int64_t(const std::string&)> timer_key_fn,
                           std::string id = {}) {
         cluster::ensure_built_ins_registered();
         const std::string op_type = env_->mint_inline_op_type("keyed_process");
@@ -1978,7 +2031,7 @@ public:
         auto* key_reg = &reg.key_extractor_registry();
         reg.template register_operator<T, U>(
             op_type,
-            [fn, op_type, channel, key_name, key_reg](
+            [fn, timer_key_fn, op_type, channel, key_name, key_reg](
                 const clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, U>> {
                 auto extractor = key_reg->template find<T>(channel, key_name);
                 if (!extractor) {
@@ -1988,10 +2041,7 @@ public:
                 }
                 return std::make_shared<
                     clink::detail::KeyedProcessFunctionAdapter<std::int64_t, T, U>>(
-                    fn,
-                    [extractor](const T& v) { return extractor(v); },
-                    /*timer_key_fn=*/nullptr,
-                    op_type);
+                    fn, [extractor](const T& v) { return extractor(v); }, timer_key_fn, op_type);
             });
         cluster::OperatorSpec op;
         op.id = std::move(id);
@@ -2188,9 +2238,10 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = desc.channel_type.empty() ? ChannelName<T>::get() : desc.channel_type;
         op.params = std::move(desc.params);
-        op.parallelism = (desc.parallelism > 1) ? desc.parallelism : env_->default_parallelism();
+        const bool parallelism_pinned = desc.parallelism > 0;
+        op.parallelism = parallelism_pinned ? desc.parallelism : env_->default_parallelism();
         op.key_by = key_by_;
-        env_->append_op(std::move(op));
+        env_->append_op(std::move(op), parallelism_pinned);
     }
 
     // Same .name() / .uid() shape as DataStream<T> - see that class
@@ -2354,14 +2405,15 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = ChannelName<Agg>::get();
         op.key_by = key_by_;
-        op.parallelism = (parallelism_ > 1) ? parallelism_ : env_->default_parallelism();
+        const bool parallelism_pinned = parallelism_ > 0;
+        op.parallelism = parallelism_pinned ? parallelism_ : env_->default_parallelism();
         if (late_tag_.has_value()) {
             cluster::SideOutputDecl decl;
             decl.tag = late_tag_->id;
             decl.channel_type = ChannelName<T>::get();
             op.side_outputs.push_back(std::move(decl));
         }
-        auto new_id = env_->append_op(std::move(op));
+        auto new_id = env_->append_op(std::move(op), parallelism_pinned);
         return DataStream<Agg>(env_, std::move(new_id), ChannelName<Agg>::get());
     }
 
@@ -2421,14 +2473,15 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = ChannelName<Out>::get();
         op.key_by = key_by_;
-        op.parallelism = (parallelism_ > 1) ? parallelism_ : env_->default_parallelism();
+        const bool parallelism_pinned = parallelism_ > 0;
+        op.parallelism = parallelism_pinned ? parallelism_ : env_->default_parallelism();
         if (late_tag_.has_value()) {
             cluster::SideOutputDecl decl;
             decl.tag = late_tag_->id;
             decl.channel_type = ChannelName<T>::get();
             op.side_outputs.push_back(std::move(decl));
         }
-        auto new_id = env_->append_op(std::move(op));
+        auto new_id = env_->append_op(std::move(op), parallelism_pinned);
         return DataStream<Out>(env_, std::move(new_id), ChannelName<Out>::get());
     }
 
@@ -2442,7 +2495,7 @@ private:
     std::chrono::milliseconds allowed_lateness_{0};
     std::optional<OutputTag<T>> late_tag_;
     TriggerFactory trigger_factory_;
-    std::uint32_t parallelism_{1};
+    std::uint32_t parallelism_{0};  // 0: the pipeline's default
 };
 
 // Tumbling window handle - same shape as SlidingWindowedDataStream
@@ -2544,14 +2597,15 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = ChannelName<Agg>::get();
         op.key_by = key_by_;
-        op.parallelism = (parallelism_ > 1) ? parallelism_ : env_->default_parallelism();
+        const bool parallelism_pinned = parallelism_ > 0;
+        op.parallelism = parallelism_pinned ? parallelism_ : env_->default_parallelism();
         if (late_tag_.has_value()) {
             cluster::SideOutputDecl decl;
             decl.tag = late_tag_->id;
             decl.channel_type = ChannelName<T>::get();
             op.side_outputs.push_back(std::move(decl));
         }
-        auto new_id = env_->append_op(std::move(op));
+        auto new_id = env_->append_op(std::move(op), parallelism_pinned);
         return DataStream<Agg>(env_, std::move(new_id), ChannelName<Agg>::get());
     }
 
@@ -2631,14 +2685,15 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = ChannelName<Out>::get();
         op.key_by = key_by_;
-        op.parallelism = (parallelism_ > 1) ? parallelism_ : env_->default_parallelism();
+        const bool parallelism_pinned = parallelism_ > 0;
+        op.parallelism = parallelism_pinned ? parallelism_ : env_->default_parallelism();
         if (late_tag_.has_value()) {
             cluster::SideOutputDecl decl;
             decl.tag = late_tag_->id;
             decl.channel_type = ChannelName<T>::get();
             op.side_outputs.push_back(std::move(decl));
         }
-        auto new_id = env_->append_op(std::move(op));
+        auto new_id = env_->append_op(std::move(op), parallelism_pinned);
         return DataStream<Out>(env_, std::move(new_id), ChannelName<Out>::get());
     }
 
@@ -2651,7 +2706,7 @@ private:
     std::chrono::milliseconds allowed_lateness_{0};
     std::optional<OutputTag<T>> late_tag_;
     TriggerFactory trigger_factory_;
-    std::uint32_t parallelism_{1};
+    std::uint32_t parallelism_{0};  // 0: the pipeline's default
 };
 
 // EvictingTumbling window handle - distinct from
@@ -2755,14 +2810,15 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = ChannelName<Out>::get();
         op.key_by = key_by_;
-        op.parallelism = (parallelism_ > 1) ? parallelism_ : env_->default_parallelism();
+        const bool parallelism_pinned = parallelism_ > 0;
+        op.parallelism = parallelism_pinned ? parallelism_ : env_->default_parallelism();
         if (late_tag_.has_value()) {
             cluster::SideOutputDecl decl;
             decl.tag = late_tag_->id;
             decl.channel_type = ChannelName<T>::get();
             op.side_outputs.push_back(std::move(decl));
         }
-        auto new_id = env_->append_op(std::move(op));
+        auto new_id = env_->append_op(std::move(op), parallelism_pinned);
         return DataStream<Out>(env_, std::move(new_id), ChannelName<Out>::get());
     }
 
@@ -2776,7 +2832,7 @@ private:
     std::chrono::milliseconds allowed_lateness_{0};
     std::optional<OutputTag<T>> late_tag_;
     TriggerFactory trigger_factory_;
-    std::uint32_t parallelism_{1};
+    std::uint32_t parallelism_{0};  // 0: the pipeline's default
 };
 
 // Out-of-line definition of TumblingWindowedDataStream::evicting.
@@ -2868,14 +2924,15 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = ChannelName<Agg>::get();
         op.key_by = key_by_;
-        op.parallelism = (parallelism_ > 1) ? parallelism_ : env_->default_parallelism();
+        const bool parallelism_pinned = parallelism_ > 0;
+        op.parallelism = parallelism_pinned ? parallelism_ : env_->default_parallelism();
         if (late_tag_.has_value()) {
             cluster::SideOutputDecl decl;
             decl.tag = late_tag_->id;
             decl.channel_type = ChannelName<T>::get();
             op.side_outputs.push_back(std::move(decl));
         }
-        auto new_id = env_->append_op(std::move(op));
+        auto new_id = env_->append_op(std::move(op), parallelism_pinned);
         return DataStream<Agg>(env_, std::move(new_id), ChannelName<Agg>::get());
     }
 
@@ -2932,14 +2989,15 @@ public:
         op.inputs = {upstream_id_};
         op.out_channel = ChannelName<Out>::get();
         op.key_by = key_by_;
-        op.parallelism = (parallelism_ > 1) ? parallelism_ : env_->default_parallelism();
+        const bool parallelism_pinned = parallelism_ > 0;
+        op.parallelism = parallelism_pinned ? parallelism_ : env_->default_parallelism();
         if (late_tag_.has_value()) {
             cluster::SideOutputDecl decl;
             decl.tag = late_tag_->id;
             decl.channel_type = ChannelName<T>::get();
             op.side_outputs.push_back(std::move(decl));
         }
-        auto new_id = env_->append_op(std::move(op));
+        auto new_id = env_->append_op(std::move(op), parallelism_pinned);
         return DataStream<Out>(env_, std::move(new_id), ChannelName<Out>::get());
     }
 
@@ -2951,7 +3009,7 @@ private:
     std::chrono::milliseconds gap_;
     std::chrono::milliseconds allowed_lateness_{0};
     std::optional<OutputTag<T>> late_tag_;
-    std::uint32_t parallelism_{1};
+    std::uint32_t parallelism_{0};  // 0: the pipeline's default
 };
 
 template <typename T>
@@ -3001,16 +3059,17 @@ DataStream<T> Pipeline::source(SourceDescriptor desc, std::string id) {
     op.type = std::move(desc.op_type);
     op.out_channel = desc.channel_type.empty() ? ChannelName<T>::get() : desc.channel_type;
     op.params = std::move(desc.params);
-    // Descriptor parallelism wins if it's been set above the default
-    // (1); otherwise inherit env's default_parallelism.
-    op.parallelism = (desc.parallelism > 1) ? desc.parallelism : default_parallelism_;
+    // A descriptor parallelism wins when set (any value above 0, 1 included);
+    // otherwise the pipeline's default applies.
+    const bool parallelism_pinned = desc.parallelism > 0;
+    op.parallelism = parallelism_pinned ? desc.parallelism : default_parallelism_;
     // Capture out_channel BEFORE the move - append_op(std::move(op))
     // moves op into the graph, after which op.out_channel is in
     // moved-from state (empty). The returned DataStream<T> needs the
     // channel string for later .key_by() / .reduce() lookups that go
     // through KeyExtractorRegistry by (channel, name).
     std::string out_channel = op.out_channel;
-    auto new_id = append_op(std::move(op));
+    auto new_id = append_op(std::move(op), parallelism_pinned);
     return DataStream<T>(this, std::move(new_id), std::move(out_channel));
 }
 

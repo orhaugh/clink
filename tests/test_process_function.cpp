@@ -15,6 +15,7 @@
 #include <mutex>
 #include <set>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -236,7 +237,9 @@ public:
             element_keys_.push_back(current_key());
         }
         out.collect(v);
-        ctx.timer_service()->register_event_time_timer(200);
+        // Under the record's key, so each key gets its own timer and on_timer can
+        // tell whose it is.
+        ctx.timer_service()->register_event_time_timer(200, std::to_string(current_key()));
     }
     void on_timer(std::int64_t /*ts*/, OnTimerContext<int>& /*ctx*/, Collector<int>& out) override {
         {
@@ -756,10 +759,13 @@ TEST(KeyedProcessFunction, CurrentKeyMatchesExtractorDuringProcessElement) {
     auto h_src = dag.add_source<int>(src);
 
     auto pf = std::make_shared<KeyTrackingProcessFn>();
-    // Key extractor: identity on int -> int64.
+    // Key extractor: identity on int -> int64. The timer key decoder turns the
+    // key a timer was registered under back into the int64 key.
     auto adapter =
         std::make_shared<::clink::detail::KeyedProcessFunctionAdapter<std::int64_t, int, int>>(
-            pf, [](const int& v) -> std::int64_t { return v; });
+            pf,
+            [](const int& v) -> std::int64_t { return v; },
+            [](const std::string& k) -> std::int64_t { return std::stoll(k); });
     auto h_pf = dag.add_operator<int, int>(h_src, adapter);
     auto sink = std::make_shared<CollectingSink<int>>();
     dag.add_sink<int>(h_pf, sink);
@@ -772,10 +778,70 @@ TEST(KeyedProcessFunction, CurrentKeyMatchesExtractorDuringProcessElement) {
     EXPECT_EQ(ek[0], 1);
     EXPECT_EQ(ek[1], 2);
 
-    // Timer firing happens after watermark crosses 200. Both records
-    // registered a timer at t=200; both should have fired.
+    // Both records registered a timer at t=200 under their own key; both fire
+    // once the watermark crosses 200, and on_timer sees each one's key.
     auto tk = pf->timer_keys();
-    EXPECT_FALSE(tk.empty()) << "at least one event-time timer should have fired";
+    std::sort(tk.begin(), tk.end());
+    EXPECT_EQ(tk, (std::vector<std::int64_t>{1, 2}));
+    EXPECT_TRUE(exec.operator_errors().empty());
+}
+
+// Without a timer key decoder the key a timer was registered under cannot be
+// turned back into the key, so current_key() in on_timer refuses instead of
+// answering with the key of the last record (2 here, for key 1's timer too).
+TEST(KeyedProcessFunction, CurrentKeyInOnTimerWithoutADecoderFailsInsteadOfGuessing) {
+    Dag dag;
+    auto h_src = dag.add_source<int>(std::make_shared<TimedSource>());
+    auto pf = std::make_shared<KeyTrackingProcessFn>();
+    auto adapter =
+        std::make_shared<::clink::detail::KeyedProcessFunctionAdapter<std::int64_t, int, int>>(
+            pf, [](const int& v) -> std::int64_t { return v; });
+    auto h_pf = dag.add_operator<int, int>(h_src, adapter);
+    dag.add_sink<int>(h_pf, std::make_shared<CollectingSink<int>>());
+
+    LocalExecutor exec(std::move(dag));
+    exec.run();
+
+    EXPECT_TRUE(pf->timer_keys().empty()) << "no timer may run under a key it cannot know";
+    const auto errors = exec.operator_errors();
+    ASSERT_FALSE(errors.empty());
+    EXPECT_NE(errors.front().second.find("timer key decoder"), std::string::npos)
+        << errors.front().second;
+}
+
+// A function that never asks for the key in on_timer needs no decoder: its
+// timers fire as before.
+class KeylessTimerProcessFn final : public KeyedProcessFunction<std::int64_t, int, int> {
+public:
+    void process_element(const int& v,
+                         ProcessFunctionContext<int>& ctx,
+                         Collector<int>& out) override {
+        out.collect(v);
+        ctx.timer_service()->register_event_time_timer(200, std::to_string(current_key()));
+    }
+    void on_timer(std::int64_t ts, OnTimerContext<int>& /*ctx*/, Collector<int>& out) override {
+        out.collect(static_cast<int>(-ts));
+    }
+};
+
+TEST(KeyedProcessFunction, OnTimerThatNeverReadsTheKeyNeedsNoDecoder) {
+    Dag dag;
+    auto h_src = dag.add_source<int>(std::make_shared<TimedSource>());
+    auto adapter =
+        std::make_shared<::clink::detail::KeyedProcessFunctionAdapter<std::int64_t, int, int>>(
+            std::make_shared<KeylessTimerProcessFn>(),
+            [](const int& v) -> std::int64_t { return v; });
+    auto h_pf = dag.add_operator<int, int>(h_src, adapter);
+    auto sink = std::make_shared<CollectingSink<int>>();
+    dag.add_sink<int>(h_pf, sink);
+
+    LocalExecutor exec(std::move(dag));
+    exec.run();
+
+    EXPECT_TRUE(exec.operator_errors().empty());
+    auto got = sink->collected();
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<int>{-200, -200, 1, 2})) << "both timers fired";
 }
 
 // ---------------------------------------------------------------------------

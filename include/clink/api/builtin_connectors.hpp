@@ -87,7 +87,7 @@ public:
         std::int64_t count_{0};
         std::int64_t start_{1};
         std::int64_t step_{1};
-        std::uint32_t parallelism_{1};
+        std::uint32_t parallelism_{0};  // 0: the pipeline's default
     };
 
     static Builder builder() { return Builder{}; }
@@ -121,7 +121,7 @@ public:
 
     private:
         std::string lines_;
-        std::uint32_t parallelism_{1};
+        std::uint32_t parallelism_{0};  // 0: the pipeline's default
     };
 
     static Builder builder() { return Builder{}; }
@@ -195,7 +195,7 @@ public:
     private:
         std::filesystem::path path_;
         bool append_{false};
-        std::uint32_t parallelism_{1};
+        std::uint32_t parallelism_{0};  // 0: the pipeline's default
     };
 
     static Builder builder() { return Builder{}; }
@@ -229,7 +229,7 @@ public:
 
     private:
         std::filesystem::path path_;
-        std::uint32_t parallelism_{1};
+        std::uint32_t parallelism_{0};  // 0: the pipeline's default
     };
 
     static Builder builder() { return Builder{}; }

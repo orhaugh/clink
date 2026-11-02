@@ -24,22 +24,28 @@
 //                          Collector<Output>& out) override {
 //       if (something) {
 //         out.collect(Output{...});
+//         // Registered under the key, so on_timer knows whose timer it is.
 //         ctx.timer_service()->register_event_time_timer(
-//             ctx.timestamp().value_or(EventTime{0}).millis() + 60'000);
+//             ctx.timestamp().value_or(EventTime{0}).millis() + 60'000,
+//             std::to_string(current_key()));
 //       }
 //     }
 //     void on_timer(int64_t ts, OnTimerContext<Output>& ctx,
 //                   Collector<Output>& out) override {
-//       out.collect(Output{...});
+//       out.collect(Output{current_key(), ...});  // the timer's key
 //     }
 //   };
-//   keyed_stream.process<Output>(std::make_shared<MyFn>());
+//   // timer_key_fn turns a timer's key back into the key; without one,
+//   // current_key() in on_timer throws.
+//   keyed_stream.process<Output>(std::make_shared<MyFn>(),
+//                                [](const std::string& k) { return std::stoll(k); });
 
 #include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -191,6 +197,19 @@ public:
     virtual std::string name() const { return "process_function"; }
 };
 
+namespace detail {
+// What current_key() says when on_timer asks for a key the operator cannot
+// know: one built without a timer key decoder has no way back from the string a
+// timer was registered under to the key it stands for.
+inline std::string unknown_timer_key_message(const std::string& fn_name) {
+    return fn_name +
+           ": current_key() in on_timer, but the operator was built without a timer key "
+           "decoder, so the timer's key is unknown. Register each timer under its key "
+           "encoded as a string and pass timer_key_fn to turn it back into the key "
+           "(process(fn, key_fn, timer_key_fn) on a keyed stream).";
+}
+}  // namespace detail
+
 // Keyed variant. Same surface plus current_key() which the adapter
 // maintains via the user-supplied key extractor. State access
 // (RuntimeContext::keyed_state) lives on ctx via inheritance -
@@ -201,17 +220,29 @@ class KeyedProcessFunction : public ProcessFunction<I, O> {
 public:
     using key_type = K;
 
-    // The key of the record currently being processed. Inside
-    // on_timer, the key of the timer that fired. Adapter sets this
-    // immediately before each call.
-    const K& current_key() const noexcept { return current_key_; }
+    // The key of the record currently being processed. Inside on_timer, the key
+    // the timer was registered for, which the adapter recovers through its timer
+    // key decoder (timer_key_fn). Without a decoder the timer's key is unknown,
+    // and reading it throws rather than return the key of whichever record came
+    // last: state read or written under that key belongs to another key.
+    const K& current_key() const {
+        if (!current_key_known_) {
+            throw std::logic_error(detail::unknown_timer_key_message(this->name()));
+        }
+        return current_key_;
+    }
 
-    void set_current_key_(K k) { current_key_ = std::move(k); }
+    void set_current_key_(K k) {
+        current_key_ = std::move(k);
+        current_key_known_ = true;
+    }
+    void forget_current_key_() noexcept { current_key_known_ = false; }
 
     std::string name() const override { return "keyed_process_function"; }
 
 private:
     K current_key_{};
+    bool current_key_known_{true};
 };
 
 namespace detail {
@@ -323,13 +354,14 @@ private:
     }
 
     void pre_dispatch_timer_(const std::string& key) override {
-        // If the user supplied a timer-key-to-K decoder, recover the
-        // typed key; otherwise leave whatever the function's
-        // current_key was last set to. The typical pattern is to
-        // register timers with the same string-encoded key the
-        // KeyedState system uses, so a decoder is easy to wire.
+        // With a timer-key-to-K decoder, on_timer sees the key the timer was
+        // registered for. Without one that key cannot be known, and the key
+        // the last record set would be the wrong one, so current_key() throws
+        // until the next record sets it again.
         if (timer_key_fn_) {
             keyed_fn_->set_current_key_(timer_key_fn_(key));
+        } else {
+            keyed_fn_->forget_current_key_();
         }
     }
 
@@ -383,13 +415,25 @@ class KeyedCoProcessFunction : public CoProcessFunction<I1, I2, O> {
 public:
     using key_type = K;
 
-    const K& current_key() const noexcept { return current_key_; }
-    void set_current_key_(K k) { current_key_ = std::move(k); }
+    // As KeyedProcessFunction::current_key: in on_timer, the timer's key when the
+    // adapter has a timer key decoder, and a throw when it has none.
+    const K& current_key() const {
+        if (!current_key_known_) {
+            throw std::logic_error(detail::unknown_timer_key_message(this->name()));
+        }
+        return current_key_;
+    }
+    void set_current_key_(K k) {
+        current_key_ = std::move(k);
+        current_key_known_ = true;
+    }
+    void forget_current_key_() noexcept { current_key_known_ = false; }
 
     std::string name() const override { return "keyed_co_process_function"; }
 
 private:
     K current_key_{};
+    bool current_key_known_{true};
 };
 
 namespace detail {
@@ -504,8 +548,11 @@ private:
         keyed_fn_->set_current_key_(key2_(rec.value()));
     }
     void pre_dispatch_timer_(const std::string& key) override {
+        // As the single-input adapter: the timer's key, or none at all.
         if (timer_key_fn_) {
             keyed_fn_->set_current_key_(timer_key_fn_(key));
+        } else {
+            keyed_fn_->forget_current_key_();
         }
     }
 
