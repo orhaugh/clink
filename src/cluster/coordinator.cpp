@@ -2826,6 +2826,7 @@ std::vector<JobSummary> Coordinator::snapshot_jobs() const {
         s.id = rec.job_id;
         s.name = rec.name;
         s.stopped_at_checkpoint_id = rec.stopped_at_checkpoint_id;
+        s.from_history = true;
         s.completion_signalled = true;
         s.cancel_requested = record_cancelled(rec);
         s.error_count = rec.errors.size();
@@ -2866,6 +2867,7 @@ std::optional<JobDetail> Coordinator::snapshot_job(JobId job_id) const {
             d.id = rec.job_id;
             d.name = rec.name;
             d.stopped_at_checkpoint_id = rec.stopped_at_checkpoint_id;
+            d.from_history = true;
             d.completion_signalled = true;
             d.cancel_requested = record_cancelled(rec);
             d.errors = rec.errors;
@@ -9464,6 +9466,16 @@ void Coordinator::signal_job_completion_locked_(JobState& job) {
         }
         payload += "}";
         events::publish("coordinator.job_completed", payload);
+    }
+    // A graceful stop that ended the job cleanly stopped it at the final
+    // checkpoint its runners took (or the latest completed one). stop_job finds
+    // the same id once it stops waiting, but by then this record is written;
+    // set here, the record carries it, and a Coordinator that knows the job
+    // only from the record still reads it as stopped.
+    if (job.stop_requested && !job.cancel_requested && job.errors.empty() &&
+        job.stopped_at_checkpoint_id == 0) {
+        job.stopped_at_checkpoint_id =
+            job.final_checkpoint_id.value_or(job.latest_completed_checkpoint_id);
     }
     {
         CompletedJobRecord rec;

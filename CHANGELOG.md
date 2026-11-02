@@ -108,8 +108,10 @@ otherwise. Covered by
 **A stopped job reads as stopped.** A job ended by a graceful stop at a
 savepoint reported `COMPLETED_OK`, the same as one that ran out of input. Job
 summaries and details now carry `stopped_at_checkpoint_id`, the checkpoint the
-stop ended at, and the console shows such a job as Stopped. The status values
-and the wire protocol are unchanged.
+stop ended at, and the console shows such a job as Stopped. The job's history
+record keeps it too, so a Coordinator that takes over lists the job as stopped.
+The status values and the wire protocol are unchanged. Covered by
+`Cluster.AGracefulStopIsRecordedInTheJobsHistory`.
 
 **`GET /api/v1/jobs/:id` reports the restart budget a job runs with.** A job
 that left `max_restarts_on_worker_loss` to the default showed 4294967295, the
@@ -221,7 +223,9 @@ the new leader had read each one's record back from `<ha_dir>/history/`. Both
 now fall back to that record, which also keeps the job's name and the
 checkpoint a graceful stop ended it at, so a stopped job still reads as
 stopped; a record written by an earlier release lists them as empty and 0.
-A job submitted after the takeover numbers above every id in that history, so
+Such a job is marked `from_history`, since its graph, tasks and configuration
+are not kept, and the console shows it as a record. A job submitted after the
+takeover numbers above every id in that history, so
 it hides none of those jobs, and a client that waits for an id above the last
 one listed, as the Kubernetes operator does after a submit, sees it. Covered
 by `Cluster.AJobThatEndedUnderAnEarlierCoordinatorIsStillListed`.

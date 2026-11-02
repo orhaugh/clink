@@ -1165,6 +1165,7 @@ TEST(Cluster, AJobThatEndedUnderAnEarlierCoordinatorIsStillListed) {
     }
     ASSERT_EQ(listed.count(ran), 1U) << "the job the earlier Coordinator ran is not listed";
     EXPECT_EQ(listed[ran].name, "listed-after-takeover");
+    EXPECT_TRUE(listed[ran].from_history) << "a job known only from its record says so";
     EXPECT_EQ(listed[ran].status, ran_status);
     ASSERT_EQ(listed.count(900041), 1U);
     EXPECT_EQ(listed[900041].name, "stopped-one");
@@ -1179,6 +1180,7 @@ TEST(Cluster, AJobThatEndedUnderAnEarlierCoordinatorIsStillListed) {
     EXPECT_EQ(detail->name, "listed-after-takeover");
     EXPECT_EQ(detail->status, ran_status);
     EXPECT_TRUE(detail->completion_signalled);
+    EXPECT_TRUE(detail->from_history);
     EXPECT_FALSE(next.snapshot_job(JobId{900043}).has_value());
 
     // A job submitted now numbers above every id that history holds, so it
@@ -1220,6 +1222,79 @@ TEST(Cluster, AJobThatEndedUnderAnEarlierCoordinatorIsStillListed) {
     next_worker.stop();
     next.stop();
     std::filesystem::remove_all(ha_dir);
+}
+
+// A graceful stop's checkpoint reaches the job's history record. stop_job
+// noted it only once it stopped waiting for the job to end, and the end had
+// already written the record with 0, so a Coordinator that took over listed a
+// stopped job as one that ran out of input.
+TEST(Cluster, AGracefulStopIsRecordedInTheJobsHistory) {
+    ensure_built_ins_registered();
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink-stop-history-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+
+    JobId stopped = 0;
+    std::uint64_t at = 0;
+    {
+        Coordinator coordinator;
+        coordinator.set_ha_dir(ha_dir.string());
+        const auto port = coordinator.start();
+        coordinator.expect_workers({"worker-stop"});
+        Worker::Config worker_cfg;
+        worker_cfg.slot_count = 4;
+        Worker worker("worker-stop", "127.0.0.1", worker_cfg);
+        worker.connect_to_coordinator("127.0.0.1", port);
+        ASSERT_TRUE(coordinator.await_registrations(2s));
+
+        // Paced so that it is still running when the stop arrives.
+        JobGraphSpec g;
+        g.name = "stopped-job";
+        OperatorSpec src;
+        src.type = "int64_range_source";
+        src.id = "src";
+        src.parallelism = 1;
+        src.out_channel = std::string{kChannelInt64};
+        src.params = {{"count", "1000000"}, {"delay_ms", "2"}};
+        g.ops.push_back(src);
+        OperatorSpec snk;
+        snk.type = "collecting_int64_sink";
+        snk.id = "snk";
+        snk.inputs = {"src"};
+        snk.parallelism = 1;
+        snk.out_channel = std::string{kChannelInt64};
+        g.ops.push_back(snk);
+        CheckpointConfig checkpoint;
+        checkpoint.checkpoint_dir = (root / "ckpt").string();
+        checkpoint.interval_ms = 100;
+        stopped = coordinator.submit_job(g, OperatorRegistry::default_instance(), {}, checkpoint);
+        const auto deadline = std::chrono::steady_clock::now() + 20s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto d = coordinator.snapshot_job(stopped);
+            if (d.has_value() && d->latest_completed_checkpoint_id > 0) {
+                break;
+            }
+            std::this_thread::sleep_for(20ms);
+        }
+        const auto ack = coordinator.stop_job(stopped, 30s);
+        ASSERT_TRUE(ack.ok) << ack.message;
+        at = ack.savepoint_checkpoint_id;
+        ASSERT_GT(at, 0U);
+        const auto record = coordinator.job_history(stopped);
+        ASSERT_TRUE(record.has_value());
+        EXPECT_EQ(record->stopped_at_checkpoint_id, at);
+        worker.stop();
+        coordinator.stop();
+    }
+
+    Coordinator next;
+    next.set_ha_dir(ha_dir.string());
+    const auto detail = next.snapshot_job(stopped);
+    ASSERT_TRUE(detail.has_value());
+    EXPECT_EQ(detail->stopped_at_checkpoint_id, at) << "the stop was lost with the takeover";
+    next.stop();
+    std::filesystem::remove_all(root);
 }
 
 // --- Per-operator rescale request surface ---------------

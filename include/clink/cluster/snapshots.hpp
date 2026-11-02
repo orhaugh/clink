@@ -49,6 +49,10 @@ struct JobSummary {
     // for a job that was not stopped. status alone reads COMPLETED_OK for a
     // stopped job, the same as one that ran out of input.
     std::uint64_t stopped_at_checkpoint_id{0};
+    // True for a job that ended under an earlier Coordinator and is known to
+    // this one only from its history record: no tasks, graph or checkpoint
+    // configuration, and no progress or guarantee to report.
+    bool from_history{false};
     std::size_t expected_completion{0};
     std::size_t completed_count{0};
     bool completion_signalled{false};
@@ -99,8 +103,9 @@ struct JobDetail {
     // The name the job was submitted with (JobGraphSpec::name), empty for an
     // unnamed job.
     std::string name;
-    // As JobSummary::stopped_at_checkpoint_id.
+    // As JobSummary::stopped_at_checkpoint_id and JobSummary::from_history.
     std::uint64_t stopped_at_checkpoint_id{0};
+    bool from_history{false};
     std::size_t expected_completion{0};
     std::size_t completed_count{0};
     bool completion_signalled{false};
