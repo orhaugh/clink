@@ -217,11 +217,12 @@ void declare_builtin_capabilities() {
                         "produce"},
     });
 
-    // ---- blackhole / print ----------------------------------------------
+    // ---- blackhole ------------------------------------------------------
     //
-    // Discards or prints. There is no external system to be exactly-once
-    // against, which is why this is NoDurableRestartGuarantee rather than
-    // a delivery level - the question does not apply.
+    // Discards. There is no external system to be exactly-once against,
+    // which is why this is NoDurableRestartGuarantee rather than a delivery
+    // level - the question does not apply. The SQL frontend declares print,
+    // whose lines do reach somewhere, beside its factory.
     declare_connector(ConnectorCapabilities{
         .name = "blackhole",
         .version = "1",

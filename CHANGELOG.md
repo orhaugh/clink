@@ -161,6 +161,22 @@ release, so a killed process loses no line it logged: `--log-async` now
 defaults to `false`, and `--log-async=true` turns asynchronous logging on.
 Covered by `HttpObservability.DaemonsLogToLogFileAtLogLevel`.
 
+**`clink --capabilities` lists the Delta Lake sink and the SQL built-ins, and
+the worker-disconnected alert ships.** The connectors the SQL frontend
+registers itself, the Delta Lake sink and the `print`, `changelog`, `collect`
+and `queryable_state` built-ins, had no capability record, so the manifest
+left them out and the delivery analyser met them as undeclared. Each now
+declares one from `clink::sql::install()`, which `clink --capabilities` runs
+before it prints. None claims more than the analyser assumed without a record,
+so no job's delivery guarantee changes; the bounded-state check now knows a
+`queryable_state` read is bounded. A record names operator types only up to a
+word boundary, so the `collect` record does not describe the `collecting_*`
+test sinks. `deploy/prometheus/clink-alerts.yaml` gains
+`ClinkWorkerControlDisconnected`, which the runbook described and no rule file
+carried. Covered by
+`ConnectorManifestGate.TheSqlFrontendDeclaresTheConnectorsItRegisters` and
+`GuaranteeGateTest.ARecordNameMatchesOpTypesOnlyUpToAWordBoundary`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

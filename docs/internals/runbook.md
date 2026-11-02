@@ -243,11 +243,7 @@ got. No CLI command reports either.
 
 ## ClinkWorkerControlDisconnected
 
-`clink_worker_control_connected == 0`
-
-This alert is not in the shipped rule set (`deploy/prometheus/clink-alerts.yaml`);
-define it from the expression above if you want it. The metrics it reads are
-exported by every worker.
+`clink_worker_control_connected == 0` for two minutes
 
 The worker process is alive but has no admitted coordinator session. Its health
 endpoint returns 503 while it drains the old session, discovers a leader, or waits

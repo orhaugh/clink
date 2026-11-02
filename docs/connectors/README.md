@@ -98,11 +98,10 @@ enforced mechanically for the `impls/` modules: a build-generated list of
 enabled connector modules feeds a gate test
 (`tests/test_connector_manifest_gate.cpp`), so a new connector module cannot
 register factories without either declaring its record or being explicitly
-classified as a non-connector module. The gate does not reach the sinks the
-SQL frontend registers itself: `file`, `parquet`, `generator` and `blackhole`
-carry records, but the [Delta Lake sink](delta.md) and the `print`,
-`changelog`, `collect` and `queryable_state` built-ins do not, so they are
-absent from `clink --capabilities` and unknown to the delivery analyser.
+classified as a non-connector module. The connectors the SQL frontend
+registers itself, the [Delta Lake sink](delta.md) and the `print`,
+`changelog`, `collect` and `queryable_state` built-ins, declare their records
+from `clink::sql::install()`, and the same gate lists them by hand.
 
 ## Notes on delivery semantics
 

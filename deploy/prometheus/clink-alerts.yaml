@@ -97,6 +97,25 @@ groups:
             outbound queue stopped (its queue overflowed). One is a restart; a
             repeating count is a crash loop or one of these recurring.
 
+      # A worker process that is up but has no admitted coordinator session
+      # runs nothing, and its health endpoint answers 503. A dip during a
+      # coordinator failover is the worker fencing its old session and
+      # registering a fresh one; the `for` lets that finish. Assumes leader
+      # discovery and reconnect backoff settle within two minutes.
+      - alert: ClinkWorkerControlDisconnected
+        expr: clink_worker_control_connected == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A worker has no coordinator session"
+          description: >-
+            {{ $labels.instance }} has had no admitted coordinator session for
+            two minutes and runs no subtasks meanwhile. Its /api/v1/worker
+            recovery snapshot and its worker.recovery log lines say whether it
+            is discovering a leader, backing off or being refused, and
+            clink_worker_control_reconnects_total rises once it is back.
+
       # Restarts are the self-healing path working. A SUSTAINED restart rate
       # is that path failing to converge, which is a different thing and the
       # one worth waking someone for.

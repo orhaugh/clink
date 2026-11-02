@@ -82,6 +82,24 @@ TEST_F(GuaranteeGateTest, AnUnknownOpTypeResolvesToNothing) {
     EXPECT_TRUE(connector_name_for_op_type("some_third_party_sink").empty());
 }
 
+// A record names its op types up to a word boundary. Without one, the SQL
+// frontend's "collect" record, embedded-only, would describe the
+// "collecting_int64_sink" test sink as well as collect_sink_row.
+TEST_F(GuaranteeGateTest, ARecordNameMatchesOpTypesOnlyUpToAWordBoundary) {
+    auto& registry = connectors::CapabilityRegistry::instance();
+    connectors::ConnectorCapabilities probe;
+    probe.name = "gate_probe";
+    probe.is_sink = true;
+    probe.delivery = connectors::DeliveryGuarantee::AtLeastOnce;
+    registry.declare(probe);
+    EXPECT_EQ(connector_name_for_op_type("gate_probe"), "gate_probe");
+    EXPECT_EQ(connector_name_for_op_type("gate_probe_sink_row"), "gate_probe");
+    EXPECT_TRUE(connector_name_for_op_type("gate_probes_sink").empty());
+    // The availability sweep requires a vocabulary entry for every declared
+    // record, so the probe must not outlive the test.
+    registry.undeclare("gate_probe");
+}
+
 TEST_F(GuaranteeGateTest, TheNexmarkSourceResolvesToAReplayableRecord) {
     // Until the nexmark record existed, every nexmark job was at-most-once at
     // the source even when checkpointed: the gate reads "no record" as

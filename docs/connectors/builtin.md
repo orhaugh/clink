@@ -11,7 +11,9 @@ connector, the programmatic `GeneratorSource<T>`, is described at the end.
 
 blackhole, changelog and print natively accept changelog streams (retracting
 GROUP BY, Top-N, outer joins), which append-only sinks reject; collect is
-append-only in v1.
+append-only unless the table sets `changelog='true'`. Each SQL connector here
+declares a capability record, so `clink --capabilities` lists it with its
+delivery level and limitations.
 
 ## `blackhole`
 
@@ -95,7 +97,12 @@ via `EmbeddedEngine::collect_reader(table)` or from any language through
 `clink_collect_stream()` (the Arrow C stream interface; zero-copy into
 pyarrow, DuckDB, polars). One consumer per table; reads block until data,
 end after the producing job finishes, and cancel when the engine closes.
-Append-only in v1: a retracting (changelog) SELECT is rejected at bind.
+The queue does not bound itself, so a host that stops reading holds every
+batch in memory.
+A plain collect table is append-only: a retracting (changelog) SELECT is
+rejected at bind. With `changelog='true'` the stream carries a leading
+`row_kind` column (`insert`, `delete`, `update_before`, `update_after`) and
+the host applies the changelog itself.
 Embedded-only by design - on a cluster there is no host process to deliver
 to, and the submit fails loudly. See
 [embedded execution](../internals/embedded.md).

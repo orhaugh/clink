@@ -12611,12 +12611,170 @@ TtlParams read_ttl_params(const BuildContext& ctx) {
 
 }  // namespace
 
+// The capability records of the connectors this file registers itself, so
+// `clink --capabilities` and the delivery analyser know them as they know an
+// impl's. Each field is read out of the factory below and the sink or source
+// it builds. A sink's level is the floor the code holds to; none claims more
+// than at-least-once, the level the analyser assumed while they had no record.
+namespace {
+
+void declare_sql_frontend_capabilities() {
+    using clink::connectors::Boundedness;
+    using clink::connectors::ConnectorCapabilities;
+    using clink::connectors::DeliveryGuarantee;
+    using clink::connectors::OffsetModel;
+
+    // delta_row_sink: one Parquet data file per checkpoint interval, committed
+    // as the next _delta_log version at the barrier. An interval replayed after
+    // a recovery is committed again as a new version.
+    clink::connectors::declare_connector(ConnectorCapabilities{
+        .name = "delta",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .build_dependencies = {"arrow", "parquet", "aws-sdk-cpp (s3:// table roots)"},
+        .formats = {"parquet"},
+        .boundedness = Boundedness::Either,
+        .replayable = false,
+        .offset_model = OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .schema_evolution = false,
+        .partition_discovery = false,
+        .auth_methods = {"filesystem", "s3-credentials"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = true,
+        .limitations = {"single-writer: SQL plans the sink on one subtask, and the factory "
+                        "refuses a parallelism above 1",
+                        "append-only: mode='upsert' is refused, and nothing updates, deletes, "
+                        "merges or compacts the table",
+                        "at-least-once: an interval replayed after a recovery is committed "
+                        "again as a new version, so its rows can appear twice; "
+                        "delivery_guarantee='exactly_once' is refused",
+                        "partition_by is not honoured: the table is written unpartitioned",
+                        "no endpoint_override, so an S3-compatible store on a custom endpoint "
+                        "cannot be the table root",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
+    });
+
+    // print_sink_row: one JSON line per row, written and flushed as it arrives,
+    // so a recovery prints the rows since the last completed checkpoint again
+    // and loses none.
+    clink::connectors::declare_connector(ConnectorCapabilities{
+        .name = "print",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .formats = {"json"},
+        .boundedness = Boundedness::Either,
+        .replayable = false,
+        .offset_model = OffsetModel::None,
+        .checkpoint_integrated = false,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .backpressure = true,
+        .available_in_sql = true,
+        .limitations = {"a demo and debugging sink: one JSON line per row on the process's "
+                        "stdout, so on a cluster each Worker prints the rows of its own "
+                        "subtasks",
+                        "a recovery prints the rows since the last completed checkpoint again"},
+    });
+
+    // collect_sink_row (src/embed/collect_hub.cpp): batches go to a per-engine
+    // queue the host reads. The queue does not bound itself.
+    clink::connectors::declare_connector(ConnectorCapabilities{
+        .name = "collect",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .formats = {"arrow"},
+        .boundedness = Boundedness::Either,
+        .replayable = false,
+        .offset_model = OffsetModel::None,
+        .checkpoint_integrated = false,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .backpressure = false,
+        .available_in_sql = true,
+        .limitations = {"embedded execution only (EmbeddedEngine, clink run, pyclink): the "
+                        "factory refuses a job submitted to a cluster, which has no host "
+                        "process to deliver to",
+                        "one consumer per table, and the queue is unbounded: a host that does "
+                        "not read holds every batch in memory",
+                        "append-only unless the table sets changelog='true', which adds a "
+                        "leading row_kind column",
+                        "a restored run delivers the rows since the last completed checkpoint "
+                        "again"},
+    });
+
+    // changelog_net_sink: nets the changelog by full-row multiplicity in state
+    // written through to the chain's backend, then replaces the file at path
+    // with the survivors when the input ends.
+    clink::connectors::declare_connector(ConnectorCapabilities{
+        .name = "changelog",
+        .version = "1",
+        .is_source = false,
+        .is_sink = true,
+        .formats = {"json"},
+        .boundedness = Boundedness::Bounded,
+        .replayable = false,
+        .offset_model = OffsetModel::None,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"filesystem-permissions"},
+        .backpressure = true,
+        .available_in_sql = true,
+        .limitations = {"writes the netted relation once, when the input ends, replacing the "
+                        "file at path: an unbounded job never writes it",
+                        "nets by full-row multiplicity, with no key",
+                        "at parallelism above 1 each subtask writes <path>.<subtask>",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+                        "another sink beside it"},
+    });
+
+    // queryable_state_row_source: one scan of another job's live state over
+    // the Coordinator's HTTP route, by subtask 0 at its first produce. It keeps
+    // no position, so a restart reads the state as it is then.
+    clink::connectors::declare_connector(ConnectorCapabilities{
+        .name = "queryable_state",
+        .version = "1",
+        .is_source = true,
+        .is_sink = false,
+        .formats = {"json"},
+        .boundedness = Boundedness::Bounded,
+        .replayable = false,
+        .offset_model = OffsetModel::None,
+        .checkpoint_integrated = false,
+        .delivery = DeliveryGuarantee::NoDurableRestartGuarantee,
+        .transactional = false,
+        .auth_methods = {"none", "bearer-token"},
+        .tls = false,
+        .backpressure = true,
+        .available_in_sql = true,
+        .limitations = {"a bounded read of a moving target: each scan is consistent, but it "
+                        "is not a point-in-time snapshot of the job",
+                        "the scan is cut at limit (default 100000, the route's cap)",
+                        "plain HTTP to the Coordinator; CLINK_AUTH_TOKEN, when set, is sent as "
+                        "the bearer token",
+                        "a restart reads the state as it is then, not as it was"},
+    });
+}
+
+}  // namespace
+
 void install(clink::plugin::PluginRegistry& reg) {
     // Announce the SQL frontend to the capability manifest. clink_core (which
     // renders the manifest) sits below clink_sql and cannot detect it with a
     // preprocessor check, and "is the frontend in this process" is the
     // question that actually matters to someone reading the manifest.
     clink::connectors::mark_sql_frontend_present();
+    declare_sql_frontend_capabilities();
 
     // ---- CREATE FUNCTION ... LANGUAGE SQL ----
     // Expression-bodied scalar UDFs interpreted by the engine's own

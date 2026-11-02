@@ -223,6 +223,7 @@ TEST(ConnectorManifestGate, TheCliManifestCoversEveryEnabledImpl) {
 
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/install.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
 
@@ -296,6 +297,8 @@ bool planner_binds(const std::string& connector, bool as_source) {
 TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
     clink::plugin::PluginRegistry reg;
     clink::plugin::install_defaults(reg);
+    // The frontend's own records too (TheSqlFrontendDeclaresTheConnectorsItRegisters).
+    clink::sql::install(reg);
 
     static const std::map<std::string, std::vector<std::string>> kAliases = {
         {"s3", {"s3_parquet"}},
@@ -390,5 +393,54 @@ TEST(ConnectorManifestGate, TheNativeClickHouseRecordIsBoundWithInsertFormatNati
                   "clickhouse_native");
         EXPECT_EQ(clink::cluster::connector_name_for_op_type("clickhouse_sink"), "clickhouse");
     }
+}
+
+// The connectors the SQL frontend registers itself, which the impl list above
+// does not reach, are listed here by hand for the same reason: a human states
+// the coverage. Before they had records, `clink --capabilities` left out the
+// Delta Lake sink and the print, changelog, collect and queryable_state
+// built-ins, and the delivery analyser met them as undeclared.
+TEST(ConnectorManifestGate, TheSqlFrontendDeclaresTheConnectorsItRegisters) {
+    clink::plugin::PluginRegistry reg;
+    clink::plugin::install_defaults(reg);
+    clink::sql::install(reg);
+    const std::vector<std::string> records = {
+        "delta", "print", "collect", "changelog", "queryable_state"};
+    std::vector<std::string> failures;
+    for (const auto& name : records) {
+        const auto* c = clink::connectors::CapabilityRegistry::instance().find(name);
+        if (c == nullptr) {
+            failures.push_back(name + ": not declared by clink::sql::install()");
+            continue;
+        }
+        for (const auto& problem : c->self_check()) {
+            failures.push_back(name + ": fails self_check: " + problem);
+        }
+        if (!c->available_in_sql) {
+            failures.push_back(name + ": not marked available_in_sql");
+        }
+    }
+#ifdef CLINK_CLI_BINARY
+    const std::string cmd = std::string{CLINK_CLI_BINARY} + " --capabilities-json";
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    ASSERT_NE(pipe, nullptr) << "could not run " << cmd;
+    std::string out;
+    char buf[4096];
+    std::size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, pipe)) > 0) {
+        out.append(buf, n);
+    }
+    ASSERT_EQ(::pclose(pipe), 0) << cmd << " failed; output:\n" << out;
+    for (const auto& name : records) {
+        if (out.find("\"name\":\"" + name + "\"") == std::string::npos) {
+            failures.push_back(name + ": absent from the CLI manifest");
+        }
+    }
+#endif
+    std::string joined;
+    for (const auto& f : failures) {
+        joined += "\n  - " + f;
+    }
+    EXPECT_TRUE(failures.empty()) << failures.size() << " failure(s):" << joined;
 }
 #endif  // CLINK_HAS_SQL

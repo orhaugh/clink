@@ -15,6 +15,9 @@
 #include "clink/connectors/capability.hpp"
 #include "clink/plugin/install_defaults.hpp"
 #include "clink/plugin/plugin.hpp"
+#ifdef CLINK_CLI_HAS_SQL
+#include "clink/sql/install.hpp"
+#endif
 
 // Subcommand entry points. Each lives in its own .cpp under tools/.
 // Signatures match the original per-binary main(): the dispatcher
@@ -119,15 +122,14 @@ int main(int argc, char** argv) {
         {
             clink::plugin::PluginRegistry linked;
             clink::plugin::install_defaults(linked);
-        }
-        auto facts = clink::connectors::current_build_facts();
 #ifdef CLINK_CLI_HAS_SQL
-        // The frontend is LINKED into this binary even though nothing has
-        // called its install() yet on this path. current_build_facts() can
-        // only see the installed-in-this-process signal, so the binary
-        // that knows it linked the frontend supplies the fact.
-        facts.sql = true;
+            // The SQL frontend declares the records of the connectors it
+            // registers itself (delta, print, collect, changelog,
+            // queryable_state), and announces itself, from its install().
+            clink::sql::install(linked);
 #endif
+        }
+        const auto facts = clink::connectors::current_build_facts();
         const auto caps = clink::connectors::CapabilityRegistry::instance().all();
         std::cout << (cmd == "--capabilities-json"
                           ? clink::connectors::render_manifest_json(facts, caps)

@@ -71,6 +71,8 @@ std::set<std::string> exportable_metric_names() {
         kWorkerFencedFramesTotal,
         kWorkerSlotsCapacity,
         kWorkerSlotsInUse,
+        kWorkerControlConnected,
+        kWorkerControlReconnectsTotal,
         kDiskTotalBytes,
         kDiskFreeBytes,
         // state_metric_name() builds this one per backend, so the exported

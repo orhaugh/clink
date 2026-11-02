@@ -19,7 +19,7 @@ namespace clink {
 // do not replay; a fresh run starts at 0. Delivery is at-most-once: a failure
 // loses what was buffered since the last part.
 //
-// Implementation is in src/connectors/s3_sink.cpp; gated on AWS SDK.
+// Implementation is in impls/s3/src/s3_sink.cpp; gated on AWS SDK.
 class S3Sink final : public Sink<std::string> {
 public:
     struct Options {

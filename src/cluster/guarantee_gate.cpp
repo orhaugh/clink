@@ -150,11 +150,16 @@ std::string connector_name_for_op_type(const std::string& op_type) {
     // Longest prefix wins. "kafka_2pc_sink_string" must resolve to
     // "kafka_2pc", never "kafka": the two carry different guarantees and
     // taking the shorter match would systematically over-promise, which is
-    // the exact failure this whole mechanism exists to prevent.
+    // the exact failure this whole mechanism exists to prevent. A prefix
+    // counts only up to a word boundary, so the "collect" record does not
+    // describe the "collecting_int64_sink" test sink.
     std::string best;
     for (const auto& caps : connectors::CapabilityRegistry::instance().all()) {
-        if (op_type.rfind(caps.name, 0) == 0 && caps.name.size() > best.size()) {
-            best = caps.name;
+        const auto& name = caps.name;
+        const bool at_boundary = op_type.size() == name.size() ||
+                                 (op_type.size() > name.size() && op_type[name.size()] == '_');
+        if (at_boundary && op_type.rfind(name, 0) == 0 && name.size() > best.size()) {
+            best = name;
         }
     }
     return best;
