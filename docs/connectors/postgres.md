@@ -20,7 +20,7 @@ Controlled by the CMake cache option `CLINK_WITH_POSTGRES` (`AUTO` / `ON` / `OFF
 
 Build-env requirement: the libpq development package must be present. On the Debian image this is installed by `scripts/install-connector-deps.sh` (`libpq-dev`); on macOS it is provided by Homebrew.
 
-The prebuilt Linux SDK tarball on each release includes this connector, so its binaries need libpq at run time: on Ubuntu 24.04, `apt-get install libpq5`. The runtime image carries it already.
+The prebuilt Linux SDK tarball on each release includes this connector, so its binaries need libpq at run time: on Ubuntu 24.04, `apt-get install libpq5`. A C++ project whose `find_package(clink)` against the tarball names no components resolves this connector's dependency as well, so it needs `libpq-dev` to configure; naming components without `postgres`, as `find_package(clink REQUIRED COMPONENTS core)` does, avoids both. The runtime image carries libpq already.
 
 ```bash
 cmake -S . -B build -DCLINK_WITH_POSTGRES=ON

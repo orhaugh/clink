@@ -291,13 +291,17 @@ machine has, and that machine has PostgreSQL's client library. So every tarball
 back to v0.10.0 at least includes the PostgreSQL connector and needs `libpq5` on
 the host; without it, no binary in the tarball starts. Its smoke test ran on the
 build machine, so it never noticed. The build now asks for the PostgreSQL
-connector by name, `libpq5` is documented as the tarball's one host
-prerequisite (`apt-get install libpq5` on Ubuntu 24.04; see
+connector by name, `libpq5` is documented as the one host prerequisite of the
+tarball's binaries (`apt-get install libpq5` on Ubuntu 24.04; see
 `docs/connectors/postgres.md`), and a release step runs the CLI and a
-Coordinator in a stock `ubuntu:24.04` with only that package added, so a
-library or symbol the host lacks fails the release. Nor does the tarball carry
-the Avro format, which the release that introduced it listed; the workflow now
-says so. The runtime image and the wheels are unaffected.
+Coordinator in a stock `ubuntu:24.04` with only that package added, so a library
+or symbol the host lacks fails the release. A C++ consumer whose
+`find_package(clink)` names no components resolves the connector's dependency
+too, so it needs `libpq-dev` to configure; one that names its components, as
+`COMPONENTS core` does, needs neither package, since `clink::core` does not link
+libpq. Nor does the tarball carry the Avro format, which the release that
+introduced it listed; the workflow now says so. The runtime image and the wheels
+are unaffected.
 
 ## v0.14.1 (November 2026)
 
