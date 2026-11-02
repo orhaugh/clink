@@ -1180,6 +1180,44 @@ TEST(Cluster, AJobThatEndedUnderAnEarlierCoordinatorIsStillListed) {
     EXPECT_EQ(detail->status, ran_status);
     EXPECT_TRUE(detail->completion_signalled);
     EXPECT_FALSE(next.snapshot_job(JobId{900043}).has_value());
+
+    // A job submitted now numbers above every id that history holds, so it
+    // neither hides one of them nor sits below the highest id a client saw.
+    const auto port = next.start();
+    next.expect_workers({"worker-listed-next"});
+    Worker::Config next_cfg;
+    next_cfg.slot_count = 4;
+    Worker next_worker("worker-listed-next", "127.0.0.1", next_cfg);
+    next_worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(next.await_registrations(2s));
+    JobGraphSpec again;
+    again.name = "submitted-after-takeover";
+    OperatorSpec again_src;
+    again_src.type = "int64_range_source";
+    again_src.id = "src";
+    again_src.parallelism = 1;
+    again_src.out_channel = std::string{kChannelInt64};
+    again_src.params = {{"count", "1"}};
+    again.ops.push_back(again_src);
+    OperatorSpec again_snk;
+    again_snk.type = "collecting_int64_sink";
+    again_snk.id = "snk";
+    again_snk.inputs = {"src"};
+    again_snk.parallelism = 1;
+    again_snk.out_channel = std::string{kChannelInt64};
+    again.ops.push_back(again_snk);
+    const auto fresh = next.submit_job(again, OperatorRegistry::default_instance());
+    EXPECT_GT(fresh, JobId{900042}) << "a new job took an id below the history's";
+    ASSERT_TRUE(next.await_job_completion(fresh, 10s));
+    std::vector<std::string> under_ran;
+    for (const auto& j : next.snapshot_jobs()) {
+        if (j.id == ran) {
+            under_ran.push_back(j.name);
+        }
+    }
+    EXPECT_EQ(under_ran, std::vector<std::string>{"listed-after-takeover"})
+        << "the earlier job is listed once under its id, not hidden by the new one";
+    next_worker.stop();
     next.stop();
     std::filesystem::remove_all(ha_dir);
 }

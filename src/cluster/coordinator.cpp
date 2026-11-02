@@ -1424,6 +1424,9 @@ void Coordinator::reload_history_from_disk_() {
                   return a.job_id < b.job_id;
               });
     std::lock_guard lock(mu_);
+    for (const auto& r : records) {
+        highest_history_job_id_ = std::max(highest_history_job_id_, r.job_id);
+    }
     for (auto& r : records) {
         history_.push_back(std::move(r));
         while (history_.size() > kCoordinatorHistoryCap) {
@@ -5238,7 +5241,15 @@ void Coordinator::handle_submit_(network::Connection& conn, MessageReader& r) {
     }
 }
 
-JobId Coordinator::allocate_job_id_() {
+JobId Coordinator::allocate_job_id_(bool fresh) {
+    std::lock_guard lock(mu_);
+    // An earlier Coordinator's terminal jobs are listed from their history
+    // records (snapshot_jobs), so a new job reusing one of their ids would
+    // hide it, and a client waiting for an id above the last one listed, as
+    // the Kubernetes operator does after a submit, would wait for ever.
+    if (fresh && next_job_id_ <= highest_history_job_id_) {
+        next_job_id_ = highest_history_job_id_ + 1;
+    }
     return next_job_id_++;
 }
 
@@ -5716,7 +5727,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         index[TaskKey{t.role, t.subtask_idx}] = {t.worker_id, t.data_port};
     }
 
-    const JobId job_id = allocate_job_id_();
+    const JobId job_id = allocate_job_id_(/*fresh=*/!checkpoint.taken_over);
     auto job = std::make_shared<JobState>();
     job->id = job_id;
     // The job's own state location, apart from every other job's that shares

@@ -2237,7 +2237,9 @@ private:
                                          const std::string& op_id,
                                          std::vector<PendingDeploy>& out);
 
-    JobId allocate_job_id_();
+    // fresh: a new job, numbered above every job in the history read back;
+    // false for a recovered job, which keeps the id the counter was aligned to.
+    JobId allocate_job_id_(bool fresh);
     JobId deploy_internal_(const JobPlan& plan,
                            network::Connection* notify_client_conn,
                            std::vector<PluginBinary> plugins,
@@ -2486,6 +2488,10 @@ private:
     // alive across an eviction.
     std::deque<JobId> terminal_job_order_;
     JobId next_job_id_{1};
+    // The highest job id in the history files read back from the HA dir, every
+    // file rather than the ring's 128. A fresh job numbers above it, so ids stay
+    // unique across Coordinators that share the directory. Guarded by mu_.
+    JobId highest_history_job_id_{0};
     // The last WorkerConnection::session assigned. Under mu_.
     std::uint64_t last_worker_session_{0};
     // Convenience: the legacy `deploy(plan)`/`await_completion`/`errors`

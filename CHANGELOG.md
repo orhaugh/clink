@@ -221,7 +221,10 @@ the new leader had read each one's record back from `<ha_dir>/history/`. Both
 now fall back to that record, which also keeps the job's name and the
 checkpoint a graceful stop ended it at, so a stopped job still reads as
 stopped; a record written by an earlier release lists them as empty and 0.
-Covered by `Cluster.AJobThatEndedUnderAnEarlierCoordinatorIsStillListed`.
+A job submitted after the takeover numbers above every id in that history, so
+it hides none of those jobs, and a client that waits for an id above the last
+one listed, as the Kubernetes operator does after a submit, sees it. Covered
+by `Cluster.AJobThatEndedUnderAnEarlierCoordinatorIsStillListed`.
 
 **The delivery report warns when a broker-acknowledged source shares a job
 with the Kafka transactional sink.** The RabbitMQ, NATS JetStream and Pulsar
