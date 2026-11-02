@@ -80,6 +80,8 @@ CONNECTORS=(
   "mysql@@mysql@@clink_mysql_tests@@MysqlLive|MysqlCdcLive|MysqlUpsertSinkLive|UpsertContractSuite"
   "s3@@localstack@@clink_s3_tests@@S3Sink2PCLive|S3TextSinkLive|SinkContractSuite|S3MaterializationStore.RoundTripAgainstLiveEndpoint|StateParquetExportS3.PartitionedExportReadableBackFromS3|S3SnapshotStore.CheckpointDirRoundTripAgainstLiveEndpoint|S3SnapshotStore.CacheServesImmutableSstOnSecondFetch|S3CasSnapshotStore|S3RemotePool"
   "rocksdb-s3@@localstack@@clink_rocksdb_s3_tests@@S3RocksdbSchemes"
+  # The SQL GROUP BY on remote-read:// state, restored in a fresh cluster (WITH_SQL=1).
+  "sql-remote-read@@localstack@@clink_sql_s3_e2e_tests@@SqlRemoteReadE2E"
   "elasticsearch@@elasticsearch@@clink_http_connector_tests@@ElasticsearchLive"
   "pubsub@@pubsub@@clink_http_connector_tests@@PubSubLive"
   "cassandra@@cassandra@@clink_cassandra_tests@@CassandraLive|CassandraUpsertSinkLive|UpsertContractSuite"
@@ -101,7 +103,7 @@ WANT_TARGETS="clink_redis_tests clink_mongodb_tests clink_nats_tests clink_mqtt_
 clink_postgres_tests clink_postgres_sql_tests clink_mysql_tests clink_s3_tests clink_rocksdb_s3_tests \
 clink_http_connector_tests clink_cassandra_tests clink_pulsar_tests clink_rabbitmq_tests \
 clink_gcs_tests clink_azure_tests clink_webhdfs_tests clink_iceberg_tests clink_etcd_tests \
-clink_aws_tests"
+clink_aws_tests clink_sql_s3_e2e_tests"
 
 AWS_ENV=(-e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test
          -e AWS_DEFAULT_REGION=us-east-1 -e AWS_EC2_METADATA_DISABLED=true)
@@ -128,7 +130,7 @@ set_env() {
     etcd)          ENVARGS=(-e "CLINK_ETCD_ENDPOINT=http://etcd:2379") ;;
     elasticsearch) ENVARGS=(-e "CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://elasticsearch:9200") ;;
     pubsub)        ENVARGS=(-e "CLINK_PUBSUB_EMULATOR_HOST=pubsub:8085") ;;
-    s3|rocksdb-s3) ENVARGS=(-e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-live-test" "${AWS_ENV[@]}") ;;
+    s3|rocksdb-s3|sql-remote-read) ENVARGS=(-e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-live-test" "${AWS_ENV[@]}") ;;
     aws-kinesis)   ENVARGS=(-e "CLINK_KINESIS_TEST_ENDPOINT=http://localstack:4566" "${AWS_ENV[@]}") ;;
   esac
 }
@@ -232,7 +234,7 @@ probe() {  # connector-name
         sleep 2
       done
       echo "  WARNING: rabbitmq not fully ready; its tests may fail." ;;
-    s3|rocksdb-s3)
+    s3|rocksdb-s3|sql-remote-read)
       # localstack is torn down between connectors, so each localstack-backed
       # connector gets a fresh, empty S3 - create the bucket the tests write to.
       # (Some suites create their own bucket; rocksdb-s3's snapshot store does not.)

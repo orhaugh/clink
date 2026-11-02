@@ -13,15 +13,20 @@
 // restore from S3.
 //
 // Three phases:
-//   1. Run a GROUP BY SUM over a large single-key batch to completion. On
-//      bounded-source exit the runtime emits an end-of-stream checkpoint
-//      barrier (CheckpointId == UINT64_MAX, see dag.hpp), so the operator's
-//      final aggregate state is committed to S3 in full. Assert the output is
-//      correct.
-//   2. A FRESH cluster + job (same SQL, same S3 prefix) restores from that
-//      checkpoint and folds in a tiny second batch. Its hot tier starts empty,
-//      so the only way the recovered total can appear is a cold read from S3 -
-//      this is the load-bearing restore proof.
+//   1. Run a GROUP BY SUM over a large single-key batch to completion. At end
+//      of input each source asks the coordinator for a final checkpoint, which
+//      the job's checkpoint directory makes it take, so the operator's final
+//      aggregate state is committed to S3 in full and the directory holds the
+//      COMPLETED marker naming it. A job with no checkpoint directory takes no
+//      checkpoints and commits its tail locally, leaving nothing in S3 to
+//      restore. Assert the output is correct.
+//   2. A FRESH cluster + job (same SQL, same files, same S3 prefix) restores
+//      from that checkpoint, named by its marker, and folds in a tiny second
+//      batch: the input is a directory, and batch 2 is a file added to it
+//      after the first, which the restored source reads on to, since it keeps
+//      its place by file and line. Its hot tier starts empty, so the only way
+//      the recovered total can appear is a cold read from S3 - this is the
+//      load-bearing restore proof.
 //   3. A control job on a FRESH (empty) prefix with no restore consumes the
 //      same second batch; its total reflects only that batch. restored ==
 //      batch1 + batch2 while control == batch2 is the exact, deterministic
@@ -62,11 +67,6 @@ using namespace std::chrono_literals;
 
 namespace clink::sql {
 namespace {
-
-// The end-of-stream checkpoint id the runtime stamps on the terminal barrier
-// a bounded source emits when it exits (dag.hpp). It captures the operator's
-// complete final state - exactly what we restore from.
-constexpr std::uint64_t kEndOfStreamCheckpoint = std::numeric_limits<std::uint64_t>::max();
 
 bool s3_available() {
     return std::getenv("CLINK_S3_TEST_ENDPOINT") != nullptr &&
@@ -177,6 +177,47 @@ std::string remote_read_uri_evict(const std::string& prefix, std::size_t hot_max
     return remote_read_uri(prefix) + "&hot_max_bytes=" + std::to_string(hot_max_bytes);
 }
 
+// A run's own checkpoint directory, empty.
+std::filesystem::path fresh_checkpoint_dir(const std::string& tag) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("clink-rr-ckpt-" + tag + "-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+// The newest checkpoint a finished run completed: its job's marker directory
+// under <checkpoint dir>/_jobs/ and the id of the newest COMPLETED marker in
+// it (a whole marker name only; an unfinished publish's temp file is not one).
+struct CompletedCheckpoint {
+    std::filesystem::path marker_dir;
+    std::uint64_t id{0};
+};
+CompletedCheckpoint newest_completed(const std::filesystem::path& checkpoint_dir) {
+    CompletedCheckpoint out;
+    std::error_code ec;
+    for (const auto& job : std::filesystem::directory_iterator(checkpoint_dir / "_jobs", ec)) {
+        std::error_code inner;
+        for (const auto& f : std::filesystem::directory_iterator(job.path(), inner)) {
+            const auto name = f.path().filename().string();
+            const std::string marker = "COMPLETED-";
+            if (name.rfind(marker, 0) != 0) {
+                continue;
+            }
+            const auto digits = name.substr(marker.size());
+            if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+                continue;
+            }
+            const auto id = std::stoull(digits);
+            if (id > out.id) {
+                out.id = id;
+                out.marker_dir = job.path();
+            }
+        }
+    }
+    return out;
+}
+
 // Bump the keyed aggregate operator to `p` subtasks so the GROUP BY runs sharded
 // across the cluster (the upstream key-by edge fans out to the p keyed subtasks
 // by key group). The file source/sink stay at 1. Returns the modified spec.
@@ -189,25 +230,28 @@ cluster::JobGraphSpec with_parallelism(cluster::JobGraphSpec spec, std::uint32_t
     return spec;
 }
 
-// Run one GROUP BY job to completion against the cluster, optionally restoring
-// from a prior checkpoint on the given S3 prefix. Returns the final total for
-// user_id=1 from the sink output.
+// Run one GROUP BY job to completion against the cluster, its state on the
+// given S3 prefix and its markers in `checkpoint_dir`, optionally restoring
+// from a prior run's checkpoint. Returns the final total for user_id=1 from
+// the sink output.
 std::int64_t run_groupby_job(const std::string& worker_id,
                              const std::filesystem::path& in_path,
                              const std::filesystem::path& out_path,
                              const std::string& state_prefix,
-                             bool restore,
-                             std::uint64_t restore_ckpt) {
+                             const std::filesystem::path& checkpoint_dir,
+                             const CompletedCheckpoint* restore) {
     InProcessCluster cluster(worker_id, 4);
     application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 60s;
-    // checkpoint_dir stays empty: state lives entirely in S3 via the
-    // decoupled state_backend_uri; the end-of-stream barrier still commits it.
+    // The state lives in S3 through the decoupled state_backend_uri; the
+    // checkpoint directory holds only the markers, and is what makes the job
+    // take its end-of-input checkpoint.
+    opts.checkpoint.checkpoint_dir = checkpoint_dir.string();
     opts.checkpoint.state_backend_uri = remote_read_uri(state_prefix);
-    if (restore) {
-        opts.checkpoint.restore_from_dir = remote_read_uri(state_prefix);  // presence flag
-        opts.checkpoint.restore_from_checkpoint_id = restore_ckpt;
+    if (restore != nullptr) {
+        opts.checkpoint.restore_from_dir = restore->marker_dir.string();
+        opts.checkpoint.restore_from_checkpoint_id = restore->id;
     }
     auto result = submitter.submit(compile_groupby(in_path, out_path).to_json(), {}, opts);
     EXPECT_TRUE(result.completed) << "reject: " << result.reject_message;
@@ -237,16 +281,17 @@ std::map<std::int64_t, std::int64_t> run_groupby_evict(const std::string& worker
                                                        const std::string& state_prefix,
                                                        std::size_t hot_max_bytes,
                                                        std::uint32_t parallelism,
-                                                       bool restore,
-                                                       std::uint64_t restore_ckpt) {
+                                                       const std::filesystem::path& checkpoint_dir,
+                                                       const CompletedCheckpoint* restore) {
     InProcessCluster cluster(worker_id, 8);
     application::JobSubmitter submitter("127.0.0.1", cluster.coordinator_port);
     application::SubmitOptions opts;
     opts.wait_timeout = 90s;
+    opts.checkpoint.checkpoint_dir = checkpoint_dir.string();
     opts.checkpoint.state_backend_uri = remote_read_uri_evict(state_prefix, hot_max_bytes);
-    if (restore) {
-        opts.checkpoint.restore_from_dir = remote_read_uri_evict(state_prefix, hot_max_bytes);
-        opts.checkpoint.restore_from_checkpoint_id = restore_ckpt;
+    if (restore != nullptr) {
+        opts.checkpoint.restore_from_dir = restore->marker_dir.string();
+        opts.checkpoint.restore_from_checkpoint_id = restore->id;
     }
     auto spec = with_parallelism(compile_groupby(in_path, out_path), parallelism);
     auto result = submitter.submit(spec.to_json(), {}, opts);
@@ -271,12 +316,12 @@ TEST(SqlRemoteReadE2E, MultiKeyEvictionAndRestoreShardedOverS3) {
 
     const auto pid = std::to_string(::getpid());
     const auto tmp = std::filesystem::temp_directory_path();
-    const auto in1 = tmp / ("clink-rr-mk-in1-" + pid + ".ndjson");
+    const auto in1 = tmp / ("clink-rr-mk-in-" + pid);  // a directory of parts
     const auto out1 = tmp / ("clink-rr-mk-out1-" + pid + ".ndjson");
     const auto in2 = tmp / ("clink-rr-mk-in2-" + pid + ".ndjson");
     const auto out2 = tmp / ("clink-rr-mk-out2-" + pid + ".ndjson");
     for (const auto& p : {in1, out1, in2, out2})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     constexpr std::int64_t kKeys = 20;
     constexpr std::int64_t kB1PerKey = 10;
@@ -291,7 +336,9 @@ TEST(SqlRemoteReadE2E, MultiKeyEvictionAndRestoreShardedOverS3) {
             for (int i = 0; i < kB2PerKey; ++i)
                 r2.push_back(row);
         }
-        write_lines(in1, r1);
+        std::filesystem::remove_all(in1);
+        std::filesystem::create_directories(in1);
+        write_lines(in1 / "part-1.ndjson", r1);
         write_lines(in2, r2);
     }
 
@@ -300,35 +347,31 @@ TEST(SqlRemoteReadE2E, MultiKeyEvictionAndRestoreShardedOverS3) {
     constexpr std::uint32_t kPar = 4;  // sharded GROUP BY across 4 keyed subtasks
 
     // Build 20-key aggregate state, sharded, evicting under the budget.
-    auto built = run_groupby_evict("worker-rr-mk-build",
-                                   in1,
-                                   out1,
-                                   prefix,
-                                   kHot,
-                                   kPar,
-                                   /*restore=*/false,
-                                   0);
+    const auto build_ckpt = fresh_checkpoint_dir("mk-build");
+    auto built =
+        run_groupby_evict("worker-rr-mk-build", in1, out1, prefix, kHot, kPar, build_ckpt, nullptr);
     ASSERT_EQ(built.size(), static_cast<std::size_t>(kKeys));
     for (std::int64_t k = 1; k <= kKeys; ++k)
         EXPECT_EQ(built[k], kB1PerKey) << "build key " << k;
+    const auto committed = newest_completed(build_ckpt);
+    ASSERT_GT(committed.id, 0U) << "the build run completed no checkpoint, so nothing reached S3";
 
     // Fresh cluster restores all 20 keys lazily from S3 (hot tier empty)
-    // and folds batch 2 touching every key. Under the tiny budget each key is
-    // cold-read from S3, filled, then evicted as others arrive (heavy churn).
-    auto restored = run_groupby_evict("worker-rr-mk-restore",
-                                      in2,
-                                      out2,
-                                      prefix,
-                                      kHot,
-                                      kPar,
-                                      /*restore=*/true,
-                                      kEndOfStreamCheckpoint);
+    // and folds batch 2, a later file in the input directory, touching every key. Under the
+    // tiny budget each key is cold-read from S3, filled, then evicted as
+    // others arrive (heavy churn).
+    write_lines(in1 / "part-2.ndjson", read_lines(in2));
+    const auto restore_ckpt = fresh_checkpoint_dir("mk-restore");
+    auto restored = run_groupby_evict(
+        "worker-rr-mk-restore", in1, out1, prefix, kHot, kPar, restore_ckpt, &committed);
     ASSERT_EQ(restored.size(), static_cast<std::size_t>(kKeys));
     for (std::int64_t k = 1; k <= kKeys; ++k)
         EXPECT_EQ(restored[k], kB1PerKey + kB2PerKey) << "restored key " << k;
 
     for (const auto& p : {in1, out1, in2, out2})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
+    std::filesystem::remove_all(build_ckpt);
+    std::filesystem::remove_all(restore_ckpt);
 }
 
 TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
@@ -339,13 +382,13 @@ TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
 
     const auto pid = std::to_string(::getpid());
     const auto tmp = std::filesystem::temp_directory_path();
-    const auto in1 = tmp / ("clink-rr-e2e-in1-" + pid + ".ndjson");
+    const auto in1 = tmp / ("clink-rr-e2e-in-" + pid);  // a directory of parts
     const auto out1 = tmp / ("clink-rr-e2e-out1-" + pid + ".ndjson");
     const auto in2 = tmp / ("clink-rr-e2e-in2-" + pid + ".ndjson");
     const auto out2 = tmp / ("clink-rr-e2e-out2-" + pid + ".ndjson");
     const auto outc = tmp / ("clink-rr-e2e-outc-" + pid + ".ndjson");
     for (const auto& p : {in1, out1, in2, out2, outc})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
 
     // Batch 1: a large single-key stream whose full aggregate is committed to
     // S3 at end-of-stream. Batch 2: a tiny stream on the same key.
@@ -354,7 +397,9 @@ TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
     {
         std::vector<std::string> rows(static_cast<std::size_t>(kBatch1Rows),
                                       R"({"user_id":1,"amount":1})");
-        write_lines(in1, rows);
+        std::filesystem::remove_all(in1);
+        std::filesystem::create_directories(in1);
+        write_lines(in1 / "part-1.ndjson", rows);
         std::vector<std::string> rows2(static_cast<std::size_t>(kBatch2Rows),
                                        R"({"user_id":1,"amount":1})");
         write_lines(in2, rows2);
@@ -364,21 +409,24 @@ TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
     const std::string prefix_ctrl = "clink-sql-rr-e2e/" + pid + "/ctrl";
 
     // ---- Build aggregate state and commit it to S3. ----
+    const auto build_ckpt = fresh_checkpoint_dir("e2e-build");
     const std::int64_t built =
-        run_groupby_job("worker-rr-e2e-build", in1, out1, prefix_main, /*restore=*/false, 0);
+        run_groupby_job("worker-rr-e2e-build", in1, out1, prefix_main, build_ckpt, nullptr);
     EXPECT_EQ(built, kBatch1Rows);  // GROUP BY SUM over batch 1
+    const auto committed = newest_completed(build_ckpt);
+    ASSERT_GT(committed.id, 0U) << "the build run completed no checkpoint, so nothing reached S3";
 
-    // ---- Fresh cluster restores that state from S3, folds batch 2. ----
-    const std::int64_t restored = run_groupby_job("worker-rr-e2e-restore",
-                                                  in2,
-                                                  out2,
-                                                  prefix_main,
-                                                  /*restore=*/true,
-                                                  kEndOfStreamCheckpoint);
+    // ---- Fresh cluster restores that state from S3, folds batch 2, a later
+    // file in the input directory. ----
+    write_lines(in1 / "part-2.ndjson", read_lines(in2));
+    const auto restore_ckpt = fresh_checkpoint_dir("e2e-restore");
+    const std::int64_t restored =
+        run_groupby_job("worker-rr-e2e-restore", in1, out1, prefix_main, restore_ckpt, &committed);
 
     // ---- Control: fresh empty prefix, no restore. ----
+    const auto control_ckpt = fresh_checkpoint_dir("e2e-control");
     const std::int64_t control =
-        run_groupby_job("worker-rr-e2e-control", in2, outc, prefix_ctrl, /*restore=*/false, 0);
+        run_groupby_job("worker-rr-e2e-control", in2, outc, prefix_ctrl, control_ckpt, nullptr);
 
     // Control had no prior state, so it reflects only batch 2.
     EXPECT_EQ(control, kBatch2Rows);
@@ -389,7 +437,9 @@ TEST(SqlRemoteReadE2E, GroupByAsyncCheckpointsToS3AndRestores) {
     EXPECT_GT(restored, control);
 
     for (const auto& p : {in1, out1, in2, out2, outc})
-        std::filesystem::remove(p);
+        std::filesystem::remove_all(p);
+    for (const auto& d : {build_ckpt, restore_ckpt, control_ckpt})
+        std::filesystem::remove_all(d);
 }
 
 }  // namespace clink::sql
