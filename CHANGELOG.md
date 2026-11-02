@@ -111,6 +111,12 @@ summaries and details now carry `stopped_at_checkpoint_id`, the checkpoint the
 stop ended at, and the console shows such a job as Stopped. The status values
 and the wire protocol are unchanged.
 
+**`GET /api/v1/jobs/:id` reports the restart budget a job runs with.** A job
+that left `max_restarts_on_worker_loss` to the default showed 4294967295, the
+unresolved auto sentinel. The field is now the effective budget, the self-heal
+default with a checkpoint directory and 0 without, and
+`max_restarts_on_worker_loss_auto` says the default chose it.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

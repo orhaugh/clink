@@ -463,7 +463,19 @@ void write_job_detail(clink::http::JsonWriter& w, const clink::cluster::JobDetai
     w.kv("state_backend_uri", j.state_backend_uri);
     w.kv("restore_from_dir", j.restore_from_dir);
     w.kv("restore_from_checkpoint_id", static_cast<std::int64_t>(j.restore_from_checkpoint_id));
-    w.kv("max_restarts_on_worker_loss", static_cast<std::int64_t>(j.max_restarts_on_worker_loss));
+    // The restart budget the job runs with. The default is the kRestartAuto
+    // sentinel, which resolves to the self-heal budget with a checkpoint dir and to
+    // 0 without (effective_max_restarts); written raw it read as 4294967295. The
+    // _auto flag says the budget was chosen for the job rather than by it.
+    {
+        clink::cluster::CheckpointConfig restarts;
+        restarts.checkpoint_dir = j.checkpoint_dir;
+        restarts.max_restarts_on_worker_loss = j.max_restarts_on_worker_loss;
+        w.kv("max_restarts_on_worker_loss",
+             static_cast<std::int64_t>(clink::cluster::effective_max_restarts(restarts)));
+        w.kv("max_restarts_on_worker_loss_auto",
+             j.max_restarts_on_worker_loss == clink::cluster::kRestartAuto);
+    }
     w.kv("unaligned_checkpoints", j.unaligned_checkpoints);
     w.kv("adaptive_barrier_mode", j.adaptive_barrier_mode);
     w.kv("status", j.status);
