@@ -318,7 +318,10 @@ if [[ -z "${SKIP_BUILD:-}" ]]; then
     -e IN_DOCKER=1 -e CLINK_DEPS_PREFIX=/usr/local \
     "$IMAGE" bash -c "
       set -e
-      cmake -S . -B '$BUILD_DIR' -DCLINK_BUILD_TESTS=ON -DCLINK_INTEGRATION_TESTS=ON $sql_flag >/dev/null
+      # Connector targets only. The integration suite is not run here, and it
+      # needs the SQL frontend (clink_submit_sql), so configuring it failed
+      # the generate step unless WITH_SQL=1 was set.
+      cmake -S . -B '$BUILD_DIR' -DCLINK_BUILD_TESTS=ON -DCLINK_INTEGRATION_TESTS=OFF $sql_flag >/dev/null
       avail=\$(cmake --build '$BUILD_DIR' --target help 2>/dev/null | grep -oE 'clink_[a-z0-9_]+_tests' | sort -u)
       build=''
       for t in $WANT_TARGETS; do echo \"\$avail\" | grep -qx \"\$t\" && build=\"\$build \$t\"; done
