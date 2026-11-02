@@ -117,6 +117,12 @@ unresolved auto sentinel. The field is now the effective budget, the self-heal
 default with a checkpoint directory and 0 without, and
 `max_restarts_on_worker_loss_auto` says the default chose it.
 
+**The guarantee warning names each lookup once.** Every Neo4j or async lookup
+added its own copy of the same caveat to the job's determinism warning, so a
+job with seven lookups repeated it seven times in one warning. Lookups of one
+kind now make one line that names each of them. Covered by
+`GuaranteeGateTest.SeveralNeo4jLookupsAreNamedInOneLineNotRepeated`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

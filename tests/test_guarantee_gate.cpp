@@ -554,6 +554,27 @@ TEST_F(GuaranteeGateTest, ANeo4jLookupIsCurrentStateAndSoNotReplayDeterministic)
               std::string::npos);
 }
 
+// Several lookups of one kind make one line naming each of them: a line per lookup
+// repeated the same caveat once per operator in a single warning.
+TEST_F(GuaranteeGateTest, SeveralNeo4jLookupsAreNamedInOneLineNotRepeated) {
+    auto g = sql_graph();
+    g.ops.insert(g.ops.begin() + 1,
+                 op("neo4j_lookup_join_row", "lookup_a", {"src"}, {{"function_name", "neo4j"}}));
+    g.ops.insert(
+        g.ops.begin() + 2,
+        op("neo4j_lookup_join_row", "lookup_b", {"lookup_a"}, {{"function_name", "neo4j"}}));
+    g.ops.insert(
+        g.ops.begin() + 3,
+        op("neo4j_lookup_join_row", "lookup_c", {"lookup_b"}, {{"function_name", "neo4j"}}));
+    g.ops[4].inputs = {"lookup_c"};
+    const auto facts = pipeline_facts_from_graph(g, durable_checkpointing());
+    ASSERT_EQ(facts.determinism.sources_of_nondeterminism.size(), 1u);
+    const auto& line = facts.determinism.sources_of_nondeterminism[0];
+    EXPECT_NE(line.find("Neo4j lookups 'lookup_a', 'lookup_b' and 'lookup_c' read the graph"),
+              std::string::npos)
+        << line;
+}
+
 TEST_F(GuaranteeGateTest, APluginGraphWithNoDeclarationsIsUnknownNotClean) {
     // No determinism_coverage claim and no per-op declarations: the ops are
     // native code the engine cannot inspect. "Nothing found" must be

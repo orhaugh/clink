@@ -1,7 +1,10 @@
 #include "clink/cluster/guarantee_gate.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/connectors/capability.hpp"
@@ -122,6 +125,19 @@ std::vector<HeldSink> held_sinks(const JobGraphSpec& graph,
     return held;
 }
 
+// Names quoted for a sentence: one as 'a', two as 'a' and 'b', more as 'a', 'b'
+// and 'c'.
+std::string quoted_names(const std::vector<std::string>& names) {
+    std::string out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            out += i + 1 == names.size() ? " and " : ", ";
+        }
+        out += "'" + names[i] + "'";
+    }
+    return out;
+}
+
 }  // namespace
 
 std::string connector_name_for_op_type(const std::string& op_type) {
@@ -215,6 +231,8 @@ connectors::PipelineFacts pipeline_facts_from_graph(const JobGraphSpec& graph,
     auto& det = facts.determinism;
     det.classification_complete = graph.determinism_coverage == "sql-planner";
     bool all_ops_declared = !graph.ops.empty();
+    std::vector<std::string> async_lookups;  // by function name, else operator id
+    std::vector<std::string> neo4j_lookups;  // by operator id
     for (const auto& op : graph.ops) {
         const auto declared = op.params.find(std::string{kOpDeterminismParam});
         if (declared == op.params.end() || (declared->second != "deterministic" &&
@@ -248,19 +266,31 @@ connectors::PipelineFacts pipeline_facts_from_graph(const JobGraphSpec& graph,
         if (op.type == "async_lookup_row" || op.type == "async_lookup_join_row") {
             det.calls_external_service = true;
             const auto fn = op.params.find("function_name");
-            det.sources_of_nondeterminism.push_back(
-                "async lookup" + (fn == op.params.end() ? std::string{} : " '" + fn->second + "'") +
-                " reads an external system whose answers can change between runs");
+            async_lookups.push_back(fn == op.params.end() ? op.id : fn->second);
         }
         if (op.type == "neo4j_lookup_join_row") {
             // Current-state enrichment: each lookup reads the graph as it is
             // when the query runs, so a replay can enrich a row differently.
             det.calls_external_service = true;
-            det.sources_of_nondeterminism.push_back(
-                "Neo4j lookup '" + op.id +
-                "' reads the graph as it is when each lookup runs, so a replay can enrich a row "
-                "differently");
+            neo4j_lookups.push_back(op.id);
         }
+    }
+    // One line per kind of lookup, naming every operator of it: a line per
+    // operator repeated the same caveat seven times in one warning on a job with
+    // seven lookups.
+    if (!async_lookups.empty()) {
+        det.sources_of_nondeterminism.push_back(
+            (async_lookups.size() == 1 ? "async lookup " : "async lookups ") +
+            quoted_names(async_lookups) +
+            (async_lookups.size() == 1 ? " reads an external system" : " read external systems") +
+            " whose answers can change between runs");
+    }
+    if (!neo4j_lookups.empty()) {
+        det.sources_of_nondeterminism.push_back(
+            (neo4j_lookups.size() == 1 ? "Neo4j lookup " : "Neo4j lookups ") +
+            quoted_names(neo4j_lookups) + (neo4j_lookups.size() == 1 ? " reads" : " read") +
+            " the graph as it is when each lookup runs, so a replay can enrich a row "
+            "differently");
     }
     for (const auto& u : graph.udfs) {
         // LANGUAGE SQL bodies are composed of built-ins the binder already
