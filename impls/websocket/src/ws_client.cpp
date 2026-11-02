@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 
 #ifdef CLINK_WEBSOCKET_TLS
+#include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -27,6 +28,27 @@ namespace clink::websocket {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+#ifdef CLINK_WEBSOCKET_TLS
+// The address `host` spells when it is an IPv4 or IPv6 literal (without
+// brackets or an IPv6 zone); empty when it is a name. TlsSocket reads a host the
+// same way.
+std::string ip_literal(std::string host) {
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    in_addr v4{};
+    if (::inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+        return host;
+    }
+    const std::string unzoned = host.substr(0, host.find('%'));
+    in6_addr v6{};
+    if (::inet_pton(AF_INET6, unzoned.c_str(), &v6) == 1) {
+        return unzoned;
+    }
+    return {};
+}
+#endif
 
 [[noreturn]] void throw_errno(const std::string& name, const std::string& stage) {
     throw std::runtime_error(name + ": " + stage + ": " + std::strerror(errno));
@@ -288,12 +310,29 @@ struct WsClient::Impl {
             throw std::runtime_error(opts.name + ": SSL_new failed");
         }
         SSL_set_fd(ssl, fd);
-        // SNI + hostname verification (disabled together by tls_verify=false,
-        // for self-signed endpoints in development).
-        SSL_set_tlsext_host_name(ssl, url.host.c_str());
+        // SNI carries host names only (RFC 6066, section 3), so an address is not
+        // sent. The certificate check is TlsSocket's: a name against the
+        // certificate's DNS names, a wildcard only as a whole left-most label, and
+        // an address against its IP entries. tls_verify=false, for self-signed
+        // endpoints in development, skips the check.
+        const std::string ip = ip_literal(url.host);
+        if (ip.empty()) {
+            SSL_set_tlsext_host_name(ssl, url.host.c_str());
+        }
         if (opts.tls_verify) {
             SSL_set_verify(ssl, SSL_VERIFY_PEER, nullptr);
-            SSL_set1_host(ssl, url.host.c_str());
+            X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
+            int ok = 0;
+            if (ip.empty()) {
+                X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                ok = X509_VERIFY_PARAM_set1_host(param, url.host.c_str(), url.host.size());
+            } else {
+                ok = X509_VERIFY_PARAM_set1_ip_asc(param, ip.c_str());
+            }
+            if (ok != 1) {
+                throw std::runtime_error(opts.name + ": cannot check the certificate against '" +
+                                         url.host + "'");
+            }
         }
         while (true) {
             const int rc = SSL_connect(ssl);

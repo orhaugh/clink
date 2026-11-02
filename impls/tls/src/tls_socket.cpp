@@ -571,7 +571,11 @@ TlsSocket TlsSocket::connect(const std::string& host,
         throw std::runtime_error("TlsSocket::connect: SSL_new failed");
     }
     SSL_set_fd(out.impl_->ssl, fd);
-    SSL_set_tlsext_host_name(out.impl_->ssl, host.c_str());
+    // SNI carries host names only (RFC 6066, section 3), so an address is not
+    // sent: the certificate check matches it against the IP entries instead.
+    if (ip_literal(host).empty()) {
+        SSL_set_tlsext_host_name(out.impl_->ssl, host.c_str());
+    }
     if (opts.verify_hostname) {
         require_certificate_names(out.impl_->ssl, host);
     }

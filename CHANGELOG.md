@@ -65,6 +65,15 @@ that division by zero yields NULL for floating-point operands too. Covered by
 `SqlRow.NonFiniteTextTakesTheDeclaredFloatingType` and both registry formats'
 `NonFiniteDoublesDecodeToTheSameValue`.
 
+**TLS clients send SNI for a host name only, and the WebSocket client checks a
+certificate as `TlsSocket` does.** SNI carries host names only (RFC 6066), but
+`TlsSocket` and the WebSocket client sent an address too. The WebSocket client
+also accepted a partial wildcard such as `f*.example.com` and, on OpenSSL 1.1.1,
+matched an address as a name; it now follows `TlsSocket`'s rule, a name against
+the certificate's DNS names with a wildcard only as a whole left-most label and
+an address against its IP entries. Covered by
+`TlsSocketConnect.SniCarriesAHostNameAndNeverAnAddress` and `WsClientTls.*`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

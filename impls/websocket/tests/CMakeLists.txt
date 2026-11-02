@@ -17,6 +17,11 @@ target_link_libraries(clink_websocket_tests PRIVATE
 )
 target_compile_definitions(clink_websocket_tests PRIVATE CLINK_HAS_WEBSOCKET)
 clink_set_warnings(clink_websocket_tests)
+# wss:// against an in-process TLS server, where the impl was built with OpenSSL.
+if(OpenSSL_FOUND)
+    target_sources(clink_websocket_tests PRIVATE test_ws_tls.cpp)
+    target_link_libraries(clink_websocket_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 gtest_discover_tests(clink_websocket_tests
     DISCOVERY_MODE PRE_TEST
     PROPERTIES TIMEOUT 60 LABELS websocket

@@ -1020,3 +1020,63 @@ TEST(TlsSocketHostname, AMismatchNamesTheOptOutTheCallerGives) {
     EXPECT_FALSE(mentions(error, "--tls-no-verify-hostname")) << error;
     std::filesystem::remove_all(dir);
 }
+
+namespace {
+
+// The server name each handshake on `ctx` carried, "" for none, recorded by
+// the server's SNI callback (which OpenSSL may skip when no name is sent).
+std::vector<std::string>* record_server_names(SSL_CTX* ctx) {
+    auto* seen = new std::vector<std::string>();
+    SSL_CTX_set_tlsext_servername_arg(ctx, seen);
+    SSL_CTX_set_tlsext_servername_callback(
+        ctx, +[](SSL* ssl, int*, void* arg) -> int {
+            const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+            static_cast<std::vector<std::string>*>(arg)->push_back(name != nullptr ? name : "");
+            return SSL_TLSEXT_ERR_OK;
+        });
+    return seen;
+}
+
+}  // namespace
+
+// SNI carries host names only (RFC 6066, section 3): a connect by address sends
+// none, where it used to send the address, and a connect by name sends the name.
+TEST(TlsSocketConnect, SniCarriesAHostNameAndNeverAnAddress) {
+    if (!TlsServerContext::is_real_implementation()) {
+        GTEST_SKIP() << "Built without OpenSSL";
+    }
+    const auto cert_dir =
+        generate_self_signed_cert("DNS:localhost,IP:127.0.0.1", "localhost", "_sni");
+    if (cert_dir.empty()) {
+        GTEST_SKIP() << "openssl CLI unavailable, can't fixture self-signed cert";
+    }
+    const auto cert = (cert_dir / "cert.pem").string();
+    TlsServerContext server_ctx(cert, (cert_dir / "key.pem").string());
+    TlsClientContext client_ctx(cert);
+    std::unique_ptr<std::vector<std::string>> seen{
+        record_server_names(static_cast<SSL_CTX*>(server_ctx.native_handle()))};
+
+    const auto names_sent_connecting_to = [&](const std::string& host) {
+        seen->clear();
+        std::uint16_t port = 0;
+        const int listener = NetworkSocket::listen_on(port, "127.0.0.1");
+        EXPECT_GE(listener, 0);
+        std::thread client([&] { (void)TlsSocket::connect(host, port, client_ctx); });
+        {
+            TlsSocket accepted = TlsSocket::accept(listener, server_ctx);
+        }
+        NetworkSocket::close(listener);
+        client.join();
+        std::vector<std::string> named;
+        for (const auto& n : *seen) {
+            if (!n.empty()) {
+                named.push_back(n);
+            }
+        }
+        return named;
+    };
+
+    EXPECT_TRUE(names_sent_connecting_to("127.0.0.1").empty()) << "an address was sent as SNI";
+    EXPECT_EQ(names_sent_connecting_to("localhost"), (std::vector<std::string>{"localhost"}));
+    std::filesystem::remove_all(cert_dir);
+}
