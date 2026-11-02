@@ -123,6 +123,11 @@ job with seven lookups repeated it seven times in one warning. Lookups of one
 kind now make one line that names each of them. Covered by
 `GuaranteeGateTest.SeveralNeo4jLookupsAreNamedInOneLineNotRepeated`.
 
+**Two completed checkpoints are kept by default.** `--checkpoint-num-retained`
+defaulted to 1, so a checkpoint that failed its integrity check at restore had
+no completed one to fall back to. It now defaults to 2; set it to 1 to keep
+the old footprint.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

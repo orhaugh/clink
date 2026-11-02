@@ -94,8 +94,10 @@ public:
         // are purged from each subtask's state backend so checkpoint
         // storage stays bounded. The latest completed checkpoint (the one
         // recovery restores from) is always kept; clamped to >= 1.
-        // Defaults to 1 (retain only the latest completed checkpoint).
-        std::size_t checkpoint_num_retained{1};
+        // Defaults to 2: the latest and the one before it, so a checkpoint that
+        // fails its integrity check at restore has a completed one to fall back
+        // to. 1 kept no fallback at all.
+        std::size_t checkpoint_num_retained{2};
     };
 
     Worker(std::string worker_id, std::string data_host);

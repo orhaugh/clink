@@ -79,8 +79,8 @@ That older one is a recovery option, not an automatic one: the failing checkpoin
 marked COMPLETED, so a sink may already have committed output for it, and restoring
 further back replays everything after it. Check the sinks before taking it.
 
-Note that `--checkpoint-num-retained` defaults to 1, which means there is usually no
-older checkpoint to name. Raising it is what buys a fallback.
+`--checkpoint-num-retained` defaults to 2, so there is usually one older checkpoint
+to name; raising it buys more. At 1 there is none.
 
 One specific cause worth knowing: a checkpoint whose payload and sidecar disagree is
 refused at restore, not at write. If the log shows

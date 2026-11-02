@@ -420,7 +420,7 @@ Worker (`Worker::Config`):
 - `slot_count` = 1; concurrent tasks this worker can host.
 - `peer_update_timeout` = 30000 ms; max wait for `PeerUpdate` before aborting a task.
 - `http_port` = 0; advertised read-API port (0 = no HTTP, coordinator proxy skips it).
-- `checkpoint_num_retained` = 1 (clamped to >= 1); completed checkpoints kept per job.
+- `checkpoint_num_retained` = 2 (clamped to >= 1); completed checkpoints kept per job: the latest and one to fall back to.
 
 Per-job `CheckpointConfig` (`protocol.hpp`): `checkpoint_dir` (empty disables checkpointing), `interval_ms` (0 disables periodic triggers), `restore_from_dir` (a checkpoint directory, or a job's marker directory in one) + `restore_from_checkpoint_id`, `max_restarts_on_worker_loss` (`kRestartAuto` resolves to self-heal when checkpointing is on, else fail-fast), `alignment` (default `Aligned`), and `state_backend_uri` (the base the job's own state root, `<base>/_state/<job id>`, is composed under; empty means `checkpoint_dir`).
 

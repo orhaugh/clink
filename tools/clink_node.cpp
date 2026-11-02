@@ -3188,7 +3188,7 @@ int run_worker(int argc, char** argv) {
     // because every older checkpoint had been purged). Rigs and
     // durability-sensitive deployments should run >= 2.
     supervisor_cfg.worker.checkpoint_num_retained =
-        static_cast<std::size_t>(std::stoull(get_arg(argc, argv, "checkpoint-num-retained", "1")));
+        static_cast<std::size_t>(std::stoull(get_arg(argc, argv, "checkpoint-num-retained", "2")));
     supervisor_cfg.discovery_timeout = std::chrono::milliseconds{
         std::stoll(get_arg(argc, argv, "reconnect-discovery-timeout-ms", "1000"))};
     supervisor_cfg.initial_backoff = std::chrono::milliseconds{
@@ -3651,6 +3651,9 @@ int main(int argc, char** argv) {
                    "1000).\n"
                 << "  --reconnect-initial-backoff-ms=<n>     first retry cap (default 100).\n"
                 << "  --reconnect-max-backoff-ms=<n>         retry cap (default 5000).\n"
+                << "  --checkpoint-num-retained=<n>          completed checkpoints kept per job\n"
+                << "                                         (default 2: the latest and one\n"
+                << "                                         to fall back to).\n"
                 << "\n"
                 << "Worker TLS flags:\n"
                 << "  --tls-ca=<pem>               connect to the coordinator over TLS, verifying\n"
