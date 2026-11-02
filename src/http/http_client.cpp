@@ -3,6 +3,7 @@
 #include "clink/http/http_client.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <httplib.h>
 #include <string>
 #include <utility>
@@ -33,6 +34,12 @@ void HttpClient::set_bearer_token(const std::string& token) {
         impl_->client.set_default_headers({});
     } else {
         impl_->client.set_default_headers({{"Authorization", "Bearer " + token}});
+    }
+}
+
+void HttpClient::present_cluster_token() {
+    if (const char* token = std::getenv("CLINK_AUTH_TOKEN"); token != nullptr && *token != '\0') {
+        set_bearer_token(token);
     }
 }
 

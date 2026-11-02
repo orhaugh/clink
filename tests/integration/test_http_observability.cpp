@@ -99,13 +99,15 @@ struct HttpResult {
 HttpResult http_request(const std::string& host,
                         std::uint16_t port,
                         const std::string& method,
-                        const std::string& path) {
+                        const std::string& path,
+                        const std::string& token = "") {
     HttpResult r;
     const int fd = NetworkSocket::connect_to(host, port);
     if (fd < 0) {
         return r;
     }
-    const std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + host +
+    const std::string auth = token.empty() ? "" : "\r\nAuthorization: Bearer " + token;
+    const std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + host + auth +
                             "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     NetworkSocket::send_all(fd, reinterpret_cast<const std::byte*>(req.data()), req.size());
     std::string buf;
@@ -143,14 +145,19 @@ HttpResult http_request(const std::string& host,
     return r;
 }
 
-HttpResult http_get(const std::string& host, std::uint16_t port, const std::string& path) {
-    return http_request(host, port, "GET", path);
+HttpResult http_get(const std::string& host,
+                    std::uint16_t port,
+                    const std::string& path,
+                    const std::string& token = "") {
+    return http_request(host, port, "GET", path, token);
 }
 
-bool await_http_ready(std::uint16_t port, std::chrono::milliseconds timeout) {
+bool await_http_ready(std::uint16_t port,
+                      std::chrono::milliseconds timeout,
+                      const std::string& token = "") {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
-        const auto r = http_get("127.0.0.1", port, "/api/v1/health");
+        const auto r = http_get("127.0.0.1", port, "/api/v1/health", token);
         if (r.status == 200) {
             return true;
         }
@@ -194,7 +201,20 @@ struct Cluster {
     }
 };
 
-std::optional<Cluster> start_cluster(int n_workers) {
+// With a token, every node is started with it as CLINK_AUTH_TOKEN, and every
+// request this harness makes carries it.
+std::optional<Cluster> start_cluster(int n_workers, const std::string& token = "") {
+    if (!token.empty()) {
+        ::setenv("CLINK_AUTH_TOKEN", token.c_str(), 1);
+    }
+    struct Unset {
+        bool active;
+        ~Unset() {
+            if (active) {
+                ::unsetenv("CLINK_AUTH_TOKEN");
+            }
+        }
+    } unset{!token.empty()};
     Cluster c;
     const auto node = node_binary_path();
     if (!std::filesystem::exists(node)) {
@@ -208,7 +228,7 @@ std::optional<Cluster> start_cluster(int n_workers) {
                                     "--http-port=" + std::to_string(c.coordinator_http_port),
                                     "--http-bind=127.0.0.1"},
                                    node);
-    if (c.coordinator_pid <= 0 || !await_http_ready(c.coordinator_http_port, 2s)) {
+    if (c.coordinator_pid <= 0 || !await_http_ready(c.coordinator_http_port, 2s, token)) {
         return std::nullopt;
     }
     for (int i = 1; i <= n_workers; ++i) {
@@ -223,7 +243,7 @@ std::optional<Cluster> start_cluster(int n_workers) {
                         "--http-port=" + std::to_string(http_port),
                         "--http-bind=127.0.0.1"},
                        node);
-        if (pid <= 0 || !await_http_ready(http_port, 2s)) {
+        if (pid <= 0 || !await_http_ready(http_port, 2s, token)) {
             return std::nullopt;
         }
         c.worker_pids.push_back(pid);
@@ -240,7 +260,8 @@ std::optional<Cluster> start_cluster(int n_workers) {
     // bound - this returns as soon as the count is right.
     if (!clink::itest::await_condition(
             [&] {
-                const auto r = http_get("127.0.0.1", c.coordinator_http_port, "/api/v1/workers");
+                const auto r =
+                    http_get("127.0.0.1", c.coordinator_http_port, "/api/v1/workers", token);
                 if (r.status != 200) {
                     return false;
                 }
@@ -347,6 +368,62 @@ TEST(HttpObservability, CoordinatorProxiesWorkerMetricsAndLogs) {
         "127.0.0.1", c->coordinator_http_port, "/api/v1/workers/" + c->worker_ids[0] + "/logs");
     EXPECT_EQ(proxied_l.status, 200);
     EXPECT_NE(proxied_l.body.find("\"logs\""), std::string::npos) << "body: " << proxied_l.body;
+}
+
+// Every node of this cluster asks for a token, as the quickstart advises for
+// a shared network. The coordinator read its workers without one, so its
+// proxied worker endpoints, the operator overlay and the queryable-state
+// routes all met the workers' 401s: the console showed every operator stale.
+TEST(HttpObservability, TheCoordinatorPresentsTheClusterTokenToItsWorkers) {
+    const std::string token = "observability-test-token";
+    auto c = start_cluster(/*n_workers=*/1, token);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    const auto direct = http_get("127.0.0.1", c->worker_http_ports[0], "/metrics");
+    EXPECT_EQ(direct.status, 401) << "the worker should ask for the token";
+    const auto proxied_m = http_get("127.0.0.1",
+                                    c->coordinator_http_port,
+                                    "/api/v1/workers/" + c->worker_ids[0] + "/metrics",
+                                    token);
+    EXPECT_EQ(proxied_m.status, 200) << proxied_m.body;
+    EXPECT_NE(proxied_m.body.find("# TYPE " + std::string{metrics::kWorkerSlotsCapacity}),
+              std::string::npos)
+        << "proxied body: " << proxied_m.body;
+    const auto proxied_l = http_get("127.0.0.1",
+                                    c->coordinator_http_port,
+                                    "/api/v1/workers/" + c->worker_ids[0] + "/logs",
+                                    token);
+    EXPECT_EQ(proxied_l.status, 200) << proxied_l.body;
+
+    // A worker started with another token refuses the coordinator, which says
+    // so, rather than passing on a 401 that reads as the caller's token being
+    // wrong.
+    const auto odd_port = probe_free_port();
+    ::setenv("CLINK_AUTH_TOKEN", "another-token", 1);
+    const pid_t odd =
+        spawn_proc({"clink_node",
+                    "--role=worker",
+                    "--id=worker-odd-token",
+                    "--coordinator-host=127.0.0.1",
+                    "--coordinator-port=" + std::to_string(c->coordinator_control_port),
+                    "--http-port=" + std::to_string(odd_port),
+                    "--http-bind=127.0.0.1"},
+                   node_binary_path());
+    ::unsetenv("CLINK_AUTH_TOKEN");
+    ASSERT_GT(odd, 0);
+    c->worker_pids.push_back(odd);
+    ASSERT_TRUE(clink::itest::await_condition(
+        [&] {
+            const auto r =
+                http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/workers", token);
+            return r.status == 200 && r.body.find("worker-odd-token") != std::string::npos;
+        },
+        std::chrono::seconds(20)));
+    const auto odd_m = http_get(
+        "127.0.0.1", c->coordinator_http_port, "/api/v1/workers/worker-odd-token/metrics", token);
+    EXPECT_EQ(odd_m.status, 502) << odd_m.body;
+    EXPECT_NE(odd_m.body.find("refused the coordinator's token"), std::string::npos) << odd_m.body;
 }
 
 TEST(HttpObservability, JobSubmissionBumpsCoordinatorCounters) {

@@ -247,6 +247,20 @@ id, so its capture holds `epoch-<N>.cap` files and no `final.cap`, and
 `--state-from`. Covered by
 `ReplayCli.EpochFinalReplaysTheLastEpochOfACheckpointedRun`.
 
+**With a token on every node, the Coordinator presents it to its Workers.** The
+quickstart advises starting every node with `CLINK_AUTH_TOKEN`, but the
+Coordinator read its Workers' HTTP APIs without it, and each call met the
+Worker's 401. `/api/v1/jobs/:id/operators` reported every operator stale, so
+the console showed no records, rates or watermarks; the proxied
+`/api/v1/workers/:id/metrics` and `/logs` returned 401, which the console took
+for the user's own token being refused; and queryable-state reads and the live
+state export through the Coordinator found nothing, so `clink state-query`
+answered empty. The Coordinator now presents its own token on those calls and
+only those: `HttpClient::present_cluster_token()` never sends it to a metrics
+collector or a lineage endpoint. A Worker that refuses the Coordinator's token
+is reported as a 502 that says so. Covered by
+`HttpObservability.TheCoordinatorPresentsTheClusterTokenToItsWorkers`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

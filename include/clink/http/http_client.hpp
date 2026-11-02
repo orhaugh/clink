@@ -31,6 +31,13 @@ public:
     // client can talk to a server started with CLINK_AUTH_TOKEN. Empty clears it.
     void set_bearer_token(const std::string& token);
 
+    // Present this node's own CLINK_AUTH_TOKEN, when it has one, on a request to
+    // another node of the cluster: every node of a cluster that asks for a token
+    // takes the same one. Only for calls inside the cluster, such as the
+    // coordinator reading a worker's HTTP API; the token must not go to anything
+    // else, a metrics collector or a lineage endpoint among them.
+    void present_cluster_token();
+
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;
     HttpClient(HttpClient&&) = delete;

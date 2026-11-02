@@ -1743,6 +1743,7 @@ inline std::vector<OpRuntime> build(const clink::cluster::Coordinator& coordinat
         bool reachable = tgt.has_value();
         if (reachable) {
             clink::http::HttpClient client(tgt->first, tgt->second);
+            client.present_cluster_token();
             auto r = client.get("/metrics");
             if (r.status != 200) {
                 reachable = false;
@@ -1943,10 +1944,21 @@ clink::http::HttpResponse proxy_to_worker(const clink::cluster::Coordinator& coo
         return out;
     }
     clink::http::HttpClient client(target->first, target->second);
+    client.present_cluster_token();
     auto r = client.get(remote_path);
     if (r.status == 0) {
         out.status = 502;
         out.body = std::string{R"({"error":"proxy to worker failed: )"} + r.error + "\"}";
+        return out;
+    }
+    // The worker refused the coordinator's own token, not the caller's, who got
+    // this far with one the coordinator accepted. Passed on as a 401 it read as
+    // the caller's token being wrong, and the console asked for it again.
+    if (r.status == 401) {
+        out.status = 502;
+        out.body = std::string{R"({"error":"worker )"} + worker_id +
+                   R"( refused the coordinator's token: every node of a cluster that asks for a )"
+                   R"(token must be started with the same CLINK_AUTH_TOKEN"})";
         return out;
     }
     out.status = r.status;

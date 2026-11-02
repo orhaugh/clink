@@ -99,6 +99,7 @@ inline FannedScan fan_out_scan(cluster::Coordinator& coordinator,
             break;
         }
         http::HttpClient client(t.host, t.port);
+        client.present_cluster_token();
         auto worker_resp = client.get("/api/v1/queryable_state/op/" + role + "/subtask/" +
                                       std::to_string(t.subtask_idx) + "/json/" + slot +
                                       "/scan?limit=" + std::to_string(limit - out.entries.size()) +
@@ -268,6 +269,7 @@ inline void register_coordinator_routes(http::HttpServer& server,
                    }
                    for (const auto& t : targets) {
                        http::HttpClient client(t.host, t.port);
+                       client.present_cluster_token();
                        auto worker_resp =
                            client.get("/api/v1/queryable_state/op/" + role_it->second +
                                       "/subtask/" + std::to_string(t.subtask_idx) + "/json/" +

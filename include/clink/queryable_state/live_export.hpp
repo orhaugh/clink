@@ -132,6 +132,7 @@ inline void register_coordinator_state_export_route(http::HttpServer& server,
             std::vector<std::vector<std::byte>> parts;
             for (const auto& [host, port] : workers) {
                 http::HttpClient client(host, port);
+                client.present_cluster_token();
                 auto worker_resp = client.get("/api/v1/state/export/job/" + std::to_string(job));
                 if (worker_resp.status != 200) {
                     continue;  // worker hosts no backends for the job (or is gone)
