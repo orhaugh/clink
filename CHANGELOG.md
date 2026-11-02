@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## v0.15.0 (November 2026)
+
+A sweep release: the defects and rough edges found since v0.14.0, fixed
+together rather than one patch release at a time, and the ops console v0.3.0.
+The plugin ABI fingerprint rotates (headers on its surface changed, among them
+`keyed_state.hpp`, `pipeline.hpp`, `snapshots.hpp`, `worker.hpp` and
+`coordinator.hpp`), so job modules built against v0.14 must be rebuilt. There
+are no state-format or wire-protocol changes; the HTTP API gains fields and
+loses none.
+
+Defaults that change: a Worker keeps two completed checkpoints
+(`--checkpoint-num-retained`), a daemon logs synchronously unless started with
+`--log-async=true`, a source whose input does not divide is read by one subtask
+at any parallelism, and in the typed API a timer that reads `current_key()`
+needs a timer key decoder. A cluster that asks for a token works with the token
+on every node, as the quickstart advises; before, the Coordinator's own reads of
+its Workers were refused. The Kafka to ClickHouse tutorial runs on the native
+sink and ClickHouse 26.8, and needs a runtime image from v0.11.0 or later.
 
 **A source whose input does not divide between subtasks is read once at any
 parallelism.** A file, a query's result, an Iceberg snapshot, an endpoint

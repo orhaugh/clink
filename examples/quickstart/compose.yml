@@ -12,7 +12,7 @@
 name: clink-quickstart
 
 x-clink: &clink
-  image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.14.1}
+  image: ${CLINK_IMAGE:-ghcr.io/orhaugh/clink-runtime:0.15.0}
 
 services:
   coordinator:
