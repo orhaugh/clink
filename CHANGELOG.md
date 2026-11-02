@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## v0.14.0 (November 2026)
+
+Every release carries the ops console. The SDK tarball and the runtime image
+install clink-fe's console at `share/clink/console`, a Coordinator with an
+HTTP port serves it at `/`, and it loads behind a token. A quickstart starts a
+Coordinator, two Workers and two jobs with the console from the published
+image, and the job list and a job's page name the job. The name is a new
+field of `JobSummary` and `JobDetail` in `snapshots.hpp`, so the plugin ABI
+fingerprint rotates: rebuild job modules against this release. The wire
+protocol and the checkpoint and state formats are unchanged.
 
 **Every release carries the ops console, and a Coordinator serves it.** The
 console lives in its own repository and reached users only through a separate
