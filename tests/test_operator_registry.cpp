@@ -11,12 +11,14 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/operators/source_operator.hpp"
+#include "clink/runtime/log_buffer.hpp"
 
 using namespace clink;
 using namespace clink::cluster;
@@ -100,4 +102,39 @@ TEST(OperatorRegistry, SinkRequiresPathParam) {
     OperatorBuildContext ctx;
     ctx.params = {};  // 'path' missing -> factory throws
     EXPECT_THROW((void)fac->build(ctx), std::runtime_error);
+}
+
+// A factory registered over another is logged, once per factory per process: a
+// job module that registers the same factories on every submit used to log
+// every one of them again each time.
+TEST(OperatorRegistry, AReplacedFactoryIsLoggedOnceNotOnEveryRegistration) {
+    const auto factory = [] {
+        return SourceFactory{
+            .out = std::string{clink::cluster::kChannelInt64},
+            .build = [](const OperatorBuildContext&) -> std::shared_ptr<void> {
+                return std::static_pointer_cast<void>(std::make_shared<VectorSource<std::int64_t>>(
+                    std::vector<Record<std::int64_t>>{}));
+            },
+        };
+    };
+    const auto replaced_lines = [] {
+        int n = 0;
+        for (const auto& r : clink::LogBuffer::global().tail(4000, "info")) {
+            if (r.message.find("factory for 'twice_registered_src' was already registered") !=
+                std::string::npos) {
+                ++n;
+            }
+        }
+        return n;
+    };
+    OperatorRegistry reg;
+    reg.register_source("twice_registered_src", factory());
+    EXPECT_EQ(replaced_lines(), 0);
+    reg.register_source("twice_registered_src", factory());
+    EXPECT_EQ(replaced_lines(), 1);
+    reg.register_source("twice_registered_src", factory());
+    OperatorRegistry another;
+    another.register_source("twice_registered_src", factory());
+    another.register_source("twice_registered_src", factory());
+    EXPECT_EQ(replaced_lines(), 1) << "the same replacement was logged again";
 }

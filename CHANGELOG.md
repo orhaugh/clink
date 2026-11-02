@@ -80,6 +80,14 @@ wherever it stood as a statement, so every consumer that compiled an inline
 clink header with a fault point in it saw `-Wunused-value`. It is now a call to
 the inline `reach`, which the optimiser removes as before.
 
+**Two log lines stop flooding.** The Coordinator logged every checkpoint of
+every job as commit-confirmed at INFO, about nine lines a second at 18 jobs; it
+is now a debug line, and `latest_confirmed_checkpoint_id` reports the same
+progress. A replaced factory is logged once per process instead of on every
+registration, so a job module that registers its factories on each submit no
+longer logs twelve lines a submit. Covered by
+`OperatorRegistry.AReplacedFactoryIsLoggedOnceNotOnEveryRegistration`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

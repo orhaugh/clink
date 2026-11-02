@@ -4,6 +4,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -34,10 +35,19 @@ namespace {
 // It took a stack trace out of the row-materialisation site to find, because
 // nothing else distinguished the two.
 //
-// One line per replacement makes the next one visible. It cannot be noisy: it
-// only fires when a key is genuinely taken, which for a legitimate plugin override
-// is exactly the event worth recording.
+// One line per replaced factory makes the next override visible. Once per factory
+// per process, though: a job module that registers the same factories again on
+// every submit took twelve lines a submit to say the same thing, and the first
+// line already says what a repeat would.
 void note_replacement(const char* kind, const std::string& type) {
+    static std::mutex noted_mu;
+    static std::set<std::string> noted;
+    {
+        std::lock_guard lock(noted_mu);
+        if (!noted.insert(std::string{kind} + '\0' + type).second) {
+            return;
+        }
+    }
     log::info("registry.replace",
               std::string{"a "} + kind + " factory for '" + type +
                   "' was already registered and has been REPLACED; "

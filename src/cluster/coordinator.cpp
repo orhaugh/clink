@@ -9985,9 +9985,12 @@ void Coordinator::handle_commit_confirmed_(MessageReader& r, const WorkerConnect
                 .emit();
         }
     }
-    clink::log::info("coordinator.checkpoint",
-                     "job_id=" + std::to_string(jid) + " checkpoint " +
-                         std::to_string(confirmed_id) + " commit-CONFIRMED");
+    // Debug, not info: it fires for every checkpoint of every job, which at 18
+    // jobs was about nine lines a second. latest_confirmed_checkpoint_id on the
+    // job reports the same progress.
+    clink::log::debug("coordinator.checkpoint",
+                      "job_id=" + std::to_string(jid) + " checkpoint " +
+                          std::to_string(confirmed_id) + " commit-CONFIRMED");
 }
 
 std::vector<Coordinator::PendingDeploy> Coordinator::initiate_job_restart_locked_(
