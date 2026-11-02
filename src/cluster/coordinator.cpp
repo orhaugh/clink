@@ -4868,6 +4868,40 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
         ack.message = "savepoint timed out after " + std::to_string(timeout.count()) + "ms";
         return ack;
     }
+    // A later checkpoint completing ends the wait too, and says nothing about this
+    // one: a failed ack or a restart can have dropped it. The id is a savepoint
+    // only if its own COMPLETED marker exists, so look, outside the lock. Without
+    // the look a savepoint could hand back an id with no checkpoint behind it,
+    // which the restore it was taken for then cannot find.
+    if (const auto marker_root = it->second->checkpoint.checkpoint_dir; !marker_root.empty()) {
+        lock.unlock();
+        bool has_marker = false;
+        try {
+            has_marker = make_coordination_store(marker_root)
+                             ->get("_jobs/" + std::to_string(job_id) + "/COMPLETED-" +
+                                   std::to_string(ckpt_id))
+                             .has_value();
+        } catch (const std::exception& e) {
+            ack.ok = false;
+            ack.message = "savepoint checkpoint " + std::to_string(ckpt_id) +
+                          ": cannot read its COMPLETED marker: " + e.what();
+            return ack;
+        }
+        lock.lock();
+        it = jobs_.find(job_id);
+        if (it == jobs_.end()) {
+            ack.ok = false;
+            ack.message = "job disappeared during savepoint";
+            return ack;
+        }
+        if (!has_marker) {
+            ack.ok = false;
+            ack.message = "savepoint checkpoint " + std::to_string(ckpt_id) +
+                          " did not complete, though a later checkpoint did; nothing was saved "
+                          "under it";
+            return ack;
+        }
+    }
     // The handle the operator is about to be given must not decay under
     // them. Pinned here, once the checkpoint has COMPLETED, so a savepoint
     // that failed pins nothing (item 74).

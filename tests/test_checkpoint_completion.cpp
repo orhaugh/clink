@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -622,6 +623,34 @@ struct CheckpointFixture {
         return true;
     }
 
+    // The drain of a rewind: every deployed subtask reports it has finished.
+    bool finish_all(JobId job_id) {
+        for (const auto& [role, subtask] : deployed_) {
+            if (!worker->send_finished(job_id, role, subtask)) {
+                return false;
+            }
+        }
+        return !deployed_.empty();
+    }
+
+    // The redeploy after a rewind: take the Deploy the coordinator sends and
+    // report every task in it listening, as bring_up does for the first.
+    bool redeploy(JobId job_id) {
+        auto deploy = worker->await_frame(MessageKind::Deploy, 10s);
+        if (!deploy.has_value()) {
+            return false;
+        }
+        deployed_.clear();
+        std::uint16_t fake_port = 40100;
+        for (const auto& t : decode_deploy(*deploy).tasks) {
+            deployed_.emplace_back(t.role, t.subtask_idx);
+            if (!worker->report_listening(job_id, t.role, t.subtask_idx, fake_port++)) {
+                return false;
+            }
+        }
+        return !deployed_.empty();
+    }
+
     // Wait for a TriggerCheckpoint and return the id it carries.
     std::optional<std::uint64_t> await_trigger() {
         auto r = worker->await_frame(MessageKind::TriggerCheckpoint);
@@ -1205,6 +1234,50 @@ TEST(CheckpointCompletion, ASavepointWhoseIdCannotBeRecordedSendsNothing) {
     ASSERT_TRUE(detail.has_value());
     EXPECT_TRUE(detail->pending_checkpoint_ids.empty())
         << "the refused savepoint left a checkpoint waiting on acks";
+}
+
+// A savepoint is its own checkpoint or nothing. Its checkpoint can fail, a
+// subtask unable to snapshot, and the job rewind; the restarted job then
+// completes later checkpoints, which carried the completed high-water mark past
+// the savepoint's id. The wait used to end there with success: an id with no
+// COMPLETED marker, so the restore the savepoint was taken for found nothing.
+TEST(CheckpointCompletion, ASavepointWhoseCheckpointFailedIsNotReportedTakenAfterTheRewind) {
+    CheckpointFixture fx;
+    // No periodic trigger in the window: every checkpoint here is a savepoint.
+    const auto job_id = fx.bring_up(/*max_restarts=*/3, /*interval_ms=*/600'000);
+    ASSERT_GT(job_id, 0U);
+
+    auto first =
+        std::async(std::launch::async, [&] { return fx.coordinator->take_savepoint(job_id, 20s); });
+    const auto failed = fx.await_trigger();
+    ASSERT_TRUE(failed.has_value());
+    ASSERT_TRUE(fx.ack_all(job_id, *failed, /*ok=*/false));
+
+    // The rewind: the subtasks drain, and the job is deployed again.
+    ASSERT_TRUE(fx.worker->await_frame(MessageKind::CancelJob, 5s).has_value());
+    ASSERT_TRUE(fx.finish_all(job_id));
+    ASSERT_TRUE(fx.redeploy(job_id)) << "the rewind never redeployed the job";
+
+    // A later checkpoint completes on the restarted job. Every checkpoint it
+    // triggers is acked until the savepoint answers: the restart can trigger one
+    // of its own beside the savepoint's, and the savepoint's waits behind it.
+    auto later =
+        std::async(std::launch::async, [&] { return fx.coordinator->take_savepoint(job_id, 10s); });
+    while (later.wait_for(0s) != std::future_status::ready) {
+        if (auto frame = fx.worker->await_frame(MessageKind::TriggerCheckpoint, 200ms)) {
+            ASSERT_TRUE(
+                fx.ack_all(job_id, decode_trigger_checkpoint(*frame).checkpoint_id, /*ok=*/true));
+        }
+    }
+    const auto taken = later.get();
+    ASSERT_TRUE(taken.ok) << taken.message;
+    ASSERT_GT(taken.checkpoint_id, *failed);
+
+    const auto refused = first.get();
+    EXPECT_FALSE(refused.ok) << "a savepoint was reported taken as checkpoint "
+                             << refused.checkpoint_id << ", which has no COMPLETED marker";
+    EXPECT_NE(refused.message.find("did not complete"), std::string::npos) << refused.message;
+    EXPECT_FALSE(fx.marker_exists(job_id, *failed));
 }
 
 // The final id's barrier leaves with the reply: the source injects it the

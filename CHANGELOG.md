@@ -97,6 +97,14 @@ unchecked, leaving the refusal to the Worker after deploy. It now resolves the
 snapshot as the restore does, from the checkpoint's COMPLETED marker. Covered by
 `RestoreCompatGate.*`, which now write the layout a job writes.
 
+**A savepoint is reported taken only when its own checkpoint completed.** The
+wait ended once the job's completed high-water mark passed the savepoint's id,
+so a savepoint whose checkpoint failed, followed by a rewind and a later
+checkpoint, answered success with an id that had no COMPLETED marker, and the
+restore it was taken for found nothing. It now checks the marker and refuses
+otherwise. Covered by
+`CheckpointCompletion.ASavepointWhoseCheckpointFailedIsNotReportedTakenAfterTheRewind`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's
