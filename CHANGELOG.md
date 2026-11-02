@@ -223,6 +223,18 @@ checkpoint a graceful stop ended it at, so a stopped job still reads as
 stopped; a record written by an earlier release lists them as empty and 0.
 Covered by `Cluster.AJobThatEndedUnderAnEarlierCoordinatorIsStillListed`.
 
+**The delivery report warns when a broker-acknowledged source shares a job
+with the Kafka transactional sink.** The RabbitMQ, NATS JetStream and Pulsar
+sources acknowledge their broker when a checkpoint completes. A sink whose
+commit cannot be re-executed after a crash, the Kafka transactional sink, has
+the job restore from the newest checkpoint whose commit is confirmed, which can
+be the one before: if a crash falls between the two and the commit cannot be
+completed at recovery, that interval is replayed by every other source but lost
+from the acknowledged one. A job that asks for exactly-once is already refused
+with such a source; one that builds the sink directly is now warned, naming
+both. Covered by
+`ConnectorCapabilityTest.AnAcknowledgingSourceBesideAnUnconfirmedCommitIsWarnedAbout`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

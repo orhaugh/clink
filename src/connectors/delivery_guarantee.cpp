@@ -156,6 +156,9 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
     auto weakest = DeliveryGuarantee::ExactlyOnceTwoPhaseCommit;
     std::string weakest_sink;
     bool any_sink = false;
+    // A sink on the commit-confirmed protocol: a restore after a crash goes to
+    // the newest checkpoint whose commit is confirmed.
+    std::string unconfirmed_sink;
     bool needs_idempotent_key = false;
     for (const auto& c : facts.connectors) {
         if (c.is_source) {
@@ -178,6 +181,11 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
             continue;
         }
         auto sink_level = caps->delivery;
+        if ((caps->delivery == DeliveryGuarantee::ExactlyOnceTwoPhaseCommit ||
+             caps->delivery == DeliveryGuarantee::ExactlyOnceAtomicPublish) &&
+            !caps->commit_recoverable && unconfirmed_sink.empty()) {
+            unconfirmed_sink = c.op_type;
+        }
 
         // A sink that CLAIMS exactly-once only delivers it when the
         // options that make the mechanism work were actually supplied. A
@@ -284,6 +292,22 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
          r.level == EndToEndGuarantee::StateExactlyOnceOutputAtLeastOnce)) {
         r.level = EndToEndGuarantee::AtLeastOnceSource;
         r.limiting_factor = "source '" + redelivered_source + "'";
+    }
+    // Such a source acknowledges when a checkpoint completes, and a sink on the
+    // commit-confirmed protocol has the job restore from the newest checkpoint
+    // whose commit is confirmed, which can be the one before. An interval
+    // between the two is then replayed by every other source and not by this
+    // one: its broker has dropped what was acknowledged. An exactly-once
+    // request is refused above, so only a job built with the sink directly
+    // reaches this.
+    if (!redelivered_source.empty() && !unconfirmed_sink.empty()) {
+        r.warnings.emplace_back(
+            "source '" + redelivered_source +
+            "' acknowledges its broker when a checkpoint completes, before sink '" +
+            unconfirmed_sink +
+            "' confirms that checkpoint's commit; if a crash falls between the two and the "
+            "commit cannot be completed at recovery, the job restores from the checkpoint "
+            "before it and the broker does not deliver that interval's records again");
     }
 
     // ---- 6. Determinism. Orthogonal to delivery: a job can commit each

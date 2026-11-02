@@ -412,6 +412,58 @@ TEST_F(ConnectorCapabilityTest, AnAcknowledgingSourceIsAtLeastOnceNotAtMostOnce)
     EXPECT_TRUE(r.acceptable()) << r.render_text();
 }
 
+// The same source beside a sink on the commit-confirmed protocol, built
+// directly rather than asked for (an exactly-once request is refused above).
+// The source acknowledges at completion and the restore can go to the
+// checkpoint before, so the report says what interval that loses.
+TEST_F(ConnectorCapabilityTest, AnAcknowledgingSourceBesideAnUnconfirmedCommitIsWarnedAbout) {
+    CapabilityRegistry::instance().declare(ConnectorCapabilities{
+        .name = "test_acknowledging",
+        .version = "1",
+        .is_source = true,
+        .replayable = false,
+        .offset_model = OffsetModel::Acknowledgement,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+    });
+    CapabilityRegistry::instance().declare(ConnectorCapabilities{
+        .name = "test_unrecoverable",
+        .version = "1",
+        .is_sink = true,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::ExactlyOnceTwoPhaseCommit,
+        .transactional = true,
+        .commit_recoverable = false,
+    });
+    struct Undeclare {
+        ~Undeclare() {
+            CapabilityRegistry::instance().undeclare("test_acknowledging");
+            CapabilityRegistry::instance().undeclare("test_unrecoverable");
+        }
+    } cleanup;
+    const auto warned = [](const GuaranteeReport& r) {
+        for (const auto& w : r.warnings) {
+            if (w.find("does not deliver that interval's records again") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    PipelineFacts f;
+    f.connectors = {src("test_acknowledging"), snk("test_unrecoverable", {})};
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    auto r = analyse_pipeline(f);
+    EXPECT_EQ(r.level, EndToEndGuarantee::AtLeastOnceSource) << r.render_text();
+    EXPECT_TRUE(warned(r)) << r.render_text();
+
+    // A sink whose commit a later process can complete restores from the
+    // checkpoint the source acknowledged, so there is nothing to warn about.
+    f.connectors = {src("test_acknowledging"), snk("file_2pc", {"dir"})};
+    r = analyse_pipeline(f);
+    EXPECT_FALSE(warned(r)) << r.render_text();
+}
+
 TEST_F(ConnectorCapabilityTest, RequestingExactlyOnceFromAWeakPipelineIsRejected) {
     PipelineFacts f;
     f.connectors = {src("file"), snk("file")};
