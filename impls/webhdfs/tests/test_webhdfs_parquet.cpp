@@ -270,6 +270,25 @@ TEST(WebHdfsParquetSource, OpenAgainstDeadEndpointFailsCleanly) {
     EXPECT_NO_THROW(src.close());  // close after a failed open must be safe
 }
 
+// A cancelled run uploads nothing: the sink builds its file in memory and close()
+// sends it with its footer, so a cut-short run would publish a complete-looking
+// file.
+TEST(WebHdfsParquetSink, ACancelledSinkUploadsNothing) {
+    MockWebHdfs srv;
+    WebHdfsParquetSink<std::int64_t>::Options so;
+    so.base_url = srv.base_url();
+    so.path = "/clink/cancelled.parquet";
+    {
+        WebHdfsParquetSink<std::int64_t> sink(so, int64_arrow_batcher());
+        sink.open();
+        Batch<std::int64_t> b;
+        b.emplace(10);
+        sink.on_data(b);
+        sink.close_cancelled();
+    }
+    EXPECT_TRUE(srv.paths().empty()) << "a cancelled run uploaded a file";
+}
+
 TEST(WebHdfsParquetRoundTrip, Int64WriteThenRead) {
     MockWebHdfs srv;
     const std::string path = "/clink/rt_int64.parquet";

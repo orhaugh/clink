@@ -199,6 +199,14 @@ public:
         }
     }
 
+    // A cancelled run uploads nothing. The file is built in memory and only
+    // close() sends it, with its footer, so a cut-short run would publish a
+    // file that reads as complete; the buffer is dropped instead.
+    void close_cancelled() override {
+        writer_.reset();
+        out_stream_.reset();
+    }
+
     void close() override {
         if (!writer_) {
             return;  // never opened, or already finalised

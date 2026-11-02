@@ -128,6 +128,16 @@ defaulted to 1, so a checkpoint that failed its integrity check at restore had
 no completed one to fall back to. It now defaults to 2; set it to 1 to keep
 the old footprint.
 
+**A cancelled single-object Parquet sink leaves no complete-looking output.**
+The programmatic `ParquetSink`, `ParquetS3Sink`, `ParquetGcsSink`,
+`ParquetAzureSink` and `WebHdfsParquetSink` write their footer, or their upload,
+in `close()`, which a cancelled task called as well, so a run cut short left
+an object that read as the run's complete output. On cancel the local sink now
+removes its file, the S3 sink aborts its multipart upload, the GCS and Azure
+sinks, whose streams cannot abort, delete the object, and the WebHDFS sink
+uploads nothing. Covered by `ParquetConnector.ACancelledSinkLeavesNoFileBehind`
+and `WebHdfsParquetSink.ACancelledSinkUploadsNothing`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

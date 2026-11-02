@@ -389,3 +389,21 @@ TEST(ParquetConnector, AFileAnotherToolWroteReadsWithNoEventTime) {
     EXPECT_EQ(values, (std::vector<std::int64_t>{7, 8, 9}));
     std::filesystem::remove(path);
 }
+
+// A cancelled run leaves no file. close() writes the footer, so a file a
+// cancelled task closed read as complete though the run was cut short.
+TEST(ParquetConnector, ACancelledSinkLeavesNoFileBehind) {
+    const auto path = tmp_parquet("cancelled");
+    {
+        ParquetSink<std::int64_t> sink(path, int64_arrow_batcher());
+        sink.open();
+        Batch<std::int64_t> b;
+        b.emplace(10, EventTime{100});
+        b.emplace(20, EventTime{200});
+        sink.on_data(b);
+        ASSERT_TRUE(std::filesystem::exists(path));
+        sink.close_cancelled();
+    }
+    EXPECT_FALSE(std::filesystem::exists(path))
+        << "a cancelled run left a file that reads as its complete output";
+}

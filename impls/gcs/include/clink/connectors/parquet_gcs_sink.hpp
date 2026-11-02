@@ -149,6 +149,21 @@ public:
         }
     }
 
+    // A cancelled run leaves no object. close() would write each footer, so a
+    // cut-short run would read as complete, and this stream cannot abort (its
+    // Abort completes the upload): the object is closed as it is and deleted.
+    void close_cancelled() override {
+        for (auto& [k, entry] : writers_) {
+            if (entry.out) {
+                (void)entry.out->Close();
+            }
+            entry.writer.reset();  // its footer write meets a closed stream
+            entry.out.reset();
+            (void)fs_->DeleteFile(opts_.bucket + "/" + k);
+        }
+        writers_.clear();
+    }
+
     void close() override {
         // Close + release EVERY writer/stream before reporting an error, so a failure on one
         // key does not strand the other keys' streams un-Closed (a partial object) or leave

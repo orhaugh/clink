@@ -97,6 +97,20 @@ public:
         }
     }
 
+    // A cancelled run leaves no file. close() writes the footer, so the file
+    // would read as complete though the run was cut short. The stream is closed
+    // first: the writer's destructor then fails to write a footer, quietly, and
+    // the partial file is removed.
+    void close_cancelled() override {
+        if (out_) {
+            (void)out_->Close();
+        }
+        writer_.reset();
+        out_.reset();
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
+
     void close() override {
         if (writer_) {
             if (auto s = writer_->Close(); !s.ok()) {

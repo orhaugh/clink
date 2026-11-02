@@ -185,6 +185,20 @@ public:
         }
     }
 
+    // A cancelled run publishes nothing. close() would write each footer and
+    // complete each upload, so a cut-short run would read as complete; Abort
+    // ends the multipart upload instead, and no object appears.
+    void close_cancelled() override {
+        for (auto& [k, entry] : writers_) {
+            if (entry.out) {
+                (void)entry.out->Abort();
+            }
+            entry.writer.reset();  // its footer write meets an aborted stream
+            entry.out.reset();
+        }
+        writers_.clear();
+    }
+
     void close() override {
         // Close + release EVERY writer/stream before reporting an error, so a failure on one
         // key does not strand the other keys' streams un-Closed (a partial object) or leave
