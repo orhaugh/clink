@@ -110,6 +110,10 @@ private:
     std::uint64_t op_id_;
     std::string path_;
     std::string body_prefix_;  // {"statement":...,"accessMode":"READ",...,"parameters":{"key":
+    // The same, for the reads before the pool's first answer: their limit is
+    // the open check's, past request_timeout_ms, not server_timeout_s.
+    std::string first_body_prefix_;
+    std::atomic<bool> answered_{false};  // a read has been answered
     clink::http_connector::BoundedRequest request_;
     std::vector<std::string> result_names_;
     std::vector<std::unique_ptr<Worker>> workers_;

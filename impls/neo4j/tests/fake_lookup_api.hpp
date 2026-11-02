@@ -106,6 +106,14 @@ public:
         const std::lock_guard<std::mutex> lock(mu_);
         planning_ = took;
     }
+    // How long the server takes over the statement's first execution, which
+    // plans and compiles it even after an EXPLAIN. As for EXPLAIN, it applies
+    // maxExecutionTime only once the plan is made: until a read is answered, a
+    // read given less time is answered, after it, with the timeout error.
+    void first_execution(std::chrono::milliseconds took) {
+        const std::lock_guard<std::mutex> lock(mu_);
+        first_execution_ = took;
+    }
     void explain_body(int status, std::string body) {
         const std::lock_guard<std::mutex> lock(mu_);
         explain_status_ = status;
@@ -226,6 +234,19 @@ private:
                 return;
             }
             reads_.push_back(got);
+            if (first_execution_.count() > 0 && !executed_) {
+                cv_.wait_for(lock, first_execution_, [this] { return released_; });
+                if (!got.max_execution_time.empty() &&
+                    std::stoll(got.max_execution_time) * 1000 < first_execution_.count()) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"errors":[{"code":"Neo.ClientError.Transaction.)"
+                        R"(TransactionTimedOutClientConfiguration","message":"scripted"}]})",
+                        "application/vnd.neo4j.query");
+                    return;
+                }
+                executed_ = true;
+            }
             if (!queue_.empty()) {
                 a = std::move(queue_.front());
                 queue_.pop_front();
@@ -273,6 +294,8 @@ private:
     int explain_status_{202};
     std::string explain_raw_;
     std::chrono::milliseconds planning_{0};
+    std::chrono::milliseconds first_execution_{0};
+    bool executed_{false};
     std::vector<LookupReceived> reads_;
     std::size_t explains_{0};
     std::vector<std::string> explain_limits_;

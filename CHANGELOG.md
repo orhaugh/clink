@@ -192,6 +192,17 @@ plugin's override of a built-in still is. Covered by
 `OperatorRegistry.AReplacementInsideTheBuiltInsScopeIsNotReported` and
 `OperatorRegistry.RegisteringTheBuiltInsReportsNoReplacement`.
 
+**A Neo4j lookup's first read is no longer held to `server_timeout_s`.** A
+server that has just started plans and compiles a statement on its first
+execution, which the open check's `EXPLAIN` does not spare it, and counts that
+time against `maxExecutionTime` once the plan is made. A first read held to
+`server_timeout_s` on a slow start was ended with `neo4j.timeout`, and since
+the server keeps no plan from a request it ends, the restarted job met the
+same limit. Until the lookup has an answer, its reads now carry the open
+check's limit, past `request_timeout_ms`, which bounds them; every read after
+the first answer carries `server_timeout_s`. Covered by
+`Neo4jLookup.AFirstReadSlowerThanServerTimeoutIsAnsweredAndLaterReadsKeepTheLimit`.
+
 ## v0.14.1 (November 2026)
 
 A packaging fix: the SDK tarball carries the ops console, which v0.14.0's

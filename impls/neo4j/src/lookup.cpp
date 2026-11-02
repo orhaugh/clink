@@ -67,13 +67,25 @@ LookupPool::LookupPool(LookupOptions options,
                        std::uint64_t op_id)
     : opts_(std::move(options)), cancel_(std::move(cancel)), metrics_(metrics), op_id_(op_id) {
     path_ = opts_.query_path();
-    body_prefix_ = "{\"statement\":";
-    append_json_string(opts_.statement, body_prefix_);
-    body_prefix_ += ",\"accessMode\":\"READ\"";
+    std::string head = "{\"statement\":";
+    append_json_string(opts_.statement, head);
+    head += ",\"accessMode\":\"READ\"";
+    body_prefix_ = head;
+    first_body_prefix_ = head;
+    // A server that has just started plans and compiles a statement on its
+    // first execution, which the open check's EXPLAIN does not spare it, and
+    // the elapsed time counts against maxExecutionTime once the plan is made.
+    // A first read held to server_timeout_s on a slow start is ended, the
+    // server keeps no plan from a request it ends, and every restart meets the
+    // same limit. So until the pool has an answer its reads carry the check's
+    // limit, past request_timeout_ms, which bounds them instead.
     if (opts_.server_timeout_s > 0) {
         body_prefix_ += ",\"maxExecutionTime\":" + std::to_string(opts_.server_timeout_s);
+        first_body_prefix_ +=
+            ",\"maxExecutionTime\":" + std::to_string(opts_.request_timeout_ms / 1000 + 1);
     }
     body_prefix_ += ",\"parameters\":{\"key\":";
+    first_body_prefix_ += ",\"parameters\":{\"key\":";
     request_.headers["Accept"] = kTypedJson;
     request_.max_response_bytes = opts_.max_response_bytes;
     for (const auto& c : opts_.result_columns) {
@@ -304,9 +316,11 @@ void LookupPool::serve_(Worker& w, LookupCall& call) {
 }
 
 LookupResult LookupPool::read_(Worker& w, const std::string& key) {
+    const bool answered = answered_.load(std::memory_order_acquire);
+    const std::string& prefix = answered ? body_prefix_ : first_body_prefix_;
     std::string body;
-    body.reserve(body_prefix_.size() + key.size() + 2);
-    body += body_prefix_;
+    body.reserve(prefix.size() + key.size() + 2);
+    body += prefix;
     body += key;
     body += "}}";
     Backoff backoff;
@@ -336,6 +350,7 @@ LookupResult LookupPool::read_(Worker& w, const std::string& key) {
         Reply reply;
         Outcome o = judge_read(r, reply);
         if (o.verdict == Verdict::Committed) {
+            answered_.store(true, std::memory_order_release);
             if (metrics_ != nullptr) {
                 metrics_
                     ->histogram(
@@ -364,9 +379,14 @@ LookupResult LookupPool::read_(Worker& w, const std::string& key) {
                 if (o.code ==
                     "Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration") {
                     fail_(code::kTimeout,
-                          "the server ended the read at server_timeout_s=" +
-                              std::to_string(opts_.server_timeout_s) +
-                              "; the statement is too slow for the limit");
+                          answered ? "the server ended the read at server_timeout_s=" +
+                                         std::to_string(opts_.server_timeout_s) +
+                                         "; the statement is too slow for the limit"
+                                   : "the server ended the lookup's first read at "
+                                     "maxExecutionTime=" +
+                                         std::to_string(opts_.request_timeout_ms / 1000 + 1) +
+                                         ", the limit a read carries until the lookup has an "
+                                         "answer; the statement is too slow for it");
                 }
                 fail_(error_code_for(o.error_class), "the server refused the lookup: " + o.detail);
             case Verdict::TlsRefused:

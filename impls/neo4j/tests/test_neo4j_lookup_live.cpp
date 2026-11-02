@@ -349,6 +349,9 @@ TEST_F(Neo4jLookupLive, TheServersOwnTimeoutEndsASlowRead) {
     LiveLookup l(
         params(slow, "c:BIGINT", {{"server_timeout_s", "1"}, {"request_timeout_ms", "20000"}}));
     l.op->open();
+    // The lookup's first answer, from a key that matches nothing: reads before
+    // it carry the open check's limit, the ones after it server_timeout_s.
+    (void)l.run({"absent"});
     const auto start = Clock::now();
     const auto [c, m] = failure([&] { (void)l.run({"k1"}); });
     const auto took = Clock::now() - start;
@@ -369,6 +372,17 @@ TEST_F(Neo4jLookupLive, ACancelEndsTheWaitAtOnceAndTheServerTimeoutEndsTheRead) 
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     LookupPool pool(opts, clink::CancelSignal{cancel, nullptr}, nullptr, 1);
     pool.open();
+    // The pool's first answer, from a key that matches nothing, so that the
+    // slow read below carries server_timeout_s rather than the first reads'
+    // limit.
+    auto first = std::make_shared<LookupCall>();
+    first->key = R"({"$type":"String","_value":"absent"})";
+    pool.submit(first);
+    for (int i = 0; i < 1000 && !first->done.load(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    ASSERT_TRUE(first->done.load()) << "the first read was never answered";
+    ASSERT_FALSE(first->error) << "the first read failed";
     auto call = std::make_shared<LookupCall>();
     call->key = R"({"$type":"String","_value":"k1"})";
     pool.submit(call);

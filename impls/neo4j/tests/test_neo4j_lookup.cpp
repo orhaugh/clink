@@ -416,6 +416,29 @@ TEST(Neo4jLookup, RefusalsAreNotRetriedAndTheServerTimeoutIsSentAndNamed) {
         EXPECT_EQ(api.reads().size(), 1U);
     }
     {
+        // After the lookup's first answer a read carries server_timeout_s,
+        // and the server ending it names that limit.
+        FakeLookupApi api({"shared", "evidence"});
+        LookupAnswer slow;
+        slow.error_code = "Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration";
+        api.answer("3", one(2, "acct-09"));
+        api.answer("4", slow);
+        Rig rig(
+            api,
+            {{"server_timeout_s", "1"}, {"max_concurrent_requests", "1"}, {"max_in_flight", "1"}});
+        rig.op->open();
+        const auto [c, m] = failure([&] {
+            rig.process(data({probe(1, 3)}));
+            rig.process(data({probe(2, 4)}));
+            rig.op->flush(rig.out);
+        });
+        EXPECT_EQ(c, code::kTimeout);
+        EXPECT_NE(m.find("server_timeout_s=1"), std::string::npos) << m;
+        ASSERT_EQ(api.reads().size(), 2U);
+        EXPECT_EQ(api.reads()[1].max_execution_time, "1");
+    }
+    {
+        // The first read carries the open check's limit, and is named by it.
         FakeLookupApi api({"shared", "evidence"});
         LookupAnswer slow;
         slow.error_code = "Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration";
@@ -427,9 +450,9 @@ TEST(Neo4jLookup, RefusalsAreNotRetriedAndTheServerTimeoutIsSentAndNamed) {
             rig.op->flush(rig.out);
         });
         EXPECT_EQ(c, code::kTimeout);
-        EXPECT_NE(m.find("server_timeout_s=1"), std::string::npos) << m;
+        EXPECT_NE(m.find("first read at maxExecutionTime=6"), std::string::npos) << m;
         ASSERT_EQ(api.reads().size(), 1U);
-        EXPECT_EQ(api.reads()[0].max_execution_time, "1");
+        EXPECT_EQ(api.reads()[0].max_execution_time, "6");
     }
 }
 
@@ -714,8 +737,7 @@ TEST(Neo4jLookup, TheOpenCheckRefusesStatementsThatMayNotOnlyRead) {
 TEST(Neo4jLookup, TheOpenCheckIsNotHeldToTheReadLimitWhileTheServerPlans) {
     // The server plans for longer than server_timeout_s. It applies the limit
     // only once the plan is made, so a check held to it would fail a statement
-    // that is fine; the check is held to request_timeout_ms, and the reads
-    // still to server_timeout_s.
+    // that is fine; the check is held to request_timeout_ms.
     FakeLookupApi api({"shared", "evidence"});
     api.planning(1500ms);
     api.answer("4", one(2, "acct-09"));
@@ -726,7 +748,32 @@ TEST(Neo4jLookup, TheOpenCheckIsNotHeldToTheReadLimitWhileTheServerPlans) {
     rig.op->flush(rig.out);
     ASSERT_EQ(rig.rows_out().size(), 1U);
     ASSERT_EQ(api.reads().size(), 1U);
-    EXPECT_EQ(api.reads()[0].max_execution_time, "1");
+}
+
+TEST(Neo4jLookup, AFirstReadSlowerThanServerTimeoutIsAnsweredAndLaterReadsKeepTheLimit) {
+    // A server that has just started plans and compiles the statement on its
+    // first execution, and counts that against maxExecutionTime once the plan
+    // is made. Held to server_timeout_s, the first read was ended with
+    // neo4j.timeout, and the restarted job met the same limit, since the
+    // server keeps no plan from a request it ends. It carries the open check's
+    // limit instead, and the reads after the first answer server_timeout_s.
+    FakeLookupApi api({"shared", "evidence"});
+    api.first_execution(1500ms);
+    api.answer("4", one(2, "acct-09"));
+    api.answer("5", one(3, "acct-10"));
+    Rig rig(api,
+            {{"server_timeout_s", "1"},
+             {"request_timeout_ms", "4000"},
+             {"max_concurrent_requests", "1"},
+             {"max_in_flight", "1"}});
+    rig.op->open();
+    rig.process(data({probe(1, 4)}));
+    rig.process(data({probe(2, 5)}));
+    rig.op->flush(rig.out);
+    ASSERT_EQ(rig.rows_out().size(), 2U);
+    ASSERT_EQ(api.reads().size(), 2U);
+    EXPECT_EQ(api.reads()[0].max_execution_time, "5");
+    EXPECT_EQ(api.reads()[1].max_execution_time, "1");
 }
 
 TEST(Neo4jLookup, RowsHeldThroughAnOutageAllLeaveInOrderOnceTheServerAnswers) {
