@@ -835,6 +835,19 @@ public:
     // ack the savepoint. 0 picks a 30s default.
     SavepointAckMsg take_savepoint(JobId job_id, std::chrono::milliseconds timeout = {});
 
+    // Take a savepoint and cancel the job at it, for a job about to be
+    // resubmitted restored from that savepoint (an upgrade, a park). From the
+    // savepoint's trigger the job's periodic checkpoints are held, and once the
+    // savepoint has completed the job is cancelled, so no checkpoint completes
+    // after it and the restored job writes nothing its predecessor already
+    // committed. A savepoint followed by a separate cancel left a gap in which
+    // a periodic checkpoint could complete and commit output the restored job
+    // then wrote again. `cancel` is the cancel's ack, set when the savepoint
+    // was taken; a failed savepoint releases the hold and the job runs on.
+    SavepointAckMsg take_savepoint_and_cancel(JobId job_id,
+                                              std::chrono::milliseconds timeout,
+                                              CancelJobAckMsg& cancel);
+
     // Stop a running job GRACEFULLY and report the checkpoint to resume from.
     //
     // Tells every subtask to stop producing and run its end-of-input path, which
@@ -1008,6 +1021,12 @@ public:
     };
 
 private:
+    // take_savepoint, holding the job's periodic checkpoints from the
+    // savepoint's trigger when `hold_periodic` (take_savepoint_and_cancel).
+    SavepointAckMsg take_savepoint_(JobId job_id,
+                                    std::chrono::milliseconds timeout,
+                                    bool hold_periodic);
+
     struct WorkerConnection {
         std::string worker_id;
         std::string data_host;
@@ -1626,6 +1645,11 @@ private:
             std::vector<EarlyDrain> early_drains;
         };
         std::optional<HotCutover> hot_cutover;
+
+        // Set by take_savepoint_and_cancel from its savepoint's trigger: the
+        // trigger loop starts no periodic checkpoint of the job, so none can
+        // complete between the savepoint and the cancel.
+        bool periodic_held_for_savepoint{false};
 
         // Per-job adaptive autoscaler. Created in
         // deploy_internal_ when cfg_.autoscaler is set and at least

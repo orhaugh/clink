@@ -4746,6 +4746,33 @@ std::optional<OperatorRescaleStatus> Coordinator::operator_rescale_status(
 }
 
 SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseconds timeout) {
+    return take_savepoint_(job_id, timeout, /*hold_periodic=*/false);
+}
+
+SavepointAckMsg Coordinator::take_savepoint_and_cancel(JobId job_id,
+                                                       std::chrono::milliseconds timeout,
+                                                       CancelJobAckMsg& cancel) {
+    auto ack = take_savepoint_(job_id, timeout, /*hold_periodic=*/true);
+    if (!ack.ok) {
+        // Not taken: the job runs on, checkpointing as before.
+        std::lock_guard lock(mu_);
+        if (auto it = jobs_.find(job_id); it != jobs_.end()) {
+            it->second->periodic_held_for_savepoint = false;
+        }
+        return ack;
+    }
+    // The hold stays until the job ends: the trigger loop starts no checkpoint
+    // of a job being cancelled at its savepoint.
+    cancel = cancel_job(job_id);
+    log::info("coordinator.savepoint",
+              "job_id=" + std::to_string(job_id) + " cancelled at savepoint " +
+                  std::to_string(ack.checkpoint_id) + ": " + cancel.message);
+    return ack;
+}
+
+SavepointAckMsg Coordinator::take_savepoint_(JobId job_id,
+                                             std::chrono::milliseconds timeout,
+                                             bool hold_periodic) {
     SavepointAckMsg ack;
     ack.job_id = job_id;
     if (timeout == std::chrono::milliseconds{0}) {
@@ -4802,6 +4829,11 @@ SavepointAckMsg Coordinator::take_savepoint(JobId job_id, std::chrono::milliseco
                 want = job.next_checkpoint_id;
             } else {
                 ckpt_id = job.next_checkpoint_id++;
+                if (hold_periodic) {
+                    // Under the lock that allocated the id: no periodic trigger
+                    // can take an id after it.
+                    job.periodic_held_for_savepoint = true;
+                }
                 // A savepoint is a checkpoint the trigger loop did not start:
                 // the trace marks its trigger as the loop's are, or a run that
                 // takes one has acks and a completion for an id nothing
@@ -11167,6 +11199,13 @@ void Coordinator::checkpoint_trigger_loop_() {
                     if (interval < sleep_for) {
                         sleep_for = interval;
                     }
+                    continue;
+                }
+                // A savepoint that ends the job holds the clock from its
+                // trigger to the cancel (take_savepoint_and_cancel): a
+                // checkpoint completing after the savepoint would commit
+                // output the job restored from it then writes again.
+                if (job.periodic_held_for_savepoint) {
                     continue;
                 }
                 // The checkpoint clock pauses for a hot cutover (design

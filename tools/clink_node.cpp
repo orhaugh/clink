@@ -2891,6 +2891,10 @@ int run_coordinator(int argc, char** argv) {
         // POST /api/v1/jobs/:id/savepoint - HTTP equivalent of clink_savepoint.
         // Triggers a one-off synchronous checkpoint and returns the (dir, id)
         // handle. ?timeout_ms bounds the wait (0/unset = 30s default).
+        // ?cancel=true also ends the job at the savepoint, with no checkpoint
+        // completing in between (Coordinator::take_savepoint_and_cancel), for a
+        // client about to resubmit the job restored from it; the reply's
+        // "cancelled" says whether it did.
         http_srv->post(
             "/api/v1/jobs/:id/savepoint", [coordinator_ptr](const clink::http::HttpRequest& req) {
                 clink::http::HttpResponse resp;
@@ -2912,7 +2916,19 @@ int run_coordinator(int argc, char** argv) {
                         // fall through to the coordinator default
                     }
                 }
-                const auto ack = coordinator_ptr->take_savepoint(job_id, timeout);
+                bool then_cancel = false;
+                if (auto it = req.query.find("cancel"); it != req.query.end()) {
+                    if (it->second != "true" && it->second != "false") {
+                        resp.status = 400;
+                        resp.body = R"({"error":"cancel must be true or false"})";
+                        return resp;
+                    }
+                    then_cancel = it->second == "true";
+                }
+                clink::cluster::CancelJobAckMsg cancel;
+                const auto ack = then_cancel ? coordinator_ptr->take_savepoint_and_cancel(
+                                                   job_id, timeout, cancel)
+                                             : coordinator_ptr->take_savepoint(job_id, timeout);
                 clink::http::JsonWriter w;
                 w.begin_object();
                 w.kv("job_id", static_cast<std::int64_t>(ack.job_id));
@@ -2920,6 +2936,10 @@ int run_coordinator(int argc, char** argv) {
                 w.kv("checkpoint_id", static_cast<std::int64_t>(ack.checkpoint_id));
                 w.kv("checkpoint_dir", ack.checkpoint_dir);
                 w.kv("message", ack.message);
+                if (then_cancel) {
+                    w.kv("cancelled", ack.ok && cancel.ok);
+                    w.kv("cancel_message", cancel.message);
+                }
                 w.end_object();
                 resp.body = w.str();
                 if (!ack.ok) {

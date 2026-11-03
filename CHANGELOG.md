@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**A savepoint can cancel the job at it, with no checkpoint completing in
+between.** An upgrade took a savepoint and then cancelled the job, and a
+periodic checkpoint completing in that gap committed output that the job
+restored from the savepoint then wrote again: on the playback showcase, an
+operator upgrade committed one minute of the GCS sink's windows twice.
+`POST /api/v1/jobs/:id/savepoint?cancel=true` (`take_savepoint_and_cancel`)
+holds the job's periodic checkpoints from the savepoint's trigger and cancels
+the job once it has completed; the reply's `cancelled` says whether it did.
+Covered by `HttpSubmit.ASavepointThatCancelsEndsTheJobAtTheSavepoint`.
+
 **The Kubernetes operator runs SQL jobs, and runs a secured, HA cluster.** A
 `ClinkJob` took only a compiled `.so`, submitted, savepointed and cancelled by
 exec'ing the CLI in a Coordinator's pod over the control port: not over TLS,

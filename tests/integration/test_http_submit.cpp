@@ -12,6 +12,7 @@
 //     assert specific depths - just that the gauges exist with sane
 //     values (capacity > 0).
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -445,6 +446,80 @@ TEST(HttpSubmit, PostJobsHonoursRecoveryParametersOnTheQuery) {
 
     http_post_empty("127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/1/cancel");
     // Stop the cluster before removing the directory it checkpoints into.
+    c.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(ckpt_dir, ec);
+}
+
+// A savepoint that cancels ends the job at the savepoint: no checkpoint
+// completes after it, so a job restored from it writes nothing its predecessor
+// committed. A savepoint followed by a separate cancel left a gap in which a
+// periodic checkpoint could complete and commit output the restored job then
+// wrote again, which an operator upgrade on the playback showcase did.
+TEST(HttpSubmit, ASavepointThatCancelsEndsTheJobAtTheSavepoint) {
+    const auto job_so = cancel_test_job_path();
+    if (!std::filesystem::exists(job_so)) {
+        GTEST_SKIP() << "cancel_test_job.so not built";
+    }
+    auto c = start_cluster(/*n_workers=*/1);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    ::setenv("CLINK_CANCEL_TICK_MS", "20", 1);
+    const auto ckpt_dir = std::filesystem::temp_directory_path() /
+                          ("clink_http_savepoint_cancel_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::create_directories(ckpt_dir);
+    const auto port = c->coordinator_http_port;
+
+    // Checkpointing every 50 ms, so a periodic checkpoint is never far off.
+    const auto submitted = http_post_multipart_file(
+        "127.0.0.1",
+        port,
+        "/api/v1/jobs?checkpoint_dir=" + ckpt_dir.string() + "&checkpoint_interval_ms=50",
+        "job_so",
+        "cancel_test_job.so",
+        read_file_bytes(job_so),
+        "job_name",
+        "test-savepoint-cancel");
+    ASSERT_EQ(submitted.status, 200) << submitted.body;
+    const auto completed_id = [&]() -> std::uint64_t {
+        const auto detail = http_get("127.0.0.1", port, "/api/v1/jobs/1").body;
+        const std::string field = "\"latest_completed_checkpoint_id\":";
+        const auto at = detail.find(field);
+        return at == std::string::npos ? 0 : std::stoull(detail.substr(at + field.size()));
+    };
+    ASSERT_TRUE(clink::itest::await_condition([&] { return completed_id() >= 2; },
+                                              std::chrono::seconds(30)))
+        << "the job completed no periodic checkpoint";
+
+    const auto sp = http_post_empty("127.0.0.1", port, "/api/v1/jobs/1/savepoint?cancel=true");
+    ASSERT_EQ(sp.status, 200) << sp.body;
+    EXPECT_NE(sp.body.find("\"cancelled\":true"), std::string::npos) << sp.body;
+    const std::string id_field = "\"checkpoint_id\":";
+    const auto id_at = sp.body.find(id_field);
+    ASSERT_NE(id_at, std::string::npos) << sp.body;
+    const auto savepoint_id = std::stoull(sp.body.substr(id_at + id_field.size()));
+
+    // Once the job has ended nothing more can complete, so the savepoint must
+    // be the newest checkpoint on disk.
+    ASSERT_TRUE(clink::itest::await_condition(
+        [&] {
+            return http_get("127.0.0.1", port, "/api/v1/jobs/1")
+                       .body.find("\"status\":\"CANCELLED\"") != std::string::npos;
+        },
+        std::chrono::seconds(30)))
+        << "the job did not end at its savepoint: "
+        << http_get("127.0.0.1", port, "/api/v1/jobs/1").body;
+    std::uint64_t newest = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(ckpt_dir / "_jobs" / "1")) {
+        const auto name = entry.path().filename().string();
+        if (name.starts_with("COMPLETED-")) {
+            newest = std::max<std::uint64_t>(newest, std::stoull(name.substr(10)));
+        }
+    }
+    EXPECT_EQ(newest, savepoint_id) << "a checkpoint completed after the savepoint";
+
     c.reset();
     std::error_code ec;
     std::filesystem::remove_all(ckpt_dir, ec);
