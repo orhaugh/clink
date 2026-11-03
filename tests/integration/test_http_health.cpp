@@ -166,14 +166,23 @@ TEST(HttpHealthEndpoint, WorkerExposesHealth) {
     ASSERT_GT(worker_pid, 0);
     ASSERT_TRUE(await_http_ready(worker_http, 2s)) << "worker HTTP didn't accept within 2s";
 
-    const auto body = http_get("127.0.0.1", worker_http, "/api/v1/health");
+    // A worker serves HTTP before its control session has connected, and its
+    // health says ok only once it has: wait for that, rather than reading the
+    // health the moment the port answers.
+    std::string body;
+    const bool connected = clink::itest::await_condition(
+        [&] {
+            body = http_get("127.0.0.1", worker_http, "/api/v1/health");
+            return body.find("\"ok\":true") != std::string::npos;
+        },
+        std::chrono::seconds(10));
 
     kill_quietly(worker_pid);
     kill_quietly(coordinator_pid);
 
     EXPECT_NE(body.find("\"role\":\"worker\""), std::string::npos)
         << "expected role=worker in body, got: " << body;
-    EXPECT_NE(body.find("\"ok\":true"), std::string::npos);
+    EXPECT_TRUE(connected) << "the worker's health never said ok: " << body;
 }
 
 TEST(HttpHealthEndpoint, UnknownPathReturnsError) {
