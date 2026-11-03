@@ -2060,12 +2060,12 @@ clink::logging::LoggingConfig make_logging_config(int argc, char** argv, std::st
 // coordinator mode. Bind, idle, await jobs. Stops cleanly on SIGINT/SIGTERM. The
 // binary stays up until killed; jobs come and go entirely over the
 // submission protocol.
-// OTLP export (optional, off unless asked for): --otlp-endpoint=host[:port]
-// ships MetricsRegistry snapshots and lifecycle spans to an OpenTelemetry
-// collector's OTLP/HTTP JSON endpoints every --otlp-interval-ms (default
-// 10000). Returns nullptr when the flag is absent; exits loudly when it is
-// given but this binary carries no HTTP client, rather than silently not
-// exporting what the operator asked for.
+// OTLP export (optional, off unless asked for): --otlp-endpoint=host[:port],
+// or the same as an http:// URL (parse_otlp_endpoint), ships MetricsRegistry
+// snapshots and lifecycle spans to an OpenTelemetry collector's OTLP/HTTP JSON
+// endpoints every --otlp-interval-ms (default 10000). Returns nullptr when the
+// flag is absent; a value the exporter cannot use, or a binary with no HTTP
+// client, is a usage error rather than an exporter that silently sends nothing.
 std::unique_ptr<clink::metrics::OtlpHttpExporter> make_otlp_exporter(
     int argc, char** argv, const std::string& service_name, bool& usage_error) {
     usage_error = false;
@@ -2076,14 +2076,25 @@ std::unique_ptr<clink::metrics::OtlpHttpExporter> make_otlp_exporter(
 #ifdef CLINK_HAS_HTTP
     clink::metrics::OtlpHttpExporter::Config cfg;
     cfg.service_name = service_name;
-    if (const auto colon = endpoint.rfind(':'); colon != std::string::npos) {
-        cfg.host = endpoint.substr(0, colon);
-        cfg.port = static_cast<std::uint16_t>(std::stoi(endpoint.substr(colon + 1)));
-    } else {
-        cfg.host = endpoint;  // default OTLP/HTTP port
+    try {
+        auto where = clink::metrics::parse_otlp_endpoint(endpoint);
+        cfg.host = std::move(where.host);
+        cfg.port = where.port;
+    } catch (const std::invalid_argument& e) {
+        std::cerr << "--otlp-endpoint: " << e.what() << "\n";
+        usage_error = true;
+        return nullptr;
     }
-    cfg.interval_ms =
-        static_cast<std::uint32_t>(std::stoul(get_arg(argc, argv, "otlp-interval-ms", "10000")));
+    const auto interval = get_arg(argc, argv, "otlp-interval-ms", "10000");
+    if (interval.empty() || interval.size() > 9 ||
+        interval.find_first_not_of("0123456789") != std::string::npos ||
+        std::stoul(interval) == 0) {
+        std::cerr << "--otlp-interval-ms: '" << interval
+                  << "' is not a positive number of milliseconds\n";
+        usage_error = true;
+        return nullptr;
+    }
+    cfg.interval_ms = static_cast<std::uint32_t>(std::stoul(interval));
     std::cout << "otlp export to http://" << cfg.host << ":" << cfg.port << " every "
               << cfg.interval_ms << "ms as service '" << service_name << "'\n";
     return std::make_unique<clink::metrics::OtlpHttpExporter>(std::move(cfg));
@@ -3720,6 +3731,15 @@ int main(int argc, char** argv) {
                    "named one.\n"
                 << "  --metrics-disk-path=<path>   Report disk usage for this filesystem as the "
                    "'checkpoint' volume in /metrics (coordinator defaults to --ha-dir).\n"
+                << "  --otlp-endpoint=<collector>  Export metrics and lifecycle spans to an "
+                   "OTLP/HTTP collector, as http://host[:port] or host[:port]\n"
+                   "                               (default port 4318; plain HTTP only). Off "
+                   "unless given.\n"
+                << "  --otlp-interval-ms=<n>       How often to export (default 10000).\n"
+                << "  --lineage-listener=openlineage --lineage-endpoint=<http url> "
+                   "[--lineage-namespace=<ns>]\n"
+                   "                               Coordinator: send every job's lineage as "
+                   "OpenLineage run events.\n"
                 << "\n"
                 << "Global flags:\n"
                 << "  --version    Print version + commit and exit.\n"

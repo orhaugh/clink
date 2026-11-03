@@ -92,6 +92,19 @@ private:
 [[nodiscard]] std::string otlp_spans_json(const std::vector<OtlpSpan>& spans,
                                           std::string_view service_name);
 
+// Where an OTLP/HTTP collector listens, as `--otlp-endpoint` names it: `host`,
+// `host:port`, `[ipv6]` or `[ipv6]:port`, each optionally as a URL,
+// `http://...`, with or without a trailing `/`. The URL form is the
+// OpenTelemetry convention (OTEL_EXPORTER_OTLP_ENDPOINT); the exporter appends
+// /v1/metrics and /v1/traces itself. It speaks plain HTTP, so `https://` is
+// refused rather than sent in the clear, as is a path, an empty host or a port
+// outside 1-65535; std::invalid_argument names what is wrong.
+struct OtlpEndpoint {
+    std::string host;
+    std::uint16_t port{4318};
+};
+OtlpEndpoint parse_otlp_endpoint(std::string_view value);
+
 // Periodic pusher: every `interval_ms`, snapshot the registry and POST it to
 // http://host:port/v1/metrics, and drain SpanBuffer::global() to /v1/traces.
 // Constructing it enables the span buffer; destroying it disables the buffer

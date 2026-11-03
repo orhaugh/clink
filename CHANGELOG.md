@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**`--otlp-endpoint` takes the collector as a URL, and refuses a value it
+cannot use.** The flag was documented as `host[:port]`, but the OpenTelemetry
+convention writes the endpoint as a URL, and a URL was split at its last colon:
+`http://collector:4318` became the host `http://collector`, every export failed,
+and nothing said why. The value is now parsed as `host[:port]`, `[ipv6]:port`
+or the same behind `http://`, with or without a trailing `/`. A value the
+exporter cannot use stops the daemon at start, with the reason: `https://`
+(the exporter sends plain HTTP only), a path (it adds `/v1/metrics` and
+`/v1/traces` itself), a port outside 1-65535, and an `--otlp-interval-ms` that
+is not a positive number. `clink_node --help` lists the OTLP and lineage flags.
+Covered by `OtlpExport.AnEndpointIsAHostAPortOrAnHttpUrl`,
+`OtlpExport.AnEndpointTheExporterCannotUseIsRefusedWithTheReason` and
+`HttpObservability.ADaemonExportsToAnOtlpEndpointGivenAsAUrlAndRefusesHttps`.
+
 **A run that ends with a cancel validates against the exactly-once
 specification.** A checkpoint that completes as its job is being cancelled
 keeps its marker, and its commit is withheld, since a cancelled job has no

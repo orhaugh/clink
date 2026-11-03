@@ -7,7 +7,9 @@
 // wants a string) fails here and not in a collector at 2am.
 
 #include <limits>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -29,6 +31,55 @@ namespace {
 using clink::MetricsRegistry;
 using clink::metrics::OtlpSpan;
 using clink::metrics::SpanBuffer;
+
+// --otlp-endpoint takes the collector as host[:port] or, the OpenTelemetry
+// convention, as an http:// URL. A URL used to be split at its last colon, so
+// http://collector:4318 became the host "http://collector" and every export
+// failed without a word.
+TEST(OtlpExport, AnEndpointIsAHostAPortOrAnHttpUrl) {
+    using clink::metrics::parse_otlp_endpoint;
+    const auto is = [](std::string_view value, const std::string& host, std::uint16_t port) {
+        const auto e = parse_otlp_endpoint(value);
+        EXPECT_EQ(e.host, host) << value;
+        EXPECT_EQ(e.port, port) << value;
+    };
+    is("collector", "collector", 4318);
+    is("collector:4319", "collector", 4319);
+    is("http://collector", "collector", 4318);
+    is("http://collector:4319", "collector", 4319);
+    is("http://otel-collector.cloud.svc.cluster.local:4318/",
+       "otel-collector.cloud.svc.cluster.local",
+       4318);
+    is("10.0.0.7:4318", "10.0.0.7", 4318);
+    is("[::1]", "::1", 4318);
+    is("http://[fd00::7]:4319", "fd00::7", 4319);
+}
+
+TEST(OtlpExport, AnEndpointTheExporterCannotUseIsRefusedWithTheReason) {
+    using clink::metrics::parse_otlp_endpoint;
+    const auto refused = [](std::string_view value, std::string_view reason) {
+        try {
+            (void)parse_otlp_endpoint(value);
+            ADD_FAILURE() << value << " was accepted";
+        } catch (const std::invalid_argument& e) {
+            EXPECT_NE(std::string_view(e.what()).find(reason), std::string_view::npos)
+                << value << ": " << e.what();
+        }
+    };
+    refused("https://collector:4318", "plain HTTP only");
+    refused("grpc://collector:4317", "scheme other than http");
+    refused("http://collector:4318/v1/metrics", "has a path");
+    refused("", "names no host");
+    refused("http://", "names no host");
+    refused(":4318", "names no host");
+    refused("collector:", "port");
+    refused("collector:abc", "port");
+    refused("collector:0", "port");
+    refused("collector:65536", "port");
+    refused("::1", "brackets");
+    refused("[::1", "never closes");
+    refused("[::1]4318", "not :port");
+}
 
 TEST(OtlpExport, MetricsJsonCarriesEveryKindInProtobufJsonShape) {
     MetricsRegistry::Snapshot snap;

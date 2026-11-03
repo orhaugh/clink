@@ -4,8 +4,10 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <optional>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 #include "clink/config/json.hpp"
@@ -96,6 +98,69 @@ std::string random_hex(std::size_t chars) {
 }
 
 }  // namespace
+
+OtlpEndpoint parse_otlp_endpoint(std::string_view value) {
+    const auto refuse = [&](const std::string& why) {
+        return std::invalid_argument("'" + std::string(value) + "' " + why);
+    };
+    std::string_view rest = value;
+    if (rest.starts_with("https://")) {
+        throw refuse("is an https URL; the OTLP exporter sends plain HTTP only");
+    }
+    if (rest.starts_with("http://")) {
+        rest.remove_prefix(7);
+    } else if (rest.find("://") != std::string_view::npos) {
+        throw refuse("has a scheme other than http://");
+    }
+    if (const auto slash = rest.find('/'); slash != std::string_view::npos) {
+        if (slash + 1 != rest.size()) {
+            throw refuse(
+                "has a path; name the collector only, the exporter adds /v1/metrics and "
+                "/v1/traces");
+        }
+        rest.remove_suffix(1);
+    }
+    OtlpEndpoint out;
+    std::optional<std::string_view> port_text;  // set when the value names a port
+    if (rest.starts_with("[")) {
+        const auto close = rest.find(']');
+        if (close == std::string_view::npos) {
+            throw refuse("opens an IPv6 address with '[' and never closes it");
+        }
+        out.host = std::string(rest.substr(1, close - 1));
+        const auto after = rest.substr(close + 1);
+        if (!after.empty()) {
+            if (after.front() != ':') {
+                throw refuse("has text after the IPv6 address that is not :port");
+            }
+            port_text = after.substr(1);
+        }
+    } else {
+        const auto colon = rest.find(':');
+        if (colon != std::string_view::npos &&
+            rest.find(':', colon + 1) != std::string_view::npos) {
+            throw refuse("looks like an IPv6 address; write it in brackets, [addr]:port");
+        }
+        out.host = std::string(rest.substr(0, colon));
+        if (colon != std::string_view::npos) {
+            port_text = rest.substr(colon + 1);
+        }
+    }
+    if (out.host.empty()) {
+        throw refuse("names no host");
+    }
+    if (port_text.has_value()) {
+        const auto text = *port_text;
+        unsigned long port = 0;
+        if (text.empty() || text.size() > 5 ||
+            text.find_first_not_of("0123456789") != std::string_view::npos ||
+            (port = std::stoul(std::string(text))) == 0 || port > 65535) {
+            throw refuse("has a port that is not a number from 1 to 65535");
+        }
+        out.port = static_cast<std::uint16_t>(port);
+    }
+    return out;
+}
 
 SpanBuffer& SpanBuffer::global() {
     static SpanBuffer instance;

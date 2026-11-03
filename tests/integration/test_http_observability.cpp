@@ -11,11 +11,13 @@
 //              coordinator proxy to the corresponding worker endpoints.
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <signal.h>
 #include <spawn.h>
 #include <string>
@@ -27,6 +29,9 @@
 #include <sys/wait.h>
 
 #include "clink/core/codec.hpp"
+#ifdef CLINK_HAS_HTTP
+#include "clink/http/http_server.hpp"
+#endif
 #include "clink/metrics/process_metrics.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
@@ -555,4 +560,72 @@ TEST(HttpObservability, DaemonsLogToLogFileAtLogLevel) {
     EXPECT_EQ(read(worker_log).find("called more than once"), std::string::npos)
         << read(worker_log);
     std::filesystem::remove_all(dir);
+}
+
+// A daemon given --otlp-endpoint as an http:// URL, the OpenTelemetry
+// convention, exports to it. The value used to be split at its last colon, so
+// http://host:port became the host "http://host" and every export failed
+// without a word; a value the exporter cannot use, such as https://, which it
+// would send in the clear, now stops the daemon at start.
+TEST(HttpObservability, ADaemonExportsToAnOtlpEndpointGivenAsAUrlAndRefusesHttps) {
+#ifndef CLINK_HAS_HTTP
+    GTEST_SKIP() << "built without the HTTP subsystem";
+#else
+    const auto node = node_binary_path();
+    if (!std::filesystem::exists(node)) {
+        GTEST_SKIP() << "clink_node not built";
+    }
+    std::mutex mu;
+    std::condition_variable posted;
+    int metrics_posts = 0;
+    clink::http::HttpServer collector;
+    collector.post("/v1/metrics", [&](const clink::http::HttpRequest&) {
+        {
+            std::lock_guard lock(mu);
+            ++metrics_posts;
+        }
+        posted.notify_all();
+        return clink::http::HttpResponse{};
+    });
+    collector.post("/v1/traces",
+                   [](const clink::http::HttpRequest&) { return clink::http::HttpResponse{}; });
+    const auto collector_port = collector.start("127.0.0.1", 0);
+    ASSERT_NE(collector_port, 0);
+
+    Cluster c;
+    c.coordinator_control_port = probe_free_port();
+    c.coordinator_http_port = probe_free_port();
+    c.coordinator_pid =
+        spawn_proc({"clink_node",
+                    "--role=coordinator",
+                    "--port=" + std::to_string(c.coordinator_control_port),
+                    "--http-port=" + std::to_string(c.coordinator_http_port),
+                    "--http-bind=127.0.0.1",
+                    "--otlp-endpoint=http://127.0.0.1:" + std::to_string(collector_port) + "/",
+                    "--otlp-interval-ms=100"},
+                   node);
+    ASSERT_GT(c.coordinator_pid, 0);
+    {
+        std::unique_lock lock(mu);
+        EXPECT_TRUE(posted.wait_for(lock, 10s, [&] { return metrics_posts > 0; }))
+            << "the Coordinator never posted to the collector's /v1/metrics";
+    }
+
+    const pid_t refused =
+        spawn_proc({"clink_node",
+                    "--role=coordinator",
+                    "--port=" + std::to_string(probe_free_port()),
+                    "--otlp-endpoint=https://127.0.0.1:" + std::to_string(collector_port)},
+                   node);
+    ASSERT_GT(refused, 0);
+    int status = 0;
+    const bool exited = clink::itest::await_condition(
+        [&] { return ::waitpid(refused, &status, WNOHANG) == refused; }, 10s);
+    if (!exited) {
+        kill_quietly(refused);
+    }
+    ASSERT_TRUE(exited) << "a Coordinator given an https OTLP endpoint kept running";
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        << "it must refuse to start, not run without exporting";
+#endif
 }
