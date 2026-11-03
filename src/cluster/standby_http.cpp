@@ -73,13 +73,35 @@ std::optional<http::HttpResponse> answer_as_standby(HaCoordinator& ha,
     return http::forward_request(request, leader->host, leader->http_port, read_timeout);
 }
 
+std::optional<http::HttpResponse> answer_while_recovering(const http::HttpRequest& request) {
+    const std::string_view path = request.path;
+    if (path != "/api/v1/jobs" && !path.starts_with("/api/v1/jobs/")) {
+        return std::nullopt;
+    }
+    http::HttpResponse out;
+    out.status = 503;
+    out.headers["Retry-After"] = "2";
+    http::JsonWriter w;
+    w.begin_object();
+    w.kv("error", "recovering");
+    w.kv("detail",
+         "this Coordinator has just taken over and is recovering the jobs its predecessor ran");
+    w.end_object();
+    out.body = w.str();
+    return out;
+}
+
 http::HttpResponse coordinator_readiness(HaCoordinator* ha,
                                          bool control_port_bound,
+                                         bool jobs_recovered,
                                          const std::string& self_host,
                                          std::uint16_t self_http_port) {
     if (ha == nullptr || ha->is_leader()) {
         if (!control_port_bound) {
             return plain(503, "starting\n");
+        }
+        if (!jobs_recovered) {
+            return plain(503, "recovering\n");
         }
         return plain(200, ha == nullptr ? "ok\n" : "leader\n");
     }

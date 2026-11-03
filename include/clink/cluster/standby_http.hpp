@@ -40,11 +40,20 @@ std::optional<http::HttpResponse> answer_as_standby(HaCoordinator& ha,
                                                     const http::HttpRequest& request,
                                                     std::chrono::milliseconds read_timeout);
 
+// How a leader that has not yet recovered the jobs its predecessor ran answers
+// `request`: a request for the job API (/api/v1/jobs and everything under it)
+// is refused with 503 and Retry-After, as a list without those jobs, a 404 for
+// one of them or a submission numbered among them would each be wrong; nullopt
+// for any other request, which it answers as usual.
+std::optional<http::HttpResponse> answer_while_recovering(const http::HttpRequest& request);
+
 // GET /readyz for a Coordinator: 200 when it can answer the API, as the leader
-// with its control port bound or as a standby with a leader to forward to; 503
-// otherwise. `ha` is null without HA, where the Coordinator is ready once bound.
+// with its control port bound and its predecessor's jobs recovered, or as a
+// standby with a leader to forward to; 503 otherwise. `ha` is null without HA,
+// where the Coordinator is ready once bound.
 http::HttpResponse coordinator_readiness(HaCoordinator* ha,
                                          bool control_port_bound,
+                                         bool jobs_recovered,
                                          const std::string& self_host,
                                          std::uint16_t self_http_port);
 

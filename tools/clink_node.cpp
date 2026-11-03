@@ -2462,6 +2462,12 @@ int run_coordinator(int argc, char** argv) {
     // path). Full-refresh materialized views persist here, so a new leader can reload
     // them and resume their refresh schedule.
     const std::string sql_catalog_dir = get_arg(argc, argv, "sql-catalog-dir", "");
+    // The leadership epoch whose takeover has recovered the jobs its predecessor
+    // ran. While this Coordinator leads at a later epoch, its job API answers
+    // 503 (answer_while_recovering) and /readyz "recovering", where it used to
+    // list those jobs as gone. Keyed on the epoch rather than a flag the
+    // takeover sets, because is_leader() turns true before the takeover runs.
+    std::atomic<std::uint64_t> recovered_epoch{0};
     std::unique_ptr<clink::cluster::HaCoordinator> ha_coord;
     if (ha_dir.empty()) {
         const auto bound = coordinator.start(want_port);
@@ -2516,7 +2522,8 @@ int run_coordinator(int argc, char** argv) {
                          "--etcd-endpoints)\n";
         }
         ha_coord->set_on_become_leader(
-            [&coordinator, want_port, advertise_host, sql_catalog_dir](std::uint64_t epoch) {
+            [&coordinator, &recovered_epoch, want_port, advertise_host, sql_catalog_dir](
+                std::uint64_t epoch) {
                 try {
                     // Bind the fencing epoch BEFORE the listener opens, so
                     // every frame this leader ever sends carries it and a
@@ -2561,6 +2568,7 @@ int run_coordinator(int argc, char** argv) {
                               << advertise_host << ":" << bound << "\n";
                     std::cout.flush();
                     coordinator.recover_persisted_jobs();
+                    recovered_epoch.store(epoch);
 #ifdef CLINK_LINKED_SQL
                     // Reload the persisted catalog (the previous leader may have
                     // created materialized views after this node's startup load) and
@@ -3079,12 +3087,17 @@ int run_coordinator(int argc, char** argv) {
             resp.body = "ok\n";
             return resp;
         });
-        http_srv->get("/readyz",
-                      [ha = ha_coord.get(), coordinator_ptr, advertise_host, http_port](
-                          const clink::http::HttpRequest&) {
-                          return clink::cluster::coordinator_readiness(
-                              ha, coordinator_ptr->bound_port() != 0, advertise_host, http_port);
-                      });
+        http_srv->get(
+            "/readyz",
+            [ha = ha_coord.get(), coordinator_ptr, &recovered_epoch, advertise_host, http_port](
+                const clink::http::HttpRequest&) {
+                return clink::cluster::coordinator_readiness(
+                    ha,
+                    coordinator_ptr->bound_port() != 0,
+                    ha == nullptr || recovered_epoch.load() == ha->epoch(),
+                    advertise_host,
+                    http_port);
+            });
 
         // The human-facing UI. The embedded dashboard SPA is gone - the ops
         // console lives in its own repository (clink-fe) - and the
@@ -3156,13 +3169,21 @@ int run_coordinator(int argc, char** argv) {
         }
 
         // Under HA a standby forwards the API to the leader, so a client that
-        // reaches either Coordinator gets the leader's answer.
+        // reaches either Coordinator gets the leader's answer; a leader still
+        // recovering its predecessor's jobs refuses the job API until it has.
         if (ha_coord) {
-            http_srv->set_forwarder([ha = ha_coord.get(), advertise_host, http_port](
-                                        const clink::http::HttpRequest& req) {
-                return clink::cluster::answer_as_standby(
-                    *ha, advertise_host, http_port, req, std::chrono::minutes{2});
-            });
+            http_srv->set_forwarder(
+                [ha = ha_coord.get(), &recovered_epoch, advertise_host, http_port](
+                    const clink::http::HttpRequest& req)
+                    -> std::optional<clink::http::HttpResponse> {
+                    if (ha->is_leader() && recovered_epoch.load() != ha->epoch()) {
+                        if (auto refused = clink::cluster::answer_while_recovering(req)) {
+                            return refused;
+                        }
+                    }
+                    return clink::cluster::answer_as_standby(
+                        *ha, advertise_host, http_port, req, std::chrono::minutes{2});
+                });
         }
 
         const auto http_bound = http_srv->start(http_bind, http_port);

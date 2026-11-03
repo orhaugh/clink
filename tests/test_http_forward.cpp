@@ -16,6 +16,8 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -224,16 +226,44 @@ TEST(StandbyHttp, AStandbyForwardsTheApiToTheLeaderAndAnswersWhatIsAboutItself) 
         << refused->body;
 
     const auto standby_ready =
-        clink::cluster::coordinator_readiness(standby.get(), false, "127.0.0.1", 9);
+        clink::cluster::coordinator_readiness(standby.get(), false, true, "127.0.0.1", 9);
     EXPECT_EQ(standby_ready.status, 200);
     EXPECT_EQ(standby_ready.body, "standby\n");
-    EXPECT_EQ(clink::cluster::coordinator_readiness(leader.get(), true, "127.0.0.1", 1).body,
+    EXPECT_EQ(clink::cluster::coordinator_readiness(leader.get(), true, true, "127.0.0.1", 1).body,
               "leader\n");
-    EXPECT_EQ(clink::cluster::coordinator_readiness(leader.get(), false, "127.0.0.1", 1).status,
-              503)
+    EXPECT_EQ(
+        clink::cluster::coordinator_readiness(leader.get(), false, true, "127.0.0.1", 1).status,
+        503)
         << "a leader is not ready before its control port is bound";
-    EXPECT_EQ(clink::cluster::coordinator_readiness(nullptr, true, "127.0.0.1", 1).body, "ok\n");
+    const auto recovering =
+        clink::cluster::coordinator_readiness(leader.get(), true, false, "127.0.0.1", 1);
+    EXPECT_EQ(recovering.status, 503) << "a leader is not ready before it has recovered its jobs";
+    EXPECT_EQ(recovering.body, "recovering\n");
+    EXPECT_EQ(clink::cluster::coordinator_readiness(nullptr, true, true, "127.0.0.1", 1).body,
+              "ok\n");
     leader->stop();
+}
+
+// A leader that has just taken over refuses the job API until it has recovered
+// its predecessor's jobs, and answers everything else, so a client is told to
+// wait rather than shown a list without them.
+TEST(StandbyHttp, ALeaderStillRecoveringRefusesTheJobApiAndNothingElse) {
+    using clink::cluster::answer_while_recovering;
+    for (const auto& [method, path] :
+         std::vector<std::pair<std::string, std::string>>{{"GET", "/api/v1/jobs"},
+                                                          {"GET", "/api/v1/jobs/3"},
+                                                          {"POST", "/api/v1/jobs/sql"},
+                                                          {"POST", "/api/v1/jobs/3/savepoint"}}) {
+        const auto refused = answer_while_recovering(request(method, path));
+        ASSERT_TRUE(refused.has_value()) << method << " " << path;
+        EXPECT_EQ(refused->status, 503);
+        EXPECT_EQ(refused->headers.at("Retry-After"), "2");
+        EXPECT_NE(refused->body.find("recovering"), std::string::npos) << refused->body;
+    }
+    for (const char* path :
+         {"/api/v1/workers", "/api/v1/cluster", "/api/v1/jobsx", "/readyz", "/livez", "/"}) {
+        EXPECT_FALSE(answer_while_recovering(request("GET", path)).has_value()) << path;
+    }
 }
 
 TEST(StandbyHttp, AStandbyWithNoLeaderToForwardToRefusesAndIsNotReady) {
@@ -250,8 +280,9 @@ TEST(StandbyHttp, AStandbyWithNoLeaderToForwardToRefusesAndIsNotReady) {
     ASSERT_TRUE(refused.has_value());
     EXPECT_EQ(refused->status, 503);
     EXPECT_EQ(refused->headers.at("Retry-After"), "1");
-    EXPECT_EQ(clink::cluster::coordinator_readiness(standby.get(), false, "10.0.0.8", 8081).body,
-              "no leader\n");
+    EXPECT_EQ(
+        clink::cluster::coordinator_readiness(standby.get(), false, true, "10.0.0.8", 8081).body,
+        "no leader\n");
 
     // A record this node left behind when it led before.
     write_record(
@@ -259,6 +290,7 @@ TEST(StandbyHttp, AStandbyWithNoLeaderToForwardToRefusesAndIsNotReady) {
     refused = clink::cluster::answer_as_standby(*standby, "10.0.0.8", 8081, api, 2s);
     ASSERT_TRUE(refused.has_value());
     EXPECT_EQ(refused->status, 503);
-    EXPECT_EQ(clink::cluster::coordinator_readiness(standby.get(), false, "10.0.0.8", 8081).status,
-              503);
+    EXPECT_EQ(
+        clink::cluster::coordinator_readiness(standby.get(), false, true, "10.0.0.8", 8081).status,
+        503);
 }

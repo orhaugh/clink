@@ -27,16 +27,19 @@
 // See docs/history/production-hardening-2026-08.md, W15.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -738,4 +741,73 @@ TEST_F(HaFailoverTest, AStandbyAnswersTheApiWithTheLeadersView) {
     })) << "the survivor did not report itself the leader";
     EXPECT_TRUE(clink::itest::await_condition(lists_the_worker))
         << "the new leader never listed the worker that re-registered with it";
+}
+
+// A Coordinator that has just taken over answers the job API only once it has
+// recovered the jobs its predecessor ran. It used to answer from the moment it
+// bound its control port, and while the Workers settled back onto it, it listed
+// a running job as gone: a client that acts on the list reads that as the job's
+// end, and the Kubernetes operator, which resubmits a job it no longer finds,
+// would have started this one a second time.
+TEST_F(HaFailoverTest, ANewLeaderListsNoJobsBeforeItHasRecoveredThem) {
+    // A job long enough to outlive the takeover.
+    constexpr int kRecords = 600;
+    ::setenv("CLINK_2PC_TOTAL", std::to_string(kRecords).c_str(), 1);
+    auto s = spec();
+    s.http = true;
+    Cluster c(s);
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_ha_coordinators(2));
+    ASSERT_TRUE(c.start_ha_worker(0));
+    ASSERT_TRUE(c.await_workers_registered(1));
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(
+        clink::itest::await([&] { return verify_exactly_once(out_dir_, kRecords).total_lines > 0; },
+                            std::chrono::seconds(45)))
+        << "nothing was committed before the failover, so the takeover would have no job to "
+           "recover";
+    const auto leader = c.current_leader_index();
+    ASSERT_TRUE(leader.has_value());
+    const std::size_t survivor = 1 - *leader;
+
+    // Ask the survivor for the job list throughout the takeover: as a standby
+    // it forwards to the leader, then nothing answers for a moment, then it
+    // answers as the new leader. Every answer that lists jobs must list this one.
+    std::atomic<bool> stop{false};
+    std::atomic<int> listed{0};
+    std::atomic<int> recovering{0};
+    std::vector<std::string> without_the_job;
+    std::thread poller([&] {
+        clink::http::HttpClient api("127.0.0.1", c.ha_http_port(survivor));
+        while (!stop.load()) {
+            const auto r = api.get("/api/v1/jobs");
+            if (r.status == 200) {
+                if (r.body.find("\"id\":1,") != std::string::npos) {
+                    listed.fetch_add(1);
+                } else {
+                    without_the_job.push_back(r.body);
+                }
+            } else if (r.status == 503 && r.body.find("recovering") != std::string::npos) {
+                recovering.fetch_add(1);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+    });
+    const bool failed_over = c.kill_leader_and_await_failover().has_value();
+    const int listed_by_the_old_leader = listed.load();
+    const bool listed_again =
+        failed_over && clink::itest::await([&] { return listed.load() > listed_by_the_old_leader; },
+                                           std::chrono::seconds(60));
+    stop.store(true);
+    poller.join();
+
+    ASSERT_TRUE(failed_over) << "no standby took over after the leader was killed";
+    EXPECT_TRUE(listed_again) << "the new leader never listed the job it recovered ["
+                              << c.describe_coordinator_exits() << "]";
+    EXPECT_TRUE(without_the_job.empty())
+        << without_the_job.size() << " answer(s) listed the jobs without the running one, the "
+        << "first: " << (without_the_job.empty() ? std::string{} : without_the_job.front());
+    std::cout << "[takeover] " << recovering.load() << " request(s) refused while recovering\n";
+    sub->kill_and_reap();
 }

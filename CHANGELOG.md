@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**A Coordinator that has just taken over answers the job API only once it has
+recovered its predecessor's jobs.** A new leader binds its control port so the
+Workers can register with it, then waits for them to settle before it
+recovers the jobs the previous leader ran, and in between its HTTP API was
+already answering: `GET /api/v1/jobs` listed a running job as gone for the
+seconds the takeover took, a job's own routes answered 404, and a submission
+could take an id among the ones being recovered. A client that acts on the
+list reads that as the job's end; the Kubernetes operator resubmits a job it
+no longer finds, and would have run it twice. Until the recovery returns, the
+job API now answers 503 with `Retry-After`, and `/readyz` says `recovering`,
+so a Service holds requests off the Coordinator in the meantime. Covered by
+`HaFailoverTest.ANewLeaderListsNoJobsBeforeItHasRecoveredThem`, which asks the
+survivor for the list throughout a takeover; against the previous node it
+answered `{"jobs":[]}` more than a hundred times.
+
 **`clink run --job` names the job it submits.** The `--name` flag was printed
 in the submit line and went no further: the graph reached the Coordinator
 unnamed, so the job was listed with an empty name, its lineage was named
