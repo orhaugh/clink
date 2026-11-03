@@ -27,11 +27,16 @@
 // writing class hierarchies. The closures are stored on TypeRegistry
 // alongside Codec<T> and threaded through bridge construction.
 
+#include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -40,6 +45,7 @@
 #include <arrow/io/api.h>
 #include <arrow/io/memory.h>
 #include <arrow/ipc/api.h>
+#include <arrow/util/key_value_metadata.h>
 #endif
 
 #include "clink/core/codec.hpp"
@@ -439,7 +445,108 @@ inline ArrowBatcher<std::uint64_t> uint64_arrow_batcher() {
                                            arrow::UInt64Array>(arrow::uint64());
 }
 
+// The engine-only source partition each record of a batch carries
+// (Record::source_partition), as schema metadata under this key: runs of
+// "<partition>*<count>", comma-separated, "_" for a record without one, in
+// record order. Set by a partitioned source such as Kafka's, so a watermark
+// assigner can hold the watermark at its slowest partition, not its fastest.
+inline constexpr const char* kSourcePartitionRunsKey = "clink.source_partition_runs";
+
+namespace detail {
+
+// The batch's source partitions as runs, or "" when no record carries one.
+template <typename T>
+inline std::string source_partition_runs(const Batch<T>& batch) {
+    bool any = false;
+    for (const auto& rec : batch) {
+        if (rec.source_partition().has_value()) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return {};
+    }
+    std::string out;
+    std::optional<std::int32_t> run_of;
+    std::size_t run = 0;
+    const auto flush = [&] {
+        if (run == 0) {
+            return;
+        }
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += run_of.has_value() ? std::to_string(*run_of) : std::string{"_"};
+        out += '*';
+        out += std::to_string(run);
+    };
+    for (const auto& rec : batch) {
+        const auto p = rec.source_partition();
+        if (run > 0 && p == run_of) {
+            ++run;
+            continue;
+        }
+        flush();
+        run_of = p;
+        run = 1;
+    }
+    flush();
+    return out;
+}
+
+// Each record's source partition from runs written by source_partition_runs,
+// or nothing when they do not describe exactly `rows` records.
+inline std::optional<std::vector<std::optional<std::int32_t>>> parse_source_partition_runs(
+    std::string_view runs, std::int64_t rows) {
+    std::vector<std::optional<std::int32_t>> out;
+    out.reserve(static_cast<std::size_t>(std::max<std::int64_t>(rows, 0)));
+    while (!runs.empty()) {
+        const auto comma = runs.find(',');
+        const auto run = runs.substr(0, comma);
+        runs = comma == std::string_view::npos ? std::string_view{} : runs.substr(comma + 1);
+        const auto star = run.find('*');
+        if (star == std::string_view::npos || star == 0) {
+            return std::nullopt;
+        }
+        std::optional<std::int32_t> partition;
+        if (run.substr(0, star) != "_") {
+            std::int32_t v = 0;
+            const auto head = run.substr(0, star);
+            const auto [ptr, ec] = std::from_chars(head.data(), head.data() + head.size(), v);
+            if (ec != std::errc{} || ptr != head.data() + head.size()) {
+                return std::nullopt;
+            }
+            partition = v;
+        }
+        std::int64_t count = 0;
+        const auto tail = run.substr(star + 1);
+        const auto [ptr, ec] = std::from_chars(tail.data(), tail.data() + tail.size(), count);
+        if (ec != std::errc{} || ptr != tail.data() + tail.size() || count <= 0 ||
+            static_cast<std::int64_t>(out.size()) + count > rows) {
+            return std::nullopt;
+        }
+        out.insert(out.end(), static_cast<std::size_t>(count), partition);
+    }
+    if (static_cast<std::int64_t>(out.size()) != rows) {
+        return std::nullopt;
+    }
+    return out;
+}
+
+}  // namespace detail
+
 // string - schema {event_time:int64(null), value:utf8}.
+//
+// The records' source partitions ride the frame's schema metadata
+// (kSourcePartitionRunsKey). A Kafka source is a subtask of its own, so its
+// records reach the decoder over this channel, across the network when the two
+// land on different workers, and the partition-aware assigner behind the
+// decoder needs each record's partition to hold the watermark at the slowest
+// rather than the fastest. Metadata leaves the fields as they were, so a reader
+// that checks the schema (the network channel, with metadata ignored) and an
+// older reader both accept the frame, and a batch with no partition carries no
+// metadata.
 inline ArrowBatcher<std::string> string_arrow_batcher() {
     auto schema_fn = [] {
         return arrow::schema({
@@ -468,13 +575,24 @@ inline ArrowBatcher<std::string> string_arrow_batcher() {
             return nullptr;
         if (auto s = v_b.Finish(&v_arr); !s.ok())
             return nullptr;
-        return arrow::RecordBatch::Make(schema_fn(), n, {t_arr, v_arr});
+        auto schema = schema_fn();
+        if (auto runs = detail::source_partition_runs(batch); !runs.empty()) {
+            schema = schema->WithMetadata(arrow::key_value_metadata(
+                {std::string{kSourcePartitionRunsKey}}, {std::move(runs)}));
+        }
+        return arrow::RecordBatch::Make(std::move(schema), n, {t_arr, v_arr});
     };
     auto parse = [](const arrow::RecordBatch& batch) -> std::optional<Batch<std::string>> {
         if (batch.num_columns() < 2)
             return std::nullopt;
         const auto* t_arr = static_cast<const arrow::Int64Array*>(batch.column(0).get());
         const auto* v_arr = static_cast<const arrow::StringArray*>(batch.column(1).get());
+        std::optional<std::vector<std::optional<std::int32_t>>> partitions;
+        if (const auto& md = batch.schema()->metadata(); md != nullptr) {
+            if (const int at = md->FindKey(kSourcePartitionRunsKey); at >= 0) {
+                partitions = detail::parse_source_partition_runs(md->value(at), batch.num_rows());
+            }
+        }
         Batch<std::string> out;
         out.reserve(static_cast<std::size_t>(batch.num_rows()));
         for (int64_t i = 0; i < batch.num_rows(); ++i) {
@@ -482,11 +600,14 @@ inline ArrowBatcher<std::string> string_arrow_batcher() {
             const uint8_t* vptr = v_arr->GetValue(i, &vlen);
             std::string s(reinterpret_cast<const char*>(vptr), static_cast<std::size_t>(vlen));
             const auto ts = detail::read_event_time(*t_arr, i);
-            if (ts.has_value()) {
-                out.emplace(std::move(s), *ts);
-            } else {
-                out.emplace(std::move(s));
+            Record<std::string> rec = ts.has_value() ? Record<std::string>{std::move(s), *ts}
+                                                     : Record<std::string>{std::move(s)};
+            if (partitions.has_value()) {
+                if (const auto& p = (*partitions)[static_cast<std::size_t>(i)]; p.has_value()) {
+                    rec.set_source_partition(*p);
+                }
             }
+            out.push(std::move(rec));
         }
         return out;
     };

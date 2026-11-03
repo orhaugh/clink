@@ -24,9 +24,12 @@
 #endif
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <arrow/util/key_value_metadata.h>
 #include <gtest/gtest.h>
 
 #include "clink/core/arrow_batcher.hpp"
@@ -99,6 +102,72 @@ TEST(ArrowBatcherContract, StringColumnar) {
     b.emplace(std::string{"with\nnewline\tand\0null", 21});
     b.emplace(std::string{"no-ts"});
     assert_contract<std::string>(string_arrow_batcher(), std::move(b));
+}
+
+// A Kafka source's records carry the partition they were read from, and a
+// watermark assigner past the decoder holds the watermark at the slowest one.
+// The source is a subtask of its own, so its records cross this channel, over
+// the network when the decoder is on another worker; the partitions used to be
+// lost there. They ride the frame's schema metadata, so its fields are the
+// ones every reader checks for.
+TEST(ArrowBatcherContract, StringFramesCarryTheirSourcePartitionsAcrossTheWire) {
+    Batch<std::string> b;
+    for (const auto& [value, partition] : std::vector<std::pair<std::string, std::optional<int>>>{
+             {"a", 2}, {"b", 2}, {"c", std::nullopt}, {"d", 0}, {"e", 0}, {"f", 0}, {"g", 3}}) {
+        Record<std::string> r{value, EventTime{10}};
+        if (partition.has_value()) {
+            r.set_source_partition(*partition);
+        }
+        b.push(std::move(r));
+    }
+    const auto batcher = string_arrow_batcher();
+    const auto built = batcher.build(b);
+    ASSERT_NE(built, nullptr);
+    EXPECT_TRUE(built->schema()->Equals(*batcher.schema(), /*check_metadata=*/false))
+        << "the network channel refuses a frame whose fields differ from schema()";
+    EXPECT_EQ(built->num_columns(), 2) << "an older reader reads the first two columns only";
+
+    const auto ipc = arrow_batch_to_ipc(*built);
+    const auto received = arrow_batch_from_ipc(ipc.data(), ipc.size());
+    ASSERT_NE(received, nullptr);
+    const auto parsed = batcher.parse(*received);
+    ASSERT_TRUE(parsed.has_value());
+    ASSERT_EQ(parsed->size(), b.size());
+    for (std::size_t i = 0; i < b.size(); ++i) {
+        EXPECT_EQ((*parsed)[i].value(), b[i].value());
+        EXPECT_EQ((*parsed)[i].source_partition(), b[i].source_partition()) << "record " << i;
+    }
+}
+
+TEST(ArrowBatcherContract, AStringFrameWithoutPartitionsIsUnchanged) {
+    Batch<std::string> b;
+    b.emplace(std::string{"x"}, EventTime{1});
+    const auto built = string_arrow_batcher().build(b);
+    ASSERT_NE(built, nullptr);
+    EXPECT_EQ(built->schema()->metadata(), nullptr);
+    EXPECT_TRUE(built->schema()->Equals(*string_arrow_batcher().schema(), /*check_metadata=*/true));
+}
+
+// Runs that do not describe the frame's records are ignored, not trusted: the
+// records arrive untagged, as they did before partitions crossed the wire.
+TEST(ArrowBatcherContract, MalformedPartitionRunsAreIgnored) {
+    Batch<std::string> b;
+    b.emplace(std::string{"x"}, EventTime{1});
+    b.emplace(std::string{"y"}, EventTime{2});
+    const auto plain = string_arrow_batcher().build(b);
+    ASSERT_NE(plain, nullptr);
+    for (const char* runs : {"0*3", "0*1", "x*2", "1*1,", "*2", "1*0,2*2"}) {
+        const auto tagged =
+            arrow::RecordBatch::Make(plain->schema()->WithMetadata(arrow::key_value_metadata(
+                                         {std::string{kSourcePartitionRunsKey}}, {runs})),
+                                     plain->num_rows(),
+                                     plain->columns());
+        const auto parsed = string_arrow_batcher().parse(*tagged);
+        ASSERT_TRUE(parsed.has_value()) << runs;
+        for (const auto& rec : *parsed) {
+            EXPECT_FALSE(rec.source_partition().has_value()) << runs;
+        }
+    }
 }
 
 TEST(ArrowBatcherContract, Int32Columnar) {

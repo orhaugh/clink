@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**A Kafka record keeps its partition when it crosses the network to the
+decoder.** The partition-aware watermark assigner behind a Kafka table's
+decoder holds the watermark at the slowest partition, and needs each record's
+partition to do it. A Kafka source is a subtask of its own, so its records
+reach the decoder over the string channel, across the network whenever the
+scheduler puts the two on different workers, and the wire format carried no
+partition: the records arrived untagged, and the assigner took one watermark
+over all of its partitions, which races to the fastest and drops the others'
+in-window records as late. The partitions now ride the frame's schema
+metadata as runs; the fields are unchanged, so the receiver's schema check
+and an older worker accept the frame as before, and a batch without
+partitions is byte-identical. Found by the Kafka window recovery suite, where
+a Worker restart split two sources from their decoders. Covered by
+`ArrowBatcherContract.StringFramesCarryTheirSourcePartitionsAcrossTheWire`
+and the neighbouring tests.
+
 **A savepoint can cancel the job at it, with no checkpoint completing in
 between.** An upgrade took a savepoint and then cancelled the job, and a
 periodic checkpoint completing in that gap committed output that the job
