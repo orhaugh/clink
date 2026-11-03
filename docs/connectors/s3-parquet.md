@@ -38,12 +38,12 @@ cmake --build build --parallel 10
 | --- | --- | --- |
 | `s3_parquet_int64_sink` | Sink | `int64` |
 | `s3_parquet_string_sink` | Sink | `string` |
-| `s3_parquet_2pc_int64_sink` | Sink | `int64` (two-phase commit, one staged file per checkpoint) |
-| `s3_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint) |
+| `s3_parquet_2pc_int64_sink` | Sink | `int64` (two-phase commit, one staged file per checkpoint with records) |
+| `s3_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint with records) |
 | `s3_parquet_int64_source` | Source | `int64` |
 | `s3_parquet_string_source` | Source | `string` |
 | `s3_parquet_row_sink` | Sink | `row`: a SQL table's declared columns, each a typed Parquet column |
-| `s3_parquet_2pc_row_sink` | Sink | `row` (two-phase commit, one staged file per checkpoint) |
+| `s3_parquet_2pc_row_sink` | Sink | `row` (two-phase commit, one staged file per checkpoint with records) |
 | `s3_parquet_row_source` | Source | `row` |
 
 The separate `s3_text_sink` factory in the same file is a different connector (line-text objects via the AWS SDK directly) and is not covered here.
@@ -151,7 +151,7 @@ In `open()` the source resolves the batcher's columns in the file by name, with 
 
 The factory sink is at-least-once. Each subtask closes a part at every checkpoint barrier and at the end of input, and S3 publishes the object only when its multipart upload completes, so a kill never leaves a partial object and everything up to the last barrier is already published. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay. The sink lists and deletes under its prefix (a run that starts from empty state replaces the previous run's parts), so its credentials need `s3:ListBucket` and `s3:DeleteObject` as well as `s3:PutObject`. The programmatic `ParquetS3Sink<T>` completes its single object only in `close()`, so a failure before then publishes nothing, and a cancelled task aborts the upload.
 
-For exactly-once, use the 2PC sink: `s3_parquet_2pc_{int64,string,row}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` (a streamed copy, which S3 publishes only when the upload completes) only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each object is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its objects beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
+For exactly-once, use the 2PC sink: `s3_parquet_2pc_{int64,string,row}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file for each checkpoint interval records reached (an interval none reached stages and publishes nothing) under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` (a streamed copy, which S3 publishes only when the upload completes) only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each object is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its objects beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
 
 The source reads a single object to its last row group and reports itself as bounded (`is_bounded()` returns true). It does not track or replay from an offset within the object.
 

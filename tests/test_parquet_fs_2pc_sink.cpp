@@ -132,6 +132,31 @@ TEST(ParquetFsSink2PC, CommitPromotesStagingToCommittedAndIsReadable) {
     std::filesystem::remove_all(base);
 }
 
+// A checkpoint interval no records reached stages nothing and commits nothing:
+// a quiet job checkpointing every few seconds used to publish an empty object
+// every interval, for ever. The next interval with records commits as usual.
+TEST(ParquetFsSink2PC, AnIntervalNoRecordsReachedPublishesNothing) {
+    const auto base = make_temp_dir("quiet");
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{9}, "fs2pc", &state, nullptr);
+    auto sink = make_sink(base, rctx, OperatorId{9});
+
+    sink->open();
+    sink->on_data(Batch<std::int64_t>{});
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    EXPECT_EQ(count_parquet(base / "staging"), 0u);
+    EXPECT_FALSE(state.get_operator_state(OperatorId{9}, "_xo_pending_sub0_1").has_value());
+    sink->on_commit(1);
+    EXPECT_EQ(count_parquet(base / "committed"), 0u);
+
+    feed(*sink, {5, 6});
+    sink->on_barrier(CheckpointBarrier{CheckpointId{2}});
+    sink->on_commit(2);
+    EXPECT_EQ(count_parquet(base / "committed"), 1u);
+    EXPECT_EQ(read_committed(base), (std::vector<std::int64_t>{5, 6}));
+    std::filesystem::remove_all(base);
+}
+
 TEST(ParquetFsSink2PC, BarrierWithoutCommitLeavesStagingAndState) {
     const auto base = make_temp_dir("pre");
     InMemoryStateBackend state;

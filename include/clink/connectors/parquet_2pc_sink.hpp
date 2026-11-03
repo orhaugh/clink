@@ -110,11 +110,13 @@ public:
         }
     }
 
-    // Finalise the interval writer and durably write the buffer to staging.
-    // Opens the writer even if no records flowed this interval, so every
-    // (subtask, ckpt) yields a uniform staging file for recovery to find.
+    // Finalise the interval writer and durably write the buffer to staging. An
+    // interval no records reached stages nothing and has nothing to commit, so
+    // a quiet job publishes no empty files.
     std::optional<std::string> prepare_commit(std::uint64_t checkpoint_id) override {
-        ensure_pending_open_();
+        if (!writer_) {
+            return std::nullopt;
+        }
         auto buffer = finalize_pending_writer_();
 
         const auto target = staging_dir() / (sub_prefix_() + "-" + this->run_token() + "-" +

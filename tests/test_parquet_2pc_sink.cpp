@@ -172,6 +172,33 @@ TEST(ParquetSink2PC, CommitMovesStagingToCommittedAndIsExternallyTyped) {
     std::filesystem::remove_all(dir);
 }
 
+// A checkpoint interval no records reached stages nothing and commits nothing,
+// so a quiet job publishes no empty files; the next interval with records
+// commits as usual.
+TEST(ParquetSink2PC, AnIntervalNoRecordsReachedPublishesNothing) {
+    const auto dir = tmp_dir("quiet");
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{43}, "pq2pc", &state, /*metrics=*/nullptr);
+
+    auto sink = std::make_shared<ParquetSink2PC<ColPq2pcTrade>>(
+        dir, make_columnar_arrow_batcher<ColPq2pcTrade>(), 0);
+    sink->set_id(OperatorId{43});
+    sink->attach_runtime(&rctx);
+
+    sink->open();
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    EXPECT_EQ(count_parquet(dir / "staging"), 0u);
+    EXPECT_FALSE(state.get_operator_state(OperatorId{43}, "_xo_pending_sub0_1").has_value());
+    sink->on_commit(1);
+    EXPECT_EQ(count_parquet(dir / "committed"), 0u);
+
+    sink->on_data(sample_batch());
+    sink->on_barrier(CheckpointBarrier{CheckpointId{2}});
+    sink->on_commit(2);
+    EXPECT_EQ(count_parquet(dir / "committed"), 1u);
+    std::filesystem::remove_all(dir);
+}
+
 TEST(ParquetSink2PC, BarrierWithoutCommitLeavesStagingAndState) {
     const auto dir = tmp_dir("nocommit");
     InMemoryStateBackend state;

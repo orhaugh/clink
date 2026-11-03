@@ -35,12 +35,12 @@ cmake -S . -B build -DCLINK_WITH_AZURE=ON
 | --- | --- | --- |
 | `azure_parquet_int64_sink` | Sink | `int64` |
 | `azure_parquet_string_sink` | Sink | `string` |
-| `azure_parquet_2pc_int64_sink` | Sink | `int64` (two-phase commit, one staged file per checkpoint) |
-| `azure_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint) |
+| `azure_parquet_2pc_int64_sink` | Sink | `int64` (two-phase commit, one staged file per checkpoint with records) |
+| `azure_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint with records) |
 | `azure_parquet_int64_source` | Source | `int64` |
 | `azure_parquet_string_source` | Source | `string` |
 | `azure_parquet_row_sink` | Sink | `row`: a SQL table's declared columns, each a typed Parquet column |
-| `azure_parquet_2pc_row_sink` | Sink | `row` (two-phase commit, one staged file per checkpoint) |
+| `azure_parquet_2pc_row_sink` | Sink | `row` (two-phase commit, one staged file per checkpoint with records) |
 | `azure_parquet_row_source` | Source | `row` |
 
 Registered in `impls/azure/src/register_factories.cpp`.
@@ -161,7 +161,7 @@ Through the registry, look the factory up by its registered name (for example `a
 
 The factory sink is at-least-once and writes a directory of part objects under `container/prefix` through the shared `ParquetRollingSink<T>` (`include/clink/connectors/parquet_rolling_sink.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input. A part is written as `<name>.inprogress` and copied to its final `.parquet` key when complete, then the in-progress object is deleted: Arrow's Azure stream creates the blob as soon as it opens, so writing to the final key would expose an empty blob for the whole interval and leave it behind after a kill. So the prefix never shows a partial `.parquet` object, everything up to the last barrier is already published when a kill lands, and a leftover `.inprogress` object is skipped by readers and removed by the next run. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts under the prefix (only keys named exactly as the sink names its parts). The sink therefore needs list and delete permission as well as write. Read the directory back with the source on the same `prefix`. The programmatic `ParquetAzureSink<T>` writes a single object and finalises it only in `close()`; a cancelled task deletes it.
 
-For exactly-once, use the 2PC sink: `azure_parquet_2pc_{int64,string,row}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet blob per checkpoint interval under `<container>/<prefix>/staging` and promotes it to `<container>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each blob is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its blobs beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
+For exactly-once, use the 2PC sink: `azure_parquet_2pc_{int64,string,row}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet blob for each checkpoint interval records reached (an interval none reached stages and publishes nothing) under `<container>/<prefix>/staging` and promotes it to `<container>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each blob is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its blobs beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
 
 The source reads a single Parquet object to its last row group and reports `is_bounded() == true` (`parquet_azure_source.hpp`). It resolves the batcher's columns in the file by name, with the same type, and reads only those. A column the file lacks, or holds as another type, is refused naming it, except the engine's `event_time` column, which a file another tool wrote does not carry. It carries no offset or replay tracking, so it is a bounded one-shot read rather than a checkpointed, replayable source.
 

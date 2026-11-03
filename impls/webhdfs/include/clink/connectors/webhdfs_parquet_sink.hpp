@@ -375,9 +375,12 @@ public:
     }
 
     // Seal the interval: finalise the in-memory Parquet file and upload it to
-    // staging/. Every checkpoint stages a file, empty or not.
+    // staging/. An interval no records reached stages nothing and has nothing
+    // to commit, so a quiet job publishes no empty files.
     std::optional<std::string> prepare_commit(std::uint64_t checkpoint_id) override {
-        ensure_writer_open_();
+        if (!writer_) {
+            return std::nullopt;
+        }
         auto buffer = finalize_writer_();
         const std::string staging = staging_key_(checkpoint_id);
         upload_(staging, *buffer);

@@ -33,7 +33,8 @@
 //   on_data       - write() writes the batch as a row group into the in-memory writer.
 //   on_barrier(b) - prepare_commit(b) finalises the writer and uploads the buffer
 //                   to the staging object (OpenOutputStream + Write + Close is
-//                   atomic on object stores), returning the staging key.
+//                   atomic on object stores), returning the staging key; an
+//                   interval no records reached stages nothing.
 //   on_commit(id) - commit(handle) publishes staging -> committed by the route
 //                   the store publishes atomically (a streamed upload on S3, a
 //                   rename on a local disk or WebHDFS, a server-side copy on
@@ -131,11 +132,13 @@ public:
         }
     }
 
-    // Finalise the writer and upload the buffer to the staging object. Opens the
-    // writer even with no records this interval, so every (subtask, ckpt) yields
-    // a uniform staging object for recovery to find.
+    // Finalise the writer and upload the buffer to the staging object. An
+    // interval no records reached stages nothing and has nothing to commit, so
+    // a quiet job publishes no empty objects.
     std::optional<std::string> prepare_commit(std::uint64_t checkpoint_id) override {
-        ensure_writer_open_();
+        if (!writer_) {
+            return std::nullopt;
+        }
         auto buffer = finalize_writer_();
 
         const std::string staging_key = staging_key_(checkpoint_id);

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**An exactly-once Parquet sink publishes nothing for an interval no records
+reached.** The two-phase-commit Parquet sinks (local `parquet`, the S3, GCS
+and Azure ones over `ParquetFsSink2PC`, and WebHDFS) staged and committed a
+file at every checkpoint, empty or not, so a quiet job checkpointing every few
+seconds filled its output prefix with empty files for as long as it ran: the
+playback showcase's vendor bucket held 59 empty objects among 90 after half an
+hour. An interval without records now stages nothing and commits nothing, as
+the raw S3 two-phase sink already did (the exactly-once model's empty prepare);
+the next interval with records commits as before. Covered by
+`AnIntervalNoRecordsReachedPublishesNothing` for `ParquetFsSink2PC`,
+`ParquetSink2PC` and `WebHdfsParquetSink2PC`.
+
 **A standby Coordinator answers the HTTP API with the leader's view, and both
 roles answer `/livez` and `/readyz` without the token.** Under HA every
 Coordinator serves HTTP from the start, and a standby answered the API from its

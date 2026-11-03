@@ -113,8 +113,9 @@ Guarantees vary by connector and are stated on each page. In summary:
   directory of complete part files, one per subtask per checkpoint interval,
   and a 2PC variant
   (`<connector>_2pc_*_sink`, or `delivery_guarantee='exactly_once'` in SQL) stages
-  one file per checkpoint under `<prefix>/staging` and atomically promotes it to
-  `<prefix>/committed` only when the checkpoint completes globally.
+  one file for each checkpoint interval records reached under `<prefix>/staging`
+  and atomically promotes it to `<prefix>/committed` only when the checkpoint
+  completes globally; an interval no records reached publishes nothing.
 - Sources that record their position as operator state replay from the last
   checkpoint on recovery; the exact mechanism (Kafka offsets, Postgres LSN,
   object index, row index) and any caveats are documented per connector.

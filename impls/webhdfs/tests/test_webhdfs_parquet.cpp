@@ -536,6 +536,37 @@ TEST(WebHdfsParquetSink2PC, CommitRenamesStagingToCommittedAndIsReadable) {
     EXPECT_EQ(got, (std::vector<std::int64_t>{10, 20}));
 }
 
+// A checkpoint interval no records reached stages nothing and commits nothing,
+// so a quiet job publishes no empty files; the next interval with records
+// commits as usual.
+TEST(WebHdfsParquetSink2PC, AnIntervalNoRecordsReachedPublishesNothing) {
+    MockWebHdfs srv;
+    InMemoryStateBackend state;
+    RuntimeContext rctx(OperatorId{44}, "wh2pc", &state, nullptr);
+    auto sink = make_2pc_sink(srv, "/clink/quiet", rctx, OperatorId{44});
+
+    sink->open();
+    sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    EXPECT_FALSE(state.get_operator_state(OperatorId{44}, "_xo_pending_sub0_1").has_value());
+    sink->on_commit(1);
+    const auto files = [&] {
+        std::size_t n = 0;
+        for (const auto& p : srv.paths()) {
+            n += p.starts_with("/clink/quiet/") && p.ends_with(".parquet") ? 1 : 0;
+        }
+        return n;
+    };
+    EXPECT_EQ(files(), 0U);
+
+    Batch<std::int64_t> b;
+    b.emplace(7);
+    sink->on_data(b);
+    sink->on_barrier(CheckpointBarrier{CheckpointId{2}});
+    sink->on_commit(2);
+    EXPECT_EQ(files(), 1U);
+    EXPECT_EQ(read_committed_dir(srv, "/clink/quiet/committed"), (std::vector<std::int64_t>{7}));
+}
+
 TEST(WebHdfsParquetSink2PC, FreshSinkCommitsPendingOnOpen) {
     MockWebHdfs srv;
     InMemoryStateBackend state;
