@@ -231,6 +231,7 @@ public:
         ep.port = static_cast<std::uint16_t>(extract_uint_(body, "port"));
         ep.epoch = extract_uint_(body, "epoch");
         ep.updated_unix_ms = static_cast<std::int64_t>(extract_uint_(body, "updated_unix_ms"));
+        ep.http_port = static_cast<std::uint16_t>(extract_uint_(body, "http_port"));
         if (ep.host.empty() || ep.port == 0)
             return std::nullopt;
         return ep;
@@ -357,6 +358,7 @@ private:
         w.kv("port", static_cast<std::int64_t>(advertise_.port));
         w.kv("epoch", static_cast<std::int64_t>(mine));
         w.kv("updated_unix_ms", static_cast<std::int64_t>(unix_ms_now()));
+        w.kv("http_port", static_cast<std::int64_t>(advertise_.http_port));
         w.end_object();
         const auto epoch_of = [](const std::string& path) -> std::uint64_t {
             std::ifstream in(path);

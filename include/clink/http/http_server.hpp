@@ -148,6 +148,14 @@ public:
     void set_auth_exempt(
         std::function<bool(std::string_view method, std::string_view path)> exempt);
 
+    // Let a request be answered before its route's handler runs. The forwarder
+    // sees every GET and POST a route matched, after CORS and auth, parsed as
+    // the handler would see it; a response it returns is sent in place of the
+    // handler's, and nullopt lets the handler answer. A standby Coordinator
+    // forwards its API to the leader this way. SSE routes do not consult it.
+    // Call before start().
+    void set_forwarder(std::function<std::optional<HttpResponse>(const HttpRequest&)> forwarder);
+
     // Start listening on `host`:`port`. Spawns a background thread to
     // run the accept loop. Returns the actually-bound port (matches
     // `port` if non-zero; OS-picked otherwise). Throws on bind failure.

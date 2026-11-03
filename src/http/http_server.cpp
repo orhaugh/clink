@@ -110,15 +110,23 @@ struct HttpServer::Impl {
     std::string cors_origin;
     std::string auth_token;
     std::function<bool(std::string_view, std::string_view)> auth_exempt;
+    // Consulted before every adapted handler; set before start(), read-only after.
+    std::function<std::optional<HttpResponse>(const HttpRequest&)> forwarder;
 
     // Wrap a clink Handler so it adapts to httplib's signature
     // (void(const Request&, Response&)) with structured exception
     // propagation -> 500 with the exception message in the body.
-    static httplib::Server::Handler adapt(Handler h) {
-        return [h = std::move(h)](const httplib::Request& req, httplib::Response& resp) {
+    httplib::Server::Handler adapt(Handler h) {
+        return [this, h = std::move(h)](const httplib::Request& req, httplib::Response& resp) {
             try {
-                const auto r = h(build_request(req));
-                apply_response(r, resp);
+                const auto request = build_request(req);
+                if (forwarder) {
+                    if (auto answered = forwarder(request)) {
+                        apply_response(*answered, resp);
+                        return;
+                    }
+                }
+                apply_response(h(request), resp);
             } catch (const std::exception& e) {
                 resp.status = 500;
                 resp.set_content(std::string{"{\"error\":\"handler threw: "} + e.what() + "\"}",
@@ -158,14 +166,14 @@ void HttpServer::get(const std::string& path, Handler handler) {
     // earlier routes.
     if (!path.empty() && path.back() == '*') {
         impl_->server.Get(path.substr(0, path.size() - 1) + "(.*)",
-                          Impl::adapt(std::move(handler)));
+                          impl_->adapt(std::move(handler)));
         return;
     }
-    impl_->server.Get(path, Impl::adapt(std::move(handler)));
+    impl_->server.Get(path, impl_->adapt(std::move(handler)));
 }
 
 void HttpServer::post(const std::string& path, Handler handler) {
-    impl_->server.Post(path, Impl::adapt(std::move(handler)));
+    impl_->server.Post(path, impl_->adapt(std::move(handler)));
 }
 
 void HttpServer::sse(const std::string& path, SseFactory factory) {
@@ -242,6 +250,11 @@ void HttpServer::enable_cors(const std::string& allow_origin) {
 void HttpServer::set_auth_exempt(
     std::function<bool(std::string_view method, std::string_view path)> exempt) {
     impl_->auth_exempt = std::move(exempt);
+}
+
+void HttpServer::set_forwarder(
+    std::function<std::optional<HttpResponse>(const HttpRequest&)> forwarder) {
+    impl_->forwarder = std::move(forwarder);
 }
 
 void HttpServer::set_auth_token(const std::string& token) {

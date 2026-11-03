@@ -75,6 +75,7 @@
 #include "clink/lineage/lineage_listener.hpp"
 #ifdef CLINK_HAS_HTTP
 #include "clink/cluster/snapshots.hpp"
+#include "clink/cluster/standby_http.hpp"
 #include "clink/core/allocator_info.hpp"
 #include "clink/core/record.hpp"
 #include "clink/core/types.hpp"  // operator_id_from_uid
@@ -2452,6 +2453,11 @@ int run_coordinator(int argc, char** argv) {
         clink::cluster::LeaderEndpoint advertise;
         advertise.host = advertise_host;
         advertise.port = want_port;
+#ifdef CLINK_HAS_HTTP
+        // Where this Coordinator's HTTP API answers, should it lead: a standby
+        // forwards the API to the leader there.
+        advertise.http_port = static_cast<std::uint16_t>(std::stoi(http_port_str));
+#endif
         if (!etcd_endpoints.empty()) {
 #ifdef CLINK_LINKED_ETCD
             clink::cluster::EtcdHaConfig ecfg;
@@ -3017,7 +3023,35 @@ int run_coordinator(int argc, char** argv) {
         // trivial (httplib's blocking response API doesn't surface the
         // body in pieces). For HTTP-5 the coordinator stream is the canonical
         // feed; per-worker SSE comes in HTTP-6 if the console needs it.
-        http_srv->sse("/api/v1/events", make_event_bus_sse_factory());
+        // A standby has none of the cluster's events: it ends the stream at
+        // once, and the client's reconnect, through a Service spreading
+        // connections across the Coordinators, reaches the leader.
+        http_srv->sse("/api/v1/events",
+                      [ha = ha_coord.get(), events = make_event_bus_sse_factory()](
+                          const clink::http::HttpRequest& req) -> clink::http::SsePuller {
+                          if (ha != nullptr && !ha->is_leader()) {
+                              return [] { return std::optional<clink::http::SseChunk>{}; };
+                          }
+                          return events(req);
+                      });
+
+        // Probes, answered without the token and with a status line alone,
+        // registered before the console's catch-all, which would otherwise
+        // answer them with its page:
+        // /livez while this process serves HTTP, /readyz while it can answer
+        // the API, as the leader or as a standby with a leader to forward to.
+        http_srv->get("/livez", [](const clink::http::HttpRequest&) {
+            clink::http::HttpResponse resp;
+            resp.content_type = "text/plain";
+            resp.body = "ok\n";
+            return resp;
+        });
+        http_srv->get("/readyz",
+                      [ha = ha_coord.get(), coordinator_ptr, advertise_host, http_port](
+                          const clink::http::HttpRequest&) {
+                          return clink::cluster::coordinator_readiness(
+                              ha, coordinator_ptr->bound_port() != 0, advertise_host, http_port);
+                      });
 
         // The human-facing UI. The embedded dashboard SPA is gone - the ops
         // console lives in its own repository (clink-fe) - and the
@@ -3067,9 +3101,13 @@ int run_coordinator(int argc, char** argv) {
             // without it: they hold no cluster data, and a browser cannot add
             // the header when it loads a page. The console asks for the token
             // and sends it on every API call, which still requires it.
-            http_srv->set_auth_exempt(clink::http::is_console_file_request);
+            http_srv->set_auth_exempt([](std::string_view method, std::string_view path) {
+                return clink::http::is_console_file_request(method, path) ||
+                       clink::http::is_probe_request(method, path);
+            });
             std::cout << "coordinator serving console from " << static_root.string() << "\n";
         } else {
+            http_srv->set_auth_exempt(clink::http::is_probe_request);
             // No console mounted: `/` answers with a signpost rather than a
             // 404, so `curl host:8081/` tells a human where everything is.
             http_srv->get("/", [](const clink::http::HttpRequest&) {
@@ -3081,6 +3119,16 @@ int run_coordinator(int argc, char** argv) {
                     R"json(this binary; serve a built one with --http-static-dir=<dir>, )json"
                     R"json(see https://github.com/orhaugh/clink-fe"})json";
                 return resp;
+            });
+        }
+
+        // Under HA a standby forwards the API to the leader, so a client that
+        // reaches either Coordinator gets the leader's answer.
+        if (ha_coord) {
+            http_srv->set_forwarder([ha = ha_coord.get(), advertise_host, http_port](
+                                        const clink::http::HttpRequest& req) {
+                return clink::cluster::answer_as_standby(
+                    *ha, advertise_host, http_port, req, std::chrono::minutes{2});
             });
         }
 
@@ -3454,6 +3502,17 @@ int run_worker(int argc, char** argv) {
             return make_log_components_response();
         });
         http_srv->sse("/api/v1/events", make_event_bus_sse_factory());
+        // Probes, answered without the token and with a status line alone, as
+        // on the Coordinator: a Worker is ready while it serves HTTP.
+        for (const char* probe : {"/livez", "/readyz"}) {
+            http_srv->get(probe, [](const clink::http::HttpRequest&) {
+                clink::http::HttpResponse resp;
+                resp.content_type = "text/plain";
+                resp.body = "ok\n";
+                return resp;
+            });
+        }
+        http_srv->set_auth_exempt(clink::http::is_probe_request);
         http_bound = http_srv->start(http_bind, http_port_req);
         std::cout << "worker HTTP on " << http_bind << ":" << http_bound << "\n";
         std::cout.flush();

@@ -47,6 +47,9 @@ struct LeaderEndpoint {
     // on process death, but pathological cases like NFS hangs can leak
     // stale ownership).
     std::int64_t updated_unix_ms{0};
+    // The leader's HTTP API port on `host`, 0 when it serves none. A standby
+    // Coordinator forwards the API it is asked for to the leader there.
+    std::uint16_t http_port{0};
 };
 
 class HaCoordinator {

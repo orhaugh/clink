@@ -39,6 +39,7 @@ std::string serialize_leader_endpoint(const LeaderEndpoint& ep, std::uint64_t ep
     w.kv("port", static_cast<std::int64_t>(ep.port));
     w.kv("epoch", static_cast<std::int64_t>(epoch));
     w.kv("updated_unix_ms", static_cast<std::int64_t>(unix_ms_now()));
+    w.kv("http_port", static_cast<std::int64_t>(ep.http_port));
     w.end_object();
     return w.str();
 }
@@ -121,6 +122,7 @@ public:
             ep.port = static_cast<std::uint16_t>(extract_uint(body, "port"));
             ep.epoch = extract_uint(body, "epoch");
             ep.updated_unix_ms = static_cast<std::int64_t>(extract_uint(body, "updated_unix_ms"));
+            ep.http_port = static_cast<std::uint16_t>(extract_uint(body, "http_port"));
             if (ep.host.empty() || ep.port == 0)
                 return std::nullopt;
             return ep;

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -66,6 +67,37 @@ TEST(HaCoordinator, SingleProcessAcquiresLeadership) {
     EXPECT_EQ(ep->port, 6123);
     EXPECT_GE(ep->epoch, 1u);
     c->stop();
+}
+
+// The leader records where its HTTP API answers, so a standby reading the record
+// can forward the API to it; a record without one (an earlier release's, or a
+// leader serving no HTTP) reads as port 0.
+TEST(HaCoordinator, TheLeaderRecordCarriesItsHttpPort) {
+    const auto dir = fresh_ha_dir();
+    auto leader = make_file_ha_coordinator(dir.string(), {"127.0.0.1", 6123, 0, 0, 8081}, 50ms);
+    leader->start();
+    ASSERT_TRUE(wait_for([&] { return leader->current_leader_endpoint().has_value(); }, kHaWait));
+    // The standby is a reader that never stands: a second coordinator in this
+    // process would take the lock as well (POSIX record locks are per process).
+    auto standby = make_file_ha_coordinator(dir.string(), {"127.0.0.1", 6124, 0, 0, 8082}, 50ms);
+    const auto seen = standby->current_leader_endpoint();
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_FALSE(standby->is_leader());
+    EXPECT_EQ(seen->port, 6123);
+    EXPECT_EQ(seen->http_port, 8081);
+    leader->stop();
+
+    const auto old = fresh_ha_dir();
+    {
+        std::ofstream out(old / "active-leader.json");
+        out << R"({"host":"10.0.0.7","port":6123,"epoch":3,"updated_unix_ms":1})";
+    }
+    auto reader = make_file_ha_coordinator(old.string(), {}, 50ms);
+    const auto earlier = reader->current_leader_endpoint();
+    ASSERT_TRUE(earlier.has_value());
+    EXPECT_EQ(earlier->host, "10.0.0.7");
+    EXPECT_EQ(earlier->port, 6123);
+    EXPECT_EQ(earlier->http_port, 0);
 }
 
 TEST(HaCoordinator, OnlyOneOfTwoConcurrentInstancesIsLeader) {

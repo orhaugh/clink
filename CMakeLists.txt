@@ -554,6 +554,8 @@ if(CLINK_BUILD_HTTP)
     target_sources(clink_core PRIVATE
         src/http/http_server.cpp
         src/http/http_client.cpp
+        src/http/forward.cpp
+        src/cluster/standby_http.cpp
         src/lineage/openlineage_exporter.cpp
     )
 endif()

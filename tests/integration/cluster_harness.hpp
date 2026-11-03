@@ -535,23 +535,32 @@ public:
     // one" a real failover rather than a port collision.
 
     // Bring up `n` coordinator processes under leader election and wait for
-    // one to win. Requires ClusterSpec::ha.
+    // one to win. Requires ClusterSpec::ha. The node starts its HTTP listener
+    // before it wins leadership, so with ClusterSpec::http each coordinator
+    // serves HTTP on a port of its own: ha_http_port(i), and http_port() is
+    // coordinator 0's.
     [[nodiscard]] bool start_ha_coordinators(std::size_t n, const ProcOptions& opts = {}) {
-        // The node starts its HTTP listener before it wins leadership, so
-        // standbys cannot share one HTTP port. A test that needs HTTP uses a
-        // single HA coordinator and starts its replacement after the kill.
-        if (!spec_.ha || n == 0 || (spec_.http && n != 1)) {
+        if (!spec_.ha || n == 0) {
             return false;
         }
         ReservedPort rpc;
-        ReservedPort http;
+        std::vector<ReservedPort> http(spec_.http ? n : 0);
         if (!rpc.valid()) {
             return false;
         }
         coordinator_port_ = rpc.port();
-        http_port_ = spec_.http ? http.port() : 0;
+        ha_http_ports_.clear();
+        for (const auto& h : http) {
+            if (!h.valid()) {
+                return false;
+            }
+            ha_http_ports_.push_back(h.port());
+        }
+        http_port_ = ha_http_ports_.empty() ? 0 : ha_http_ports_.front();
         rpc.release();
-        http.release();
+        for (auto& h : http) {
+            h.release();
+        }
         for (std::size_t i = 0; i < n; ++i) {
             std::vector<std::string> argv{spec_.node_binary.string(),
                                           "--role=coordinator",
@@ -560,7 +569,7 @@ public:
                                           "--port=" + std::to_string(coordinator_port_),
                                           "--ha-dir=" + ha_dir().string()};
             if (spec_.http) {
-                argv.push_back("--http-port=" + std::to_string(http_port_));
+                argv.push_back("--http-port=" + std::to_string(ha_http_ports_[i]));
             }
             argv.insert(argv.end(), opts.extra_args.begin(), opts.extra_args.end());
             ha_coordinators_.push_back(std::make_unique<Process>());
@@ -572,9 +581,15 @@ public:
                 return false;
             }
         }
-        return await_leader_elected() && await_coordinator_ready() &&
-               (!spec_.http || await([this] { return port_accepting(http_port_); }));
+        return await_leader_elected() && await_coordinator_ready() && await([this] {
+                   return std::all_of(ha_http_ports_.begin(),
+                                      ha_http_ports_.end(),
+                                      [](std::uint16_t p) { return port_accepting(p); });
+               });
     }
+
+    // The HTTP port of the i-th HA coordinator (ClusterSpec::http).
+    [[nodiscard]] std::uint16_t ha_http_port(std::size_t i) const { return ha_http_ports_.at(i); }
 
     // One more HA coordinator on the port and HA directory the first ones use,
     // with options of its own: a standby that takes over clean while the
@@ -963,6 +978,7 @@ private:
     ClusterSpec spec_;
     std::unique_ptr<Process> coordinator_;
     std::vector<std::unique_ptr<Process>> ha_coordinators_;
+    std::vector<std::uint16_t> ha_http_ports_;
     std::vector<std::unique_ptr<Process>> workers_;
     std::vector<std::uint16_t> worker_ports_;
     std::uint16_t coordinator_port_{0};

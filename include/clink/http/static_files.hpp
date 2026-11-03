@@ -156,4 +156,11 @@ inline bool is_console_file_request(std::string_view method, std::string_view pa
     return !path.starts_with("/api/") && path != "/api" && !path.starts_with("/metrics");
 }
 
+// Whether a request is a probe: a GET or HEAD of /livez or /readyz. A probe's
+// answer is its status line alone, so a node that requires a token answers it
+// without one, as a kubelet asks.
+inline bool is_probe_request(std::string_view method, std::string_view path) {
+    return (method == "GET" || method == "HEAD") && (path == "/livez" || path == "/readyz");
+}
+
 }  // namespace clink::http

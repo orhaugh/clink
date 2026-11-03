@@ -43,6 +43,7 @@
 
 #include "clink/cluster/coordinator.hpp"
 #include "clink/config/json.hpp"
+#include "clink/http/http_client.hpp"
 
 #include "tests/integration/await_port.hpp"
 #include "tests/integration/cluster_harness.hpp"
@@ -687,3 +688,54 @@ TEST_F(HaFailoverTest, ATakeoverNumbersAboveABarrierTheDeadLeaderDelivered) {
 }
 
 }  // namespace
+
+// The HTTP API under HA. A client may reach either Coordinator, as through a
+// Kubernetes Service spreading requests across both: the standby answers with
+// the leader's view by forwarding to it, while its probes answer for itself,
+// without the token a kubelet does not have. After a failover the survivor,
+// now the leader, answers itself.
+TEST_F(HaFailoverTest, AStandbyAnswersTheApiWithTheLeadersView) {
+    auto s = spec();
+    s.http = true;
+    Cluster c(s);
+    ScopedDiagnostics diag(c);
+    // A mounted console, as the runtime image has: its catch-all route must
+    // not answer the probes.
+    const auto console = out_dir_ / "console";
+    std::filesystem::create_directories(console);
+    std::ofstream(console / "index.html") << "<!doctype html><title>console</title>";
+    clink::itest::ProcOptions opts;
+    opts.env = {{"CLINK_AUTH_TOKEN", "ha-t0k"}};
+    clink::itest::ProcOptions coordinator_opts = opts;
+    coordinator_opts.extra_args = {"--http-static-dir=" + console.string()};
+    ASSERT_TRUE(c.start_ha_coordinators(2, coordinator_opts)) << "no coordinator won the election";
+    ASSERT_TRUE(c.start_worker(0, opts));
+    const auto leader = c.current_leader_index();
+    ASSERT_TRUE(leader.has_value());
+    const std::size_t standby = 1 - *leader;
+
+    clink::http::HttpClient probe_leader("127.0.0.1", c.ha_http_port(*leader));
+    clink::http::HttpClient probe_standby("127.0.0.1", c.ha_http_port(standby));
+    EXPECT_EQ(probe_leader.get("/readyz").body, "leader\n");
+    EXPECT_EQ(probe_standby.get("/readyz").body, "standby\n");
+    EXPECT_EQ(probe_standby.get("/livez").body, "ok\n");
+    EXPECT_EQ(probe_standby.get("/api/v1/cluster").status, 401)
+        << "only the probes answer without the token";
+
+    clink::http::HttpClient api_standby("127.0.0.1", c.ha_http_port(standby));
+    api_standby.set_bearer_token("ha-t0k");
+    const auto lists_the_worker = [&] {
+        const auto r = api_standby.get("/api/v1/cluster");
+        return r.status == 200 && r.body.find("worker-0") != std::string::npos;
+    };
+    EXPECT_TRUE(clink::itest::await_condition(lists_the_worker))
+        << "the standby never answered with the leader's worker: "
+        << api_standby.get("/api/v1/cluster").body;
+
+    ASSERT_TRUE(c.kill_leader_and_await_failover().has_value());
+    EXPECT_TRUE(clink::itest::await_condition([&] {
+        return probe_standby.get("/readyz").body == "leader\n";
+    })) << "the survivor did not report itself the leader";
+    EXPECT_TRUE(clink::itest::await_condition(lists_the_worker))
+        << "the new leader never listed the worker that re-registered with it";
+}

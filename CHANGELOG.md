@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**A standby Coordinator answers the HTTP API with the leader's view, and both
+roles answer `/livez` and `/readyz` without the token.** Under HA every
+Coordinator serves HTTP from the start, and a standby answered the API from its
+own empty state: through a Kubernetes Service spreading requests across both
+Coordinators, about half the requests listed no workers and a submission could
+land on a Coordinator that would never run it. The leader now records its HTTP
+port in the leader record, and a standby forwards each `/api/` request to it
+and returns the leader's answer, answering only its probes, health, metrics and
+console files itself; a request already forwarded once, or one with no leader
+to go to, gets 503. The chart's probes could not run with `CLINK_AUTH_TOKEN`
+set, since every route, `/api/v1/health` included, required the token. `GET
+/livez` (the process serves HTTP) and `GET /readyz` (a Coordinator can answer
+the API, as the leader or as a standby with a leader to forward to) now answer
+with a status line and need no token. Covered by `HttpForward`,
+`HttpServerForwarder` and `StandbyHttp` against in-process servers and real
+file-based leader records,
+`HaCoordinator.TheLeaderRecordCarriesItsHttpPort`, and
+`HaFailoverTest.AStandbyAnswersTheApiWithTheLeadersView` across two Coordinator
+processes, a Worker and a failover.
+
 **A SQL table on S3, GCS, Azure or WebHDFS Parquet writes and reads its
 declared columns as typed Parquet columns.** A table with more than one column,
 or `format='json'`, on `s3_parquet`, `gcs_parquet`, `azure_parquet` or
