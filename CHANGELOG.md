@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+**A run that ends with a cancel validates against the exactly-once
+specification.** A checkpoint that completes as its job is being cancelled
+keeps its marker, and its commit is withheld, since a cancelled job has no
+in-doubt resolution behind it to finish a partial commit. The protocol trace
+recorded that withheld broadcast, but the specification has no cancel and no
+step for it, so a traced run whose last checkpoint completed inside the
+cancel's window failed validation at its final event, though every event
+before it was a step the specification allows. The trace now records a
+withheld broadcast only when a restart withholds it, which the specification
+models, and leaves out one withheld only by a cancel, as it already leaves out
+a broadcast after its run's Redeploy. Covered by
+`CheckpointCompletion.ACommitWithheldForACancelIsLeftOutOfTheProtocolTrace`; a
+traced card-sentry payment-rail run that failed validation this way is accepted
+once that line is left out (3,069 events), and the recorded runs under
+`formal/traces` are all still accepted.
+
 ## v0.15.0 (November 2026)
 
 A sweep release: the defects and rough edges found since v0.14.0, fixed

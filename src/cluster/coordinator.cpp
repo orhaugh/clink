@@ -11015,7 +11015,13 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
             // no held resolution behind it: a partial commit there is
             // permanent.
             if (job.awaiting_restart || job.cancel_requested) {
-                if (protocol_trace::enabled()) {
+                // Traced for a restart only. The specification withholds a
+                // commit while its run is not running, which a restart's
+                // drain is; it has no cancel, so a broadcast withheld only
+                // because the job is being cancelled is no step of it, and the
+                // trace ends at the cancel as far as the model can judge, as
+                // it does for a checkpoint after its run's Redeploy.
+                if (protocol_trace::enabled() && job.awaiting_restart) {
                     protocol_trace::Event("Broadcast")
                         .u("job", jid)
                         .u("ckpt", ckpt_id)

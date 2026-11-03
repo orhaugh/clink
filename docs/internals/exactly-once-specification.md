@@ -226,7 +226,7 @@ name and leaves the field out. The table lists each event's other fields.
 | `SubtaskAck` | worker, as `SubtaskCheckpointed` is sent (the subtask's own step, so it precedes the subtask's next prepare in the merged trace) | `job`, `sub`, `ckpt`, `ok` | `SinkAck` (a non-sink subtask's ack is a stutter). An ack for a checkpoint an earlier incarnation of the sink sealed is a stutter: it comes from a lost worker's process, whose frames the coordinator drops |
 | `CoordComplete` | coordinator, last ack in | `job`, `ckpt`, `outcome` = `completed`, `failed`, `discarded`, `epoch` | `CoordComplete`. From a superseded coordinator's epoch, a `completed` decision on acks sent before the supersession is a stutter: the supersession turned that checkpoint's put stale (`DecidedLate`). A late `failed` or `discarded` decision diverges, as does one on an ack sent after the supersession by a worker not yet re-registered |
 | `WriteCompleted` | coordinator, in the hold after the marker fsync that advances the completed restore point, before the `after_completed_marker` fault point; not emitted when the job redeployed while the put was out, and the advance is skipped while the restart is held for in-doubt resolution | `job`, `ckpt`, `epoch` | `WriteCompleted` for the leader. From a superseded coordinator's epoch, the stale put landing (`StaleCompletedLands`), or a stutter when the takeover already read the marker; before the takeover's line, a stutter with the put left stale |
-| `Broadcast` | coordinator | `job`, `ckpt`, `withheld`, `epoch` | `Broadcast` for the leader; a stutter from a superseded coordinator |
+| `Broadcast` | coordinator; not for a commit withheld only by a cancel, which the model has no step for | `job`, `ckpt`, `withheld`, `epoch` | `Broadcast` for the leader; a stutter from a superseded coordinator |
 | `DeliverCommit`, `DeliverAbort` | the sink, on dispatch | `sub`, `ckpt`, `accepted` | `DeliverCommit`, `DeliverAbort`. An old incarnation's abort is `LostDeliverAbort`; its refused commit is `LostSinkCommit` with no effect, and an accepted one a stutter until its `SinkCommit`, since the specification takes its dispatch and commit as one step |
 | `SinkCommit` | the sink, external commit executed | `sub`, `ckpt` | `SinkCommit`; an old incarnation's is `LostSinkCommit`, and a stutter when the specification already took that commit inside a reopening sink's open |
 | `SinkReceipt` | the Kafka sink, receipt durable | `sub`, `ckpt` | `SinkReceipt`; an old incarnation's is `LostSinkReceipt` |
@@ -326,23 +326,24 @@ engine, or the model abstracts something the engine legitimately does,
 which is a gap in the model. Both are findings; the second is fixed in
 `ExactlyOnce.tla` and the mutants keep it honest.
 
-Known gaps, stated so a divergence there is read correctly: the model's
-`Host` is fixed, so a sink that moves to another worker on redeploy is
-outside it (the source may move; only sinks are pinned); the model has one
-source, so a second source subtask's barrier is a stutter; a checkpoint
-failed by a subtask that is not a two-phase sink has no sink failure for
-the model to see; a commit broadcast withheld because the job was cancelled
-is not modelled; and a `Placement` must precede a sink's first event, so a
-trace started mid-run is not validated. A worker declared lost and still
-running has three more: a sink still inside `open()` at the declaration is
-taken down at once, so lines from an open finishing on the lost process
-diverge; a coordinator's death or supersession takes the old incarnations down,
-so their lines after a takeover diverge; and the lost source is not followed
-past the redeploy, so its later barrier lines are stutters and an old
-incarnation's prepare of such a barrier diverges. The model keeps one old
-incarnation per sink, so a second loss of a worker hosting the same subtask
-lets the first go. The in-process happy path and the multi-process fault tests
-stay inside those bounds.
+Known gaps, stated so a divergence there is read correctly: the model's `Host`
+is fixed, so a sink that moves to another worker on redeploy is outside it
+(the source may move; only sinks are pinned); the model has one source, so a
+second source subtask's barrier is a stutter; a checkpoint failed by a subtask
+that is not a two-phase sink has no sink failure for the model to see; a
+cancel is not modelled, so a commit broadcast withheld only because the job is
+being cancelled is left out of the trace, which ends there as far as the model
+can judge; and a `Placement` must precede a sink's first event, so a trace
+started mid-run is not validated. A worker declared lost and still running has
+three more: a sink still inside `open()` at the declaration is taken down at
+once, so lines from an open finishing on the lost process diverge; a
+coordinator's death or supersession takes the old incarnations down, so their
+lines after a takeover diverge; and the lost source is not followed past the
+redeploy, so its later barrier lines are stutters and an old incarnation's
+prepare of such a barrier diverges. The model keeps one old incarnation per
+sink, so a second loss of a worker hosting the same subtask lets the first go.
+The in-process happy path and the multi-process fault tests stay inside those
+bounds.
 
 Writing the module against real traces found three places where the model
 was narrower than the engine, each fixed in the specification: a recovered

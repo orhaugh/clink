@@ -1992,6 +1992,89 @@ TEST(CheckpointCompletion, AConfirmedMarkerLandingAfterARedeployLeavesTheNewRunA
         << "the trace has a WriteConfirmed after the Redeploy, which the specification forbids";
 }
 
+// A checkpoint that completes as its job is being cancelled keeps its marker,
+// and its commit is withheld: a cancelled job has no resolution behind it to
+// finish a partial commit. The specification has no cancel, so it has no step
+// for that withheld broadcast, and the protocol trace leaves it out, as it
+// leaves out a broadcast after a Redeploy. A run whose last checkpoint
+// completed inside the cancel's window used to end its trace on an event the
+// validator could not explain.
+TEST(CheckpointCompletion, ACommitWithheldForACancelIsLeftOutOfTheProtocolTrace) {
+    const auto trace_dir = std::filesystem::temp_directory_path() /
+                           ("clink_ckpt_cancel_withheld_trace_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(trace_dir);
+    std::filesystem::create_directories(trace_dir);
+    ::setenv("CLINK_PROTOCOL_TRACE_DIR", trace_dir.c_str(), 1);
+    clink::protocol_trace::reset_for_tests();
+    struct TraceOff {
+        std::filesystem::path dir;
+        ~TraceOff() {
+            ::unsetenv("CLINK_PROTOCOL_TRACE_DIR");
+            clink::protocol_trace::reset_for_tests();
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } trace_off{trace_dir};
+    clink::fault::Registry::instance().reset();
+
+    CheckpointFixture fx;
+    const auto job_id = fx.bring_up(/*max_restarts=*/0, /*interval_ms=*/600'000);
+    ASSERT_GT(job_id, 0U);
+    const auto first = first_checkpoint_with_next_on_record(fx, job_id);
+    ASSERT_TRUE(first.has_value());
+
+    clink::fault::ScopedFault hold{
+        clink::fault::Rule{.point = clink::fault::points::kCoordinatorAfterCompletedMarker,
+                           .ordinal = 1,
+                           .action = clink::fault::Action::Block}};
+    const auto since_ms = log_cursor_ms();
+    ASSERT_TRUE(fx.ack_all(job_id, *first, /*ok=*/true));
+    ASSERT_TRUE(ckpt_await([] {
+        return clink::fault::Registry::instance().hits(
+                   clink::fault::points::kCoordinatorAfterCompletedMarker) >= 1;
+    })) << "the checkpoint never completed";
+    ASSERT_TRUE(fx.marker_exists(job_id, *first));
+
+    // The cancel lands between the completed marker and the commit broadcast.
+    ASSERT_TRUE(fx.coordinator->cancel_job(job_id).ok);
+    EXPECT_EQ(clink::fault::Registry::instance().release(
+                  clink::fault::points::kCoordinatorAfterCompletedMarker),
+              1U);
+    const auto withheld = [&] {
+        for (const auto& rec :
+             LogBuffer::global().tail(1000, "info", since_ms, "coordinator.checkpoint")) {
+            if (rec.message.find("a restart or cancel began before its commit broadcast") !=
+                std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    ASSERT_TRUE(ckpt_await(withheld)) << "the commit was not withheld for the cancel";
+    EXPECT_FALSE(fx.worker->await_frame(MessageKind::CommitCheckpoint, 500ms).has_value())
+        << "a cancelled job's checkpoint was committed";
+
+    bool completed = false;
+    bool broadcast = false;
+    const auto job_field = "\"job\":" + std::to_string(job_id) + ",";
+    const auto ckpt_field = "\"ckpt\":" + std::to_string(*first) + ",";
+    for (const auto& entry : std::filesystem::directory_iterator(trace_dir)) {
+        std::ifstream in(entry.path());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.find(job_field) == std::string::npos ||
+                line.find(ckpt_field) == std::string::npos) {
+                continue;
+            }
+            completed |= line.find("\"event\":\"WriteCompleted\"") != std::string::npos;
+            broadcast |= line.find("\"event\":\"Broadcast\"") != std::string::npos;
+        }
+    }
+    EXPECT_TRUE(completed) << "the trace has no WriteCompleted for the checkpoint";
+    EXPECT_FALSE(broadcast) << "the trace has a Broadcast for a commit withheld by a cancel, "
+                               "which the specification has no step for";
+}
+
 namespace {
 
 // True once the log records that worker "w"'s previous session was retired,
