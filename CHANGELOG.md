@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**`CLINK_AUTH_TOKEN` is read without the whitespace around it.** A Kubernetes
+Secret made from a file, or a token written with `echo token > file`, ends the
+token with a newline. Every node kept it, and since no request header can
+carry a newline, no request matched: a cluster given its token that way
+refused every client and its own nodes, and a client presenting the same
+value sent a malformed request, which the node answered with a 400. Every node
+and client now reads the token through one function, `cluster_auth_token`,
+that drops the whitespace around it, and a node given a token holding a
+control character stops at start with the reason. Covered by
+`HttpAuth.ATokenIsReadWithoutTheWhitespaceAroundIt` and
+`HttpObservability.ATokenEndingInANewlineIsReadWithoutIt`, which fails against
+the previous node.
+
 **The Helm chart runs a secured cluster: token auth and control-plane TLS from
 Secrets, and environment and volumes for connector secrets.** The chart gave
 clink nothing but `extraArgs`, so a pod could get neither the auth token, nor

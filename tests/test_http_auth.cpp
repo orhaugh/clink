@@ -18,6 +18,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 
+#include "clink/http/auth_token.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
 
@@ -251,4 +252,19 @@ TEST(HttpLifecycle, ServesWhenDescriptorsAreAboveFdSetsize) {
     EXPECT_EQ(r.body, "pong");
 
     server.stop();
+}
+
+// A Secret made from a file, or `echo token > file`, ends the token with a
+// newline, which no request header can carry: read as it was, the token would
+// match no request, and a cluster given it would refuse even its own nodes.
+// It is read without the whitespace around it; a control character inside it,
+// which no request can carry either, is refused rather than kept.
+TEST(HttpAuth, ATokenIsReadWithoutTheWhitespaceAroundIt) {
+    EXPECT_EQ(auth_token_from("t0k\n"), "t0k");
+    EXPECT_EQ(auth_token_from(" \tt0k\r\n"), "t0k");
+    EXPECT_EQ(auth_token_from("t0 k"), "t0 k") << "a space inside is a header's to carry";
+    EXPECT_FALSE(auth_token_from("").has_value());
+    EXPECT_FALSE(auth_token_from(" \n").has_value());
+    EXPECT_THROW((void)auth_token_from("t0\nk"), std::invalid_argument);
+    EXPECT_THROW((void)auth_token_from(std::string_view{"t0\x01k", 4}), std::invalid_argument);
 }

@@ -381,6 +381,7 @@ include/clink/core/sha256.hpp
 include/clink/embed/arrow_pool_pin.hpp
 include/clink/embed/collect_hub.hpp
 include/clink/fault/fault_injection.hpp
+include/clink/http/auth_token.hpp
 include/clink/http/forward.hpp
 include/clink/http/json_writer.hpp
 include/clink/http/static_files.hpp

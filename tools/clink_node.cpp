@@ -79,6 +79,7 @@
 #include "clink/core/allocator_info.hpp"
 #include "clink/core/record.hpp"
 #include "clink/core/types.hpp"  // operator_id_from_uid
+#include "clink/http/auth_token.hpp"
 #include "clink/http/http_client.hpp"
 #include "clink/http/http_server.hpp"
 #include "clink/http/json_writer.hpp"
@@ -2572,10 +2573,16 @@ int run_coordinator(int argc, char** argv) {
             http_srv->enable_cors(cors);
         }
         // Shared-secret auth for exposing the control plane beyond a trusted
-        // network. The token rides an env var (not a flag - flags leak in `ps`);
-        // unset leaves auth off (backward compatible).
-        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
-            http_srv->set_auth_token(tok);
+        // network. The token rides an env var (not a flag - flags leak in `ps`),
+        // read without the whitespace around it (auth_token.hpp); unset leaves
+        // auth off (backward compatible).
+        try {
+            if (const auto tok = clink::http::cluster_auth_token()) {
+                http_srv->set_auth_token(*tok);
+            }
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "clink_node: " << e.what() << "\n";
+            return 1;
         }
         // Disk volumes reported by /metrics: always the working dir, plus the
         // checkpoint/state mount (--metrics-disk-path, defaulting to the HA dir
@@ -3405,10 +3412,16 @@ int run_worker(int argc, char** argv) {
             http_srv->enable_cors(cors);
         }
         // Shared-secret auth for exposing the control plane beyond a trusted
-        // network. The token rides an env var (not a flag - flags leak in `ps`);
-        // unset leaves auth off (backward compatible).
-        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
-            http_srv->set_auth_token(tok);
+        // network. The token rides an env var (not a flag - flags leak in `ps`),
+        // read without the whitespace around it (auth_token.hpp); unset leaves
+        // auth off (backward compatible).
+        try {
+            if (const auto tok = clink::http::cluster_auth_token()) {
+                http_srv->set_auth_token(*tok);
+            }
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "clink_node: " << e.what() << "\n";
+            return 1;
         }
         // Disk volumes for /metrics: working dir + the worker's checkpoint/state
         // mount when the operator names one (--metrics-disk-path).

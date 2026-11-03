@@ -207,10 +207,13 @@ struct Cluster {
 };
 
 // With a token, every node is started with it as CLINK_AUTH_TOKEN, and every
-// request this harness makes carries it.
-std::optional<Cluster> start_cluster(int n_workers, const std::string& token = "") {
+// request this harness makes carries it. `node_token`, when given, is what the
+// nodes are started with instead, written as a Secret made from a file has it.
+std::optional<Cluster> start_cluster(int n_workers,
+                                     const std::string& token = "",
+                                     const std::string& node_token = "") {
     if (!token.empty()) {
-        ::setenv("CLINK_AUTH_TOKEN", token.c_str(), 1);
+        ::setenv("CLINK_AUTH_TOKEN", (node_token.empty() ? token : node_token).c_str(), 1);
     }
     struct Unset {
         bool active;
@@ -628,4 +631,25 @@ TEST(HttpObservability, ADaemonExportsToAnOtlpEndpointGivenAsAUrlAndRefusesHttps
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) != 0)
         << "it must refuse to start, not run without exporting";
 #endif
+}
+
+// The token as a Kubernetes Secret made from a file holds it, with a newline at
+// the end. Each node reads it without the newline, so the token itself is
+// accepted and the coordinator still reaches its workers with it; kept, the
+// newline would have matched no request, the cluster's own included.
+TEST(HttpObservability, ATokenEndingInANewlineIsReadWithoutIt) {
+    if (!std::filesystem::exists(node_binary_path())) {
+        GTEST_SKIP() << "clink_node is not built";
+    }
+    const std::string token = "file-made-token";
+    auto c = start_cluster(/*n_workers=*/1, token, token + "\n");
+    ASSERT_TRUE(c.has_value()) << "the nodes never accepted the token they were given";
+    EXPECT_EQ(http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/workers", token).status,
+              200);
+    EXPECT_EQ(http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/workers").status, 401);
+    const auto proxied = http_get("127.0.0.1",
+                                  c->coordinator_http_port,
+                                  "/api/v1/workers/" + c->worker_ids.front() + "/metrics",
+                                  token);
+    EXPECT_EQ(proxied.status, 200) << proxied.body;
 }

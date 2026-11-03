@@ -102,9 +102,7 @@ SubmitFn make_http_submit(std::string coordinator_host,
         client.set_read_timeout(kSubmitResponseTimeout);
         // Authenticated submission: present CLINK_AUTH_TOKEN if set, so a coordinator
         // started with the same token accepts the job (401 otherwise).
-        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {
-            client.set_bearer_token(tok);
-        }
+        client.present_cluster_token();
         std::string path = "/api/v1/jobs/spec";
         char sep = '?';
         auto add_param = [&](const std::string& key, const std::string& value) {

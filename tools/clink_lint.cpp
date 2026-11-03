@@ -135,9 +135,7 @@ int clink_cmd_lint(int argc, char** argv) {
         }
 
         clink::http::HttpClient client(host, port);
-        if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr) {
-            client.set_bearer_token(tok);
-        }
+        client.present_cluster_token();
         const auto resp = client.get("/api/v1/jobs/" + job_id);
         if (resp.status == 0) {
             std::cerr << "lint: cannot reach coordinator at " << host << ":" << port << " - "

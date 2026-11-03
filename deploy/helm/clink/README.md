@@ -102,7 +102,8 @@ helm install my-clink deploy/helm/clink --set auth.existingSecret=clink-auth
 
 Every pod then gets `CLINK_AUTH_TOKEN` from it, and every HTTP request needs
 `Authorization: Bearer <token>`, except the probes and the console's own files
-(the console asks for the token). `clink run` and the other clients present
+(the console asks for the token). A Secret made from a file usually ends the
+token with a newline; clink reads it without the whitespace around it. `clink run` and the other clients present
 `CLINK_AUTH_TOKEN` from their own environment.
 
 ## TLS

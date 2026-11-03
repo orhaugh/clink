@@ -8,6 +8,8 @@
 #include <string>
 #include <utility>
 
+#include "clink/http/auth_token.hpp"
+
 namespace clink::http {
 
 struct HttpClient::Impl {
@@ -42,8 +44,8 @@ void HttpClient::set_bearer_token(const std::string& token) {
 }
 
 void HttpClient::present_cluster_token() {
-    if (const char* token = std::getenv("CLINK_AUTH_TOKEN"); token != nullptr && *token != '\0') {
-        set_bearer_token(token);
+    if (const auto token = cluster_auth_token()) {
+        set_bearer_token(*token);
     }
 }
 
