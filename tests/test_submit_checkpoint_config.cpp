@@ -11,8 +11,11 @@
 // Two halves, both pinned here: the client emits the parameters, and the
 // server parses them back into the CheckpointConfig submit_job acts on.
 
+#include <chrono>
 #include <map>
+#include <sstream>
 #include <string>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -186,6 +189,39 @@ TEST(SubmitCheckpointConfig, UnsetClientOptionsSendNoParameters) {
     EXPECT_EQ(seen_query.count("state_backend"), 0U);
     EXPECT_EQ(seen_query.count("capture_dir"), 0U);
     EXPECT_EQ(seen_query.count("capture_records"), 0U);
+}
+
+// The Coordinator holds a submission while it waits for free slots (15 s by
+// default) and answers once the wait is over, here with the refusal. The client
+// used to give up after 5 s and report a transport failure, so the answer that
+// named the problem was never seen.
+TEST(SubmitCheckpointConfig, ASubmissionHeldPastFiveSecondsGetsTheCoordinatorsAnswer) {
+    clink::http::HttpServer server;
+    server.post("/api/v1/jobs/spec", [](const clink::http::HttpRequest&) {
+        std::this_thread::sleep_for(std::chrono::seconds{6});
+        clink::http::HttpResponse resp;
+        resp.status = 500;
+        resp.body =
+            R"json({"ok":false,"error":"submit_job: insufficient free slots (need 3, have 2)"})json";
+        return resp;
+    });
+    const auto port = server.start("127.0.0.1", 0);
+
+    std::ostringstream out;
+    std::ostringstream err;
+    auto submit = clink::sql::make_http_submit(
+        "127.0.0.1", port, clink::sql::SubmitCheckpointOptions{}, out, err);
+    JobGraphSpec graph;
+    OperatorSpec op;
+    op.type = "int64_range_source";
+    op.id = "src";
+    graph.ops.push_back(op);
+    EXPECT_EQ(submit(graph, "edges"), 1);
+    server.stop();
+
+    EXPECT_EQ(err.str().find("transport failure"), std::string::npos) << err.str();
+    EXPECT_NE(out.str().find("insufficient free slots (need 3, have 2)"), std::string::npos)
+        << "out: " << out.str() << "\nerr: " << err.str();
 }
 
 }  // namespace

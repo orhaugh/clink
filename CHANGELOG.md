@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**A submission that waits for free slots says so, and the client waits for
+the answer.** A Coordinator holds a submission while it waits for free slots
+(15 s under `clink_node`), and it said nothing while it waited, or when it then
+refused the job. `clink run` against a cluster gave up after its HTTP client's
+default 5 s, so a job refused for capacity was reported as `HTTP transport
+failure: Failed to read connection`, and the Coordinator's answer, which named
+the problem, was never seen. The Coordinator now logs when a submission starts
+to wait (how many slots it needs and how many are free) and when one is
+refused, and `clink run` gives a cluster submission two minutes to answer
+(`HttpClient::set_read_timeout`). Covered by
+`CheckpointCompletion.AJobWaitingForSlotsSaysSoAndIsRefusedWhenTheyNeverCome`
+and `SubmitCheckpointConfig.ASubmissionHeldPastFiveSecondsGetsTheCoordinatorsAnswer`.
+
 **OpenLineage events name only datasets that have an identity, carry the spec's
 `schemaURL`, and say why a receiver refused them.** A sink that writes nowhere
 a dataset lives, such as `blackhole` or `print`, gave its job an output dataset

@@ -2765,6 +2765,40 @@ TEST(CheckpointCompletion, ASessionChargedPastItsCapacityCountsAsHavingNoFreeSlo
         << "a submit to a full cluster was not refused as a retryable lack of slots";
 }
 
+// A job the cluster cannot place yet is held while the Coordinator waits for
+// free slots, and the wait is logged when it starts, since the submitter hears
+// nothing until it ends; a job the slots never come for is refused, and that is
+// logged too. Before, both happened in silence, and a client whose deadline
+// was shorter than the wait reported only its own timeout.
+TEST(CheckpointCompletion, AJobWaitingForSlotsSaysSoAndIsRefusedWhenTheyNeverCome) {
+    Coordinator::Config cfg;
+    cfg.submit_wait_for_slots = std::chrono::milliseconds{300};
+    CheckpointFixture fx(cfg);
+    fx.worker = std::make_unique<FakeWorker>(fx.port, "w", /*slots=*/1);
+    ASSERT_TRUE(fx.worker->valid() && fx.worker->register_and_ack());
+    ASSERT_TRUE(fx.coordinator->await_registrations(2s));
+
+    auto graph = two_subtask_graph(fx.dir / "out.txt");
+    graph.name = "edges";
+    const auto since_ms = log_cursor_ms();
+    EXPECT_THROW((void)fx.coordinator->submit_job(
+                     graph, OperatorRegistry::default_instance(), {}, CheckpointConfig{}),
+                 Coordinator::InsufficientSlotsError);
+
+    bool waited = false;
+    bool refused = false;
+    for (const auto& rec : LogBuffer::global().tail(1000, "info", since_ms, "coordinator.submit")) {
+        waited |=
+            rec.message.find("job 'edges' needs 2 slots and 1 are free; waiting up to 300 ms") !=
+            std::string::npos;
+        refused |= rec.level == "warn" &&
+                   rec.message.find("refused job 'edges': it needs 2 slots and 1 are free") !=
+                       std::string::npos;
+    }
+    EXPECT_TRUE(waited) << "the wait for slots was not logged when it began";
+    EXPECT_TRUE(refused) << "the refusal for lack of slots was not logged";
+}
+
 // A session lost while it is still retiring its predecessor folds only what it
 // held itself. The predecessor's subtasks wait for the predecessor's queued
 // frames, or for its retirement once those are handled. Folded with the lost

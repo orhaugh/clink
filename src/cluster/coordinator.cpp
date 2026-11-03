@@ -5423,8 +5423,26 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
     // policy: we just check `free_slots() >= required` periodically. A
     // production scheduler would integrate with the slot accountant.
     const auto required = plan.tasks.size();
+    // Slots no live Worker has in use. Called with mu_ held.
+    const auto free_slots_locked = [this] {
+        std::size_t free = 0;
+        for (const auto& [_, worker] : registered_) {
+            if (!worker->lost && worker->slots_in_use < worker->slot_capacity) {
+                free += (worker->slot_capacity - worker->slots_in_use);
+            }
+        }
+        return free;
+    };
+    const std::string job_label = graph.name.empty() ? "a job" : "job '" + graph.name + "'";
     if (cfg_.submit_wait_for_slots.count() > 0) {
         std::unique_lock lock(mu_);
+        if (const auto free = free_slots_locked(); free < required) {
+            // Said before the wait: the submitter hears nothing until it ends.
+            log::info("coordinator.submit",
+                      job_label + " needs " + std::to_string(required) + " slots and " +
+                          std::to_string(free) + " are free; waiting up to " +
+                          std::to_string(cfg_.submit_wait_for_slots.count()) + " ms for the rest");
+        }
         const auto deadline = std::chrono::steady_clock::now() + cfg_.submit_wait_for_slots;
         cv_.wait_until(lock, deadline, [&] {
             // stop_ in the predicate so a coordinator shutting down never
@@ -5433,24 +5451,15 @@ JobId Coordinator::submit_job(const JobGraphSpec& graph,
             if (stop_.load(std::memory_order_acquire)) {
                 return true;
             }
-            std::size_t free = 0;
-            for (const auto& [_, worker] : registered_) {
-                if (!worker->lost && worker->slots_in_use < worker->slot_capacity) {
-                    free += (worker->slot_capacity - worker->slots_in_use);
-                }
-            }
-            return free >= required;
+            return free_slots_locked() >= required;
         });
     }
     {
         std::lock_guard lock(mu_);
-        std::size_t free = 0;
-        for (const auto& [_, worker] : registered_) {
-            if (!worker->lost && worker->slots_in_use < worker->slot_capacity) {
-                free += (worker->slot_capacity - worker->slots_in_use);
-            }
-        }
-        if (free < required) {
+        if (const auto free = free_slots_locked(); free < required) {
+            log::warn("coordinator.submit",
+                      "refused " + job_label + ": it needs " + std::to_string(required) +
+                          " slots and " + std::to_string(free) + " are free");
             throw InsufficientSlotsError("submit_job: insufficient free slots (need " +
                                          std::to_string(required) + ", have " +
                                          std::to_string(free) + ")");

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -78,6 +79,10 @@ bool plan_is_row_channel(const LogicalPlan& node) {
 
 }  // namespace
 
+// Long enough for the Coordinator's slot wait at its default, and planning and
+// deploying after it, with room to spare.
+constexpr std::chrono::milliseconds kSubmitResponseTimeout{std::chrono::minutes{2}};
+
 SubmitFn make_http_submit(std::string coordinator_host,
                           std::uint16_t coordinator_port,
                           SubmitCheckpointOptions checkpoint,
@@ -89,6 +94,12 @@ SubmitFn make_http_submit(std::string coordinator_host,
             &out,
             &err](const cluster::JobGraphSpec& spec, const std::string& name) -> int {
         clink::http::HttpClient client(coordinator_host, coordinator_port);
+        // The Coordinator answers a submission only once it has planned and
+        // deployed the job, and it first waits for free slots when the cluster
+        // has too few (15 s by default, --submit-wait-for-slots). The client's
+        // 5 s default gave up first, so a job refused for capacity was reported
+        // as a transport failure in place of the Coordinator's answer.
+        client.set_read_timeout(kSubmitResponseTimeout);
         // Authenticated submission: present CLINK_AUTH_TOKEN if set, so a coordinator
         // started with the same token accepts the job (401 otherwise).
         if (const char* tok = std::getenv("CLINK_AUTH_TOKEN"); tok != nullptr && *tok != '\0') {

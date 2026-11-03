@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -37,6 +38,12 @@ public:
     // coordinator reading a worker's HTTP API; the token must not go to anything
     // else, a metrics collector or a lineage endpoint among them.
     void present_cluster_token();
+
+    // How long a request waits for the response once it is sent. The default,
+    // 5 s, keeps the console's proxy responsive on a stalled peer; a request
+    // the server legitimately holds longer, such as a job submission while the
+    // Coordinator waits for free slots, needs more.
+    void set_read_timeout(std::chrono::milliseconds timeout);
 
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;

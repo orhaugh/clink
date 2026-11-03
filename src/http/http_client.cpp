@@ -29,6 +29,10 @@ HttpClient::HttpClient(std::string host, std::uint16_t port)
 
 HttpClient::~HttpClient() = default;
 
+void HttpClient::set_read_timeout(std::chrono::milliseconds timeout) {
+    impl_->client.set_read_timeout(timeout);
+}
+
 void HttpClient::set_bearer_token(const std::string& token) {
     if (token.empty()) {
         impl_->client.set_default_headers({});
