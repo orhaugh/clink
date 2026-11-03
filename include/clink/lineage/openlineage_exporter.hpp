@@ -49,7 +49,7 @@ struct OpenLineageConfig {
     std::uint16_t port{80};               // parsed from endpoint
     std::string path{"/api/v1/lineage"};  // POST path on the receiver
     std::string job_namespace{"clink"};   // OpenLineage job namespace
-    std::string producer{"https://github.com/clink/clink"};
+    std::string producer{"https://github.com/orhaugh/clink"};
     std::size_t max_queue{1024};
 };
 

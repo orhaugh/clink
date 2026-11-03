@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**OpenLineage events name only datasets that have an identity, carry the spec's
+`schemaURL`, and say why a receiver refused them.** A sink that writes nowhere
+a dataset lives, such as `blackhole` or `print`, gave its job an output dataset
+with no name. Marquez accepted it in the run's START event and then refused the
+run's terminal event with a 400, so a job with such a sink never closed its run,
+and the log said only `status=400`. Such a dataset is now left out of the
+exported events (clink's own lineage graph keeps the vertex), every event
+carries the `schemaURL` the OpenLineage spec requires, the producer and facet
+URLs name the project's real repository, and a refusal is logged with the
+receiver's reason. Covered by
+`OpenLineageExporter.ARunEventCarriesTheSpecSchemaAndOnlyDatasetsWithAnIdentity`
+and `OpenLineageExporter.ARefusedEventIsLoggedWithTheReceiversReason`, against
+an in-process receiver.
+
 **`--otlp-endpoint` takes the collector as a URL, and refuses a value it
 cannot use.** The flag was documented as `host[:port]`, but the OpenTelemetry
 convention writes the endpoint as a URL, and a URL was split at its last colon:

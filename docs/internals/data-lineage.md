@@ -169,7 +169,7 @@ lineage was captured (`fields → { <out>: { inputFields:[{namespace,name,field}
 transformationType } }`). Delivery is asynchronous: `on_event` serialises the
 event and pushes it onto a bounded outbox; a worker thread POSTs from the outbox
 so the publish thread is never blocked. Overflow drops the oldest queued event
-and counts the drop.
+and counts the drop. A dataset with no name or namespace (the vertex a blackhole or print sink gets) is left out of the exported event, though clink's own graph keeps it: a receiver cannot tell two such datasets apart, and Marquez accepts one in a START and then refuses the run's terminal event. Every event carries the spec's `schemaURL`, and a receiver's refusal is logged with the reason it gave (`lineage.openlineage`), not the status alone.
 
 The OpenLineage job name is the submitter's job name (`JobGraphSpec::name`),
 carried through to both events; it falls back to `job_<id>` only when the job was

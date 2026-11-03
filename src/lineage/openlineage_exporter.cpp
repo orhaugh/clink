@@ -64,6 +64,15 @@ void write_datasets(http::JsonWriter& w,
     w.begin_array();
     for (const auto& v : vertices) {
         for (const auto& d : v.datasets) {
+            // A sink that writes nowhere a dataset lives (blackhole, print,
+            // collect) has no name, and an identity-less dataset is no
+            // lineage: a receiver cannot tell two of them apart, and Marquez
+            // accepts one in a START, then refuses the run's terminal event
+            // with a 400, so the run never closes. clink's own graph keeps the
+            // vertex; the export leaves it out.
+            if (d.ns.empty() || d.name.empty()) {
+                continue;
+            }
             w.begin_object();
             w.kv("namespace", d.ns);
             w.kv("name", d.name);
@@ -73,7 +82,7 @@ void write_datasets(http::JsonWriter& w,
             w.key("facets").begin_object();
             w.key("clink").begin_object();
             w.kv("_producer", producer);
-            w.kv("_schemaURL", "https://github.com/clink/clink/lineage/clink-dataset-facet.json");
+            w.kv("_schemaURL", "https://github.com/orhaugh/clink/lineage/clink-dataset-facet.json");
             for (const auto& [k, val] : d.facets) {
                 w.kv(k, val);
             }
@@ -133,6 +142,9 @@ std::string build_event_json(const LineageEvent& ev, const OpenLineageConfig& cf
     w.kv("eventType", event_type_for(ev));
     w.kv("eventTime", iso8601(ev.ts_ms));
     w.kv("producer", cfg.producer);
+    // Required on every run event by the OpenLineage spec; receivers that
+    // validate against it refuse an event without one.
+    w.kv("schemaURL", "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent");
     w.key("run").begin_object();
     w.kv("runId", run_id_for(ev.job_id));
     if (!ev.error.empty()) {
@@ -214,9 +226,18 @@ void OpenLineageExporter::run() {
             // v1). The outbox keeps draining so a dead receiver does not wedge
             // the worker.
             dropped_.fetch_add(1);
+            // The receiver's own reason, when it gave one, is what tells an
+            // operator which event or facet it objected to.
+            std::string reason = resp.body.substr(0, 300);
+            for (auto& ch : reason) {
+                if (ch == '\n' || ch == '\r') {
+                    ch = ' ';
+                }
+            }
             log::warn("lineage.openlineage",
                       "POST " + cfg_.path + " failed: status=" + std::to_string(resp.status) +
-                          (resp.error.empty() ? "" : " (" + resp.error + ")"));
+                          (resp.error.empty() ? "" : " (" + resp.error + ")") +
+                          (reason.empty() ? "" : ": " + reason));
         }
     }
 }
