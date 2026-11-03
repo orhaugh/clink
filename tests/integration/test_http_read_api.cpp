@@ -349,6 +349,39 @@ TEST(HttpReadApi, JobsEndpointEmptyThenPopulatedAfterSubmission) {
     kill_quietly(submit_pid);
 }
 
+// --name names a compiled job, as a job uploaded over HTTP is named: the
+// Coordinator lists it under that name, which is how the client that submitted
+// it (the Kubernetes operator) finds it again.
+TEST(HttpReadApi, ACompiledJobSubmittedWithANameIsListedUnderIt) {
+    const auto submit = submit_binary_path();
+    const auto job_so = cancel_test_job_path();
+    if (!std::filesystem::exists(submit) || !std::filesystem::exists(job_so)) {
+        GTEST_SKIP() << "submitter or cancel_test_job.so not built";
+    }
+    auto cluster = start_cluster(/*n_workers=*/1);
+    if (!cluster.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    ::setenv("CLINK_CANCEL_TICK_MS", "100", 1);
+    const pid_t submit_pid =
+        spawn_proc({"clink_submit_job",
+                    "--job=" + job_so.string(),
+                    "--name=named-by-the-cli",
+                    "--coordinator-host=127.0.0.1",
+                    "--coordinator-port=" + std::to_string(cluster->coordinator_control_port),
+                    "--wait-timeout-s=20"},
+                   submit);
+    ASSERT_GT(submit_pid, 0);
+    std::string listed;
+    EXPECT_TRUE(clink::itest::await_condition([&] {
+        const auto r = http_get("127.0.0.1", cluster->coordinator_http_port, "/api/v1/jobs");
+        listed = r.body;
+        return r.status == 200 && r.body.find("\"name\":\"named-by-the-cli\"") != std::string::npos;
+    })) << "the job was not listed under the name it was submitted with: "
+        << listed;
+    kill_quietly(submit_pid);
+}
+
 TEST(HttpReadApi, WorkersEndpointListsRegisteredWorkers) {
     auto cluster = start_cluster(/*n_workers=*/2);
     if (!cluster.has_value()) {

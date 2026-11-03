@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**`clink run --job` names the job it submits.** The `--name` flag was printed
+in the submit line and went no further: the graph reached the Coordinator
+unnamed, so the job was listed with an empty name, its lineage was named
+after its id, and nothing could find it again by the name it was given. The
+name now goes on the graph when the graph carries none of its own, as a job
+uploaded over HTTP is named. Covered by
+`HttpReadApi.ACompiledJobSubmittedWithANameIsListedUnderIt`, which fails
+against the previous CLI.
+
 **`POST /api/v1/jobs/sql` takes `catalog=own`, compiling a request as a script
 of its own.** Every request's DDL went into the Coordinator's shared session
 catalog, so a client that submits one self-contained script per job could

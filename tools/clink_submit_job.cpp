@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -33,6 +34,7 @@
 
 #include "clink/application/job_submitter.hpp"
 #include "clink/cluster/config_lint.hpp"
+#include "clink/cluster/job_graph.hpp"
 
 #include "cli_config_args.hpp"
 
@@ -184,7 +186,25 @@ int clink_cmd_run(int argc, char** argv) {
         ::dlclose(handle);
         return 7;
     }
-    const std::string graph_json{graph_json_data, graph_json_size};
+    std::string graph_json{graph_json_data, graph_json_size};
+    // --name names the job, in the Coordinator's job list and in its lineage,
+    // as a job uploaded over HTTP is named; a name the graph already carries
+    // is kept. Until it did, the flag was printed and nothing else, so a
+    // compiled job submitted here ran unnamed and nothing could find it by
+    // the name it was given.
+    if (has_arg(argc, argv, "name")) {
+        try {
+            auto graph = clink::cluster::JobGraphSpec::from_json(graph_json);
+            if (graph.name.empty()) {
+                graph.name = job_name;
+                graph_json = graph.to_json();
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "clink_submit_job: cannot read the job graph: " << e.what() << "\n";
+            ::dlclose(handle);
+            return 7;
+        }
+    }
 
     const auto coordinator_port = static_cast<std::uint16_t>(std::stoi(coordinator_port_str));
     clink::application::JobSubmitter submitter(coordinator_host, coordinator_port);
