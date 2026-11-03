@@ -1,0 +1,30 @@
+{{- if .Values.ha.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "clink.coordinator.headless" . }}
+  labels:
+    {{- include "clink.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # Headless: backs the HA Coordinators' StatefulSet, giving each the stable
+  # DNS name it advertises as leader. publishNotReadyAddresses, so a leader's
+  # name resolves for the Workers while it is still binding its control port.
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "clink.componentSelectorLabels" (dict "root" . "component" "coordinator") | nindent 4 }}
+  ports:
+    - name: control
+      port: {{ .Values.coordinator.controlPort }}
+      targetPort: control
+      protocol: TCP
+    - name: http
+      port: {{ .Values.coordinator.httpPort }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

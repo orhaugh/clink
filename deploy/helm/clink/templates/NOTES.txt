@@ -1,6 +1,6 @@
 clink cluster "{{ .Release.Name }}" deployed.
 
-  Coordinator : {{ include "clink.coordinator.fullname" . }} (1 replica)
+  Coordinator : {{ include "clink.coordinator.fullname" . }} ({{ if .Values.ha.enabled }}{{ .Values.ha.replicas }} replicas, one leader{{ else }}1 replica{{ end }})
   Workers: {{ include "clink.worker.fullname" . }} ({{ .Values.worker.replicas }} replicas x {{ .Values.worker.slots }} slots)
 
 Watch them come up:
@@ -11,10 +11,25 @@ Open the ops console and the HTTP API (port-forward the Coordinator):
 
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "clink.coordinator.fullname" . }} {{ .Values.coordinator.httpPort }}:{{ .Values.coordinator.httpPort }}
   # then: open http://localhost:{{ .Values.coordinator.httpPort }}
+{{- if .Values.auth.existingSecret }}
+
+Every request but the probes and the console's files needs the token in Secret
+{{ .Values.auth.existingSecret }} (key {{ .Values.auth.secretKey }}), as Authorization: Bearer <token>.
+{{- end }}
+
+{{- if .Values.ha.enabled }}
+
+Submit a job over the HTTP API from inside the cluster, which every Coordinator
+answers (a standby forwards it to the leader); the control port answers on the
+leader alone, so the Service reaches it only some of the time:
+
+  clink run job.sql --coordinator-host={{ include "clink.coordinator.fullname" . }} --coordinator-port={{ .Values.coordinator.httpPort }}
+{{- else }}
 
 Submit a job against the control port from inside the cluster (target):
 
   {{ include "clink.coordinator.fullname" . }}:{{ .Values.coordinator.controlPort }}
+{{- end }}
 
 {{- if .Values.ha.enabled }}
 
@@ -22,7 +37,7 @@ HA: {{ .Values.ha.replicas }} Coordinators race for leadership on the shared
 --ha-dir ({{ .Values.ha.storage.type }}); the leader binds the control port,
 standbys take over on its death. Inspect the current leader:
 
-  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "clink.coordinator.fullname" . }} -- cat {{ .Values.ha.storage.mountPath }}/active-leader.json
+  kubectl -n {{ .Release.Namespace }} exec sts/{{ include "clink.coordinator.fullname" . }} -- cat {{ .Values.ha.storage.mountPath }}/active-leader.json
 {{- else }}
 
 Note: this release runs a SINGLE Coordinator (no HA). For multi-coordinator leader

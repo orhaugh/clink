@@ -3,10 +3,11 @@
 #
 # Deploys the chart with ha.enabled (N Coordinators sharing an --ha-dir via a
 # hostPath volume - correct on single-node kind), confirms a leader is elected
-# and the Workers register with it, then KILLS the leader and asserts a
-# standby takes over (epoch bump + a different leader pod) and the workers
-# re-register with the new leader. This exercises clink's file HA coordinator
-# (fcntl lock on the shared dir) across pods.
+# and the Workers register with it, that the standby answers the API with the
+# leader's view (it forwards to the leader) and both report ready, then KILLS
+# the leader and asserts a standby takes over (a different leader pod) and the
+# workers re-register with the new leader. This exercises clink's file HA
+# coordinator (fcntl lock on the shared dir) across pods.
 #
 # Single-node kind makes the hostPath genuinely shared (fcntl works across
 # co-located pods). A real multi-node cluster needs ha.storage.type=pvc with an
@@ -32,7 +33,7 @@ if [[ "${1:-}" == "--cleanup" ]]; then kind delete cluster --name "${CLUSTER}"; 
 step() { printf '\n=== %s ===\n' "$*"; }
 fail() { printf 'HA SMOKE FAILED: %s\n' "$*" >&2; exit 1; }
 kx() { kubectl --context "${CTX}" -n "${NAMESPACE}" "$@"; }
-leader_json() { kx exec "deploy/${RELEASE}-coordinator" -- cat "${MOUNT}/active-leader.json" 2>/dev/null || true; }
+leader_json() { kx exec "sts/${RELEASE}-coordinator" -- cat "${MOUNT}/active-leader.json" 2>/dev/null || true; }
 # Extract a top-level JSON scalar (string or number) by key; portable across
 # BSD (macOS) and GNU sed - no \? extension.
 jget() {
@@ -41,8 +42,9 @@ jget() {
   [[ -n "${v}" ]] || v="$(grep -oE "\"$1\":[0-9]+" <<<"${in}" | head -1 | sed -E 's/^"[^"]*"://')"
   printf '%s' "${v}"
 }
-pod_for_ip() { kx get pods -l app.kubernetes.io/component=coordinator \
-  -o jsonpath='{range .items[*]}{.metadata.name} {.status.podIP}{"\n"}{end}' | awk -v ip="$1" '$2==ip{print $1}'; }
+# The HA Coordinators are a StatefulSet, each advertising its stable name,
+# <pod>.<headless service>.<namespace>.svc.cluster.local: its first label is the pod.
+pod_for_host() { printf '%s' "${1%%.*}"; }
 # registered worker count as seen by a specific coordinator pod (the leader)
 registered_on() { kx exec "$1" -- curl -fsS "http://127.0.0.1:8081/api/v1/workers" 2>/dev/null | grep -o '"worker_id"' | wc -l | tr -d ' '; }
 
@@ -71,7 +73,7 @@ step "verify: a leader is elected (${COORDINATOR_REPLICAS} coordinator pods, one
 lj=""; for _ in $(seq 1 30); do lj="$(leader_json)"; grep -q '"host"' <<<"${lj}" && break; sleep 2; done
 grep -q '"host"' <<<"${lj}" || fail "no leader elected (active-leader.json never appeared)"
 host1="$(jget host <<<"${lj}")"; epoch1="$(jget epoch <<<"${lj}")"
-leader1="$(pod_for_ip "${host1}")"
+leader1="$(pod_for_host "${host1}")"
 echo "leader: ${leader1} (host=${host1}, epoch=${epoch1})"
 [[ -n "${leader1}" ]] || fail "could not map leader host ${host1} to a pod"
 
@@ -79,6 +81,14 @@ step "verify: Workers registered with the leader"
 got=0; for _ in $(seq 1 30); do [[ "$(registered_on "${leader1}")" == "${TM_REPLICAS}" ]] && { got=1; break; }; sleep 2; done
 [[ "${got}" == "1" ]] || fail "workers did not register with the leader (${leader1})"
 echo "leader ${leader1} sees ${TM_REPLICAS} workers"
+
+step "verify: the standby answers with the leader's view, and both are ready"
+standby1="$(kx get pods -l app.kubernetes.io/component=coordinator -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -vx "${leader1}" | head -1)"
+[[ "$(registered_on "${standby1}")" == "${TM_REPLICAS}" ]] \
+  || fail "the standby ${standby1} did not forward the API to the leader"
+[[ "$(kx exec "${leader1}" -- curl -fsS http://127.0.0.1:8081/readyz)" == "leader" ]] || fail "${leader1} /readyz is not leader"
+[[ "$(kx exec "${standby1}" -- curl -fsS http://127.0.0.1:8081/readyz)" == "standby" ]] || fail "${standby1} /readyz is not standby"
+echo "standby ${standby1} answers with the leader's ${TM_REPLICAS} workers"
 
 step "FAILOVER: kill the leader; a standby must take over"
 # The file coordinator's epoch is PER-PROCESS (each coordinator's first acquisition is
@@ -92,7 +102,7 @@ for _ in $(seq 1 45); do
   sleep 2
 done
 [[ "${new}" == "1" ]] || fail "no standby took over (leader host stayed ${host1}): ${lj}"
-leader2="$(pod_for_ip "${h}")"
+leader2="$(pod_for_host "${h}")"
 echo "new leader: ${leader2:-<recreating>} (host=${h}, epoch=${e}) - took over from ${leader1} (${host1})"
 
 step "verify: Workers re-register with the new leader"

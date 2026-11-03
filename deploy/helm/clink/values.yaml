@@ -21,6 +21,32 @@ fullnameOverride: ""
 commonLabels: {}
 commonAnnotations: {}
 
+# Bearer-token auth on every pod's HTTP API (CLINK_AUTH_TOKEN). The token comes
+# from a Secret you create; existingSecret names it and secretKey its key. Every
+# request then needs `Authorization: Bearer <token>`, except the probes
+# (/livez, /readyz) and a mounted console's own files. Empty: no auth.
+auth:
+  existingSecret: ""
+  secretKey: token
+
+# Control-plane TLS between the Workers and the Coordinator(s). Each Secret is a
+# kubernetes.io/tls Secret that also carries ca.crt (cert-manager's layout),
+# and both are issued by one CA. The Coordinator's certificate must name every
+# host a Worker connects to it by: without HA the Coordinator Service
+# (<fullname>-coordinator), with HA each Coordinator's stable name, which
+# *.<fullname>-coordinator-headless.<namespace>.svc.cluster.local covers.
+tls:
+  enabled: false
+  # tls.crt and tls.key the Coordinator serves, ca.crt the CA that issued them.
+  coordinatorSecret: ""
+  # Mutual TLS: the Workers' client certificate (tls.crt, tls.key, ca.crt).
+  # Empty: server-only TLS, the Workers verifying with the Coordinator
+  # Secret's ca.crt alone (its key is never mounted on a Worker).
+  workerSecret: ""
+  # false passes --tls-no-verify-hostname: the CA must still have signed the
+  # Coordinator's certificate, but the names in it are not checked.
+  verifyHostname: true
+
 serviceAccount:
   # Create a ServiceAccount for the pods. A future etcd/k8s-native HA mode that
   # uses leader election will need RBAC on this account.
@@ -46,6 +72,12 @@ coordinator:
   # State backend URI passed as --state-backend (empty = node default). e.g.
   # "s3+rocksdb://bucket/prefix?..." for disaggregated state.
   stateBackend: ""
+  # Extra environment, volumes and mounts for the Coordinator container, in
+  # the Kubernetes shapes (EnvVar, EnvFromSource, Volume, VolumeMount).
+  extraEnv: []
+  extraEnvFrom: []
+  extraVolumes: []
+  extraVolumeMounts: []
   resources: {}
   nodeSelector: {}
   tolerations: []
@@ -58,6 +90,14 @@ worker:
   slots: 4
   httpPort: 8082
   extraArgs: []
+  # Extra environment, volumes and mounts for the Worker container. A job's
+  # connector secrets go here, e.g. extraEnvFrom: [{secretRef: {name: pg}}]
+  # for a table that reads `password = 'env://PG_PASSWORD'`, and so does a
+  # shared checkpoint volume outside the HA one.
+  extraEnv: []
+  extraEnvFrom: []
+  extraVolumes: []
+  extraVolumeMounts: []
   resources: {}
   nodeSelector: {}
   tolerations: []
@@ -67,6 +107,10 @@ worker:
   terminationGracePeriodSeconds: 30
 
 # High availability: run multiple Coordinator replicas with leader election.
+# The Coordinators become a StatefulSet behind a headless Service, so each has
+# a stable name to advertise (and a TLS certificate can name it), and the
+# Coordinator Service reaches any of them: a standby forwards the API to the
+# leader, and /readyz admits a Coordinator once it leads or knows the leader.
 #
 # Uses clink's file-based HA backend (always compiled into clink_node, no extra
 # dependency): every coordinator races an fcntl lock on a SHARED --ha-dir; the winner

@@ -37,8 +37,8 @@ spec:
       initContainers:
         # k8s has no compose-style depends_on; without this gate the worker races
         # the Coordinator's bind, fails connect_to_coordinator, exits, and crash-loops
-        # until the coordinator is up. Wait for the coordinator's health endpoint (the same
-        # readiness signal compose used) before starting clink_node.
+        # until the coordinator is up. Wait until a Coordinator is ready (/readyz,
+        # which answers without the token) before starting clink_node.
         - name: wait-for-coordinator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -46,7 +46,7 @@ spec:
             - sh
             - -c
             - |
-              until curl -fsS "http://{{ include "clink.coordinator.fullname" . }}:{{ .Values.coordinator.httpPort }}/api/v1/health" >/dev/null 2>&1; do
+              until curl -fsS "http://{{ include "clink.coordinator.fullname" . }}:{{ .Values.coordinator.httpPort }}/readyz" >/dev/null 2>&1; do
                 echo "waiting for coordinator..."
                 sleep 2
               done
@@ -71,6 +71,16 @@ spec:
             # connect (the default 127.0.0.1 is single-host only).
             - name: CLINK_DATA_BIND_HOST
               value: "0.0.0.0"
+            {{- with include "clink.authEnv" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.worker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.worker.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           args:
             - --role=worker
             - --id=$(POD_NAME)
@@ -86,39 +96,43 @@ spec:
             # leader change when k8s restarts it on coordinator disconnect.
             - --ha-dir={{ .Values.ha.storage.mountPath }}
             {{- end }}
+            {{- with include "clink.workerTlsArgs" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- with .Values.worker.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.worker.httpPort }}
-          readinessProbe:
-            httpGet:
-              path: /api/v1/health
-              port: http
-            initialDelaySeconds: 2
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 6
-          livenessProbe:
-            httpGet:
-              path: /api/v1/health
-              port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 6
+          {{- include "clink.probes" . | nindent 10 }}
           {{- with .Values.worker.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- if .Values.ha.enabled }}
+          {{- if or .Values.ha.enabled .Values.tls.enabled .Values.worker.extraVolumeMounts }}
           volumeMounts:
+            {{- if .Values.ha.enabled }}
             {{- include "clink.haVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- with include "clink.tlsVolumeMount" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.worker.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
-      {{- if .Values.ha.enabled }}
+      {{- if or .Values.ha.enabled .Values.tls.enabled .Values.worker.extraVolumes }}
       volumes:
+        {{- if .Values.ha.enabled }}
         {{- include "clink.haVolume" . | nindent 8 }}
+        {{- end }}
+        {{- with include "clink.tlsVolume" (dict "root" . "role" "worker") }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.worker.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       {{- with .Values.worker.nodeSelector }}
       nodeSelector:

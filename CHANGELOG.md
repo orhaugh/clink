@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**The Helm chart runs a secured cluster: token auth and control-plane TLS from
+Secrets, and environment and volumes for connector secrets.** The chart gave
+clink nothing but `extraArgs`, so a pod could get neither the auth token, nor
+a certificate, nor a Secret's values for a job's `env://` options. It now takes
+`auth.existingSecret` (every pod gets `CLINK_AUTH_TOKEN` from it), `tls.*` (the
+Coordinators serve the certificate in `tls.coordinatorSecret`, a
+`tls.workerSecret` makes it mutual, and a Worker never mounts the Coordinator's
+key), and for each role `extraEnv`, `extraEnvFrom`, `extraVolumes` and
+`extraVolumeMounts`. The probes and the Workers' wait for a Coordinator use
+`/livez` and `/readyz`, which answer without the token, where `/api/v1/health`
+was refused once auth was on. With `ha.enabled` the Coordinators are a
+StatefulSet behind a headless Service, so each advertises a stable name a
+certificate can carry rather than its pod IP, and the install notes point HA
+submissions at the HTTP API, which every Coordinator answers. Upgrading an HA
+release replaces the Coordinators' Deployment with the StatefulSet; the jobs
+carry over through the shared HA directory, as in a failover. Checked with
+`helm lint`, `helm template` across the configurations, a server-side dry run,
+and `kind-ha-smoke.sh`, which now also checks that the standby answers with the
+leader's view.
+
 **An exactly-once Parquet sink publishes nothing for an interval no records
 reached.** The two-phase-commit Parquet sinks (local `parquet`, the S3, GCS
 and Azure ones over `ParquetFsSink2PC`, and WebHDFS) staged and committed a

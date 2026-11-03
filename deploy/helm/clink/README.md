@@ -29,7 +29,7 @@ kind-verified (see HA below).
 
 | clink role | k8s object | why |
 |---|---|---|
-| Coordinator | Deployment (1 replica, `Recreate`) + Service | single leader; the Service DNS name is what the coordinator advertises (`--advertise-host`) and workers dial |
+| Coordinator | Deployment (1 replica, `Recreate`) + Service; with HA a StatefulSet + headless Service | single leader; without HA the Service DNS name is what the coordinator advertises (`--advertise-host`) and workers dial, with HA each Coordinator advertises its own stable name |
 | Worker | StatefulSet + headless Service | stable ordinal pod names give each worker a stable `--id` across restarts |
 
 Data plane: each Worker advertises its **own pod IP** (`--data-host=$(POD_IP)`
@@ -38,15 +38,19 @@ data port is published on a Service. The headless Service exists to back the
 StatefulSet and provide per-pod DNS. `CLINK_DATA_BIND_HOST=0.0.0.0` binds the
 data-plane listener on all interfaces (the default `127.0.0.1` is single-host).
 
-Readiness and liveness probes hit `/api/v1/health` on each role's HTTP port
-(the Coordinator and Worker both serve it).
+Readiness probes hit `/readyz` and liveness probes `/livez` on each role's
+HTTP port; both answer without the auth token. A Coordinator is ready once it
+leads with its control port bound, or as a standby once it knows a leader to
+forward the API to; a Worker once it serves HTTP. The Workers' init container
+waits for a ready Coordinator the same way.
 
 ## Prerequisites
 
 - Helm 3 / Kubernetes 1.25+, and a cluster that can reach `ghcr.io`.
 
-The chart defaults to the published runtime image
-(`ghcr.io/orhaugh/clink-runtime:main`), so nothing needs building first. If you
+The chart defaults to the published runtime image at the release it was
+written against (`ghcr.io/orhaugh/clink-runtime`, `image.tag`), so nothing
+needs building first. If you
 mirror it into your own registry, or build `docker/Dockerfile.runtime` yourself,
 override `image.repository` / `image.tag`.
 
@@ -76,12 +80,65 @@ kubectl port-forward svc/my-clink-coordinator 8081:8081
 
 | key | default | meaning |
 |---|---|---|
-| `image.repository` / `image.tag` | `ghcr.io/orhaugh/clink-runtime` / `main` | the runtime image; `main` is the rolling default-branch build, `latest` the newest release |
+| `image.repository` / `image.tag` | `ghcr.io/orhaugh/clink-runtime` / the chart's release | the runtime image; `main` is the rolling default-branch build, `latest` the newest release |
 | `worker.replicas` | `3` | number of Workers |
 | `worker.slots` | `4` | task slots per Worker |
 | `coordinator.service.type` | `ClusterIP` | set NodePort/LoadBalancer to expose the dashboard |
 | `coordinator.stateBackend` | `""` | `--state-backend` URI (e.g. a `s3+rocksdb://...` disaggregated backend) |
 | `ha.enabled` | `false` | see below |
+| `auth.existingSecret` / `auth.secretKey` | `""` / `token` | a Secret holding the HTTP API token, given to every pod as `CLINK_AUTH_TOKEN` |
+| `tls.enabled`, `tls.coordinatorSecret`, `tls.workerSecret`, `tls.verifyHostname` | `false`, `""`, `""`, `true` | control-plane TLS, mutual with a worker Secret |
+| `coordinator.extraEnv` / `extraEnvFrom` / `extraVolumes` / `extraVolumeMounts` | `[]` | more environment and volumes for the Coordinator, in the Kubernetes shapes |
+| `worker.extraEnv` / `extraEnvFrom` / `extraVolumes` / `extraVolumeMounts` | `[]` | the same for the Workers: connector secrets, a checkpoint volume |
+
+## Auth
+
+Create a Secret holding the token, and name it:
+
+```sh
+kubectl create secret generic clink-auth --from-literal=token="$(openssl rand -hex 32)"
+helm install my-clink deploy/helm/clink --set auth.existingSecret=clink-auth
+```
+
+Every pod then gets `CLINK_AUTH_TOKEN` from it, and every HTTP request needs
+`Authorization: Bearer <token>`, except the probes and the console's own files
+(the console asks for the token). `clink run` and the other clients present
+`CLINK_AUTH_TOKEN` from their own environment.
+
+## TLS
+
+`tls.enabled=true` puts the control plane between the Workers and the
+Coordinators on TLS. Each Secret is a `kubernetes.io/tls` Secret that also
+carries `ca.crt`, as cert-manager writes them, both issued by one CA:
+
+- `tls.coordinatorSecret`: the certificate the Coordinators serve. It must name
+  every host a Worker connects by: the Coordinator Service,
+  `<release>-clink-coordinator` and its longer forms, without HA; with HA each
+  Coordinator's stable name, which
+  `*.<release>-clink-coordinator-headless.<namespace>.svc.cluster.local` covers.
+- `tls.workerSecret`: the Workers' client certificate, which makes it mutual
+  TLS (the Coordinators require a client certificate the CA signed). Empty,
+  the Workers mount only the Coordinator Secret's `ca.crt`, never its key.
+
+`tls.verifyHostname=false` keeps the CA check and drops the name check, for
+certificates that cannot name the hosts. The data plane between Workers is not
+on TLS; keep it on a private network.
+
+## Connector secrets and extra volumes
+
+A job reads a secret through `env://`, as in `password = 'env://PG_PASSWORD'`,
+which a Worker resolves from its environment when it builds the operator. Give
+the Workers the variable from a Secret:
+
+```yaml
+worker:
+  extraEnvFrom:
+    - secretRef:
+        name: pg-credentials        # holds PG_PASSWORD
+```
+
+`extraVolumes` and `extraVolumeMounts` mount anything else, such as a shared
+checkpoint volume outside the HA one.
 
 ## HA (multi-Coordinator)
 
@@ -91,6 +148,14 @@ coordinator races an `fcntl` lock on a **shared** `--ha-dir`; the winner binds t
 control port and writes `active-leader.json`, standbys wait, and Workers
 discover the leader from that shared dir. On leader death a standby acquires the
 lock and takes over.
+
+The Coordinators are a StatefulSet behind a headless Service then, and each
+advertises its stable name,
+`<pod>.<release>-clink-coordinator-headless.<namespace>.svc.cluster.local`,
+which a TLS certificate can name. The Coordinator Service reaches every ready
+Coordinator: a standby forwards the API to the leader, so a request answers the
+same through either, and a rolling update proceeds whichever pod wins the
+election.
 
 Shared storage is required (`ha.storage`):
 - `type: pvc` (production) - a **ReadWriteMany** PVC; needs an RWX StorageClass
@@ -105,7 +170,8 @@ helm install my-clink deploy/helm/clink --set ha.enabled=true --set ha.replicas=
 ```
 
 Verified by `kind-ha-smoke.sh` (single-node hostPath): a leader is elected, workers
-register with it, the leader is killed, a standby takes over, and the workers
+register with it, the standby answers the API with the leader's view and both
+report ready, the leader is killed, a standby takes over, and the workers
 re-register with the new leader.
 
 Follow-on: the **etcd** coordinator is the more robust multi-machine election

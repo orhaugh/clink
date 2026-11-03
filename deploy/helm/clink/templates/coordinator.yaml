@@ -1,0 +1,150 @@
+{{- /*
+Without HA, one Coordinator: a Deployment (Recreate) whose Service DNS name is
+the host it advertises and Workers dial. With HA (ha.enabled), the replicas
+race an fcntl lock on the shared --ha-dir; the winner binds the control port
+and leads, standbys wait, and a standby takes over on leader death. They are a
+StatefulSet behind a headless Service then, so each advertises a stable name of
+its own, $(POD_NAME).<headless>.<namespace>.svc.cluster.local, which a TLS
+certificate can name. See values.ha.
+*/}}
+apiVersion: apps/v1
+kind: {{ if .Values.ha.enabled }}StatefulSet{{ else }}Deployment{{ end }}
+metadata:
+  name: {{ include "clink.coordinator.fullname" . }}
+  labels:
+    {{- include "clink.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ha.enabled }}
+  serviceName: {{ include "clink.coordinator.headless" . }}
+  replicas: {{ .Values.ha.replicas }}
+  # Start every replica at once; the election, not the ordinal, picks the leader.
+  podManagementPolicy: Parallel
+  {{- else }}
+  replicas: 1
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "clink.componentSelectorLabels" (dict "root" . "component" "coordinator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "clink.labels" . | nindent 8 }}
+        app.kubernetes.io/component: coordinator
+      {{- with .Values.coordinator.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "clink.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: coordinator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if or .Values.ha.enabled .Values.auth.existingSecret .Values.coordinator.extraEnv }}
+          env:
+            {{- if .Values.ha.enabled }}
+            # The name this Coordinator advertises as leader: peers and Workers
+            # read it from active-leader.json and connect to it.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- end }}
+            {{- with include "clink.authEnv" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.coordinator.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- with .Values.coordinator.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          args:
+            - --role=coordinator
+            - --port={{ .Values.coordinator.controlPort }}
+            - --bind-host=0.0.0.0
+            {{- if .Values.ha.enabled }}
+            - --advertise-host=$(POD_NAME).{{ include "clink.coordinator.headless" . }}.$(POD_NAMESPACE).svc.cluster.local
+            - --ha-dir={{ .Values.ha.storage.mountPath }}
+            {{- else }}
+            # Workers reach the coordinator via this Service DNS name; the coordinator advertises it.
+            - --advertise-host={{ include "clink.coordinator.fullname" . }}
+            {{- end }}
+            - --http-port={{ .Values.coordinator.httpPort }}
+            # Every pod's address, not loopback: a standby forwards the API to the leader here.
+            - --http-bind=0.0.0.0
+            {{- if not .Values.coordinator.console }}
+            - --no-console
+            {{- end }}
+            {{- if .Values.coordinator.stateBackend }}
+            - --state-backend={{ .Values.coordinator.stateBackend }}
+            {{- end }}
+            {{- with include "clink.coordinatorTlsArgs" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.coordinator.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: control
+              containerPort: {{ .Values.coordinator.controlPort }}
+            - name: http
+              containerPort: {{ .Values.coordinator.httpPort }}
+          {{- include "clink.probes" . | nindent 10 }}
+          {{- with .Values.coordinator.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or .Values.ha.enabled .Values.tls.enabled .Values.coordinator.extraVolumeMounts }}
+          volumeMounts:
+            {{- if .Values.ha.enabled }}
+            {{- include "clink.haVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- with include "clink.tlsVolumeMount" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.coordinator.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.ha.enabled .Values.tls.enabled .Values.coordinator.extraVolumes }}
+      volumes:
+        {{- if .Values.ha.enabled }}
+        {{- include "clink.haVolume" . | nindent 8 }}
+        {{- end }}
+        {{- with include "clink.tlsVolume" (dict "root" . "role" "coordinator") }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.coordinator.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.coordinator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
