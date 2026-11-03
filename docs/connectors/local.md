@@ -69,6 +69,24 @@ JSON has no token for NaN or an infinity, so the `file` JSON sinks write a non-f
 
 The `parquet` row source derives its Arrow schema from the table's declared columns (`schema_columns`), so no separate schema option is needed. It resolves those columns by name, with the same type, in any file: one clink wrote, or one another tool wrote (pyarrow, DuckDB, Spark, ClickHouse). A file from another tool carries none of clink's own columns, and its rows read with no event time; a declared column the file lacks, or holds as another type, is refused at open, naming it.
 
+### Column types on the row channel
+
+Each declared column is a Parquet column of the type below, in a file the sink writes and in one the source reads. The [S3](s3-parquet.md), [GCS](gcs-parquet.md), [Azure](azure-parquet.md) and [WebHDFS](webhdfs-parquet.md) Parquet connectors use the same mapping.
+
+| Declared column | Parquet column |
+| --- | --- |
+| `BIGINT` | `int64` |
+| `INTEGER` | `int32` |
+| `DOUBLE` | `double` |
+| `REAL` | `float` |
+| `BOOLEAN` | `boolean` |
+| `DECIMAL(p,s)` | `decimal(p,s)` |
+| `TEXT`, `VARCHAR`, `STRING` | `string` |
+| `REAL[]` (`ARRAY<REAL>`) | `list<float>` |
+| any other type (`SMALLINT`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `MAP`, `ROW`, other arrays) | `string`: a `TIMESTAMP` holds its epoch milliseconds as digits, a nested value its JSON text |
+
+A file clink writes also carries the engine's own `event_time` column (`int64`, nullable).
+
 ## SQL usage
 
 `connector='file'` (or `filesystem`) and `connector='parquet'` are both first-class SQL source and sink connectors. The channel follows the table shape: a single TEXT column uses the string channel, `format='json'` uses the row channel.

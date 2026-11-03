@@ -4,7 +4,7 @@
 
 ## Overview
 
-This connector moves Parquet data to and from HDFS using the WebHDFS / HttpFS HTTP protocol rather than the native HDFS client. It reuses `clink::http_connector` (the vendored cpp-httplib client) for transport and clink's Arrow/Parquet for encoding, so there is no JVM and no `libhdfs` dependency. The sink builds a single Parquet file in memory and uploads it on `close()`; the source fetches a single Parquet file whole and parses it through Arrow's Parquet reader. Both ride the shared `ArrowBatcher<T>` seam, with `int64` and `string` record channels registered as built-in factories. Transport uses WebHDFS's two-step request model: a `CREATE` or `OPEN` call that returns a `307 Temporary Redirect` to a datanode `Location`, followed by the data transfer to that location (see `impls/webhdfs/include/clink/connectors/webhdfs_parquet_sink.hpp`).
+This connector moves Parquet data to and from HDFS using the WebHDFS / HttpFS HTTP protocol rather than the native HDFS client. It reuses `clink::http_connector` (the vendored cpp-httplib client) for transport and clink's Arrow/Parquet for encoding, so there is no JVM and no `libhdfs` dependency. The sink builds a single Parquet file in memory and uploads it on `close()`; the source fetches a single Parquet file whole and parses it through Arrow's Parquet reader. Both ride the shared `ArrowBatcher<T>` seam, with `int64`, `string` and SQL `row` record channels registered as built-in factories; on the `row` channel each declared column is a typed Parquet column of its own. Transport uses WebHDFS's two-step request model: a `CREATE` or `OPEN` call that returns a `307 Temporary Redirect` to a datanode `Location`, followed by the data transfer to that location (see `impls/webhdfs/include/clink/connectors/webhdfs_parquet_sink.hpp`).
 
 ## Dependency and version
 
@@ -29,9 +29,11 @@ cmake -S . -B build -DCLINK_WITH_WEBHDFS=ON
 | --- | --- | --- |
 | `webhdfs_parquet_int64_sink` | sink | `int64`; with `path`, the at-least-once sink writing a directory of part files; with `prefix`, the two-phase-commit sink (`WebHdfsParquetSink2PC<T>`, one staged file per checkpoint) |
 | `webhdfs_parquet_string_sink` | sink | `string`; the same `path` / `prefix` selection |
-| `webhdfs_parquet_2pc_int64_sink` / `webhdfs_parquet_2pc_string_sink` | sink | the two-phase-commit sink under `prefix` (or `path` when only that is given); what SQL plans for `delivery_guarantee='exactly_once'` |
+| `webhdfs_parquet_row_sink` | sink | `row`: a SQL table's declared columns, each a typed Parquet column; the same `path` / `prefix` selection |
+| `webhdfs_parquet_2pc_int64_sink` / `webhdfs_parquet_2pc_string_sink` / `webhdfs_parquet_2pc_row_sink` | sink | the two-phase-commit sink under `prefix` (or `path` when only that is given); what SQL plans for `delivery_guarantee='exactly_once'` |
 | `webhdfs_parquet_int64_source` | source | `int64` |
 | `webhdfs_parquet_string_source` | source | `string` |
+| `webhdfs_parquet_row_source` | source | `row` |
 
 Exact registered names from `impls/webhdfs/src/register_factories.cpp`. The
 plain sink factory builds either class, chosen by whether `path` or `prefix` is
@@ -62,7 +64,7 @@ Notes:
 
 ## SQL usage
 
-Mapped in `src/sql/physical_plan.cpp` to the connector string `webhdfs_parquet` (string channel only: `webhdfs_parquet_string_source` / `webhdfs_parquet_string_sink`).
+Mapped in `src/sql/physical_plan.cpp` to the connector string `webhdfs_parquet`. The channel follows the table's shape, as for [`connector='parquet'`](local.md): a single `TEXT` column uses the string factories (`webhdfs_parquet_string_source` / `webhdfs_parquet_string_sink`), and a table with more columns, or `format='json'`, uses the row factories (`webhdfs_parquet_row_source`, and `webhdfs_parquet_row_sink` or, for exactly-once, `webhdfs_parquet_2pc_row_sink`), which write each declared column as a typed Parquet column of its own and read the columns back by name. The column types are those of [the local `parquet` connector](local.md#column-types-on-the-row-channel).
 
 ```sql
 CREATE TABLE hdfs_out (
@@ -75,7 +77,25 @@ CREATE TABLE hdfs_out (
 );
 ```
 
-A `format='json'` sink table's rows are serialised by the `row_to_json_string` bridge, so a NaN or infinite double in the stored JSON text is `null`, or `"NaN"`, `"Infinity"` or `"-Infinity"` with `json_non_finite='string'`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+A table with declared columns writes them as typed Parquet columns, here exactly once:
+
+```sql
+CREATE TABLE hdfs_scores (
+    id     BIGINT,
+    region STRING,
+    score  DOUBLE
+) WITH (
+    connector = 'webhdfs_parquet',
+    base_url  = 'http://httpfs:14000',
+    prefix    = '/clink/scores',       -- staged, then committed under /clink/scores/committed
+    user      = 'clink',
+    delivery_guarantee = 'exactly_once'
+);
+```
+
+Read it back with a table of the same columns on `path = '/clink/scores/committed'`. A source table may declare fewer columns than a file holds, in any order, and reads only the columns a query uses, so it also reads files other tools wrote.
+
+A row table's sink stores a NaN or an infinite double as the value itself, so it refuses `json_non_finite`, as a `parquet` sink does (see [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output)). Up to and including v0.15.0 a row table was written through the `row_to_json_string` bridge as one `value` column of JSON text; read files written that way with a single `TEXT` column table, which returns the JSON text as it is.
 
 ## Example
 
@@ -138,9 +158,9 @@ In a deployed job the factories are usually looked up by name from the plugin re
 
 The default sink (`path`) is at-least-once and writes a directory of part files through the shared `ParquetRollingSink<T>` over `WebHdfsFileSystem` (`webhdfs_filesystem.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input; a part is uploaded under `<name>.inprogress` and renamed into place when complete, so the directory never shows a partly written part, and everything up to the last barrier survives a kill. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts (only files named `sub<N>-*.parquet`). The programmatic `WebHdfsParquetSink<T>` still writes one file in a single upload on `close()`; a cancelled task uploads nothing. The two-step write fails loudly if `CREATE` does not return a `307` redirect to a datanode, because `CREATE` carries no body and a non-redirect `2xx` would create an empty file rather than upload the Parquet bytes; a gateway that only does single-request inline writes is not supported.
 
-For exactly-once, use the 2PC sink: give the `webhdfs_parquet_{int64,string}_sink` factory a `prefix` instead of a `path` (or construct `WebHdfsParquetSink2PC<T>` directly), or set `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `path`. It stages one Parquet file per checkpoint interval under `<prefix>/staging` and commits with an atomic HDFS `RENAME` to `<prefix>/committed` only when the checkpoint completes globally (`MKDIRS` prepares the dirs, abort `DELETE`s staging, and recovery on open re-runs the rename idempotently). This is a true atomic rename rather than a copy. Each file is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix renames to a name of its own. Named after the checkpoint alone, a later run's part could meet an earlier run's file at its committed name; HDFS refuses a `RENAME` onto an existing file, and the sink took that refusal for a commit already done, so the later run's part was never published. The sink is a `CommittingSink`, so its pending handles live in operator state and each is finalised by exactly one subtask after a rescale, under the staged file's own name (see [the sink committer framework](../internals/sink-committer-framework.md)). Read the result with the source pointed at `<prefix>/committed`.
+For exactly-once, use the 2PC sink: give the `webhdfs_parquet_{int64,string,row}_sink` factory a `prefix` instead of a `path` (or construct `WebHdfsParquetSink2PC<T>` directly), or set `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `path`. It stages one Parquet file per checkpoint interval under `<prefix>/staging` and commits with an atomic HDFS `RENAME` to `<prefix>/committed` only when the checkpoint completes globally (`MKDIRS` prepares the dirs, abort `DELETE`s staging, and recovery on open re-runs the rename idempotently). This is a true atomic rename rather than a copy. Each file is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix renames to a name of its own. Named after the checkpoint alone, a later run's part could meet an earlier run's file at its committed name; HDFS refuses a `RENAME` onto an existing file, and the sink took that refusal for a commit already done, so the later run's part was never published. The sink is a `CommittingSink`, so its pending handles live in operator state and each is finalised by exactly one subtask after a rescale, under the staged file's own name (see [the sink committer framework](../internals/sink-committer-framework.md)). Read the result with the source pointed at `<prefix>/committed`.
 
-The source reports `is_bounded() == true`: it reads a single Parquet object to its last row group and then stops. On `OPEN` it follows a `307` redirect and GETs the datanode bytes, or accepts a direct `2xx` body if the gateway returns the file inline (`webhdfs_parquet_source.hpp`).
+The source reports `is_bounded() == true`: it reads a single Parquet object to its last row group and then stops. It resolves the batcher's columns in the file by name, with the same type, and reads only those; a column the file lacks, or holds as another type, is refused naming it, except the engine's `event_time` column, which a file another tool wrote does not carry. On `OPEN` it follows a `307` redirect and GETs the datanode bytes, or accepts a direct `2xx` body if the gateway returns the file inline (`webhdfs_parquet_source.hpp`).
 
 ## Limitations
 
@@ -149,14 +169,14 @@ The source reports `is_bounded() == true`: it reads a single Parquet object to i
 - WebHDFS has no incremental upload, so a part is buffered in memory until it closes: one checkpoint interval's output per subtask (a job without checkpointing buffers its whole output).
 - The programmatic single-file `WebHdfsParquetSink<T>` keeps no checkpoint state and uploads its file from memory only at close. A failure before then uploads nothing; a cancelled task uploads the rows it held, so the file reads as complete; and a run restored from a checkpoint writes only the rows after the restore point, so those before it are lost. Use it where a failure re-reads the input from the start; the factory sinks keep their output across a restore.
 - The default sink (`path`, a directory of part files) is at-least-once; the `prefix` 2PC sink is exactly-once (atomic HDFS RENAME on checkpoint commit).
-- Record channels are limited to the registered `int64` and `string` types.
-- SQL exposes the `string` channel only.
+- Three channels are registered: `int64`, `string` and `row`. The `row` channel writes the column types of [`connector='parquet'`](local.md#column-types-on-the-row-channel), so a `TIMESTAMP` column is text holding its epoch milliseconds.
+- SQL plans the `string` and `row` factories; `int64` is programmatic-only.
 - Sink `compression` is fixed at ZSTD through the factory path; it is not configurable via the SQL or `BuildContext` keys.
 - A datanode `Location` returned by a NameNode must be resolvable by this process. An HttpFS gateway (single endpoint, no per-datanode redirect target) avoids that constraint and is the simplest target.
 - `https://` endpoints require the `http_connector` module to have been built with OpenSSL; otherwise the constructor throws.
 
 ## Testing
 
-In-process tests run without external Hadoop. `impls/webhdfs/tests/test_webhdfs_parquet.cpp` stands up an httplib server that emulates the WebHDFS / HttpFS `CREATE` / `OPEN` 307-redirect protocol over a real socket and exercises required-param validation, clean failure against a dead endpoint, and `int64` and `string` write-then-read round-trips.
+In-process tests run without external Hadoop. `impls/webhdfs/tests/test_webhdfs_parquet.cpp` stands up an httplib server that emulates the WebHDFS / HttpFS `CREATE` / `OPEN` 307-redirect protocol over a real socket and exercises required-param validation, clean failure against a dead endpoint, and `int64` and `string` write-then-read round-trips. `WebHdfsParquetRowChannel.DeclaredColumnsAreTypedParquetColumnsWrittenAndReadByName` runs the `row` channel through its factories: typed columns written and read by name, a read narrowed to the columns a query uses, and a file another tool wrote, with its columns in another order and one the table does not declare.
 
 A gated live test, `impls/webhdfs/tests/test_webhdfs_parquet_live.cpp`, runs the same round-trip against a real WebHDFS NameNode or HttpFS gateway. It is skipped unless `CLINK_WEBHDFS_TEST_ENDPOINT` is set (e.g. `http://127.0.0.1:14000` for an HttpFS gateway). The optional `CLINK_WEBHDFS_TEST_USER` sets `user.name` to an HDFS user with write permission. No specific Docker image is named by the test; point the endpoint at any reachable WebHDFS or HttpFS instance.

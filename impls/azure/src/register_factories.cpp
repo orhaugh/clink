@@ -21,10 +21,32 @@
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/sql/row.hpp"
+#include "clink/sql/row_channel.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 
 namespace clink::azure {
 
 namespace {
+
+// How a factory gets its Arrow batcher: one fixed batcher for the int64 and
+// string channels, and for the Row channel one built for each table from its
+// declared columns, so a SQL table's rows are written and read as typed
+// Parquet columns, one per column, as the local parquet connector does. A scan
+// the optimizer narrowed reads only its projected columns.
+template <typename T>
+using BatcherFor = std::function<ArrowBatcher<T>(const clink::plugin::BuildContext&)>;
+
+template <typename T>
+BatcherFor<T> fixed_batcher(ArrowBatcher<T> batcher) {
+    return [batcher = std::move(batcher)](const clink::plugin::BuildContext&) { return batcher; };
+}
+
+ArrowBatcher<clink::sql::Row> row_batcher(const clink::plugin::BuildContext& ctx) {
+    return clink::sql::make_row_columnar_arrow_batcher(clink::sql::projected_row_columns(
+        clink::sql::parse_row_schema(ctx.param_or("schema_columns")),
+        ctx.param_or("projected_columns")));
+}
 
 // Apply the shared Azure auth/endpoint params onto an Options struct (sink + source share these).
 template <typename Opts>
@@ -59,10 +81,11 @@ void apply_azure_params(const clink::plugin::BuildContext& ctx, Opts& opts) {
 template <typename T>
 void register_azure_parquet_source(clink::plugin::PluginRegistry& reg,
                                    std::string name,
-                                   ArrowBatcher<T> batcher) {
+                                   BatcherFor<T> batcher_for) {
     reg.register_source<T>(
         name,
-        [name, batcher](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Source<T>> {
+        [name, batcher_for](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Source<T>> {
+            const auto batcher = batcher_for(ctx);
             const auto container = ctx.param_or("container");
             const auto account_name = ctx.param_or("account_name");
             if (container.empty() || account_name.empty()) {
@@ -174,9 +197,11 @@ std::function<std::shared_ptr<arrow::fs::FileSystem>()> azure_sink_fs_factory(
 template <typename T>
 void register_azure_parquet_2pc_sink(clink::plugin::PluginRegistry& reg,
                                      std::string name,
-                                     ArrowBatcher<T> batcher) {
+                                     BatcherFor<T> batcher_for) {
     reg.register_sink<T>(
-        name, [name, batcher](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+        name,
+        [name, batcher_for](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+            const auto batcher = batcher_for(ctx);
             const auto container = ctx.param_or("container");
             const auto account_name = ctx.param_or("account_name");
             const auto prefix = ctx.param_or("prefix");
@@ -198,9 +223,11 @@ void register_azure_parquet_2pc_sink(clink::plugin::PluginRegistry& reg,
 template <typename T>
 void register_azure_parquet_rolling_sink(clink::plugin::PluginRegistry& reg,
                                          std::string name,
-                                         ArrowBatcher<T> batcher) {
+                                         BatcherFor<T> batcher_for) {
     reg.register_sink<T>(
-        name, [name, batcher](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+        name,
+        [name, batcher_for](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+            const auto batcher = batcher_for(ctx);
             const auto container = ctx.param_or("container");
             auto prefix = ctx.param_or("prefix", "");
             if (prefix.empty()) {
@@ -286,18 +313,27 @@ void install(clink::plugin::PluginRegistry& reg) {
     // key); a source reads one blob (key) or every blob under a prefix.
 
     register_azure_parquet_rolling_sink<std::int64_t>(
-        reg, "azure_parquet_int64_sink", int64_arrow_batcher());
+        reg, "azure_parquet_int64_sink", fixed_batcher(int64_arrow_batcher()));
     register_azure_parquet_rolling_sink<std::string>(
-        reg, "azure_parquet_string_sink", string_arrow_batcher());
+        reg, "azure_parquet_string_sink", fixed_batcher(string_arrow_batcher()));
 
     register_azure_parquet_source<std::int64_t>(
-        reg, "azure_parquet_int64_source", int64_arrow_batcher());
+        reg, "azure_parquet_int64_source", fixed_batcher(int64_arrow_batcher()));
     register_azure_parquet_source<std::string>(
-        reg, "azure_parquet_string_source", string_arrow_batcher());
+        reg, "azure_parquet_string_source", fixed_batcher(string_arrow_batcher()));
     register_azure_parquet_2pc_sink<std::int64_t>(
-        reg, "azure_parquet_2pc_int64_sink", int64_arrow_batcher());
+        reg, "azure_parquet_2pc_int64_sink", fixed_batcher(int64_arrow_batcher()));
     register_azure_parquet_2pc_sink<std::string>(
-        reg, "azure_parquet_2pc_string_sink", string_arrow_batcher());
+        reg, "azure_parquet_2pc_string_sink", fixed_batcher(string_arrow_batcher()));
+
+    // The Row channel: a SQL table's declared columns as typed Parquet columns.
+    // Its factories need the Row type registered first.
+    clink::sql::register_row_channel(reg);
+    register_azure_parquet_source<clink::sql::Row>(reg, "azure_parquet_row_source", row_batcher);
+    register_azure_parquet_rolling_sink<clink::sql::Row>(
+        reg, "azure_parquet_row_sink", row_batcher);
+    register_azure_parquet_2pc_sink<clink::sql::Row>(
+        reg, "azure_parquet_2pc_row_sink", row_batcher);
 }
 
 }  // namespace clink::azure

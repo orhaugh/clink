@@ -85,6 +85,14 @@ void require_kafka_for_registry_format(const TableDef& table, const std::string&
     }
 }
 
+// Parquet on an object store or WebHDFS: the same file layout as connector='parquet' over a
+// remote filesystem, with the same factory family on each (<connector>_{string,row}_{source,sink}
+// and <connector>_2pc_{string,row}_sink).
+bool is_object_store_parquet(const std::string& connector) {
+    return connector == "s3_parquet" || connector == "gcs_parquet" ||
+           connector == "azure_parquet" || connector == "webhdfs_parquet";
+}
+
 Channel channel_for_table(const TableDef& table) {
     // The Neo4j sink passes each row to its statement as typed parameters named
     // after the declared columns, whatever their number: always the Row channel.
@@ -225,8 +233,7 @@ std::string string_sink_factory_for(const TableDef& table) {
     if (connector == "parquet") {
         return "parquet_string_sink";
     }
-    if (connector == "s3_parquet" || connector == "gcs_parquet" || connector == "azure_parquet" ||
-        connector == "webhdfs_parquet") {
+    if (is_object_store_parquet(connector)) {
         // delivery_guarantee='exactly_once' selects the 2PC sink (stages then atomically
         // promotes one file per checkpoint under <prefix>/committed); else the at-least-once
         // sink (a directory of part files).
@@ -620,6 +627,12 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // column. The Row batcher is built from the schema_columns param.
         return RowConnectorBinding{"parquet_row_source", kChannelRow, {}};
     }
+    if (is_object_store_parquet(connector)) {
+        // Typed-columnar Parquet on an object store or WebHDFS, read as
+        // connector='parquet' reads a local file: each declared column is its
+        // own Arrow column, resolved by name from the schema_columns param.
+        return RowConnectorBinding{connector + "_row_source", kChannelRow, {}};
+    }
     if (connector == "iceberg") {
         // Apache Iceberg snapshot scan (bounded): catalog-resolved table,
         // typed-columnar data-file reads with column pruning.
@@ -683,9 +696,10 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         return RowConnectorBinding{"postgres_source", kChannelString, "json_string_to_row"};
     }
     unsupported(
-        "format='json' source requires connector='file', 'kafka', 'parquet', 'nexmark', "
-        "'kinesis', 'http_poll', 'pubsub', 'redis', 'mysql', 'clickhouse', 'postgres' or "
-        "'websocket' (got '" +
+        "format='json' source requires connector='file', 'queryable_state', 'kafka', "
+        "'rabbitmq', 'websocket', 'nats', 'pulsar', 'parquet', 's3_parquet', 'gcs_parquet', "
+        "'azure_parquet', 'webhdfs_parquet', 'iceberg', 'nexmark', 'kinesis', 'http_poll', "
+        "'pubsub', 'redis', 'mysql', 'clickhouse' or 'postgres' (got '" +
         connector + "')");
 }
 
@@ -1151,22 +1165,17 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"parquet_row_sink", kChannelRow, {}};
     }
-    if (connector == "s3_parquet" || connector == "gcs_parquet" || connector == "azure_parquet" ||
-        connector == "webhdfs_parquet") {
-        // Object-store / WebHDFS Parquet sink. Rows are serialised to JSON strings and written as a
-        // single-column Parquet file. exactly_once routes to the 2PC variant (stages one file per
-        // checkpoint under <prefix>/staging and atomically promotes it to <prefix>/committed); the
-        // default is the at-least-once sink (a directory of part files). upsert is not
-        // supported (append-only).
+    if (is_object_store_parquet(connector)) {
+        // Object-store / WebHDFS Parquet sink, typed-columnar as connector='parquet' writes it:
+        // each declared column is its own Parquet column. exactly_once routes to the 2PC variant
+        // (stages one file per checkpoint under <prefix>/staging and atomically promotes it to
+        // <prefix>/committed); the default is the at-least-once sink (a directory of part files).
+        // upsert is not supported (append-only).
         if (upsert) {
             unsupported("connector='" + connector + "' sink does not support mode='upsert'");
         }
-        if (exactly_once) {
-            return RowConnectorBinding{
-                connector + "_2pc_string_sink", kChannelString, "row_to_json_string"};
-        }
         return RowConnectorBinding{
-            connector + "_string_sink", kChannelString, "row_to_json_string"};
+            connector + (exactly_once ? "_2pc_row_sink" : "_row_sink"), kChannelRow, {}};
     }
     if (connector == "delta") {
         // Delta Lake table sink: typed Parquet data files + the _delta_log

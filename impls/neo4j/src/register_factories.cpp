@@ -6,6 +6,7 @@
 #include "clink/operators/operator_base.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/sql/row_channel.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
 #include "lookup.hpp"
@@ -70,13 +71,8 @@ clink::connectors::ConnectorCapabilities record() {
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
-    // register_sink<Row> needs the Row type registered first: the same codec
-    // and wire batcher clink::sql::install() registers (last write wins, and
-    // both write the same).
-    reg.register_type<clink::sql::Row>(
-        std::string{clink::sql::kChannelRow},
-        clink::sql::row_json_codec(),
-        clink::sql::make_row_wire_batcher(clink::sql::row_json_codec()));
+    // register_sink<Row> needs the Row type registered first.
+    clink::sql::register_row_channel(reg);
     reg.register_sink<clink::sql::Row>(
         "neo4j_sink",
         [](const clink::plugin::BuildContext& ctx) -> std::shared_ptr<Sink<clink::sql::Row>> {

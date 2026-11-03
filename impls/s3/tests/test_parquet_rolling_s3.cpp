@@ -21,6 +21,8 @@
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
+#include "test_helpers/row_parquet_contract.hpp"
+
 namespace {
 
 bool rolling_minio_configured() {
@@ -109,4 +111,22 @@ TEST(ParquetRollingS3, PartsSurviveARestoreAndAKillLeavesNoPartialObject) {
     for (const auto& key : objects()) {
         (void)fs->DeleteFile(key);
     }
+}
+
+// The Row channel against a real S3 API: a SQL table's declared columns are typed Parquet columns
+// written and read by name, including an object another tool wrote.
+TEST(ParquetRollingS3, TheRowChannelWritesAndReadsTypedColumns) {
+    if (!rolling_minio_configured()) {
+        GTEST_SKIP() << "set CLINK_S3_TEST_ENDPOINT + CLINK_S3_TEST_BUCKET";
+    }
+    auto fs = rolling_minio_fs();
+    const std::string bucket{std::getenv("CLINK_S3_TEST_BUCKET")};
+    clink::test_support::expect_row_parquet_contract(
+        "s3_parquet",
+        {{"bucket", bucket},
+         {"endpoint_override", std::string{std::getenv("CLINK_S3_TEST_ENDPOINT")}},
+         {"region", "us-east-1"}},
+        *fs,
+        bucket,
+        "clink-test/row-" + std::to_string(::getpid()));
 }

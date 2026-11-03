@@ -14,6 +14,7 @@
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/sql/row_channel.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
 namespace clink::iceberg {
@@ -103,15 +104,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     using clink::plugin::BuildContext;
     using clink::sql::Row;
 
-    // Self-register the SQL Row channel type so iceberg::install() works regardless of
-    // whether clink::sql::install() has run yet (register_sink<Row> below needs the type
-    // registered at call time). register_type is idempotent + last-write-wins, and this
-    // is byte-for-byte the same (codec + wire batcher) registration clink::sql::install
-    // performs, so the order the two installs run in does not change the final state -
-    // it never clobbers SQL's columnar wire batcher with a codec-only registration.
-    reg.register_type<Row>(std::string{clink::sql::kChannelRow},
-                           clink::sql::row_json_codec(),
-                           clink::sql::make_row_wire_batcher(clink::sql::row_json_codec()));
+    // register_sink<Row> below needs the Row type registered first.
+    clink::sql::register_row_channel(reg);
 
     // iceberg_row_sink: write Rows as an Apache Iceberg table (typed Parquet data
     // files + Iceberg snapshots) via iceberg-cpp + a SQLite SQL catalog. Append-only,

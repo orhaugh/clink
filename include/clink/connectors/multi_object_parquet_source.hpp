@@ -42,6 +42,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -57,6 +58,7 @@
 #include <arrow/record_batch.h>
 #include <parquet/arrow/reader.h>
 
+#include "clink/connectors/parquet_source.hpp"  // detail::ParquetBatchesInSchema
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/operator_base.hpp"
 
@@ -220,7 +222,7 @@ private:
     }
 
     void close_current_() {
-        batch_reader_.reset();
+        batches_.reset();
         reader_.reset();
         if (in_) {
             (void)in_->Close();
@@ -229,7 +231,7 @@ private:
     }
 
     // Open the next assigned file's reader, validating its schema. Leaves
-    // batch_reader_ null once the assigned files are exhausted.
+    // batches_ empty once the assigned files are exhausted.
     void open_next_reader_() {
         while (next_file_idx_ < files_.size()) {
             const std::string& path = files_[next_file_idx_++];
@@ -247,96 +249,21 @@ private:
             }
             reader_ = std::move(*reader_result);
 
-            std::shared_ptr<arrow::Schema> file_schema;
-            if (auto s = reader_->GetSchema(&file_schema); !s.ok()) {
-                throw std::runtime_error("MultiObjectParquetSource: GetSchema(" + path +
-                                         "): " + s.ToString());
-            }
-            auto expected = batcher_.schema();
-            reorder_.clear();
-            if (file_schema->Equals(*expected, /*check_metadata=*/false)) {
-                auto br_result = reader_->GetRecordBatchReader();
-                if (!br_result.ok()) {
-                    throw std::runtime_error("MultiObjectParquetSource: GetRecordBatchReader(" +
-                                             path + "): " + br_result.status().ToString());
-                }
-                batch_reader_ = std::move(*br_result);
-                return;
-            }
-            // Schema-on-read, as ParquetSource does for one file: the batcher
-            // names columns the file has (by name, with the same type), and only
-            // those are read, in the batcher's order. A declared-narrower or
-            // reordered table therefore reads a wider file, and a narrowed query
-            // skips the unread columns. A missing or differently typed column is
-            // a mismatch naming it, except a missing engine event-time column: a
-            // file another tool wrote has none, and its rows read as having no
-            // event time.
-            std::vector<int> indices;
-            indices.reserve(static_cast<std::size_t>(expected->num_fields()));
-            bool event_time_absent = false;
-            for (const auto& field : expected->fields()) {
-                const int idx = file_schema->GetFieldIndex(field->name());
-                if (idx < 0 && detail::is_event_time_field(*field)) {
-                    event_time_absent = true;
-                    continue;
-                }
-                if (idx < 0 || !file_schema->field(idx)->type()->Equals(*field->type())) {
-                    throw std::runtime_error(
-                        "MultiObjectParquetSource: schema mismatch in " + path + " - column '" +
-                        field->name() + "' " +
-                        (idx < 0 ? std::string{"is missing"}
-                                 : "is " + file_schema->field(idx)->type()->ToString() +
-                                       ", expected " + field->type()->ToString()) +
-                        " (file has " + file_schema->ToString() + "; ArrowBatcher expects " +
-                        expected->ToString() + ")");
-                }
-                indices.push_back(idx);
-            }
-            std::vector<int> row_groups;
-            row_groups.reserve(static_cast<std::size_t>(reader_->num_row_groups()));
-            for (int rg = 0; rg < reader_->num_row_groups(); ++rg) {
-                row_groups.push_back(rg);
-            }
-            if (auto s = reader_->GetRecordBatchReader(row_groups, indices, &batch_reader_);
-                !s.ok()) {
-                throw std::runtime_error("MultiObjectParquetSource: projected read of " + path +
-                                         ": " + s.ToString());
-            }
-            // The projected reader yields columns in file order; remap to the
-            // batcher's order when they differ (-1 marks the absent event-time
-            // column, filled with nulls).
-            const auto got = batch_reader_->schema();
-            if (event_time_absent || !got->Equals(*expected, /*check_metadata=*/false)) {
-                reorder_.reserve(static_cast<std::size_t>(expected->num_fields()));
-                for (const auto& field : expected->fields()) {
-                    reorder_.push_back(got->GetFieldIndex(field->name()));
-                }
-            }
+            // Per file, as ParquetSource reads one: by name, in the batcher's order.
+            batches_.emplace(*reader_, batcher_.schema(), "MultiObjectParquetSource", path);
             return;
         }
-        batch_reader_.reset();  // no more files
+        batches_.reset();  // no more files
     }
 
     // Next RecordBatch across the assigned-file sequence, or null when all drained.
     std::shared_ptr<arrow::RecordBatch> next_batch_() {
-        while (batch_reader_) {
-            std::shared_ptr<arrow::RecordBatch> rb;
-            if (auto s = batch_reader_->ReadNext(&rb); !s.ok()) {
-                throw std::runtime_error("MultiObjectParquetSource: ReadNext: " + s.ToString());
-            }
-            if (rb) {
-                if (reorder_.empty()) {
-                    return rb;
-                }
-                auto reordered = detail::batch_in_schema_order(*rb, reorder_, batcher_.schema());
-                if (!reordered.ok()) {
-                    throw std::runtime_error("MultiObjectParquetSource: column reorder: " +
-                                             reordered.status().ToString());
-                }
-                return std::move(*reordered);
+        while (batches_) {
+            if (auto rb = batches_->next()) {
+                return rb;
             }
             close_current_();     // current file exhausted
-            open_next_reader_();  // advance (sets batch_reader_ or leaves it null)
+            open_next_reader_();  // advance (sets batches_ or leaves it empty)
         }
         return nullptr;
     }
@@ -351,9 +278,8 @@ private:
     std::size_t next_file_idx_ = 0;
     std::shared_ptr<arrow::io::RandomAccessFile> in_;
     std::unique_ptr<parquet::arrow::FileReader> reader_;
-    std::shared_ptr<arrow::RecordBatchReader> batch_reader_;
-    std::vector<int> reorder_;           // current file's projected-to-batcher order, if any
-    std::uint64_t batches_emitted_ = 0;  // #57 replay cursor (next-batch index)
+    std::optional<detail::ParquetBatchesInSchema> batches_;  // the current file, from reader_
+    std::uint64_t batches_emitted_ = 0;                      // #57 replay cursor (next-batch index)
 };
 
 }  // namespace clink

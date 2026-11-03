@@ -1,4 +1,4 @@
-// WebHDFS Parquet factory registration (webhdfs_parquet_{int64,string}_{sink,source}).
+// WebHDFS Parquet factory registration (webhdfs_parquet_{int64,string,row}_{sink,source}).
 
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +16,9 @@
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
+#include "clink/sql/row.hpp"
+#include "clink/sql/row_channel.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/webhdfs/install.hpp"
 
 namespace clink::webhdfs {
@@ -191,6 +194,15 @@ std::shared_ptr<Source<T>> make_source(const clink::plugin::BuildContext& ctx,
         std::make_shared<WebHdfsParquetSource<T>>(std::move(opts), std::move(batcher)));
 }
 
+// The Row channel's batcher, built for each table from its declared columns, so a SQL table's
+// rows are written and read as typed Parquet columns, one per column. A scan the optimizer
+// narrowed reads only its projected columns.
+ArrowBatcher<clink::sql::Row> row_batcher(const clink::plugin::BuildContext& ctx) {
+    return clink::sql::make_row_columnar_arrow_batcher(clink::sql::projected_row_columns(
+        clink::sql::parse_row_schema(ctx.param_or("schema_columns")),
+        ctx.param_or("projected_columns")));
+}
+
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
@@ -271,6 +283,20 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     reg.register_source<std::string>("webhdfs_parquet_string_source", [](const BuildContext& ctx) {
         return make_source<std::string>(ctx, string_arrow_batcher());
+    });
+
+    // The Row channel: a SQL table's declared columns as typed Parquet columns.
+    // Its factories need the Row type registered first.
+    clink::sql::register_row_channel(reg);
+    reg.register_sink<clink::sql::Row>("webhdfs_parquet_row_sink", [](const BuildContext& ctx) {
+        return make_sink<clink::sql::Row>(ctx, row_batcher(ctx));
+    });
+    reg.register_sink<clink::sql::Row>(
+        "webhdfs_parquet_2pc_row_sink", [two_pc_base](const BuildContext& ctx) {
+            return make_2pc_sink<clink::sql::Row>(ctx, two_pc_base(ctx), row_batcher(ctx));
+        });
+    reg.register_source<clink::sql::Row>("webhdfs_parquet_row_source", [](const BuildContext& ctx) {
+        return make_source<clink::sql::Row>(ctx, row_batcher(ctx));
     });
 }
 

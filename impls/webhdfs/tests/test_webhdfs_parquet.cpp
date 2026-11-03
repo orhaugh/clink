@@ -15,8 +15,13 @@
 #include <utility>
 #include <vector>
 
+#include <arrow/api.h>
+#include <arrow/io/memory.h>
 #include <gtest/gtest.h>
+#include <parquet/arrow/reader.h>
+#include <parquet/arrow/writer.h>
 
+#include "clink/cluster/operator_registry.hpp"
 #include "clink/connectors/parquet_rolling_sink.hpp"
 #include "clink/connectors/webhdfs_filesystem.hpp"
 #include "clink/connectors/webhdfs_parquet_sink.hpp"
@@ -26,6 +31,7 @@
 #include "clink/core/stream_element.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/runtime_context.hpp"
+#include "clink/sql/row.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 
 using clink::Batch;
@@ -172,6 +178,17 @@ public:
         }
     }
     std::string base_url() const { return "http://127.0.0.1:" + std::to_string(port_); }
+    // A stored file's bytes, or "" when there is none.
+    std::string file(const std::string& hdfs_path) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = files_.find("/webhdfs/v1" + hdfs_path);
+        return it == files_.end() ? std::string{} : it->second;
+    }
+    // Store a file as another tool would have written it.
+    void put(const std::string& hdfs_path, std::string bytes) {
+        std::lock_guard<std::mutex> lk(mu_);
+        files_["/webhdfs/v1" + hdfs_path] = std::move(bytes);
+    }
     // The HDFS paths of every stored file, for asserting what a sink left behind.
     std::vector<std::string> paths() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -189,6 +206,22 @@ private:
     std::mutex mu_;
     std::map<std::string, std::string> files_;
 };
+
+// The Arrow schema of a Parquet file's bytes.
+std::shared_ptr<arrow::Schema> parquet_schema_of(const std::string& bytes) {
+    auto in = std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(bytes));
+    auto reader = parquet::arrow::OpenFile(in, arrow::default_memory_pool()).ValueOrDie();
+    std::shared_ptr<arrow::Schema> schema;
+    EXPECT_TRUE(reader->GetSchema(&schema).ok());
+    return schema;
+}
+
+// A table's Parquet bytes, as another tool would have written them.
+std::string parquet_bytes_of(const arrow::Table& table) {
+    auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    EXPECT_TRUE(parquet::arrow::WriteTable(table, arrow::default_memory_pool(), out, 1024).ok());
+    return out->Finish().ValueOrDie()->ToString();
+}
 
 WebHdfsParquetSink<std::int64_t>::Options dead_sink_opts() {
     WebHdfsParquetSink<std::int64_t>::Options o;
@@ -674,4 +707,130 @@ TEST(WebHdfsFileSystem, ReportsFilesDirectoriesAndMissingPaths) {
               arrow::fs::FileType::File);
     EXPECT_EQ(fs.GetFileInfo("/clink/fsinfo").ValueOrDie().type(), arrow::fs::FileType::Directory);
     EXPECT_EQ(fs.GetFileInfo("/clink/nothing").ValueOrDie().type(), arrow::fs::FileType::NotFound);
+}
+
+// The Row channel, through the factories the SQL planner names for a table with declared
+// columns: each column is written as a typed Parquet column of its own, and read back by name,
+// or only the columns a narrowed scan projects. A file another tool wrote reads too, with its
+// columns in another order, one the table does not declare, and no event-time column.
+TEST(WebHdfsParquetRowChannel, DeclaredColumnsAreTypedParquetColumnsWrittenAndReadByName) {
+    using clink::config::JsonValue;
+    using clink::sql::Row;
+    MockWebHdfs hdfs;
+    const auto& reg = clink::cluster::OperatorRegistry::default_instance();
+    const auto params = [&](const std::string& path) {
+        clink::cluster::OperatorBuildContext ctx;
+        ctx.params = {{"base_url", hdfs.base_url()},
+                      {"path", path},
+                      {"schema_columns", "id:i64;name:str;score:f64;ok:bool"}};
+        return ctx;
+    };
+    const auto row = [](std::int64_t id, JsonValue name, double score, bool ok) {
+        Row r;
+        r.values["id"] = JsonValue{id};
+        r.values["name"] = std::move(name);
+        r.values["score"] = JsonValue{score};
+        r.values["ok"] = JsonValue{ok};
+        return r;
+    };
+    const auto read = [&](const std::string& path, const std::string& projected = "") {
+        auto ctx = params(path);
+        if (!projected.empty()) {
+            ctx.params["projected_columns"] = projected;
+        }
+        auto src = std::static_pointer_cast<clink::Source<Row>>(
+            reg.find_source("webhdfs_parquet_row_source", "row")->build(ctx));
+        std::vector<Row> rows;
+        Emitter<Row> em([&](StreamElement<Row> e) {
+            if (e.is_data()) {
+                for (const auto& r : e.as_data()) {
+                    rows.push_back(r.value());
+                }
+            }
+            return true;
+        });
+        src->open();
+        while (src->produce(em)) {
+        }
+        src->close();
+        return rows;
+    };
+
+    {
+        auto sink = std::static_pointer_cast<clink::Sink<Row>>(
+            reg.find_sink("webhdfs_parquet_row_sink", "row")->build(params("/lake/events")));
+        sink->open();
+        Batch<Row> b;
+        b.emplace(row(1, JsonValue{std::string{"a"}}, 0.5, true));
+        b.emplace(row(2, JsonValue{}, -1.25, false));
+        sink->on_data(b);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink->close();
+    }
+    std::vector<std::string> parts;
+    for (const auto& p : hdfs.paths()) {
+        if (p.starts_with("/lake/events/") && p.ends_with(".parquet")) {
+            parts.push_back(p);
+        }
+    }
+    ASSERT_EQ(parts.size(), 1U);
+    const auto schema = parquet_schema_of(hdfs.file(parts[0]));
+    const std::vector<std::pair<std::string, std::shared_ptr<arrow::DataType>>> declared = {
+        {"id", arrow::int64()},
+        {"name", arrow::utf8()},
+        {"score", arrow::float64()},
+        {"ok", arrow::boolean()}};
+    for (const auto& [name, type] : declared) {
+        const auto field = schema->GetFieldByName(name);
+        ASSERT_NE(field, nullptr) << name << " in " << schema->ToString();
+        EXPECT_TRUE(field->type()->Equals(*type)) << name << " in " << schema->ToString();
+    }
+    EXPECT_EQ(schema->GetFieldByName("value"), nullptr) << "no JSON text column";
+
+    const auto written = read("/lake/events");
+    ASSERT_EQ(written.size(), 2U);
+    EXPECT_EQ(written[0].values.at("id").as_int(), 1);
+    EXPECT_EQ(written[0].values.at("name").as_string(), "a");
+    EXPECT_EQ(written[0].values.at("score").as_number(), 0.5);
+    EXPECT_TRUE(written[0].values.at("ok").as_bool());
+    EXPECT_EQ(written[1].values.at("id").as_int(), 2);
+    EXPECT_TRUE(written[1].values.at("name").is_null());
+    EXPECT_EQ(written[1].values.at("score").as_number(), -1.25);
+    EXPECT_FALSE(written[1].values.at("ok").as_bool());
+
+    const auto narrowed = read("/lake/events", "ok,id");
+    ASSERT_EQ(narrowed.size(), 2U);
+    EXPECT_EQ(narrowed[1].values.at("id").as_int(), 2);
+    EXPECT_FALSE(narrowed[1].values.at("ok").as_bool());
+    EXPECT_FALSE(narrowed[1].has_column("name"));
+    EXPECT_FALSE(narrowed[1].has_column("score"));
+
+    arrow::BooleanBuilder ok;
+    arrow::StringBuilder extra;
+    arrow::DoubleBuilder score;
+    arrow::StringBuilder name;
+    arrow::Int64Builder id;
+    ASSERT_TRUE(ok.AppendValues(std::vector<bool>{true}).ok());
+    ASSERT_TRUE(extra.Append("not declared").ok());
+    ASSERT_TRUE(score.Append(9.5).ok());
+    ASSERT_TRUE(name.Append("vendor").ok());
+    ASSERT_TRUE(id.Append(7).ok());
+    const auto foreign = arrow::Table::Make(arrow::schema({arrow::field("ok", arrow::boolean()),
+                                                           arrow::field("extra", arrow::utf8()),
+                                                           arrow::field("score", arrow::float64()),
+                                                           arrow::field("name", arrow::utf8()),
+                                                           arrow::field("id", arrow::int64())}),
+                                            {ok.Finish().ValueOrDie(),
+                                             extra.Finish().ValueOrDie(),
+                                             score.Finish().ValueOrDie(),
+                                             name.Finish().ValueOrDie(),
+                                             id.Finish().ValueOrDie()});
+    hdfs.put("/vendor/drop.parquet", parquet_bytes_of(*foreign));
+    const auto vendor = read("/vendor/drop.parquet");
+    ASSERT_EQ(vendor.size(), 1U);
+    EXPECT_EQ(vendor[0].values.at("id").as_int(), 7);
+    EXPECT_EQ(vendor[0].values.at("name").as_string(), "vendor");
+    EXPECT_EQ(vendor[0].values.at("score").as_number(), 9.5);
+    EXPECT_TRUE(vendor[0].values.at("ok").as_bool());
+    EXPECT_FALSE(vendor[0].has_column("extra"));
 }

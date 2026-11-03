@@ -1884,6 +1884,65 @@ TEST(SqlPhysical, ExactlyOnceObjectStoreParquetMapsTo2pcSink) {
     }
 }
 
+// A multi-column table on an object store or WebHDFS is typed-columnar Parquet, as a
+// connector='parquet' table is: each declared column is its own Parquet column, so no JSON
+// bridge stands between the rows and the file in either direction, and each factory gets the
+// declared columns (schema_columns) to build its batcher from. A single TEXT column stays on the
+// string channel (the tests below).
+TEST(SqlPhysical, MultiColumnObjectStoreParquetTablesAreTypedColumnar) {
+    struct Case {
+        std::string connector;
+        std::string src_props;
+        std::string sink_props;
+    };
+    const std::vector<Case> cases = {
+        {"s3_parquet", "bucket='b', prefix='in'", "bucket='b', prefix='out'"},
+        {"gcs_parquet", "bucket='b', prefix='in'", "bucket='b', prefix='out'"},
+        {"azure_parquet",
+         "container='c', account_name='a', prefix='in'",
+         "container='c', account_name='a', prefix='out'"},
+        {"webhdfs_parquet",
+         "base_url='http://nn:9870', path='/in'",
+         "base_url='http://nn:9870', prefix='/out'"},
+    };
+    const std::string columns = "(id BIGINT, name TEXT, score DOUBLE, ok BOOLEAN)";
+    const std::string declared = "id:i64;name:str;score:f64;ok:bool";
+    for (const auto& c : cases) {
+        for (const bool exactly_once : {false, true}) {
+            const auto label = c.connector + (exactly_once ? " exactly-once" : "");
+            Catalog cat;
+            auto s = parse("CREATE TABLE ty_in " + columns + " WITH (connector='" + c.connector +
+                           "', " + c.src_props + ");CREATE TABLE ty_out " + columns +
+                           " WITH (connector='" + c.connector + "', " + c.sink_props +
+                           (exactly_once ? ", delivery_guarantee='exactly_once'" : "") + ")");
+            cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+            cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+            auto plan =
+                bind_insert(cat, "INSERT INTO ty_out SELECT id, name, score, ok FROM ty_in");
+            PhysicalPlanner pp;
+            const auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+
+            const auto* src = find_op(spec, c.connector + "_row_source");
+            ASSERT_NE(src, nullptr) << label;
+            EXPECT_EQ(src->out_channel, "row") << label;
+            EXPECT_EQ(src->params.at("schema_columns"), declared) << label;
+
+            const auto* sink =
+                find_op(spec, c.connector + (exactly_once ? "_2pc_row_sink" : "_row_sink"));
+            ASSERT_NE(sink, nullptr) << label;
+            EXPECT_EQ(sink->out_channel, "row") << label;
+            EXPECT_EQ(sink->params.at("schema_columns"), declared) << label;
+
+            for (const char* bridge : {"row_to_json_string", "json_string_to_row"}) {
+                EXPECT_EQ(find_op(spec, bridge), nullptr) << label << ": " << bridge;
+            }
+            for (const char* text : {"_string_source", "_string_sink", "_2pc_string_sink"}) {
+                EXPECT_EQ(find_op(spec, c.connector + text), nullptr) << label << ": " << text;
+            }
+        }
+    }
+}
+
 TEST(SqlPhysical, S3ParquetSourceAndSinkMap) {
     Catalog cat;
     auto s = parse(
@@ -4028,6 +4087,21 @@ TEST(SqlPhysical, JsonNonFiniteIsRefusedOnASinkThatWritesNoJson) {
                                                   {"json_non_finite", "string"}});
     EXPECT_NE(parquet.find("applies to a sink that writes JSON"), std::string::npos) << parquet;
     EXPECT_NE(parquet.find("parquet_row_sink"), std::string::npos) << parquet;
+
+    // Parquet on an object store or WebHDFS stores the double itself, as connector='parquet' does.
+    for (const std::string connector :
+         {"s3_parquet", "gcs_parquet", "azure_parquet", "webhdfs_parquet"}) {
+        const auto err = json_non_finite_refusal({{"connector", connector},
+                                                  {"format", "json"},
+                                                  {"bucket", "b"},
+                                                  {"container", "c"},
+                                                  {"base_url", "http://nn:9870"},
+                                                  {"prefix", "out"},
+                                                  {"json_non_finite", "string"}});
+        EXPECT_NE(err.find("applies to a sink that writes JSON"), std::string::npos)
+            << connector << ": " << err;
+        EXPECT_NE(err.find(connector + "_row_sink"), std::string::npos) << err;
+    }
 
     // A single TEXT column on the string channel writes each record as it is.
     Catalog cat;

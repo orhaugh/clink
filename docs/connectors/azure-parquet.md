@@ -4,7 +4,7 @@
 
 ## Overview
 
-This connector stores stream records as Parquet objects in an Azure Blob Storage container, using Arrow's `AzureFileSystem` as the transport. The sink (`ParquetAzureSink<T>`) writes records through the shared `ArrowBatcher<T>` seam and one `parquet::arrow::FileWriter` per blob key; the source (`ParquetAzureSource<T>`) reads a single Parquet object back, validates its schema against the batcher, and emits the rows. Two record channels are registered, `int64` and `string`, and the on-disk encoding is Parquet (ZSTD-compressed on the sink by default). Paths are formed as `<container>/<blob>`, with the storage account named separately.
+This connector stores stream records as Parquet objects in an Azure Blob Storage container, using Arrow's `AzureFileSystem` as the transport. The sink (`ParquetAzureSink<T>`) writes records through the shared `ArrowBatcher<T>` seam and one `parquet::arrow::FileWriter` per blob key; the source (`ParquetAzureSource<T>`) reads a single Parquet object back, resolves the batcher's columns in it by name, and emits the rows. Three record channels are registered, `int64`, `string` and the SQL `row` (each declared column a typed Parquet column of its own), and the on-disk encoding is Parquet (ZSTD-compressed on the sink by default). Paths are formed as `<container>/<blob>`, with the storage account named separately.
 
 ## Dependency and version
 
@@ -39,6 +39,9 @@ cmake -S . -B build -DCLINK_WITH_AZURE=ON
 | `azure_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint) |
 | `azure_parquet_int64_source` | Source | `int64` |
 | `azure_parquet_string_source` | Source | `string` |
+| `azure_parquet_row_sink` | Sink | `row`: a SQL table's declared columns, each a typed Parquet column |
+| `azure_parquet_2pc_row_sink` | Sink | `row` (two-phase commit, one staged file per checkpoint) |
+| `azure_parquet_row_source` | Source | `row` |
 
 Registered in `impls/azure/src/register_factories.cpp`.
 
@@ -70,7 +73,7 @@ Each subtask names its part blobs `sub<N>-<run>-<seq>.parquet`, so parallel subt
 
 ## SQL usage
 
-Mapped in `src/sql/physical_plan.cpp` as `connector='azure_parquet'`, resolving to `azure_parquet_string_source` and `azure_parquet_string_sink` (the string channel).
+Mapped in `src/sql/physical_plan.cpp` as `connector='azure_parquet'`. The channel follows the table's shape, as for [`connector='parquet'`](local.md): a single `TEXT` column uses the string factories (`azure_parquet_string_source` / `azure_parquet_string_sink`), and a table with more columns, or `format='json'`, uses the row factories (`azure_parquet_row_source`, and `azure_parquet_row_sink` or, for exactly-once, `azure_parquet_2pc_row_sink`), which write each declared column as a typed Parquet column of its own and read the columns back by name. The column types are those of [the local `parquet` connector](local.md#column-types-on-the-row-channel).
 
 ```sql
 CREATE TABLE azure_out (
@@ -86,7 +89,26 @@ CREATE TABLE azure_out (
 
 The same property keys apply to a source table. Authentication can instead use `account_key`, `anonymous = 'true'`, or `use_default_credential = 'true'`; for an Azurite emulator, set `blob_storage_authority` and `blob_storage_scheme = 'http'`.
 
-A `format='json'` sink table's rows are serialised by the `row_to_json_string` bridge, so a NaN or infinite double in the stored JSON text is `null`, or `"NaN"`, `"Infinity"` or `"-Infinity"` with `json_non_finite='string'`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+A table with declared columns writes them as typed Parquet columns, here exactly once:
+
+```sql
+CREATE TABLE azure_scores (
+    id     BIGINT,
+    region STRING,
+    score  DOUBLE
+) WITH (
+    connector = 'azure_parquet',
+    account_name = 'mystorageacct',
+    container = 'analytics',
+    prefix = 'scores',                   -- staged, then committed under scores/committed
+    use_default_credential = 'true',
+    delivery_guarantee = 'exactly_once'
+);
+```
+
+Read it back with a table of the same columns on `prefix = 'scores/committed'`. A source table may declare fewer columns than a blob holds, in any order, and reads only the columns a query uses, so it also reads blobs other tools wrote.
+
+A row table's sink stores a NaN or an infinite double as the value itself, so it refuses `json_non_finite`, as a `parquet` sink does (see [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output)). Up to and including v0.15.0 a row table was written through the `row_to_json_string` bridge as one `value` column of JSON text; read blobs written that way with a single `TEXT` column table, which returns the JSON text as it is.
 
 ## Example
 
@@ -139,27 +161,27 @@ Through the registry, look the factory up by its registered name (for example `a
 
 The factory sink is at-least-once and writes a directory of part objects under `container/prefix` through the shared `ParquetRollingSink<T>` (`include/clink/connectors/parquet_rolling_sink.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input. A part is written as `<name>.inprogress` and copied to its final `.parquet` key when complete, then the in-progress object is deleted: Arrow's Azure stream creates the blob as soon as it opens, so writing to the final key would expose an empty blob for the whole interval and leave it behind after a kill. So the prefix never shows a partial `.parquet` object, everything up to the last barrier is already published when a kill lands, and a leftover `.inprogress` object is skipped by readers and removed by the next run. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts under the prefix (only keys named exactly as the sink names its parts). The sink therefore needs list and delete permission as well as write. Read the directory back with the source on the same `prefix`. The programmatic `ParquetAzureSink<T>` writes a single object and finalises it only in `close()`; a cancelled task deletes it.
 
-For exactly-once, use the 2PC sink: `azure_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet blob per checkpoint interval under `<container>/<prefix>/staging` and promotes it to `<container>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each blob is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its blobs beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
+For exactly-once, use the 2PC sink: `azure_parquet_2pc_{int64,string,row}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet blob per checkpoint interval under `<container>/<prefix>/staging` and promotes it to `<container>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each blob is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its blobs beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
 
-The source reads a single Parquet object to its last row group and reports `is_bounded() == true` (`parquet_azure_source.hpp`). It validates the file schema against the `ArrowBatcher` schema (ignoring metadata) and throws on mismatch. It carries no offset or replay tracking, so it is a bounded one-shot read rather than a checkpointed, replayable source.
+The source reads a single Parquet object to its last row group and reports `is_bounded() == true` (`parquet_azure_source.hpp`). It resolves the batcher's columns in the file by name, with the same type, and reads only those. A column the file lacks, or holds as another type, is refused naming it, except the engine's `event_time` column, which a file another tool wrote does not carry. It carries no offset or replay tracking, so it is a bounded one-shot read rather than a checkpointed, replayable source.
 
 ## Limitations
 
 - The `azure_parquet_2pc` sink must be the only sink on its chain: at every checkpoint barrier it prepares the interval's transaction and stages its handle in the checkpoint, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - The factory sink rolls parts at checkpoint barriers only (no size-based rollover) and is at-least-once. For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages one blob per checkpoint and promotes it with a server-side copy when the checkpoint completes, so the committed blob appears only whole. Up to and including v0.11.0 the promotion streamed the blob to its committed name, which Azure creates when the stream opens, so a reader could see an empty or partial committed blob, and a commit cut short left one until recovery committed again.
-- The source reads one object with `key`, on subtask 0 alone whatever the job's parallelism, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). Hive-partition pruning and column projection are not performed.
+- The source reads one object with `key`, on subtask 0 alone whatever the job's parallelism, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). Hive-partition pruning is not performed; a `row` source reads only the columns a query uses.
 - Source has no replay or offset tracking; it is a bounded one-shot read.
-- Record channels are limited to `int64` and `string`. Only those four factories are registered.
-- The source enforces an exact schema match (excluding metadata) against the batcher and throws otherwise.
+- Three channels are registered: `int64`, `string` and `row`. The `row` channel writes the column types of [`connector='parquet'`](local.md#column-types-on-the-row-channel), so a `TIMESTAMP` column is text holding its epoch milliseconds.
+- A source reads a declared column only as the type the file holds it as; a column of another type is refused at open, naming it.
 - `compression` and `bucket_assigner` on the sink are reachable only through the programmatic API; the factory parameter parsing does not expose them.
 - The programmatic `ParquetAzureSink<T>` keeps no checkpoint state and finishes each blob only at close. Azure creates a blob when its stream opens, so one being written when the process fails is left empty or incomplete; a cancelled task closes its blobs with the rows they held, so they read as complete; and a run restored from a checkpoint writes only the rows after the restore point, so those before it are lost. Use it where a failure re-reads the input from the start; the factory sinks keep their output across a restore.
 - Writes do not auto-create the container; it must exist beforehand (see the live test, which creates it via `AzureFileSystem::CreateDir`).
 
 ## Testing
 
-Offline tests in `impls/azure/tests/test_parquet_azure.cpp` cover required-parameter validation and clean failure against a dead endpoint; they need no Azure access and run as part of the normal suite.
+Offline tests in `impls/azure/tests/test_parquet_azure.cpp` cover required-parameter validation and clean failure against a dead endpoint, and `impls/azure/tests/test_factory_registration.cpp` checks that every factory is registered and that the `row` factories build from a table's declared columns; they need no Azure access and run as part of the normal suite.
 
-The end-to-end write-then-read round-trip lives in `impls/azure/tests/test_parquet_azure_live.cpp` and is skipped unless `CLINK_AZURE_TEST_ENDPOINT` is set. The variable is an Azure Blob endpoint authority (`host:port`), for example `127.0.0.1:10000` from an Azurite emulator. The test authenticates with Azurite's well-known development account (`devstoreaccount1`) and shared key over `http`, creates a per-PID container, writes three `int64` records through the sink, and reads them back through the source.
+The end-to-end write-then-read round-trip lives in `impls/azure/tests/test_parquet_azure_live.cpp` and is skipped unless `CLINK_AZURE_TEST_ENDPOINT` is set. The variable is an Azure Blob endpoint authority (`host:port`), for example `127.0.0.1:10000` from an Azurite emulator. The test authenticates with Azurite's well-known development account (`devstoreaccount1`) and shared key over `http`, creates a per-PID container, writes three `int64` records through the sink, and reads them back through the source. `AzureParquetLive.TheRowChannelWritesAndReadsTypedColumns` runs the `row` channel's contract (`tests/test_helpers/row_parquet_contract.hpp`, shared with S3 and GCS): typed columns written through `azure_parquet_row_sink` and read by name through `azure_parquet_row_source`, and a blob another tool wrote, read by `key`.
 
 ```bash
 # With an Azurite emulator listening on the blob port (default 10000):

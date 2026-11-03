@@ -36,6 +36,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1062,6 +1063,41 @@ inline std::vector<RowColumn> parse_row_schema(const std::string& spec,
         pos = semi + 1;
     }
     return cols;
+}
+
+// The declared columns a scan reads: `columns` narrowed to those `projected_csv` names (a
+// scan's projected_columns, from the optimizer's projection pushdown), in declaration order,
+// so a Parquet source reads only them from the file. Narrowed only when every projected name
+// is a declared column; otherwise every declared column is read, and the projection above
+// the scan still applies.
+inline std::vector<RowColumn> projected_row_columns(std::vector<RowColumn> columns,
+                                                    const std::string& projected_csv) {
+    std::set<std::string> wanted;
+    std::size_t pos = 0;
+    while (pos <= projected_csv.size()) {
+        auto end = projected_csv.find(',', pos);
+        if (end == std::string::npos) {
+            end = projected_csv.size();
+        }
+        if (auto c = projected_csv.substr(pos, end - pos); !c.empty()) {
+            wanted.insert(std::move(c));
+        }
+        if (end == projected_csv.size()) {
+            break;
+        }
+        pos = end + 1;
+    }
+    if (wanted.empty()) {
+        return columns;
+    }
+    std::vector<RowColumn> narrowed;
+    narrowed.reserve(columns.size());
+    for (const auto& c : columns) {
+        if (wanted.count(c.name) != 0) {
+            narrowed.push_back(c);
+        }
+    }
+    return narrowed.size() == wanted.size() ? narrowed : columns;
 }
 
 }  // namespace clink::sql

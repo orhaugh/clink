@@ -4,7 +4,7 @@
 
 ## Overview
 
-This connector moves Parquet files to and from S3 using Arrow's `S3FileSystem` as the transport. The sink factories write a directory of part objects under `bucket/prefix` through the shared `ParquetRollingSink<T>`: each subtask streams one complete Parquet object per checkpoint interval, published when its upload completes. The programmatic `ParquetS3Sink<T>` still writes a single object at `bucket/key` for direct C++ use. The source (`ParquetS3Source<T>`) opens a single object and emits its row groups as batches via a `parquet::arrow::FileReader`. A single object is read by subtask 0 alone, whatever the job's parallelism; a `prefix` divides its objects between subtasks (below). Both ride the same `ArrowBatcher<T>` seam as the local Parquet connector, so the records are encoded as Parquet and the only registered channel types are `int64` and `string`. Credentials resolve through the standard AWS chain (environment variables, instance profile, `~/.aws/credentials`, IAM role); `endpoint_override` redirects to localstack or MinIO.
+This connector moves Parquet files to and from S3 using Arrow's `S3FileSystem` as the transport. The sink factories write a directory of part objects under `bucket/prefix` through the shared `ParquetRollingSink<T>`: each subtask streams one complete Parquet object per checkpoint interval, published when its upload completes. The programmatic `ParquetS3Sink<T>` still writes a single object at `bucket/key` for direct C++ use. The source (`ParquetS3Source<T>`) opens a single object and emits its row groups as batches via a `parquet::arrow::FileReader`. A single object is read by subtask 0 alone, whatever the job's parallelism; a `prefix` divides its objects between subtasks (below). Both ride the same `ArrowBatcher<T>` seam as the local Parquet connector, so the records are encoded as Parquet, on three channels: `int64`, `string`, and `row`, which writes a SQL table's declared columns as typed Parquet columns, one each. Credentials resolve through the standard AWS chain (environment variables, instance profile, `~/.aws/credentials`, IAM role); `endpoint_override` redirects to localstack or MinIO.
 
 Defined in `include/clink/connectors/parquet_rolling_sink.hpp` (the factories' sink), `impls/s3/include/clink/connectors/parquet_s3_sink.hpp`, `impls/s3/include/clink/connectors/parquet_s3_source.hpp`, and registered in `impls/s3/src/register_factories.cpp`.
 
@@ -42,6 +42,9 @@ cmake --build build --parallel 10
 | `s3_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint) |
 | `s3_parquet_int64_source` | Source | `int64` |
 | `s3_parquet_string_source` | Source | `string` |
+| `s3_parquet_row_sink` | Sink | `row`: a SQL table's declared columns, each a typed Parquet column |
+| `s3_parquet_2pc_row_sink` | Sink | `row` (two-phase commit, one staged file per checkpoint) |
+| `s3_parquet_row_source` | Source | `row` |
 
 The separate `s3_text_sink` factory in the same file is a different connector (line-text objects via the AWS SDK directly) and is not covered here.
 
@@ -71,7 +74,7 @@ Multi-object source: the source factories accept a `prefix` instead of a `key` t
 
 ## SQL usage
 
-Mapped in `src/sql/physical_plan.cpp` as `connector='s3_parquet'`, which resolves to the string-typed factories (`s3_parquet_string_source` / `s3_parquet_string_sink`). The remaining `WITH` properties pass through as factory parameters.
+Mapped in `src/sql/physical_plan.cpp` as `connector='s3_parquet'`. The channel follows the table's shape, as for [`connector='parquet'`](local.md): a single `TEXT` column uses the string factories (`s3_parquet_string_source` / `s3_parquet_string_sink`), and a table with more columns, or `format='json'`, uses the row factories (`s3_parquet_row_source`, and `s3_parquet_row_sink` or, for exactly-once, `s3_parquet_2pc_row_sink`), which write each declared column as a typed Parquet column of its own and read the columns back by name. The column types are those of [the local `parquet` connector](local.md#column-types-on-the-row-channel). The remaining `WITH` properties pass through as factory parameters.
 
 ```sql
 CREATE TABLE s3_out (
@@ -88,7 +91,24 @@ Read it back with a table on the same `prefix`.
 
 For a local MinIO or localstack target, add `endpoint_override = 'http://localhost:9000'`. The `int64` factories are reachable only through the programmatic API.
 
-A `format='json'` sink table's rows are serialised by the `row_to_json_string` bridge, so a NaN or infinite double in the stored JSON text is `null`, or `"NaN"`, `"Infinity"` or `"-Infinity"` with `json_non_finite='string'`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+A table with declared columns writes them as typed Parquet columns, here exactly once:
+
+```sql
+CREATE TABLE s3_scores (
+  id     BIGINT,
+  region STRING,
+  score  DOUBLE
+) WITH (
+  connector = 's3_parquet',
+  bucket = 'my-bucket',
+  prefix = 'scores',                     -- staged, then committed under scores/committed
+  delivery_guarantee = 'exactly_once'
+);
+```
+
+Read it back with a table of the same columns on `prefix = 'scores/committed'`. A source table may declare fewer columns than an object holds, in any order, and reads only the columns a query uses, so it also reads objects other tools wrote.
+
+A row table's sink stores a NaN or an infinite double as the value itself, so it refuses `json_non_finite`, as a `parquet` sink does (see [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output)). Up to and including v0.15.0 a row table was written through the `row_to_json_string` bridge as one `value` column of JSON text; read objects written that way with a single `TEXT` column table, which returns the JSON text as it is.
 
 ## Example
 
@@ -125,23 +145,23 @@ auto source = std::make_shared<ParquetS3Source<std::int64_t>>(
     std::move(in_opts), int64_arrow_batcher());
 ```
 
-The source validates the file schema against the batcher's expected schema in `open()` and throws on a mismatch.
+In `open()` the source resolves the batcher's columns in the file by name, with the same type, and reads only those. A column the file lacks, or holds as another type, is refused naming it, except the engine's `event_time` column, which a file another tool wrote does not carry.
 
 ## Delivery semantics
 
 The factory sink is at-least-once. Each subtask closes a part at every checkpoint barrier and at the end of input, and S3 publishes the object only when its multipart upload completes, so a kill never leaves a partial object and everything up to the last barrier is already published. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay. The sink lists and deletes under its prefix (a run that starts from empty state replaces the previous run's parts), so its credentials need `s3:ListBucket` and `s3:DeleteObject` as well as `s3:PutObject`. The programmatic `ParquetS3Sink<T>` completes its single object only in `close()`, so a failure before then publishes nothing, and a cancelled task aborts the upload.
 
-For exactly-once, use the 2PC sink: `s3_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` (a streamed copy, which S3 publishes only when the upload completes) only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each object is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its objects beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
+For exactly-once, use the 2PC sink: `s3_parquet_2pc_{int64,string,row}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` (a streamed copy, which S3 publishes only when the upload completes) only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each object is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its objects beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
 
 The source reads a single object to its last row group and reports itself as bounded (`is_bounded()` returns true). It does not track or replay from an offset within the object.
 
 ## Limitations
 
 - The factory sink and the 2PC sink must each be the only sink on their chain: at every checkpoint barrier the factory sink completes the interval's part and the 2PC sink prepares the interval, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
-- The factory sink writes part objects under one prefix; there is no Hive-partitioned write. The programmatic `ParquetS3Sink<T>` writes one object at `bucket/key` (or one per distinct `bucket_assigner` key). The source reads one object with `key` or every object under `prefix` (sharded across subtasks), but neither side performs Hive-partition pruning or column projection.
+- The factory sink writes part objects under one prefix; there is no Hive-partitioned write. The programmatic `ParquetS3Sink<T>` writes one object at `bucket/key` (or one per distinct `bucket_assigner` key). The source reads one object with `key` or every object under `prefix` (sharded across subtasks), but neither side prunes Hive partitions. A `row` source reads only the columns a query uses.
 - The programmatic `ParquetS3Sink<T>` keeps no checkpoint state and finishes each object only at close. An object being written when the process fails is left missing or incomplete; a cancelled task closes its objects with the rows they held, so they read as complete; and a run restored from a checkpoint writes only the rows after the restore point, so those before it are lost. Use it where a failure re-reads the input from the start; the factory sinks keep their output across a restore.
-- Channel types are limited to `int64` and `string` (the four registered factories); other record types are not registered.
-- The SQL frontend exposes only the `string` factories under `connector='s3_parquet'`; `int64` is programmatic-only.
+- Three channels are registered: `int64`, `string` and `row`. The `row` channel writes the column types of [`connector='parquet'`](local.md#column-types-on-the-row-channel), so a `TIMESTAMP` column is text holding its epoch milliseconds.
+- SQL plans the `string` and `row` factories under `connector='s3_parquet'`; `int64` is programmatic-only.
 - Parts roll at checkpoint barriers only; there is no size-based rollover, so a job without checkpointing writes one part per subtask.
 - `compression` and `bucket_assigner` are not configurable through the factory parameters or SQL; they are set only via the programmatic `Options`.
 - Authentication relies on the ambient AWS credential chain; there are no inline access-key options.
@@ -151,7 +171,7 @@ The source reads a single object to its last row group and reports itself as bou
 
 `impls/s3/tests/test_parquet_s3.cpp` contains in-process lifecycle and validation tests only. They cover constructor validation (empty bucket/key rejection, valid-options acceptance, bucket-assigner acceptance) and the `open()` failure path against the deliberately unreachable endpoint `http://127.0.0.1:1`, asserting a clean `runtime_error` rather than an abort or deadlock. They do not speak to a real S3 backend.
 
-`impls/s3/tests/test_parquet_rolling_s3.cpp` runs the factories' rolling sink against MinIO when `CLINK_S3_TEST_ENDPOINT` and `CLINK_S3_TEST_BUCKET` are set: parts published at a barrier, an unfinished part leaving no object, and a restored run keeping the parts already written. `tests/test_parquet_rolling_sink.cpp` covers the same sink on the local disk and on Arrow's in-memory mock filesystem. Run the in-process tests with the s3 impl built:
+`impls/s3/tests/test_parquet_rolling_s3.cpp` runs the factories' rolling sink against MinIO when `CLINK_S3_TEST_ENDPOINT` and `CLINK_S3_TEST_BUCKET` are set: parts published at a barrier, an unfinished part leaving no object, and a restored run keeping the parts already written. Against the same store it runs the `row` channel's contract (`tests/test_helpers/row_parquet_contract.hpp`, shared with GCS and Azure): typed columns written through `s3_parquet_row_sink` and read by name through `s3_parquet_row_source`, and an object another tool wrote, read by `key`. `impls/s3/tests/test_factory_registration.cpp` checks that the `row` factories build from a table's declared columns without reaching S3. `tests/test_parquet_rolling_sink.cpp` covers the same sink on the local disk and on Arrow's in-memory mock filesystem. Run the in-process tests with the s3 impl built:
 
 ```bash
 cmake -S . -B build -DCLINK_WITH_AWS_S3=ON -DCLINK_BUILD_TESTS=ON

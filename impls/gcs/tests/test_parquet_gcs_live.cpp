@@ -23,6 +23,8 @@
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
+#include "test_helpers/row_parquet_contract.hpp"
+
 using clink::Batch;
 using clink::Emitter;
 using clink::int64_arrow_batcher;
@@ -183,4 +185,30 @@ TEST(GcsParquetLive, RollingSinkNeverPublishesAnUnfinishedPart) {
     const auto parts = finished_parts();
     EXPECT_EQ(parts.size(), 2U);
     EXPECT_EQ(rows_in(parts), 9);
+}
+
+// The Row channel against a real GCS API (fake-gcs-server): a SQL table's declared columns are
+// typed Parquet columns written and read by name, including an object another tool wrote.
+TEST(GcsParquetLive, TheRowChannelWritesAndReadsTypedColumns) {
+    if (!gcs_configured()) {
+        GTEST_SKIP() << "set CLINK_GCS_TEST_ENDPOINT (e.g. localhost:4443 fake-gcs-server)";
+    }
+    const std::string bucket = "clink-row-" + std::to_string(static_cast<long>(::getpid()));
+    arrow::fs::GcsOptions go = arrow::fs::GcsOptions::Anonymous();
+    go.endpoint_override = gcs_endpoint();
+    go.scheme = "http";
+    go.project_id = "clink-test";
+    go.retry_limit_seconds = 5.0;
+    auto fs = arrow::fs::GcsFileSystem::Make(go).ValueOrDie();
+    ASSERT_TRUE(fs->CreateDir(bucket, /*recursive=*/true).ok());
+    clink::test_support::expect_row_parquet_contract("gcs_parquet",
+                                                     {{"bucket", bucket},
+                                                      {"anonymous", "true"},
+                                                      {"endpoint_override", gcs_endpoint()},
+                                                      {"scheme", "http"},
+                                                      {"project_id", "clink-test"},
+                                                      {"retry_limit_seconds", "10"}},
+                                                     *fs,
+                                                     bucket,
+                                                     "events");
 }

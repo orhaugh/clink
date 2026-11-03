@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+**A SQL table on S3, GCS, Azure or WebHDFS Parquet writes and reads its
+declared columns as typed Parquet columns.** A table with more than one column,
+or `format='json'`, on `s3_parquet`, `gcs_parquet`, `azure_parquet` or
+`webhdfs_parquet` was written through the `row_to_json_string` bridge as a
+single `value` column of JSON text, which another engine could read only by
+parsing it, and it could not be read back at all: the planner had no row source
+for these connectors and refused such a table as a source. It now plans to the
+new `<connector>_row_sink`, `<connector>_2pc_row_sink` and
+`<connector>_row_source` factories, which write each declared column as a
+Parquet column of its own, with the column types of `connector='parquet'`, and
+read the columns back by name, only those a query uses. A single `TEXT` column
+table is unchanged. The sink stores a NaN or an infinity as the value itself,
+so such a table now refuses `json_non_finite`, as a `parquet` table does.
+Objects written before this change hold one `value` column of JSON text; read
+them with a single `TEXT` column table. Covered by
+`SqlPhysical.MultiColumnObjectStoreParquetTablesAreTypedColumnar`, each impl's
+`RowChannelParquetFactoriesBuildFromTheDeclaredColumns`,
+`WebHdfsParquetRowChannel.DeclaredColumnsAreTypedParquetColumnsWrittenAndReadByName`
+against an in-process WebHDFS server, and the contract in
+`tests/test_helpers/row_parquet_contract.hpp`, run live against LocalStack,
+fake-gcs-server and Azurite.
+
+**Every Parquet source reads a file by its columns' names.** The local
+`parquet` sources and the shared multi-object source resolved a batcher's
+columns in a file by name, so a table could declare fewer columns than a file
+held, in another order, and read a file another tool wrote, which carries no
+`event_time` column. The single-object S3, GCS and Azure sources and both
+WebHDFS sources required the file's schema to equal the batcher's exactly, and
+refused such a file with `schema mismatch`. All six now read through one rule,
+`detail::ParquetBatchesInSchema` in `parquet_source.hpp`. Covered by the reads
+of another tool's file in the tests above, which fail with `schema mismatch`
+against the previous sources.
+
 **A submission that waits for free slots says so, and the client waits for
 the answer.** A Coordinator holds a submission while it waits for free slots
 (15 s under `clink_node`), and it said nothing while it waited, or when it then

@@ -24,6 +24,8 @@
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/runtime_context.hpp"
 
+#include "test_helpers/row_parquet_contract.hpp"
+
 using clink::Batch;
 using clink::Emitter;
 using clink::int64_arrow_batcher;
@@ -193,4 +195,31 @@ TEST(AzureParquetLive, RollingSinkNeverPublishesAnUnfinishedPart) {
     const auto parts = finished_parts();
     EXPECT_EQ(parts.size(), 2U);
     EXPECT_EQ(rows_in(parts), 9);
+}
+
+// The Row channel against a real Azure Blob endpoint (Azurite): a SQL table's declared columns are
+// typed Parquet columns written and read by name, including an object another tool wrote.
+TEST(AzureParquetLive, TheRowChannelWritesAndReadsTypedColumns) {
+    if (!azure_configured()) {
+        GTEST_SKIP() << "set CLINK_AZURE_TEST_ENDPOINT (e.g. 127.0.0.1:10000 Azurite blob port)";
+    }
+    const std::string container = "clink-row-" + std::to_string(static_cast<long>(::getpid()));
+    arrow::fs::AzureOptions ao;
+    ao.account_name = kAzuriteAccount;
+    ao.blob_storage_authority = azure_endpoint();
+    ao.dfs_storage_authority = azure_endpoint();
+    ao.blob_storage_scheme = "http";
+    ao.dfs_storage_scheme = "http";
+    ASSERT_TRUE(ao.ConfigureAccountKeyCredential(kAzuriteKey).ok());
+    auto fs = arrow::fs::AzureFileSystem::Make(ao).ValueOrDie();
+    ASSERT_TRUE(fs->CreateDir(container, /*recursive=*/true).ok());
+    clink::test_support::expect_row_parquet_contract("azure_parquet",
+                                                     {{"container", container},
+                                                      {"account_name", kAzuriteAccount},
+                                                      {"account_key", kAzuriteKey},
+                                                      {"blob_storage_authority", azure_endpoint()},
+                                                      {"blob_storage_scheme", "http"}},
+                                                     *fs,
+                                                     container,
+                                                     "events");
 }

@@ -1,10 +1,10 @@
 # Google Cloud Storage (Parquet)
 
-> Reads and writes Parquet objects on Google Cloud Storage through Arrow's `GcsFileSystem`, providing both a source and a sink for the int64 and string channels.
+> Reads and writes Parquet objects on Google Cloud Storage through Arrow's `GcsFileSystem`, providing both a source and a sink for the int64, string and row channels.
 
 ## Overview
 
-This connector integrates Google Cloud Storage as a Parquet store. It uses Arrow's `arrow::fs::GcsFileSystem` as the transport, so there is no separate GCS client dependency: the google-cloud-cpp storage client is statically bundled into `libarrow` when Arrow is built with `ARROW_GCS=ON`. Records are encoded as Parquet via the same `ArrowBatcher<T>` seam used by the operator wire and the local Parquet connector. Two record channels are supported, `std::int64_t` and `std::string`, each with a sink and a source. The sink writes with ZSTD compression by default.
+This connector integrates Google Cloud Storage as a Parquet store. It uses Arrow's `arrow::fs::GcsFileSystem` as the transport, so there is no separate GCS client dependency: the google-cloud-cpp storage client is statically bundled into `libarrow` when Arrow is built with `ARROW_GCS=ON`. Records are encoded as Parquet via the same `ArrowBatcher<T>` seam used by the operator wire and the local Parquet connector. Three record channels are supported, `std::int64_t`, `std::string` and the SQL `row`, each with a sink and a source; on the `row` channel each declared column is a typed Parquet column of its own. The sink writes with ZSTD compression by default.
 
 ## Dependency and version
 
@@ -40,6 +40,9 @@ cmake --build build -j
 | `gcs_parquet_2pc_string_sink` | Sink | `string` (two-phase commit, one staged file per checkpoint) |
 | `gcs_parquet_int64_source` | Source | `int64` |
 | `gcs_parquet_string_source` | Source | `string` |
+| `gcs_parquet_row_sink` | Sink | `row`: a SQL table's declared columns, each a typed Parquet column |
+| `gcs_parquet_2pc_row_sink` | Sink | `row` (two-phase commit, one staged file per checkpoint) |
+| `gcs_parquet_row_source` | Source | `row` |
 
 These are the exact names passed to `register_sink` / `register_source` in `impls/gcs/src/register_factories.cpp`.
 
@@ -68,7 +71,7 @@ Each subtask names its part objects `sub<N>-<run>-<seq>.parquet`, so parallel su
 
 ## SQL usage
 
-Mapped in `src/sql/physical_plan.cpp` under `connector='gcs_parquet'`. The SQL frontend resolves this to the string-channel factories (`gcs_parquet_string_source` / `gcs_parquet_string_sink`).
+Mapped in `src/sql/physical_plan.cpp` under `connector='gcs_parquet'`. The channel follows the table's shape, as for [`connector='parquet'`](local.md): a single `TEXT` column uses the string factories (`gcs_parquet_string_source` / `gcs_parquet_string_sink`), and a table with more columns, or `format='json'`, uses the row factories (`gcs_parquet_row_source`, and `gcs_parquet_row_sink` or, for exactly-once, `gcs_parquet_2pc_row_sink`), which write each declared column as a typed Parquet column of its own and read the columns back by name. The column types are those of [the local `parquet` connector](local.md#column-types-on-the-row-channel).
 
 ```sql
 CREATE TABLE gcs_out (
@@ -85,7 +88,24 @@ Read it back with a table on the same `prefix`.
 
 Other option keys from the table above (`anonymous`, `access_token`, `endpoint_override`, `scheme`, `retry_limit_seconds`) are passed through the same `WITH (...)` properties.
 
-A `format='json'` sink table's rows are serialised by the `row_to_json_string` bridge, so a NaN or infinite double in the stored JSON text is `null`, or `"NaN"`, `"Infinity"` or `"-Infinity"` with `json_non_finite='string'`. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
+A table with declared columns writes them as typed Parquet columns, here exactly once:
+
+```sql
+CREATE TABLE gcs_scores (
+    id     BIGINT,
+    region STRING,
+    score  DOUBLE
+) WITH (
+    connector = 'gcs_parquet',
+    bucket    = 'my-bucket',
+    prefix    = 'scores',              -- staged, then committed under scores/committed
+    delivery_guarantee = 'exactly_once'
+);
+```
+
+Read it back with a table of the same columns on `prefix = 'scores/committed'`. A source table may declare fewer columns than an object holds, in any order, and reads only the columns a query uses, so it also reads objects other tools wrote.
+
+A row table's sink stores a NaN or an infinite double as the value itself, so it refuses `json_non_finite`, as a `parquet` sink does (see [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output)). Up to and including v0.15.0 a row table was written through the `row_to_json_string` bridge as one `value` column of JSON text; read objects written that way with a single `TEXT` column table, which returns the JSON text as it is.
 
 ## Example
 
@@ -136,23 +156,23 @@ Via the registry, look up the factory by name and channel, for example `gcs_parq
 
 The factory sink is at-least-once and writes a directory of part objects under `bucket/prefix` through the shared `ParquetRollingSink<T>` (`include/clink/connectors/parquet_rolling_sink.hpp`). Each subtask closes a part at every checkpoint barrier and at the end of input. A part is written as `<name>.inprogress` and copied to its final `.parquet` key when complete, then the in-progress object is deleted: a GCS output stream cannot abort (Arrow's `Abort()` completes the upload), so writing to the final key would publish a partial part when a sink is torn down mid-interval. So the prefix never shows a partial `.parquet` object, everything up to the last barrier is already published when a kill lands, and a leftover `.inprogress` object is skipped by readers and removed by the next run. A run restored from a checkpoint keeps every part, including those past the restore point, whose rows the sources then replay; a run that starts from empty state deletes the previous run's parts under the prefix (only keys named exactly as the sink names its parts). The sink therefore needs list and delete permission as well as write. Read the directory back with the source on the same `prefix`. The programmatic `ParquetGcsSink<T>` writes a single object and finalises it only in `close()`; a cancelled task deletes it.
 
-For exactly-once, use the 2PC sink: `gcs_parquet_2pc_{int64,string}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each object is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its objects beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
+For exactly-once, use the 2PC sink: `gcs_parquet_2pc_{int64,string,row}_sink` programmatically, or `delivery_guarantee='exactly_once'` in SQL with a `prefix` instead of a `key`. It stages one Parquet file per checkpoint interval under `<bucket>/<prefix>/staging` and promotes it to `<bucket>/<prefix>/committed` only when the checkpoint completes globally; a crash between pre-commit and commit is recovered on open. Each object is named `sub<N>-<run>-<ckpt>.parquet`, where `<run>` is unique to each run of the sink, so a later run under the same prefix adds its objects beside an earlier run's, even where it reuses a checkpoint id, instead of replacing them. Read the result with the source pointed at `<prefix>/committed`.
 
-The source reads a single Parquet object to its last row group and reports `is_bounded() == true` (`parquet_gcs_source.hpp`). It does not track or replay from an offset. On `open()` it validates that the file schema equals the `ArrowBatcher` schema (ignoring metadata) and throws on a mismatch.
+The source reads a single Parquet object to its last row group and reports `is_bounded() == true` (`parquet_gcs_source.hpp`). It does not track or replay from an offset. On `open()` it resolves the batcher's columns in the file by name, with the same type, and reads only those. A column the file lacks, or holds as another type, is refused naming it, except the engine's `event_time` column, which a file another tool wrote does not carry.
 
 ## Limitations
 
 - The `gcs_parquet_2pc` sink must be the only sink on its chain: at every checkpoint barrier it prepares the interval's transaction and stages its handle in the checkpoint, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
-- The source reads one object with `key`, on subtask 0 alone whatever the job's parallelism, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). There is no Hive-partition pruning or column projection on either path.
-- Channels are limited to `int64` and `string`; there are no other typed factories.
+- The source reads one object with `key`, on subtask 0 alone whatever the job's parallelism, or every object under `prefix` (a `prefix` instead of a `key` routes to the shared `MultiObjectParquetSource`, which lists the prefix, sorts, and shards objects round-robin across subtasks: object `i` is read by subtask `i % parallelism`). Optional multi-object source params: `recursive` (default `true`), `suffix` (default `.parquet`). There is no Hive-partition pruning on either path; a `row` source reads only the columns a query uses.
+- Three channels are registered: `int64`, `string` and `row`. The `row` channel writes the column types of [`connector='parquet'`](local.md#column-types-on-the-row-channel), so a `TIMESTAMP` column is text holding its epoch milliseconds.
 - The factory sink rolls parts at checkpoint barriers only (no size-based rollover) and is at-least-once. For exactly-once use the 2PC sink (`prefix` + `delivery_guarantee='exactly_once'`), which stages one file per checkpoint and promotes it with a server-side copy when the checkpoint completes, so the committed object appears only whole. Up to and including v0.11.0 the promotion streamed the object to its committed name, and a GCS stream torn down mid-write completes its upload with what it holds, so a commit cut short could publish a partial committed object until recovery committed again.
 - `compression` and the per-record `bucket_assigner` exist on the sink `Options` but are not configurable through the factory parameters or SQL; they require the programmatic API. The compression default is ZSTD.
 - The programmatic `ParquetGcsSink<T>` keeps no checkpoint state and finishes each object only at close. An object being written when the process fails is left missing or incomplete; a cancelled task closes its objects with the rows they held, so they read as complete; and a run restored from a checkpoint writes only the rows after the restore point, so those before it are lost. Use it where a failure re-reads the input from the start; the factory sinks keep their output across a restore.
 - `access_token` is static (fixed 24-hour expiry, no refresh); use `credentials_file`/`credentials_json` (service account) or Application Default Credentials, both of which auto-refresh, for a long-running job.
-- The source requires the on-disk Parquet schema to match the `ArrowBatcher` schema exactly (metadata aside), otherwise `open()` throws.
+- A source reads a declared column only as the type the file holds it as; a column of another type is refused at `open()`, naming it.
 
 ## Testing
 
-A live integration test exists at `impls/gcs/tests/test_parquet_gcs_live.cpp` (`GcsParquetLive.WriteThenReadRoundTrip`). It is skipped unless the environment variable `CLINK_GCS_TEST_ENDPOINT` is set to a GCS-API endpoint `host:port` (for example `localhost:4443` from a fake-gcs-server emulator). The test creates a bucket up front via `GcsFileSystem` (writes do not auto-create buckets), writes int64 records through the sink, then reads them back through the source and asserts the round trip.
+A live integration test exists at `impls/gcs/tests/test_parquet_gcs_live.cpp` (`GcsParquetLive.WriteThenReadRoundTrip`). It is skipped unless the environment variable `CLINK_GCS_TEST_ENDPOINT` is set to a GCS-API endpoint `host:port` (for example `localhost:4443` from a fake-gcs-server emulator). The test creates a bucket up front via `GcsFileSystem` (writes do not auto-create buckets), writes int64 records through the sink, then reads them back through the source and asserts the round trip. `GcsParquetLive.TheRowChannelWritesAndReadsTypedColumns` runs the `row` channel's contract (`tests/test_helpers/row_parquet_contract.hpp`, shared with S3 and Azure): typed columns written through `gcs_parquet_row_sink` and read by name through `gcs_parquet_row_source`, and an object another tool wrote, read by `key`.
 
-A non-gated unit test, `impls/gcs/tests/test_factory_registration.cpp`, verifies that all four factories are registered on the runner registry without needing any GCS endpoint.
+A non-gated unit test, `impls/gcs/tests/test_factory_registration.cpp`, verifies that every factory is registered on the runner registry, and that the `row` factories build from a table's declared columns, without needing any GCS endpoint.

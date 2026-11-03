@@ -471,6 +471,7 @@ include/clink/sql/preparse.hpp
 include/clink/sql/ptf_registry.hpp
 include/clink/sql/replay.hpp
 include/clink/sql/row.hpp
+include/clink/sql/row_channel.hpp
 include/clink/sql/row_columnar_batcher.hpp
 include/clink/sql/row_columnar_output.hpp
 include/clink/sql/row_kind.hpp

@@ -8,8 +8,9 @@
 //   open():     initialises Arrow S3 (idempotent), builds an
 //               S3FileSystem from options, opens an input file at
 //               bucket/key, opens the parquet::arrow::FileReader.
-//               Validates the file's schema against the batcher's
-//               expected schema and throws on mismatch.
+//               Resolves the batcher's columns in the file by name, as
+//               every Parquet source does (detail::ParquetBatchesInSchema),
+//               and throws naming a column the file lacks.
 //   produce():  reads the next RecordBatch, parses to Batch<T> via
 //               the batcher, emits. Returns false when the reader
 //               exhausts the file.
@@ -31,6 +32,7 @@
 #include <parquet/arrow/reader.h>
 
 #include "clink/connectors/parquet_s3_sink.hpp"  // detail::ensure_arrow_s3_initialised
+#include "clink/connectors/parquet_source.hpp"   // detail::ParquetBatchesInSchema
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/operators/operator_base.hpp"
 
@@ -101,33 +103,15 @@ public:
         }
         reader_ = std::move(*reader_result);
 
-        std::shared_ptr<arrow::Schema> file_schema;
-        if (auto s = reader_->GetSchema(&file_schema); !s.ok()) {
-            throw std::runtime_error("ParquetS3Source: GetSchema: " + s.ToString());
-        }
-        auto expected = batcher_.schema();
-        if (!file_schema->Equals(*expected, /*check_metadata=*/false)) {
-            throw std::runtime_error("ParquetS3Source: schema mismatch - file has " +
-                                     file_schema->ToString() + "; ArrowBatcher expects " +
-                                     expected->ToString());
-        }
-
-        auto br_result = reader_->GetRecordBatchReader();
-        if (!br_result.ok()) {
-            throw std::runtime_error("ParquetS3Source: GetRecordBatchReader: " +
-                                     br_result.status().ToString());
-        }
-        batch_reader_ = std::move(*br_result);
+        // By name, in the batcher's order: the rule every Parquet source reads a file by.
+        batches_.emplace(*reader_, batcher_.schema(), "ParquetS3Source", path);
     }
 
     bool produce(Emitter<T>& out) override {
-        if (this->cancelled() || !batch_reader_) {
+        if (this->cancelled() || !batches_) {
             return false;
         }
-        std::shared_ptr<arrow::RecordBatch> rb;
-        if (auto s = batch_reader_->ReadNext(&rb); !s.ok()) {
-            throw std::runtime_error("ParquetS3Source: ReadNext: " + s.ToString());
-        }
+        auto rb = batches_->next();
         if (!rb) {
             return false;
         }
@@ -142,7 +126,7 @@ public:
     }
 
     void close() override {
-        batch_reader_.reset();
+        batches_.reset();
         reader_.reset();
         if (in_) {
             (void)in_->Close();
@@ -159,7 +143,7 @@ private:
     std::shared_ptr<arrow::fs::S3FileSystem> fs_;
     std::shared_ptr<arrow::io::RandomAccessFile> in_;
     std::unique_ptr<parquet::arrow::FileReader> reader_;
-    std::shared_ptr<arrow::RecordBatchReader> batch_reader_;
+    std::optional<detail::ParquetBatchesInSchema> batches_;  // reads from reader_
 };
 
 }  // namespace clink

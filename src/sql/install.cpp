@@ -73,6 +73,7 @@
 #include "clink/sql/partitioned_list.hpp"
 #include "clink/sql/ptf_registry.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/sql/row_channel.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/row_columnar_output.hpp"
 #include "clink/sql/row_kind.hpp"
@@ -12845,14 +12846,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         });
 
     // ---- Channel type ----
-    // The Row wire batcher preserves columnar data across worker boundaries: a
-    // columnar Batch<Row> ships its typed Arrow RecordBatch verbatim and is
-    // received as a columnar batch, so the post-shuffle operator chain keeps
-    // riding the columnar fast path; row-form batches fall back to the
-    // lossless per-record JSON layout. row_json_codec remains the per-record
-    // fallback codec.
-    reg.register_type<Row>(
-        std::string{kChannelRow}, row_json_codec(), make_row_wire_batcher(row_json_codec()));
+    register_row_channel(reg);
 
     // Row key extractor for parallelism > 1. Reads the synthetic
     // __key field that row_compute_key wrote, hashes it as int64.
@@ -13099,39 +13093,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                 throw std::runtime_error(
                     "parquet_row_source: 'path' or 'prefix' param is required");
             }
-            auto cols = parse_row_schema(ctx.param_or("schema_columns"));
-            if (const auto csv = ctx.param_or("projected_columns"); !csv.empty()) {
-                std::set<std::string> wanted;
-                std::size_t pos = 0;
-                while (pos <= csv.size()) {
-                    auto end = csv.find(',', pos);
-                    if (end == std::string::npos) {
-                        end = csv.size();
-                    }
-                    if (auto c = csv.substr(pos, end - pos); !c.empty()) {
-                        wanted.insert(std::move(c));
-                    }
-                    if (end == csv.size()) {
-                        break;
-                    }
-                    pos = end + 1;
-                }
-                if (!wanted.empty()) {
-                    std::vector<RowColumn> narrowed;
-                    narrowed.reserve(cols.size());
-                    for (auto& c : cols) {
-                        if (wanted.count(c.name) != 0) {
-                            narrowed.push_back(std::move(c));
-                        }
-                    }
-                    // Only narrow when every projected column resolved against
-                    // the declared schema; otherwise keep the full read (the
-                    // downstream projection still applies).
-                    if (narrowed.size() == wanted.size()) {
-                        cols = std::move(narrowed);
-                    }
-                }
-            }
+            auto cols = projected_row_columns(parse_row_schema(ctx.param_or("schema_columns")),
+                                              ctx.param_or("projected_columns"));
             // A prefix reads every matching file beneath a directory tree,
             // sharded round-robin across subtasks, as the int64 and string
             // Parquet sources do.

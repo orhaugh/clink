@@ -139,8 +139,8 @@ Kafka (`format='json'`, and the registry format `'json-schema'`), RabbitMQ,
 NATS, Pulsar, Pub/Sub, the HTTP family (`http`,
 `elasticsearch`, `opensearch`, `splunk_hec`, `influxdb`, `prometheus`), Redis,
 MySQL, Postgres, Cassandra, ClickHouse with `insert_format='jsoneachrow'`,
-Kinesis, Firehose, DynamoDB and the object-store Parquet string sinks. The
-table option `json_non_finite` chooses the form:
+Kinesis, Firehose and DynamoDB. The table option `json_non_finite` chooses the
+form:
 
 | `json_non_finite` | NaN | +Infinity | -Infinity |
 | --- | --- | --- | --- |
@@ -150,9 +150,10 @@ table option `json_non_finite` chooses the form:
 `'string'` is for a consumer that must tell NaN from a missing value. Any other
 value is refused at `CREATE TABLE`, and again when the job is planned, naming
 the accepted values; a sink factory built outside SQL refuses it too. The
-option is refused on a sink that writes no JSON (`parquet`, `delta`, `iceberg`,
-ClickHouse `insert_format='native'`, `neo4j`, `collect`, `blackhole`, or a single-TEXT
-column table, which writes each record as it is): a typed sink holds NaN and
+option is refused on a sink that writes no JSON (`parquet` and the object-store
+Parquet connectors, `delta`, `iceberg`, ClickHouse `insert_format='native'`,
+`neo4j`, `collect`, `blackhole`, or a single-TEXT column table, which writes each
+record as it is): a typed sink holds NaN and
 the infinities as they are. So does Kafka with the registry format
 `format='avro'` or `'protobuf'`, which refuses the option too: its encoder
 writes the IEEE value itself, in a nullable field as in a required one (see

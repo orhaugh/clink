@@ -23,6 +23,7 @@
 #include <parquet/arrow/reader.h>
 
 #include "clink/config/json.hpp"                      // LISTSTATUS response parsing
+#include "clink/connectors/parquet_source.hpp"        // detail::ParquetBatchesInSchema
 #include "clink/connectors/webhdfs_parquet_sink.hpp"  // webhdfs_detail helpers
 #include "clink/core/arrow_batcher.hpp"
 #include "clink/http_connector/http_request.hpp"
@@ -81,33 +82,15 @@ public:
         }
         reader_ = std::move(*reader_result);
 
-        std::shared_ptr<arrow::Schema> file_schema;
-        if (auto s = reader_->GetSchema(&file_schema); !s.ok()) {
-            throw std::runtime_error("WebHdfsParquetSource: GetSchema: " + s.ToString());
-        }
-        auto expected = batcher_.schema();
-        if (!file_schema->Equals(*expected, /*check_metadata=*/false)) {
-            throw std::runtime_error("WebHdfsParquetSource: schema mismatch - file has " +
-                                     file_schema->ToString() + "; ArrowBatcher expects " +
-                                     expected->ToString());
-        }
-
-        auto br_result = reader_->GetRecordBatchReader();
-        if (!br_result.ok()) {
-            throw std::runtime_error("WebHdfsParquetSource: GetRecordBatchReader: " +
-                                     br_result.status().ToString());
-        }
-        batch_reader_ = std::move(*br_result);
+        // By name, in the batcher's order: the rule every Parquet source reads a file by.
+        batches_.emplace(*reader_, batcher_.schema(), "WebHdfsParquetSource", opts_.path);
     }
 
     bool produce(Emitter<T>& out) override {
-        if (this->cancelled() || !batch_reader_) {
+        if (this->cancelled() || !batches_) {
             return false;
         }
-        std::shared_ptr<arrow::RecordBatch> rb;
-        if (auto s = batch_reader_->ReadNext(&rb); !s.ok()) {
-            throw std::runtime_error("WebHdfsParquetSource: ReadNext: " + s.ToString());
-        }
+        auto rb = batches_->next();
         if (!rb) {
             return false;
         }
@@ -122,7 +105,7 @@ public:
     }
 
     void close() override {
-        batch_reader_.reset();
+        batches_.reset();
         reader_.reset();
         in_.reset();
     }
@@ -182,7 +165,7 @@ private:
     std::string name_;
     std::shared_ptr<arrow::io::RandomAccessFile> in_;
     std::unique_ptr<parquet::arrow::FileReader> reader_;
-    std::shared_ptr<arrow::RecordBatchReader> batch_reader_;
+    std::optional<detail::ParquetBatchesInSchema> batches_;  // reads from reader_
 };
 
 // WebHdfsMultiObjectParquetSource<T> - reads every Parquet object under an HDFS directory via the

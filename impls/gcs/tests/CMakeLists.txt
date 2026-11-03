@@ -12,6 +12,8 @@ target_link_libraries(clink_gcs_tests PRIVATE
     clink::gcs
     GTest::gtest_main
 )
+# The Row-channel Parquet contract is shared with the other object stores.
+target_include_directories(clink_gcs_tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 target_compile_definitions(clink_gcs_tests PRIVATE CLINK_HAS_GCS)
 clink_set_warnings(clink_gcs_tests)
 gtest_discover_tests(clink_gcs_tests

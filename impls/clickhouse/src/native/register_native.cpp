@@ -11,6 +11,7 @@
 #include "clink/operators/operator_base.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/sql/row.hpp"
+#include "clink/sql/row_channel.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 
 #include "native/errors.hpp"
@@ -104,13 +105,8 @@ std::string native_unavailable_message() {
 }
 
 void register_native(clink::plugin::PluginRegistry& registry) {
-    // register_sink<Row> needs the Row type registered first. This is the
-    // same codec and wire batcher clink::sql::install() registers, and
-    // registration is last-write-wins, so whichever install runs second
-    // changes nothing.
-    registry.register_type<sql::Row>(std::string{sql::kChannelRow},
-                                     sql::row_json_codec(),
-                                     sql::make_row_wire_batcher(sql::row_json_codec()));
+    // register_sink<Row> needs the Row type registered first.
+    sql::register_row_channel(registry);
 
     // clickhouse_native_sink: Native blocks through clickhouse-cpp, on the
     // Row channel. Every key the SQL planner, the materialised-view code or

@@ -23,8 +23,34 @@
 #include "clink/operators/source_operator.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/s3/install.hpp"
+#include "clink/sql/row.hpp"
+#include "clink/sql/row_channel.hpp"
+#include "clink/sql/row_columnar_batcher.hpp"
 
 namespace clink::s3 {
+
+namespace {
+
+// How a factory gets its Arrow batcher: one fixed batcher for the int64 and
+// string channels, and for the Row channel one built for each table from its
+// declared columns, so a SQL table's rows are written and read as typed
+// Parquet columns, one per column, as the local parquet connector does. A scan
+// the optimizer narrowed reads only its projected columns.
+template <typename T>
+using BatcherFor = std::function<ArrowBatcher<T>(const clink::plugin::BuildContext&)>;
+
+template <typename T>
+BatcherFor<T> fixed_batcher(ArrowBatcher<T> batcher) {
+    return [batcher = std::move(batcher)](const clink::plugin::BuildContext&) { return batcher; };
+}
+
+ArrowBatcher<clink::sql::Row> row_batcher(const clink::plugin::BuildContext& ctx) {
+    return clink::sql::make_row_columnar_arrow_batcher(clink::sql::projected_row_columns(
+        clink::sql::parse_row_schema(ctx.param_or("schema_columns")),
+        ctx.param_or("projected_columns")));
+}
+
+}  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
@@ -252,11 +278,12 @@ void install(clink::plugin::PluginRegistry& reg) {
     };
 
     auto register_parquet_source = [&reg, make_s3_fs_factory]<typename T>(
-                                       const std::string& factory_name, ArrowBatcher<T> batcher) {
+                                       const std::string& factory_name, BatcherFor<T> batcher_for) {
         reg.register_source<T>(
             factory_name,
-            [factory_name, make_s3_fs_factory, batcher](
+            [factory_name, make_s3_fs_factory, batcher_for](
                 const BuildContext& ctx) -> std::shared_ptr<Source<T>> {
+                const auto batcher = batcher_for(ctx);
                 const auto bucket = ctx.param_or("bucket");
                 if (bucket.empty()) {
                     throw std::runtime_error(factory_name + ": 'bucket' is required");
@@ -302,19 +329,21 @@ void install(clink::plugin::PluginRegistry& reg) {
     };
 
     register_parquet_source.template operator()<std::int64_t>("s3_parquet_int64_source",
-                                                              int64_arrow_batcher());
+                                                              fixed_batcher(int64_arrow_batcher()));
     register_parquet_source.template operator()<std::string>("s3_parquet_string_source",
-                                                             string_arrow_batcher());
+                                                             fixed_batcher(string_arrow_batcher()));
 
     // Exactly-once Parquet sink over S3: stages one file per checkpoint interval under
     // <bucket>/<prefix>/staging and promotes it to <bucket>/<prefix>/committed on commit
     // (ParquetFsSink2PC). Read the result with s3_parquet source pointed at <prefix>/committed.
     auto register_parquet_2pc_sink = [&reg, make_s3_fs_factory]<typename T>(
-                                         const std::string& factory_name, ArrowBatcher<T> batcher) {
+                                         const std::string& factory_name,
+                                         BatcherFor<T> batcher_for) {
         reg.register_sink<T>(
             factory_name,
-            [factory_name, make_s3_fs_factory, batcher](
+            [factory_name, make_s3_fs_factory, batcher_for](
                 const BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+                const auto batcher = batcher_for(ctx);
                 const auto bucket = ctx.param_or("bucket");
                 const auto prefix = ctx.param_or("prefix");
                 if (bucket.empty() || prefix.empty()) {
@@ -338,11 +367,12 @@ void install(clink::plugin::PluginRegistry& reg) {
     // Read the result with s3_parquet source on the same prefix.
     auto register_parquet_rolling_sink = [&reg, make_s3_fs_factory]<typename T>(
                                              const std::string& factory_name,
-                                             ArrowBatcher<T> batcher) {
+                                             BatcherFor<T> batcher_for) {
         reg.register_sink<T>(
             factory_name,
-            [factory_name, make_s3_fs_factory, batcher](
+            [factory_name, make_s3_fs_factory, batcher_for](
                 const BuildContext& ctx) -> std::shared_ptr<Sink<T>> {
+                const auto batcher = batcher_for(ctx);
                 const auto bucket = ctx.param_or("bucket");
                 auto prefix = ctx.param_or("prefix", "");
                 if (prefix.empty()) {
@@ -366,15 +396,25 @@ void install(clink::plugin::PluginRegistry& reg) {
                     factory_name);
             });
     };
-    register_parquet_rolling_sink.template operator()<std::int64_t>("s3_parquet_int64_sink",
-                                                                    int64_arrow_batcher());
-    register_parquet_rolling_sink.template operator()<std::string>("s3_parquet_string_sink",
-                                                                   string_arrow_batcher());
+    register_parquet_rolling_sink.template operator()<std::int64_t>(
+        "s3_parquet_int64_sink", fixed_batcher(int64_arrow_batcher()));
+    register_parquet_rolling_sink.template operator()<std::string>(
+        "s3_parquet_string_sink", fixed_batcher(string_arrow_batcher()));
 
-    register_parquet_2pc_sink.template operator()<std::int64_t>("s3_parquet_2pc_int64_sink",
-                                                                int64_arrow_batcher());
-    register_parquet_2pc_sink.template operator()<std::string>("s3_parquet_2pc_string_sink",
-                                                               string_arrow_batcher());
+    register_parquet_2pc_sink.template operator()<std::int64_t>(
+        "s3_parquet_2pc_int64_sink", fixed_batcher(int64_arrow_batcher()));
+    register_parquet_2pc_sink.template operator()<std::string>(
+        "s3_parquet_2pc_string_sink", fixed_batcher(string_arrow_batcher()));
+
+    // The Row channel: a SQL table's declared columns as typed Parquet columns.
+    // Its factories need the Row type registered first.
+    clink::sql::register_row_channel(reg);
+    register_parquet_source.template operator()<clink::sql::Row>(
+        "s3_parquet_row_source", BatcherFor<clink::sql::Row>{row_batcher});
+    register_parquet_rolling_sink.template operator()<clink::sql::Row>(
+        "s3_parquet_row_sink", BatcherFor<clink::sql::Row>{row_batcher});
+    register_parquet_2pc_sink.template operator()<clink::sql::Row>(
+        "s3_parquet_2pc_row_sink", BatcherFor<clink::sql::Row>{row_batcher});
 }
 
 }  // namespace clink::s3
