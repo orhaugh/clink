@@ -9,8 +9,8 @@
 # job that lost its restore point would miss every event before it. Then:
 #
 #   1. the API refuses a request without the token and answers one with it;
-#   2. an upgrade (a new script): the operator takes a savepoint over the API,
-#      cancels the job, and submits the new script restored from the savepoint;
+#   2. an upgrade (a new script): the operator ends the job over the API with a
+#      savepoint that cancels it, and submits the new script restored from it;
 #   3. a failover: the leading Coordinator's pod is deleted, the standby takes
 #      over, and the job runs on under the same id;
 #   4. the window closes and its count is read: every event counted once,
@@ -273,7 +273,7 @@ produce a 1000 50
 await_checkpoint "${J1}"
 echo "  job ${J1} running as '${name}'; 50 events produced"
 
-step "upgrade to v2: savepoint, cancel, submit restored from the savepoint"
+step "upgrade to v2: a savepoint that cancels the job, then the new script restored from it"
 apply_job 2
 J2=""; SP_DIR=""; SP_ID=""
 for _ in $(seq 1 40); do

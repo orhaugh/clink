@@ -46,7 +46,8 @@ operator upgrade committed one minute of the GCS sink's windows twice.
 `POST /api/v1/jobs/:id/savepoint?cancel=true` (`take_savepoint_and_cancel`)
 holds the job's periodic checkpoints from the savepoint's trigger and cancels
 the job once it has completed; the reply's `cancelled` says whether it did.
-Covered by `HttpSubmit.ASavepointThatCancelsEndsTheJobAtTheSavepoint`.
+The Kubernetes operator ends a job at a savepoint this way for an upgrade or a
+park. Covered by `HttpSubmit.ASavepointThatCancelsEndsTheJobAtTheSavepoint`.
 
 **The Kubernetes operator runs SQL jobs, and runs a secured, HA cluster.** A
 `ClinkJob` took only a compiled `.so`, submitted, savepointed and cancelled by
@@ -70,10 +71,12 @@ name waits; a list the operator cannot read decides nothing, a job the
 cluster stops listing is resubmitted only after two minutes, and a
 `Pending` set while the cluster is away no longer overwrites a parked job's
 phase, which sent a job parked on idle back as a fresh submit that dropped
-its savepoint. An upgrade records its savepoint before it cancels the old
-job: a cancel whose status update was lost, to a conflicting edit or an
-operator restart, left the upgrade asking the cancelled job for a savepoint
-on every retry, with its restore point gone. A failed job is read from the
+its savepoint. An upgrade or a park ends the old job with a savepoint that
+cancels it, so no checkpoint completes in between, and records the savepoint
+at once; a retry whose recording was lost, to a conflicting edit or an
+operator restart, finds the job ended and restores from its last completed
+checkpoint, which is that savepoint, where it used to ask the cancelled job
+for a savepoint on every retry. A failed job is read from the
 Coordinator's status rather than from errors a recovered job also carries.
 The CRDs now install with `kubectl apply --server-side`: the `ClinkCluster`
 CRD carries the Kubernetes schemas for volumes and environment, so a bad

@@ -224,7 +224,7 @@ func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1al
 			res, err := r.setPhase(ctx, cj, "Suspended", "suspended (manual)", 60*time.Second)
 			return true, res, err
 		case cj.Status.JobID != 0:
-			res, err := r.park(ctx, cj, api, suspendReasonManual)
+			res, err := r.park(ctx, cj, api, jobs, suspendReasonManual)
 			return true, res, err
 		default:
 			// Suspended before ever submitting: nothing to drain.
@@ -259,7 +259,7 @@ func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1al
 // persists it BEFORE cancelling, so a crash between the two never loses the
 // restore point. The cancel is stage 2 (parkCancelStage) on the next
 // reconcile, keyed off the Suspending phase.
-func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJob, api *coordinatorClient, reason string) (ctrl.Result, error) {
+func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJob, api *coordinatorClient, jobs []jobSummaryJSON, reason string) (ctrl.Result, error) {
 	lg := log.FromContext(ctx)
 	// A park landing mid-upgrade (old job already drained + cancelled, new
 	// one not yet up) adopts the upgrade's savepoint instead of trying to
@@ -276,7 +276,7 @@ func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJo
 		return r.setPhase(ctx, cj, "Suspended", "parked mid-upgrade ("+reason+")", 30*time.Second)
 	}
 	if cj.Spec.UpgradeMode == "savepoint" && cj.Status.SuspendSavepoint == nil {
-		sp, err := api.savepoint(ctx, cj.Status.JobID)
+		sp, _, err := r.endAtSavepoint(ctx, cj, api, jobs)
 		if err != nil {
 			lg.Info("suspend savepoint failed; will retry", "err", err.Error())
 			return r.setPhase(ctx, cj, cj.Status.Phase, "suspend savepoint failed: "+err.Error(), 10*time.Second)
@@ -401,37 +401,37 @@ func (r *ClinkJobReconciler) submitInitial(ctx context.Context, cj *clinkv1alpha
 func (r *ClinkJobReconciler) upgrade(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, api *coordinatorClient, jobs []jobSummaryJSON, wantHash string) (ctrl.Result, error) {
 	lg := log.FromContext(ctx)
 
-	// Stage 1: savepoint + cancel the old job, once per target hash. The
-	// savepoint is recorded before the cancel. A retry after a cancel whose
-	// status update was lost finds the job no longer live and restores from
-	// the recorded savepoint; one that finds it still live takes a fresh one,
-	// as the job has run on since.
+	// Stage 1: end the old job at a savepoint, once per target hash. The
+	// Coordinator takes the savepoint and cancels the job at it, with no
+	// checkpoint completing in between, so the new job restored from it writes
+	// nothing the old one committed. The savepoint is recorded at once; should
+	// that update be lost, the retry finds the job ended and takes its last
+	// completed checkpoint, which is the savepoint, nothing completing after it.
 	if cj.Status.UpgradeToHash != wantHash {
 		var restore *clinkv1alpha1.SavepointRef
+		cancelled := false
 		if cj.Spec.UpgradeMode == "savepoint" {
-			old, listed := findJob(jobs, cj.Status.JobID)
-			if cj.Status.UpgradeRestore != nil && cj.Status.UpgradeFromJobID == cj.Status.JobID && (!listed || !old.live()) {
-				restore = cj.Status.UpgradeRestore
-			} else {
-				sp, err := api.savepoint(ctx, cj.Status.JobID)
-				if err != nil {
-					lg.Info("savepoint failed; will retry", "err", err.Error())
-					return r.setPhase(ctx, cj, "Upgrading", "savepoint failed: "+err.Error(), 10*time.Second)
-				}
+			sp, ended, err := r.endAtSavepoint(ctx, cj, api, jobs)
+			if err != nil {
+				lg.Info("savepoint failed; will retry", "err", err.Error())
+				return r.setPhase(ctx, cj, "Upgrading", "savepoint failed: "+err.Error(), 10*time.Second)
+			}
+			if !sameSavepoint(cj.Status.UpgradeRestore, sp) || cj.Status.UpgradeFromJobID != cj.Status.JobID {
 				cj.Status.UpgradeRestore = sp
 				cj.Status.UpgradeFromJobID = cj.Status.JobID
 				cj.Status.LastSavepoint = sp
 				cj.Status.Phase = "Upgrading"
-				cj.Status.Message = fmt.Sprintf("savepoint %s@%d taken; cancelling job %d", sp.Dir, sp.CheckpointID, cj.Status.JobID)
+				cj.Status.Message = fmt.Sprintf("job %d ended at savepoint %s@%d", cj.Status.JobID, sp.Dir, sp.CheckpointID)
 				if err := r.Status().Update(ctx, cj); err != nil {
-					// Not cancelled: the retry takes a fresh savepoint.
 					return ctrl.Result{}, err
 				}
-				restore = sp
 			}
+			restore, cancelled = sp, ended
 		}
-		if err := api.cancel(ctx, cj.Status.JobID); err != nil {
-			lg.Info("cancel during upgrade failed; continuing", "err", err.Error())
+		if !cancelled {
+			if err := api.cancel(ctx, cj.Status.JobID); err != nil {
+				lg.Info("cancel during upgrade failed; continuing", "err", err.Error())
+			}
 		}
 		// Commit stage 1: from here the old job is gone; never savepoint it again.
 		cj.Status.UpgradeToHash = wantHash
@@ -503,7 +503,7 @@ func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha
 				cj.Status.ActivityCount = count
 				cj.Status.LastActivityTime = &now
 			} else if now.Time.Sub(cj.Status.LastActivityTime.Time) >= idleAfter {
-				return r.park(ctx, cj, api, suspendReasonIdle)
+				return r.park(ctx, cj, api, jobs, suspendReasonIdle)
 			}
 			msg += fmt.Sprintf("; idle %ds/%ds",
 				int(now.Time.Sub(cj.Status.LastActivityTime.Time).Seconds()),
@@ -530,6 +530,37 @@ func (r *ClinkJobReconciler) setPhase(ctx context.Context, cj *clinkv1alpha1.Cli
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
+}
+
+// endAtSavepoint ends the job JobID names at a savepoint and returns where the
+// savepoint is, with whether the job is over (cancelled at it, or ended
+// already). A live job is asked for a savepoint and cancelled at it. A job that
+// has ended already, the update recording its savepoint lost, gives back what
+// was recorded for it, or else its last completed checkpoint: the savepoint it
+// was cancelled at, as nothing completes after one, or where it stopped.
+func (r *ClinkJobReconciler) endAtSavepoint(ctx context.Context, cj *clinkv1alpha1.ClinkJob, api *coordinatorClient, jobs []jobSummaryJSON) (*clinkv1alpha1.SavepointRef, bool, error) {
+	id := cj.Status.JobID
+	if old, listed := findJob(jobs, id); listed && old.live() {
+		return api.savepointAndCancel(ctx, id)
+	}
+	if cj.Status.UpgradeRestore != nil && cj.Status.UpgradeFromJobID == id {
+		return cj.Status.UpgradeRestore, true, nil
+	}
+	sp, err := api.lastCheckpoint(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if sp == nil {
+		return nil, false, fmt.Errorf("job %d has ended with no checkpoint to restore from", id)
+	}
+	return sp, true, nil
+}
+
+func sameSavepoint(a, b *clinkv1alpha1.SavepointRef) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // ---- submission ------------------------------------------------------------

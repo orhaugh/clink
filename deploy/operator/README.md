@@ -213,12 +213,17 @@ Changing the spec (`sql` and `parallelism`, or `jobSo`, `env` and `args`, hashed
 into `.status.specHash`) triggers an **upgrade**. In `savepoint` mode the
 controller runs a two-stage, reconcile-safe rollout:
 
-1. **drain** - trigger a savepoint on the running job, record it in
-   `.status.upgradeRestore` (and `.status.lastSavepoint`), then cancel the job,
-   guarded by `.status.upgradeToHash` so it happens exactly once even if the next
-   stage is slow or retried. Recorded before the cancel, the savepoint survives a
-   cancel whose status update is lost: the retry finds the old job no longer live
-   and restores from it;
+1. **drain** - end the running job at a savepoint, recorded in
+   `.status.upgradeRestore` (and `.status.lastSavepoint`), guarded by
+   `.status.upgradeToHash` so it happens exactly once even if the next stage is
+   slow or retried. The Coordinator takes the savepoint and cancels the job at it
+   (`POST /api/v1/jobs/:id/savepoint?cancel=true`), holding the job's periodic
+   checkpoints in between, so no checkpoint completes after the savepoint and the
+   new job writes nothing the old one committed. Should the update recording the
+   savepoint be lost, the retry finds the old job ended and restores from its last
+   completed checkpoint, which is that savepoint. A Coordinator without
+   savepoint-and-cancel takes the savepoint alone and the controller cancels;
+   there, a periodic checkpoint can complete in between;
 2. **restore** - resubmit the job restored from that savepoint, retried until the
    Coordinator accepts it (adopting a live job of the same name, so a retry whose
    status update was lost never leaks a second one).
@@ -235,7 +240,7 @@ and a job part-way through an upgrade, a park or a resume stays in that phase.
 
 SQL jobs need a Coordinator that compiles a request in a catalog of its own
 (`catalog=own` on `POST /api/v1/jobs/sql`), which clink has from the release after
-0.15.0, as it has the takeover's refusal above.
+0.15.0, as it has the takeover's refusal above and savepoint-and-cancel.
 
 Savepoints must be readable by the pod that restores them, so enable shared
 checkpoint storage on the `ClinkCluster` (a `ReadWriteMany` PVC in production, or

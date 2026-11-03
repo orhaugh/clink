@@ -264,17 +264,22 @@ func (c *coordinatorClient) submitSQL(ctx context.Context, s sqlSubmission) (int
 	return started.Jobs[0].JobID, nil
 }
 
-// savepoint takes a savepoint of the job and returns where it is.
-func (c *coordinatorClient) savepoint(ctx context.Context, id int64) (*clinkv1alpha1.SavepointRef, error) {
-	status, body, err := c.do(ctx, coordinatorActionTimeout, http.MethodPost, fmt.Sprintf("/api/v1/jobs/%d/savepoint", id), "", nil)
+// savepointAndCancel takes a savepoint of the job and cancels the job at it:
+// the Coordinator holds the job's periodic checkpoints from the savepoint's
+// trigger, so none completes after it and the job restored from it writes
+// nothing twice. cancelled says whether the Coordinator cancelled the job; one
+// that predates ?cancel=true takes the savepoint alone, and the caller cancels.
+func (c *coordinatorClient) savepointAndCancel(ctx context.Context, id int64) (*clinkv1alpha1.SavepointRef, bool, error) {
+	status, body, err := c.do(ctx, coordinatorActionTimeout, http.MethodPost, fmt.Sprintf("/api/v1/jobs/%d/savepoint?cancel=true", id), "", nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var ack struct {
 		OK            bool   `json:"ok"`
 		CheckpointID  int64  `json:"checkpoint_id"`
 		CheckpointDir string `json:"checkpoint_dir"`
 		Message       string `json:"message"`
+		Cancelled     bool   `json:"cancelled"`
 	}
 	_ = json.Unmarshal(body, &ack)
 	if status != http.StatusOK || !ack.OK {
@@ -282,12 +287,33 @@ func (c *coordinatorClient) savepoint(ctx context.Context, id int64) (*clinkv1al
 		if detail == "" {
 			detail = firstLine(string(body))
 		}
-		return nil, fmt.Errorf("savepoint of job %d not taken (HTTP %d): %s", id, status, detail)
+		return nil, false, fmt.Errorf("savepoint of job %d not taken (HTTP %d): %s", id, status, detail)
 	}
 	if ack.CheckpointDir == "" {
-		return nil, fmt.Errorf("savepoint of job %d named no directory", id)
+		return nil, false, fmt.Errorf("savepoint of job %d named no directory", id)
 	}
-	return &clinkv1alpha1.SavepointRef{Dir: ack.CheckpointDir, CheckpointID: ack.CheckpointID}, nil
+	return &clinkv1alpha1.SavepointRef{Dir: ack.CheckpointDir, CheckpointID: ack.CheckpointID}, ack.Cancelled, nil
+}
+
+// lastCheckpoint is where the job's newest completed checkpoint is, or nil when
+// it completed none: its marker directory, <checkpoint dir>/_jobs/<id>, and id.
+// Of a job cancelled at a savepoint it is that savepoint, as nothing completes
+// after one.
+func (c *coordinatorClient) lastCheckpoint(ctx context.Context, id int64) (*clinkv1alpha1.SavepointRef, error) {
+	var detail struct {
+		CheckpointDir     string `json:"checkpoint_dir"`
+		LatestCompletedID int64  `json:"latest_completed_checkpoint_id"`
+	}
+	if err := c.get(ctx, fmt.Sprintf("/api/v1/jobs/%d", id), &detail); err != nil {
+		return nil, err
+	}
+	if detail.CheckpointDir == "" || detail.LatestCompletedID <= 0 {
+		return nil, nil
+	}
+	return &clinkv1alpha1.SavepointRef{
+		Dir:          fmt.Sprintf("%s/_jobs/%d", strings.TrimRight(detail.CheckpointDir, "/"), id),
+		CheckpointID: detail.LatestCompletedID,
+	}, nil
 }
 
 // cancel ends the job. A job already gone (404) or already ending (409) is

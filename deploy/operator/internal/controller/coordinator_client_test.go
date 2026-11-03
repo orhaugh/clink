@@ -137,16 +137,44 @@ func TestTheCoordinatorsRefusalIsReportedInItsWords(t *testing.T) {
 	}
 }
 
-func TestASavepointIsReadFromTheAck(t *testing.T) {
+func TestASavepointCancelsTheJobAtIt(t *testing.T) {
 	f := &fakeCoordinator{answer: func(r *http.Request, _ string) (int, string) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/jobs/3/savepoint" {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/jobs/3/savepoint" || r.URL.Query().Get("cancel") != "true" {
 			return 404, ""
 		}
-		return 200, `{"job_id":3,"ok":true,"checkpoint_id":12,"checkpoint_dir":"/ckpt/qoe","message":""}`
+		return 200, `{"job_id":3,"ok":true,"checkpoint_id":12,"checkpoint_dir":"/ckpt/qoe/_jobs/3","message":"savepoint complete","cancelled":true,"cancel_message":"cancel requested"}`
 	}}
-	sp, err := f.client(t, "").savepoint(context.Background(), 3)
-	if err != nil || sp.Dir != "/ckpt/qoe" || sp.CheckpointID != 12 {
-		t.Fatalf("savepoint = %+v, %v", sp, err)
+	sp, cancelled, err := f.client(t, "").savepointAndCancel(context.Background(), 3)
+	if err != nil || sp.Dir != "/ckpt/qoe/_jobs/3" || sp.CheckpointID != 12 || !cancelled {
+		t.Fatalf("savepointAndCancel = %+v, %v, %v", sp, cancelled, err)
+	}
+}
+
+// A Coordinator that predates ?cancel=true takes the savepoint and leaves the
+// job running, and says nothing of a cancel: the caller cancels.
+func TestAnOlderCoordinatorTakesTheSavepointAlone(t *testing.T) {
+	f := &fakeCoordinator{answer: func(*http.Request, string) (int, string) {
+		return 200, `{"job_id":3,"ok":true,"checkpoint_id":12,"checkpoint_dir":"/ckpt/qoe/_jobs/3","message":"savepoint complete"}`
+	}}
+	_, cancelled, err := f.client(t, "").savepointAndCancel(context.Background(), 3)
+	if err != nil || cancelled {
+		t.Fatalf("cancelled = %v, %v", cancelled, err)
+	}
+}
+
+func TestAnEndedJobsLastCheckpointIsInItsMarkerDirectory(t *testing.T) {
+	f := &fakeCoordinator{answer: func(r *http.Request, _ string) (int, string) {
+		if r.URL.Path == "/api/v1/jobs/5" {
+			return 200, `{"id":5,"checkpoint_dir":"/ckpt/edges/","latest_completed_checkpoint_id":18}`
+		}
+		return 200, `{"id":6,"checkpoint_dir":"/ckpt/edges","latest_completed_checkpoint_id":0}`
+	}}
+	sp, err := f.client(t, "").lastCheckpoint(context.Background(), 5)
+	if err != nil || sp == nil || sp.Dir != "/ckpt/edges/_jobs/5" || sp.CheckpointID != 18 {
+		t.Fatalf("lastCheckpoint = %+v, %v", sp, err)
+	}
+	if sp, err := f.client(t, "").lastCheckpoint(context.Background(), 6); err != nil || sp != nil {
+		t.Fatalf("a job with no completed checkpoint: %+v, %v", sp, err)
 	}
 }
 
@@ -154,7 +182,7 @@ func TestASavepointNotTakenSaysWhy(t *testing.T) {
 	f := &fakeCoordinator{answer: func(*http.Request, string) (int, string) {
 		return 409, `{"job_id":3,"ok":false,"checkpoint_id":0,"checkpoint_dir":"","message":"job has no checkpoint dir"}`
 	}}
-	_, err := f.client(t, "").savepoint(context.Background(), 3)
+	_, _, err := f.client(t, "").savepointAndCancel(context.Background(), 3)
 	if err == nil || !strings.Contains(err.Error(), "job has no checkpoint dir") {
 		t.Fatalf("err = %v", err)
 	}

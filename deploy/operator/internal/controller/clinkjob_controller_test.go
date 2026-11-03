@@ -255,22 +255,28 @@ func TestAMissingJobIsResubmittedOnlyAfterTheGracePeriod(t *testing.T) {
 	}
 }
 
-// An upgrade records its savepoint before it cancels the old job. When the
-// status update after the cancel is lost, the retry finds the job no longer
-// live and restores from the recorded savepoint; asking the cancelled job for
-// another one failed on every retry, and the restore point was gone.
-func TestAnUpgradeKeepsTheSavepointItTookBeforeTheCancel(t *testing.T) {
-	sp := &clinkv1alpha1.SavepointRef{Dir: "/ckpt/qoe", CheckpointID: 9}
+// An upgrade ends the old job at a savepoint, which the Coordinator takes and
+// cancels the job at with no checkpoint completing in between, and records it.
+// A retry whose recording was lost finds the job ended and restores from what
+// was recorded, or from the job's last completed checkpoint, the savepoint.
+func TestAnUpgradeEndsTheOldJobAtASavepoint(t *testing.T) {
+	recorded := &clinkv1alpha1.SavepointRef{Dir: "/ckpt/edges/_jobs/5", CheckpointID: 9}
+	running := jobSummaryJSON{ID: 5, Name: "edges", Status: "RUNNING"}
+	ended := jobSummaryJSON{ID: 5, Name: "edges", Status: "CANCELLED", CompletionSignalled: true, CancelRequested: true}
 	cases := map[string]struct {
-		recorded      *clinkv1alpha1.SavepointRef
-		fromJob       int64
-		old           jobSummaryJSON
-		wantSavepoint bool
+		recorded    *clinkv1alpha1.SavepointRef
+		fromJob     int64
+		old         jobSummaryJSON
+		supported   bool  // the Coordinator takes ?cancel=true
+		savepoints  int   // savepoint requests the upgrade makes
+		cancels     int   // separate cancel requests
+		restoreFrom int64 // the checkpoint the new job restores from
 	}{
-		"a fresh upgrade takes a savepoint":           {nil, 0, jobSummaryJSON{ID: 5, Name: "qoe", Status: "RUNNING"}, true},
-		"a retry after the cancel reuses it":          {sp, 5, jobSummaryJSON{ID: 5, Name: "qoe", Status: "CANCELLED", CompletionSignalled: true, CancelRequested: true}, false},
-		"a retry before the cancel takes a fresh one": {sp, 5, jobSummaryJSON{ID: 5, Name: "qoe", Status: "RUNNING"}, true},
-		"a savepoint of another job is not reused":    {sp, 4, jobSummaryJSON{ID: 5, Name: "qoe", Status: "RUNNING"}, true},
+		"a running job is ended at a fresh savepoint":                          {nil, 0, running, true, 1, 0, 12},
+		"a stale record of a running job is not reused":                        {recorded, 5, running, true, 1, 0, 12},
+		"an ended job restores from what was recorded":                         {recorded, 5, ended, true, 0, 0, 9},
+		"an ended job with nothing recorded restores from its last checkpoint": {nil, 0, ended, true, 0, 0, 18},
+		"an older Coordinator's savepoint is followed by a cancel":             {nil, 0, running, false, 1, 1, 12},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -279,17 +285,22 @@ func TestAnUpgradeKeepsTheSavepointItTookBeforeTheCancel(t *testing.T) {
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/savepoint"):
 					savepoints++
-					return 200, `{"job_id":5,"ok":true,"checkpoint_id":12,"checkpoint_dir":"/ckpt/qoe","message":""}`
+					if c.supported {
+						return 200, `{"job_id":5,"ok":true,"checkpoint_id":12,"checkpoint_dir":"/ckpt/edges/_jobs/5","message":"","cancelled":true}`
+					}
+					return 200, `{"job_id":5,"ok":true,"checkpoint_id":12,"checkpoint_dir":"/ckpt/edges/_jobs/5","message":""}`
 				case strings.HasSuffix(r.URL.Path, "/cancel"):
 					cancels++
-					return 409, `{"job_id":5,"ok":false,"message":"job already completed"}`
+					return 200, `{"job_id":5,"ok":true,"message":""}`
+				case r.URL.Path == "/api/v1/jobs/5":
+					return 200, `{"id":5,"checkpoint_dir":"/ckpt/edges","latest_completed_checkpoint_id":18}`
 				}
 				return 404, ""
 			}}
 			cj := &clinkv1alpha1.ClinkJob{
-				ObjectMeta: metav1.ObjectMeta{Name: "qoe", Namespace: "ns"},
-				Spec:       clinkv1alpha1.ClinkJobSpec{JobName: "qoe", SQL: "v2", UpgradeMode: "savepoint"},
-				Status: clinkv1alpha1.ClinkJobStatus{Phase: "Upgrading", JobID: 5, SpecHash: "v1hash",
+				ObjectMeta: metav1.ObjectMeta{Name: "edges", Namespace: "ns"},
+				Spec:       clinkv1alpha1.ClinkJobSpec{JobName: "edges", SQL: "v2", UpgradeMode: "savepoint"},
+				Status: clinkv1alpha1.ClinkJobStatus{Phase: "Running", JobID: 5, SpecHash: "v1hash",
 					UpgradeRestore: c.recorded, UpgradeFromJobID: c.fromJob},
 			}
 			k := fake.NewClientBuilder().WithScheme(jobScheme(t)).WithObjects(cj).WithStatusSubresource(cj).Build()
@@ -298,21 +309,14 @@ func TestAnUpgradeKeepsTheSavepointItTookBeforeTheCancel(t *testing.T) {
 			if _, err := r.upgrade(context.Background(), cj, cluster(nil), f.client(t, ""), []jobSummaryJSON{c.old}, want); err != nil {
 				t.Fatal(err)
 			}
-			if (savepoints == 1) != c.wantSavepoint || savepoints > 1 {
-				t.Errorf("savepoints taken: %d", savepoints)
-			}
-			if cancels != 1 {
-				t.Errorf("cancels: %d", cancels)
+			if savepoints != c.savepoints || cancels != c.cancels {
+				t.Errorf("savepoints %d, cancels %d; want %d, %d", savepoints, cancels, c.savepoints, c.cancels)
 			}
 			if cj.Status.UpgradeToHash != want || cj.Status.UpgradeRestore == nil || cj.Status.UpgradeFromJobID != 5 {
 				t.Fatalf("status: %+v", cj.Status)
 			}
-			wantID := int64(12)
-			if !c.wantSavepoint {
-				wantID = 9
-			}
-			if cj.Status.UpgradeRestore.CheckpointID != wantID {
-				t.Errorf("restores from %+v, want checkpoint %d", cj.Status.UpgradeRestore, wantID)
+			if cj.Status.UpgradeRestore.CheckpointID != c.restoreFrom || cj.Status.UpgradeRestore.Dir != "/ckpt/edges/_jobs/5" {
+				t.Errorf("restores from %+v, want checkpoint %d", cj.Status.UpgradeRestore, c.restoreFrom)
 			}
 		})
 	}

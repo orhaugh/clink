@@ -3,7 +3,7 @@
 # kind-suspend-smoke.sh - end-to-end smoke for ClinkJob scale-to-zero.
 #
 # Proves the full park/wake surface on a kind cluster:
-#   1. MANUAL PARK   spec.suspend=true  -> savepoint -> cancel -> Suspended
+#   1. MANUAL PARK   spec.suspend=true  -> a savepoint that cancels -> Suspended
 #                    (reason Manual), job gone from the coordinator, slots freed.
 #   2. MANUAL WAKE   spec.suspend=false -> resubmitted restored from the
 #                    savepoint (new job id), wake latency measured.
