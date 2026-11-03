@@ -45,6 +45,19 @@ public:
     // without per-partition state ignore it. Idempotent - the assigner passes
     // the full idle set each probe.
     virtual void set_idle_partitions(const std::vector<std::int32_t>& /*idle*/) {}
+
+    // The per-partition progress a partition-aware strategy derives its
+    // watermark from: the greatest event time seen in each source partition.
+    // The assigner checkpoints it, so a restored stream knows which partitions
+    // it was waiting for. Empty for a strategy without per-partition state.
+    virtual std::map<std::int32_t, EventTime> partition_progress() const { return {}; }
+
+    // Reload progress the assigner checkpointed, before any record arrives:
+    // each partition joins the min at the event time it had reached, so the
+    // first partition to deliver after a restore, however far ahead of the
+    // rest, cannot set the watermark alone. Default no-op.
+    virtual void restore_partition_progress(const std::map<std::int32_t, EventTime>& /*progress*/) {
+    }
 };
 
 // Watermark = max event-time observed so far. Asserts records arrive in
@@ -171,6 +184,22 @@ public:
         if (next != idle_partitions_) {
             idle_partitions_ = std::move(next);
             dirty_ = true;  // the min may now advance past a newly-idle partition
+        }
+    }
+
+    std::map<std::int32_t, EventTime> partition_progress() const override { return part_max_; }
+
+    void restore_partition_progress(const std::map<std::int32_t, EventTime>& progress) override {
+        for (const auto& [part, mx] : progress) {
+            auto it = part_max_.find(part);
+            if (it == part_max_.end()) {
+                part_max_.emplace(part, mx);
+            } else if (mx > it->second) {
+                it->second = mx;
+            }
+        }
+        if (!progress.empty()) {
+            dirty_ = true;
         }
     }
 

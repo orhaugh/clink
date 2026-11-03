@@ -1,11 +1,15 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -77,6 +81,17 @@ public:
     // (the historic shape).
     WatermarkAssignerOperator& with_idleness(std::chrono::milliseconds duration) {
         idleness_ = duration;
+        return *this;
+    }
+
+    // Name the subtask this assigner runs as, so its checkpointed progress
+    // can be told from its peers'. A restore hands every subtask every
+    // subtask's operator state; the assigner keeps the rows its own index
+    // wrote, and at the same parallelism a subtask reads the same partitions
+    // again (a Kafka source subtask owns the partitions p with
+    // p % parallelism == its index). Unset, it carries no progress over.
+    WatermarkAssignerOperator& with_subtask_index(std::uint32_t subtask_index) {
+        subtask_index_ = subtask_index;
         return *this;
     }
 
@@ -283,8 +298,94 @@ public:
             // probe. Subsequent probes re-register from
             // on_processing_time_timer to form a loop.
             last_record_time_ms_ = now_ms_();
+            // A partition restored from the checkpoint holds the watermark
+            // until it delivers again or stays quiet for the idleness window,
+            // as one that was reading when the checkpoint was taken would.
+            for (const auto p : restored_partitions_) {
+                part_last_ms_.try_emplace(p, last_record_time_ms_);
+            }
             schedule_idle_probe_();
         }
+    }
+
+    // The watermark's per-partition progress is checkpointed beside the
+    // operator's timers, one operator-state row per source partition: the
+    // greatest event time the partition had delivered at the barrier.
+    //
+    // Without it a restored assigner knows no partition, so the first to
+    // deliver sets the watermark alone. Partitions are read unevenly, and one
+    // far ahead of the rest would move the watermark past every open window:
+    // the windows would fire with what their restored state held, and the
+    // rest of their records, replayed from the slower partitions, would arrive
+    // late and be dropped. Restored, each partition holds the min where it was.
+    void snapshot_timers(StateBackend& backend,
+                         OperatorId op_id,
+                         const std::string& slot = "") override {
+        Operator<T, T>::snapshot_timers(backend, op_id, slot);
+        if (!subtask_index_.has_value()) {
+            return;  // a restore could not tell these rows from a peer's
+        }
+        for (const auto& [part, mx] : strategy_->partition_progress()) {
+            const std::int64_t ms = mx.millis();
+            char bytes[sizeof(ms)];
+            std::memcpy(bytes, &ms, sizeof(ms));
+            backend.put_operator_state(
+                op_id, progress_key_(slot, part), StateBackend::ValueView{bytes, sizeof(bytes)});
+        }
+    }
+
+    // A restore hands every subtask the operator state of every subtask of the
+    // checkpoint, so the assigner keeps the rows its own subtask index wrote:
+    // a partition another subtask reads would hold this one's watermark until
+    // it went idle, or for good with idleness off. A rescale (a narrowed
+    // restore key-group range) moves partitions between indexes, so, as with
+    // the timers, a rescaled assigner carries no progress over and learns its
+    // partitions from the records, as a fresh one does.
+    void restore_timers(StateBackend& backend,
+                        OperatorId op_id,
+                        const std::string& slot = "") override {
+        Operator<T, T>::restore_timers(backend, op_id, slot);
+        if (!subtask_index_.has_value()) {
+            return;
+        }
+        if (auto* rt = this->runtime(); rt != nullptr) {
+            // A rescale narrows the restore key-group range of a keyed chain
+            // and moves the topology to a new generation, which a non-keyed
+            // one (a source's) shows alone.
+            const auto& succession = rt->restore_succession();
+            if (!rt->restore_key_groups_cover_all() ||
+                (succession.has_value() &&
+                 succession->generation != succession->restore_generation)) {
+                return;
+            }
+        }
+        const std::string prefix =
+            std::string(kProgressKey) + slot + ":" + std::to_string(*subtask_index_) + ":";
+        std::map<std::int32_t, EventTime> progress;
+        backend.scan_operator_state(
+            op_id, [&](StateBackend::KeyView key, StateBackend::ValueView value) {
+                if (!key.starts_with(prefix) || value.size() != sizeof(std::int64_t)) {
+                    return;
+                }
+                std::int32_t part = 0;
+                try {
+                    part = static_cast<std::int32_t>(
+                        std::stol(std::string(key.substr(prefix.size()))));
+                } catch (const std::exception&) {
+                    return;
+                }
+                std::int64_t ms = 0;
+                std::memcpy(&ms, value.data(), sizeof(ms));
+                progress[part] = EventTime{ms};
+            });
+        if (progress.empty()) {
+            return;
+        }
+        restored_partitions_.clear();
+        for (const auto& [part, _] : progress) {
+            restored_partitions_.push_back(part);
+        }
+        strategy_->restore_partition_progress(progress);
     }
 
     void process(const StreamElement<T>& element, Emitter<T>& out) override {
@@ -425,6 +526,13 @@ public:
 
 private:
     static constexpr const char* kIdleProbeKey = "__idle_probe__";
+    // Operator-state key prefix of the checkpointed per-partition progress.
+    static constexpr const char* kProgressKey = "__clink_wm_progress";
+
+    std::string progress_key_(const std::string& slot, std::int32_t partition) const {
+        return std::string(kProgressKey) + slot + ":" + std::to_string(*subtask_index_) + ":" +
+               std::to_string(partition);
+    }
 
     // Stamp the batch's wall-clock against each partition it carries, so the
     // idle probe can tell which partitions have gone quiet. No-op (and no
@@ -477,6 +585,11 @@ private:
     // tells the (partition-aware) strategy to exclude it, so a quiet partition
     // stops pinning the min watermark. Empty for non-partitioned sources.
     std::map<std::int32_t, std::int64_t> part_last_ms_;
+    // The partitions a restore carried over, seeded into the idleness
+    // tracking at open().
+    std::vector<std::int32_t> restored_partitions_;
+    // The subtask this assigner runs as, which tags its checkpointed progress.
+    std::optional<std::uint32_t> subtask_index_;
 
     // Watermark alignment state (withWatermarkAlignment).
     std::shared_ptr<AlignmentGroup> alignment_group_;

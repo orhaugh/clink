@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**A job restored from a checkpoint holds its watermark at the slowest partition
+it was waiting for.** The partition-aware watermark strategy takes the min over
+the partitions it has seen, and a restored assigner had seen none: the first
+partition to deliver set the watermark alone. Kafka partitions are read
+unevenly, and after a Coordinator failover on the playback showcase a job
+restored with one partition more than a minute of event time ahead of the
+other three; it delivered first, the watermark jumped past every open window,
+and the windows fired with what their restored state held while the replayed
+tail of the slower partitions arrived late and was dropped. A minute of the
+CDN vendor's per-location counts came out at about half. The assigner now
+checkpoints each partition's progress beside its timers, tagged with its
+subtask index, and reloads its own before `open()`: a restore hands every
+subtask every subtask's rows, and at the same parallelism a subtask reads the
+same partitions again. A restored partition that stays quiet goes idle after
+the idleness window like any other; a rescale carries no progress over, as
+with the timers. Covered by `WatermarkAssignerRestore.*`, whose restore test
+fails against the previous assigner, and by the Kafka window recovery suite,
+which caught two earlier versions that let a subtask keep a peer's partitions
+and so never fired another window after a restart at parallelism 4.
+
 **A Kafka record keeps its partition when it crosses the network to the
 decoder.** The partition-aware watermark assigner behind a Kafka table's
 decoder holds the watermark at the slowest partition, and needs each record's

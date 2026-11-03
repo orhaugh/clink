@@ -13513,6 +13513,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             if (const auto idle_ms = ctx.param_int64_or("idle_timeout_ms", 0); idle_ms > 0) {
                 op->with_idleness(std::chrono::milliseconds(idle_ms));
             }
+            // Its subtask index tags the watermark progress it checkpoints, so
+            // a restore takes back its own and not its peers'.
+            op->with_subtask_index(static_cast<std::uint32_t>(ctx.subtask_idx));
             return op;
         });
 
