@@ -295,6 +295,12 @@ Everything below is published at
   one machine, with a Worker kill, a savepoint, a Coordinator failover and
   a check that holds every store to a model of the night; the flight
   recorder on a job, and what it found.
+- [coldchain](https://github.com/orhaugh/coldchain): refrigerated freight
+  monitoring on the typed C++ API with no SQL: a state machine per container
+  in event time, a cached asynchronous lookup of each cargo's specification, a
+  fleet seeded from a savepoint written offline, and the same alerts in one
+  process and on a cluster, each run checked against an independent fold of
+  the tape.
 - [Runnable examples](docs/consumer-examples/): every core feature as a
   standalone buildable program, from hello-pipeline to the testing
   framework and state-as-data workflows.
