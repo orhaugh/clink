@@ -980,6 +980,19 @@ clink::http::HttpResponse handle_sql(clink::cluster::Coordinator& coordinator,
     if (auto it = req.query.find("name"); it != req.query.end() && !it->second.empty()) {
         base_name = it->second;
     }
+    // catalog=own compiles the request as a self-contained script, in a catalog
+    // made for it and gone with it, as `clink run` compiles a file: its tables
+    // are its own, it leaves the session catalog as it found it, and two scripts
+    // naming the same table do not collide. A client that submits one job per
+    // request (an operator, a CI step) wants this; the workbench, which builds a
+    // catalog up statement by statement, keeps the session catalog, the default.
+    bool own_catalog = false;
+    if (auto it = req.query.find("catalog"); it != req.query.end() && !it->second.empty()) {
+        if (it->second != "own" && it->second != "session") {
+            return fail(400, "catalog must be own or session");
+        }
+        own_catalog = it->second == "own";
+    }
     // Durability, on the same terms as /jobs/spec: without it a SQL job
     // submitted here could never checkpoint, so its exactly-once sinks
     // could never commit and a worker loss could never be recovered.
@@ -1014,8 +1027,12 @@ clink::http::HttpResponse handle_sql(clink::cluster::Coordinator& coordinator,
     int job_index = 0;
 
     auto& session = sql_session();
-    std::lock_guard<std::mutex> lock(session.mu);
-    auto& catalog = session.catalog;
+    std::unique_lock<std::mutex> lock(session.mu, std::defer_lock);
+    clink::sql::Catalog request_catalog;
+    if (!own_catalog) {
+        lock.lock();
+    }
+    auto& catalog = own_catalog ? request_catalog : session.catalog;
     clink::sql::Binder binder(catalog);
     clink::sql::PhysicalPlanner planner;
 
@@ -1107,6 +1124,14 @@ clink::http::HttpResponse handle_sql(clink::cluster::Coordinator& coordinator,
                 return fail(400,
                             "ANALYZE is not supported over HTTP (it runs a local scan); "
                             "use the clink_submit_sql CLI");
+            } else if (own_catalog &&
+                       (std::holds_alternative<ast::CreateMaterializedViewStmt>(stmt) ||
+                        std::holds_alternative<ast::RefreshMatViewStmt>(stmt))) {
+                // A view's refreshes re-plan it against the session catalog, where a
+                // request's own catalog is gone by then.
+                return fail(400,
+                            "a materialized view lives in the session catalog, where its "
+                            "refreshes find it; send it without catalog=own");
             } else if (std::holds_alternative<ast::CreateMaterializedViewStmt>(stmt)) {
                 auto& mv = std::get<ast::CreateMaterializedViewStmt>(stmt);
                 auto mvplan = clink::sql::plan_materialized_view(std::move(mv), catalog, req.body);
@@ -2798,7 +2823,8 @@ int run_coordinator(int argc, char** argv) {
 #ifdef CLINK_LINKED_SQL
         // POST /api/v1/jobs/sql - compile / explain / submit SQL text directly.
         // Body is raw SQL; ?mode=explain|compile|submit. DDL accumulates in the
-        // coordinator's session catalog (optionally persisted via --sql-catalog-dir).
+        // coordinator's session catalog (optionally persisted via --sql-catalog-dir),
+        // or, with ?catalog=own, in a catalog of the request's own.
         http_srv->post("/api/v1/jobs/sql", [coordinator_ptr](const clink::http::HttpRequest& req) {
             clink::metrics::http::request_seen();
             return handle_sql(*coordinator_ptr, req);

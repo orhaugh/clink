@@ -632,6 +632,54 @@ TEST(HttpSql, RejectsBadSqlWithPosition) {
     EXPECT_NE(resp.body.find("\"position\""), std::string::npos) << resp.body;
 }
 
+// catalog=own compiles a request as a self-contained script, in a catalog made
+// for it, as `clink run` compiles a file: an operator or a CI step can send the
+// same script twice, or two scripts naming the same table, and leave the
+// session catalog as it found it. The session catalog, the default, keeps the
+// first definition and refuses the second.
+TEST(HttpSql, AScriptInACatalogOfItsOwnCollidesWithNothingAndLeavesNothing) {
+    auto c = start_cluster(/*n_workers=*/0);
+    if (!c.has_value()) {
+        GTEST_SKIP() << "cluster startup failed";
+    }
+    if (!sql_endpoints_present(c->coordinator_http_port)) {
+        GTEST_SKIP() << "coordinator built without SQL";
+    }
+    const std::string script =
+        "CREATE TABLE own_s (a BIGINT, b BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/own_i.ndjson'); "
+        "CREATE TABLE own_d (a BIGINT) WITH (connector='file', format='json', "
+        "path='/tmp/own_o.ndjson'); "
+        "INSERT INTO own_d SELECT a FROM own_s WHERE b > 5;";
+    const auto post = [&](const std::string& query, const std::string& body) {
+        return http_post_body(
+            "127.0.0.1", c->coordinator_http_port, "/api/v1/jobs/sql?" + query, body);
+    };
+    for (int attempt = 1; attempt <= 2; ++attempt) {
+        const auto r = post("mode=compile&catalog=own", script);
+        EXPECT_EQ(r.status, 200) << "attempt " << attempt << ": " << r.body;
+        EXPECT_NE(r.body.find("\"spec_json\""), std::string::npos) << r.body;
+    }
+    const auto cat = http_get("127.0.0.1", c->coordinator_http_port, "/api/v1/catalog");
+    EXPECT_EQ(cat.body.find("own_s"), std::string::npos)
+        << "a request's own catalog reached the session's: " << cat.body;
+
+    EXPECT_EQ(post("mode=compile", script).status, 200);
+    const auto again = post("mode=compile", script);
+    EXPECT_EQ(again.status, 400) << again.body;
+    EXPECT_NE(again.body.find("table already exists"), std::string::npos) << again.body;
+
+    const auto view = post("mode=compile&catalog=own",
+                           "CREATE TABLE own_t (a BIGINT, b BIGINT) WITH (connector='file', "
+                           "format='json', path='/tmp/own_t.ndjson'); "
+                           "CREATE MATERIALIZED VIEW own_mv WITH (freshness='0', "
+                           "connector='file', format='json') AS SELECT a, b FROM own_t;");
+    EXPECT_EQ(view.status, 400) << view.body;
+    EXPECT_NE(view.body.find("materialized view lives in the session catalog"), std::string::npos)
+        << view.body;
+    EXPECT_EQ(post("mode=compile&catalog=mine", script).status, 400);
+}
+
 TEST(HttpSql, ConnectorsListIncludesKnownNames) {
     auto c = start_cluster(/*n_workers=*/0);
     if (!c.has_value()) {

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**`POST /api/v1/jobs/sql` takes `catalog=own`, compiling a request as a script
+of its own.** Every request's DDL went into the Coordinator's shared session
+catalog, so a client that submits one self-contained script per job could
+not send the same script twice, or two scripts that declare a table of the
+same name: the second was refused with `table already exists`, and a request
+that failed part-way left its earlier tables behind for the next one. With
+`catalog=own` the request is compiled in a catalog made for it, as `clink
+run` compiles a file, and the session catalog is left as it was; a
+materialized view, whose refreshes re-plan it against the session catalog, is
+refused there. The default keeps the session catalog, which the console's
+workbench builds up statement by statement. Covered by
+`HttpSql.AScriptInACatalogOfItsOwnCollidesWithNothingAndLeavesNothing`.
+
 **`CLINK_AUTH_TOKEN` is read without the whitespace around it.** A Kubernetes
 Secret made from a file, or a token written with `echo token > file`, ends the
 token with a newline. Every node kept it, and since no request header can
