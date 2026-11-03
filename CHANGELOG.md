@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+**The Kubernetes operator runs SQL jobs, and runs a secured, HA cluster.** A
+`ClinkJob` took only a compiled `.so`, submitted, savepointed and cancelled by
+exec'ing the CLI in a Coordinator's pod over the control port: not over TLS,
+not to a standby, and not with the token the chart's clusters require. It now
+takes `sql`, a self-contained script with an optional `parallelism`, compiled
+by the Coordinator in a catalog of its own (`catalog=own`) and refused before
+it starts when it would make more than one job. The operator speaks the HTTP
+API with the cluster's token for every job's status, savepoint and cancel,
+reading the Secret from the API server rather than watching Secrets; a
+compiled job is still built by the CLI, now in the leading Coordinator's pod,
+and waits with a message on a cluster with control-plane TLS, which the CLI
+cannot speak. A `ClinkCluster` takes `auth`, `tls` (mutual with
+`workerSecret`), per-role `envFrom`, `extraEnv`, `extraVolumes` and
+`extraVolumeMounts`, and an HA directory on a hostPath for single-node
+clusters; under HA the Coordinators are a StatefulSet behind a headless
+Service, each advertising a stable name, with `/readyz` and `/livez` probes.
+Jobs are found on the cluster by name, which defaults to the `ClinkJob`'s
+own, so several `ClinkJob`s share a cluster, and a second one claiming a
+name waits; a list the operator cannot read decides nothing, a job the
+cluster stops listing is resubmitted only after two minutes, and a
+`Pending` set while the cluster is away no longer overwrites a parked job's
+phase, which sent a job parked on idle back as a fresh submit that dropped
+its savepoint. An upgrade records its savepoint before it cancels the old
+job: a cancel whose status update was lost, to a conflicting edit or an
+operator restart, left the upgrade asking the cancelled job for a savepoint
+on every retry, with its restore point gone. A failed job is read from the
+Coordinator's status rather than from errors a recovered job also carries.
+The CRDs now install with `kubectl apply --server-side`: the `ClinkCluster`
+CRD carries the Kubernetes schemas for volumes and environment, so a bad
+`extraVolumes` is refused when the cluster is applied, and it is larger than
+the annotation a client-side apply keeps. Covered by the operator's Go tests
+and `kind-sqljob-smoke.sh`: token auth, mutual TLS, an upgrade restored from
+its savepoint, a leader failover, and every event counted once;
+`kind-clinkjob-smoke.sh` and `kind-suspend-smoke.sh` pass on the reworked
+compiled-job path, upgrade, park, idle park and lag wake included.
+
 **A Coordinator that has just taken over answers the job API only once it has
 recovered its predecessor's jobs.** A new leader binds its control port so the
 Workers can register with it, then waits for them to settle before it

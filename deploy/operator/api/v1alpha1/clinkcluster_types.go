@@ -36,6 +36,14 @@ type CoordinatorSpec struct {
 	// configuration from process env, so this is how per-cluster job env is
 	// supplied (ClinkJob.env only reaches the submit-side build).
 	Env []string `json:"env,omitempty"`
+	// EnvFrom and ExtraEnv add environment in the Kubernetes shapes, from a
+	// Secret or a ConfigMap among them: a job's connector options read a
+	// secret through env:// (password = 'env://PG_PASSWORD') from it.
+	EnvFrom  []corev1.EnvFromSource `json:"envFrom,omitempty"`
+	ExtraEnv []corev1.EnvVar        `json:"extraEnv,omitempty"`
+	// ExtraVolumes and ExtraVolumeMounts mount anything else into the pods.
+	ExtraVolumes      []corev1.Volume      `json:"extraVolumes,omitempty"`
+	ExtraVolumeMounts []corev1.VolumeMount `json:"extraVolumeMounts,omitempty"`
 }
 
 // WorkerSpec configures the Worker role.
@@ -57,6 +65,14 @@ type WorkerSpec struct {
 	// build-time configuration from process env (registered factory closures
 	// capture it), so runtime-side job env belongs here, not on ClinkJob.
 	Env []string `json:"env,omitempty"`
+	// EnvFrom and ExtraEnv add environment in the Kubernetes shapes, from a
+	// Secret or a ConfigMap among them: a job's connector options read a
+	// secret through env:// (password = 'env://PG_PASSWORD') from it.
+	EnvFrom  []corev1.EnvFromSource `json:"envFrom,omitempty"`
+	ExtraEnv []corev1.EnvVar        `json:"extraEnv,omitempty"`
+	// ExtraVolumes and ExtraVolumeMounts mount anything else into the pods.
+	ExtraVolumes      []corev1.Volume      `json:"extraVolumes,omitempty"`
+	ExtraVolumeMounts []corev1.VolumeMount `json:"extraVolumeMounts,omitempty"`
 }
 
 // HASpec turns on multi-Coordinator high availability with file-coordinator
@@ -68,10 +84,18 @@ type HASpec struct {
 	Replicas int32 `json:"replicas,omitempty"`
 	// +kubebuilder:default="/var/lib/clink/ha"
 	MountPath string `json:"mountPath,omitempty"`
+	// Type is the HA directory's volume: a ReadWriteMany PVC, or a hostPath
+	// on a single-node cluster such as kind, where every pod shares the node.
+	// +kubebuilder:validation:Enum=pvc;hostPath
+	// +kubebuilder:default=pvc
+	Type string `json:"type,omitempty"`
 	// StorageClassName for the shared HA PVC (must support ReadWriteMany).
 	StorageClassName *string `json:"storageClassName,omitempty"`
 	// +kubebuilder:default="1Gi"
 	Size string `json:"size,omitempty"`
+	// HostPath is the node directory when Type=hostPath. Ignored for Type=pvc.
+	// +kubebuilder:default="/var/lib/clink-ha"
+	HostPath string `json:"hostPath,omitempty"`
 }
 
 // CheckpointStorageSpec mounts a shared volume into every Coordinator and
@@ -96,15 +120,48 @@ type CheckpointStorageSpec struct {
 	HostPath string `json:"hostPath,omitempty"`
 }
 
+// AuthSpec gives every pod the cluster's HTTP API token as CLINK_AUTH_TOKEN,
+// from a Secret, and the operator presents it on its own calls to the
+// Coordinator. Every request then needs `Authorization: Bearer <token>`,
+// except the probes and the console's own files.
+type AuthSpec struct {
+	// ExistingSecret names a Secret in the cluster's namespace holding the
+	// token; empty leaves auth off.
+	ExistingSecret string `json:"existingSecret,omitempty"`
+	// SecretKey is the token's key in that Secret.
+	// +kubebuilder:default="token"
+	SecretKey string `json:"secretKey,omitempty"`
+}
+
+// TLSSpec puts the control plane between the Workers and the Coordinators on
+// TLS. Each Secret is a kubernetes.io/tls Secret that also carries ca.crt, as
+// cert-manager writes them, both issued by one CA.
+type TLSSpec struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// CoordinatorSecret holds the certificate the Coordinators serve. It must
+	// name every host a Worker connects by: the Coordinator Service without HA,
+	// and with HA each Coordinator's stable name, which
+	// *.<name>-coordinator-headless.<namespace>.svc.cluster.local covers.
+	CoordinatorSecret string `json:"coordinatorSecret,omitempty"`
+	// WorkerSecret holds the Workers' client certificate, which makes it mutual
+	// TLS. Empty, the Workers mount only the CoordinatorSecret's ca.crt.
+	WorkerSecret string `json:"workerSecret,omitempty"`
+	// SkipHostnameVerification keeps the CA check and drops the check that the
+	// Coordinator's certificate names the host (--tls-no-verify-hostname).
+	SkipHostnameVerification bool `json:"skipHostnameVerification,omitempty"`
+}
+
 // ClinkClusterSpec is the desired state of a clink cluster.
 type ClinkClusterSpec struct {
 	Image              ImageSpec                     `json:"image,omitempty"`
 	ServiceAccountName string                        `json:"serviceAccountName,omitempty"`
 	ImagePullSecrets   []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
-	Coordinator         CoordinatorSpec                `json:"coordinator,omitempty"`
-	Worker        WorkerSpec               `json:"worker,omitempty"`
+	Coordinator        CoordinatorSpec               `json:"coordinator,omitempty"`
+	Worker             WorkerSpec                    `json:"worker,omitempty"`
 	HA                 HASpec                        `json:"ha,omitempty"`
 	CheckpointStorage  CheckpointStorageSpec         `json:"checkpointStorage,omitempty"`
+	Auth               AuthSpec                      `json:"auth,omitempty"`
+	TLS                TLSSpec                       `json:"tls,omitempty"`
 }
 
 // ClinkClusterStatus is the observed state of a clink cluster.

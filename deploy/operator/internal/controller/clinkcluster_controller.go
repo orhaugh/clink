@@ -3,8 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -26,7 +24,10 @@ import (
 // ClinkClusterReconciler reconciles a ClinkCluster into its owned workloads.
 type ClinkClusterReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader reads the cluster's auth Secret from the API server, not the
+	// cache, so the operator never lists or watches Secrets.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 }
 
 // +kubebuilder:rbac:groups=clink.dev,resources=clinkclusters,verbs=get;list;watch;create;update;patch;delete
@@ -35,6 +36,7 @@ type ClinkClusterReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services;serviceaccounts;persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 // Reconcile drives the actual cluster state toward the ClinkCluster spec.
 func (r *ClinkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -60,7 +62,7 @@ func (r *ClinkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.reconcileServiceAccount(ctx, &cc); err != nil {
 		return ctrl.Result{}, err
 	}
-	if cc.Spec.HA.Enabled {
+	if cc.Spec.HA.Enabled && cc.Spec.HA.Type == "pvc" {
 		if err := r.reconcileHAPVC(ctx, &cc); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -76,7 +78,7 @@ func (r *ClinkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.reconcileTMHeadlessService(ctx, &cc); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileCoordinatorDeployment(ctx, &cc, jmReplicas); err != nil {
+	if err := r.reconcileCoordinators(ctx, &cc, jmReplicas); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileTMStatefulSet(ctx, &cc); err != nil {
@@ -146,6 +148,12 @@ func applyDefaults(cc *clinkv1alpha1.ClinkCluster) {
 		}
 		if s.HA.Size == "" {
 			s.HA.Size = "1Gi"
+		}
+		if s.HA.Type == "" {
+			s.HA.Type = "pvc"
+		}
+		if s.HA.HostPath == "" {
+			s.HA.HostPath = "/var/lib/clink-ha"
 		}
 	}
 	if s.CheckpointStorage.Enabled {
@@ -316,74 +324,91 @@ func (r *ClinkClusterReconciler) reconcileTMHeadlessService(ctx context.Context,
 	return err
 }
 
-func (r *ClinkClusterReconciler) reconcileCoordinatorDeployment(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, replicas int32) error {
+// reconcileCoordinators applies the Coordinators: without HA one Deployment,
+// with HA a StatefulSet behind its headless Service, so each Coordinator has
+// the stable name it advertises. A cluster that changed modes, or one an
+// earlier operator made with an HA Deployment, loses the other kind here.
+func (r *ClinkClusterReconciler) reconcileCoordinators(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, replicas int32) error {
+	key := metav1.ObjectMeta{Name: r.jmName(cc), Namespace: cc.Namespace}
+	if !cc.Spec.HA.Enabled {
+		if err := r.reconcileCoordinatorDeployment(ctx, cc); err != nil {
+			return err
+		}
+		if err := r.deleteIfOwned(ctx, cc, &appsv1.StatefulSet{ObjectMeta: key}); err != nil {
+			return err
+		}
+		return r.deleteIfOwned(ctx, cc, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: r.jmHeadlessName(cc), Namespace: cc.Namespace}})
+	}
+	if err := r.reconcileCoordinatorHeadlessService(ctx, cc); err != nil {
+		return err
+	}
+	if err := r.reconcileCoordinatorStatefulSet(ctx, cc, replicas); err != nil {
+		return err
+	}
+	return r.deleteIfOwned(ctx, cc, &appsv1.Deployment{ObjectMeta: key})
+}
+
+// deleteIfOwned deletes obj when it exists and this ClinkCluster controls it.
+func (r *ClinkClusterReconciler) deleteIfOwned(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, obj client.Object) error {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(obj, cc) {
+		return nil
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, obj))
+}
+
+func (r *ClinkClusterReconciler) reconcileCoordinatorDeployment(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) error {
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: r.jmName(cc), Namespace: cc.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
+		one := int32(1)
 		dep.Labels = componentLabels(cc, "coordinator")
-		dep.Spec.Replicas = &replicas
-		strat := appsv1.RecreateDeploymentStrategyType
-		if cc.Spec.HA.Enabled {
-			strat = appsv1.RollingUpdateDeploymentStrategyType
-		}
-		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: strat}
+		dep.Spec.Replicas = &one
+		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
 		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(cc, "coordinator")}
-
-		args := []string{
-			"--role=coordinator",
-			fmt.Sprintf("--port=%d", cc.Spec.Coordinator.ControlPort),
-			"--bind-host=0.0.0.0",
-		}
-		var env []corev1.EnvVar
-		if cc.Spec.HA.Enabled {
-			env = append(env, corev1.EnvVar{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}})
-			args = append(args, "--advertise-host=$(POD_IP)", "--ha-dir="+cc.Spec.HA.MountPath)
-		} else {
-			args = append(args, "--advertise-host="+r.jmName(cc))
-		}
-		args = append(args, fmt.Sprintf("--http-port=%d", cc.Spec.Coordinator.HTTPPort), "--http-bind=0.0.0.0")
-		if cc.Spec.Coordinator.StateBackend != "" {
-			args = append(args, "--state-backend="+cc.Spec.Coordinator.StateBackend)
-		}
-		args = append(args, cc.Spec.Coordinator.ExtraArgs...)
-		env = append(env, parseEnvKVs(cc.Spec.Coordinator.Env)...)
-
-		c := corev1.Container{
-			Name:            "coordinator",
-			Image:           r.image(cc),
-			ImagePullPolicy: cc.Spec.Image.PullPolicy,
-			Args:            args,
-			Env:             env,
-			Ports: []corev1.ContainerPort{
-				{Name: "control", ContainerPort: cc.Spec.Coordinator.ControlPort},
-				{Name: "http", ContainerPort: cc.Spec.Coordinator.HTTPPort},
-			},
-			ReadinessProbe: httpProbe("/api/v1/health", "http", 2, 5, 6),
-			LivenessProbe:  httpProbe("/api/v1/health", "http", 10, 10, 6),
-			Resources:      cc.Spec.Coordinator.Resources,
-		}
-		var volumes []corev1.Volume
-		var mounts []corev1.VolumeMount
-		if cc.Spec.HA.Enabled {
-			mounts = append(mounts, corev1.VolumeMount{Name: "ha", MountPath: cc.Spec.HA.MountPath})
-			volumes = append(volumes, corev1.Volume{Name: "ha", VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: r.haPVCName(cc)},
-			}})
-		}
-		if v, m, ok := r.checkpointVolume(cc); ok {
-			mounts = append(mounts, m)
-			volumes = append(volumes, v)
-		}
-		c.VolumeMounts = mounts
 		dep.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "coordinator")},
-			Spec: corev1.PodSpec{
-				ServiceAccountName: r.serviceAccountName(cc),
-				ImagePullSecrets:   cc.Spec.ImagePullSecrets,
-				Containers:         []corev1.Container{c},
-				Volumes:            volumes,
-			},
+			Spec:       r.coordinatorPodSpec(cc),
 		}
 		return controllerutil.SetControllerReference(cc, dep, r.Scheme)
+	})
+	return err
+}
+
+func (r *ClinkClusterReconciler) reconcileCoordinatorStatefulSet(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, replicas int32) error {
+	ss := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: r.jmName(cc), Namespace: cc.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, ss, func() error {
+		ss.Labels = componentLabels(cc, "coordinator")
+		ss.Spec.Replicas = &replicas
+		ss.Spec.ServiceName = r.jmHeadlessName(cc)
+		// Start every replica at once: the election, not the ordinal, picks the leader.
+		ss.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
+		ss.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(cc, "coordinator")}
+		ss.Spec.Template = corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "coordinator")},
+			Spec:       r.coordinatorPodSpec(cc),
+		}
+		return controllerutil.SetControllerReference(cc, ss, r.Scheme)
+	})
+	return err
+}
+
+// reconcileCoordinatorHeadlessService gives each HA Coordinator the stable DNS
+// name it advertises as leader. Not-ready addresses are published, so a
+// leader's name resolves for the Workers while it is still binding.
+func (r *ClinkClusterReconciler) reconcileCoordinatorHeadlessService(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) error {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: r.jmHeadlessName(cc), Namespace: cc.Namespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
+		svc.Labels = componentLabels(cc, "coordinator")
+		svc.Spec.Selector = selectorLabels(cc, "coordinator")
+		svc.Spec.ClusterIP = corev1.ClusterIPNone
+		svc.Spec.PublishNotReadyAddresses = true
+		svc.Spec.Ports = []corev1.ServicePort{
+			{Name: "control", Port: cc.Spec.Coordinator.ControlPort, TargetPort: intstr.FromInt32(cc.Spec.Coordinator.ControlPort)},
+			{Name: "http", Port: cc.Spec.Coordinator.HTTPPort, TargetPort: intstr.FromInt32(cc.Spec.Coordinator.HTTPPort)},
+		}
+		return controllerutil.SetControllerReference(cc, svc, r.Scheme)
 	})
 	return err
 }
@@ -397,68 +422,9 @@ func (r *ClinkClusterReconciler) reconcileTMStatefulSet(ctx context.Context, cc 
 		ss.Spec.ServiceName = r.tmHeadlessName(cc)
 		ss.Spec.PodManagementPolicy = appsv1.ParallelPodManagement
 		ss.Spec.Selector = &metav1.LabelSelector{MatchLabels: selectorLabels(cc, "worker")}
-
-		waitCmd := fmt.Sprintf(
-			"until curl -fsS \"http://%s:%d/api/v1/health\" >/dev/null 2>&1; do echo waiting for coordinator...; sleep 2; done; echo coordinator is ready",
-			r.jmName(cc), cc.Spec.Coordinator.HTTPPort)
-
-		args := []string{
-			"--role=worker",
-			"--id=$(POD_NAME)",
-			"--coordinator-host=" + r.jmName(cc),
-			fmt.Sprintf("--coordinator-port=%d", cc.Spec.Coordinator.ControlPort),
-			"--data-host=$(POD_IP)",
-			fmt.Sprintf("--slots=%d", cc.Spec.Worker.Slots),
-			fmt.Sprintf("--http-port=%d", cc.Spec.Worker.HTTPPort),
-			"--http-bind=0.0.0.0",
-		}
-		if cc.Spec.HA.Enabled {
-			args = append(args, "--ha-dir="+cc.Spec.HA.MountPath)
-		}
-		args = append(args, cc.Spec.Worker.ExtraArgs...)
-
-		grace := cc.Spec.Worker.TerminationGracePeriodSeconds
-		worker := corev1.Container{
-			Name:            "worker",
-			Image:           r.image(cc),
-			ImagePullPolicy: cc.Spec.Image.PullPolicy,
-			Env: append([]corev1.EnvVar{
-				{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
-				{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
-				{Name: "CLINK_DATA_BIND_HOST", Value: "0.0.0.0"},
-			}, parseEnvKVs(cc.Spec.Worker.Env)...),
-			Args:      args,
-			Ports:     []corev1.ContainerPort{{Name: "http", ContainerPort: cc.Spec.Worker.HTTPPort}},
-			Resources: cc.Spec.Worker.Resources,
-		}
-		var volumes []corev1.Volume
-		var mounts []corev1.VolumeMount
-		if cc.Spec.HA.Enabled {
-			mounts = append(mounts, corev1.VolumeMount{Name: "ha", MountPath: cc.Spec.HA.MountPath})
-			volumes = append(volumes, corev1.Volume{Name: "ha", VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: r.haPVCName(cc)},
-			}})
-		}
-		if v, m, ok := r.checkpointVolume(cc); ok {
-			mounts = append(mounts, m)
-			volumes = append(volumes, v)
-		}
-		worker.VolumeMounts = mounts
 		ss.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{Labels: componentLabels(cc, "worker")},
-			Spec: corev1.PodSpec{
-				ServiceAccountName:            r.serviceAccountName(cc),
-				ImagePullSecrets:              cc.Spec.ImagePullSecrets,
-				TerminationGracePeriodSeconds: &grace,
-				InitContainers: []corev1.Container{{
-					Name:            "wait-for-coordinator",
-					Image:           r.image(cc),
-					ImagePullPolicy: cc.Spec.Image.PullPolicy,
-					Command:         []string{"sh", "-c", waitCmd},
-				}},
-				Containers: []corev1.Container{worker},
-				Volumes:    volumes,
-			},
+			Spec:       r.workerPodSpec(cc),
 		}
 		return controllerutil.SetControllerReference(cc, ss, r.Scheme)
 	})
@@ -487,40 +453,30 @@ func parseEnvKVs(kvs []string) []corev1.EnvVar {
 	return out
 }
 
-// ---- Coordinator HTTP (status + job submission) -----------------------------
+// ---- Coordinator HTTP --------------------------------------------------------
 
-func (r *ClinkClusterReconciler) jmBaseURL(cc *clinkv1alpha1.ClinkCluster) string {
-	return fmt.Sprintf("http://%s.%s.svc:%d", r.jmName(cc), cc.Namespace, cc.Spec.Coordinator.HTTPPort)
-}
-
-// registeredWorkers reads the coordinator's /api/v1/workers and counts entries. Returns
-// 0 if the coordinator is not yet reachable (cluster still coming up).
+// registeredWorkers counts the Workers the Coordinator has registered and not
+// lost, asking with the cluster's token; 0 while the Coordinator cannot answer
+// (the cluster is still coming up).
 func (r *ClinkClusterReconciler) registeredWorkers(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) int32 {
-	cli := &http.Client{Timeout: 3 * time.Second}
-	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, r.jmBaseURL(cc)+"/api/v1/workers", nil)
+	api, err := newCoordinatorClient(ctx, r.APIReader, cc)
+	if err != nil {
+		log.FromContext(ctx).Info("cannot present the cluster's token", "err", err.Error())
+		return 0
+	}
+	n, err := api.liveWorkers(ctx)
 	if err != nil {
 		return 0
 	}
-	resp, err := cli.Do(httpReq)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0
-	}
-	return int32(strings.Count(string(body), "\"worker_id\""))
+	return n
 }
 
 // SetupWithManager wires the reconciler to watch ClinkCluster + its owned kinds.
 func (r *ClinkClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Scheme = mgr.GetScheme()
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&clinkv1alpha1.ClinkCluster{}).
 		Owns(&appsv1.Deployment{}).

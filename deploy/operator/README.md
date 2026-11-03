@@ -12,8 +12,9 @@ needs no host Go toolchain to build (the image is a multi-stage Docker build).
 
 Given a `ClinkCluster`, the controller creates and owns:
 
-- a **Coordinator** Deployment (1 replica, or `ha.replicas` when HA is enabled) plus
-  a ClusterIP Service (control + http ports),
+- the **Coordinators** behind a ClusterIP Service (control + http ports): one
+  Coordinator as a Deployment, or with HA `ha.replicas` of them as a StatefulSet
+  with a headless Service, each advertising its stable name under it,
 - a **Worker** StatefulSet (`worker.replicas`, parallel pod management,
   a `wait-for-coordinator` initContainer) plus a headless Service,
 - a **ServiceAccount** (unless you supply one),
@@ -22,7 +23,8 @@ Given a `ClinkCluster`, the controller creates and owns:
 
 All owned objects carry an owner reference, so deleting the `ClinkCluster`
 garbage-collects the whole cluster. The controller then reports status by reading
-the Coordinator's `/api/v1/workers` endpoint:
+the Coordinator's `/api/v1/workers` endpoint, with the cluster's token when it
+has one:
 
 ```
 $ kubectl get clinkcluster
@@ -31,15 +33,21 @@ demo   Running   2               2                 40s
 ```
 
 `.status.phase` is `Pending` until every Worker has registered, then
-`Running`; `.status.workersReady` is the live registered count.
+`Running`; `.status.workersReady` counts the registered Workers the
+Coordinator has not lost.
 
 ## Install
 
 ```sh
-kubectl apply -f config/crd/
+kubectl apply --server-side -f config/crd/
 kubectl apply -f config/manager/manager.yaml   # Namespace + operator Deployment
 kubectl apply -f config/rbac/                   # ServiceAccount + ClusterRole(Binding)
 ```
+
+The CRDs go in with a server-side apply: `ClinkCluster` embeds the Kubernetes
+schemas for environment and volumes, so the API server checks a cluster's
+`extraVolumes` when it is applied, and its CRD is larger than the annotation a
+client-side apply keeps (256 KiB). `kubectl create -f config/crd/` works too.
 
 The manager image is `clink-operator:latest` (build it with
 `docker build -t clink-operator:latest deploy/operator`).
@@ -80,6 +88,47 @@ CLUSTER; `ClinkJob.env` only reaches the submit-side spec build.
 the file coordinator over the shared HA PVC (which must be `ReadWriteMany`). This is
 the same coordinator the Helm chart uses; see `deploy/helm/clink`.
 
+The Coordinators run as a StatefulSet, and each advertises
+`<pod>.<cluster>-coordinator-headless.<namespace>.svc.cluster.local`, a name a TLS
+certificate can carry. A standby answers the HTTP API by forwarding it to the
+leader, so the Service, and anything that talks to it, needs no idea which
+Coordinator leads. `/readyz` says which each one is: `leader`, `standby`, or `ok`
+without HA.
+
+## Secured cluster
+
+```yaml
+spec:
+  auth:
+    existingSecret: clink-auth    # the HTTP API token, under key "token"
+    # secretKey: token
+  tls:
+    enabled: true
+    coordinatorSecret: clink-tls-coordinator   # tls.crt, tls.key, ca.crt
+    workerSecret: clink-tls-worker             # optional: mutual TLS
+    # skipHostnameVerification: false
+  worker:
+    envFrom:
+      - secretRef:
+          name: connector-credentials          # read by env:// in SQL options
+```
+
+`auth.existingSecret` gives every pod the token as `CLINK_AUTH_TOKEN`: each node
+then refuses an API request without it, and the operator reads the same Secret to
+present it. The operator gets that one Secret from the API server when it needs
+it; it never lists or watches Secrets.
+
+`tls` encrypts the control plane between the Workers and the Coordinators. The
+Coordinators mount `coordinatorSecret`. A Worker mounts only that Secret's `ca.crt`,
+never its key, unless `workerSecret` gives it a client certificate of its own, in
+which case the Coordinators require one from every Worker. Under HA the
+Coordinator certificate must name `*.<cluster>-coordinator-headless.<namespace>.svc.cluster.local`
+as well as the Service.
+
+`envFrom`, `extraEnv`, `extraVolumes` and `extraVolumeMounts` on either role add
+to its pod, so connector credentials arrive from Secrets and never appear in a
+job's SQL.
+
 ## Verify (kind)
 
 `kind-operator-smoke.sh` builds the operator image, stands up a kind cluster, installs
@@ -94,14 +143,44 @@ deploy/operator/kind-operator-smoke.sh --cleanup
 ```
 
 `kind-clinkjob-smoke.sh` covers the `ClinkJob` path (submit, savepoint-on-upgrade,
-cancel-on-delete) on top of the same kind setup.
+cancel-on-delete) on top of the same kind setup. `kind-sqljob-smoke.sh` runs a SQL
+`ClinkJob` on a secured HA cluster: token, mutual TLS, two Coordinators, an
+upgrade restored from its savepoint, and a failover in between.
 
 ## Jobs (ClinkJob + savepoint-on-upgrade)
 
-A `ClinkJob` runs a compiled job plugin (`.so`, baked into the runtime image) on a
-`ClinkCluster` and manages its lifecycle declaratively. The controller submits the
-job by exec'ing the in-image `clink` CLI inside a Coordinator pod and tracks it over
-the Coordinator HTTP API.
+A `ClinkJob` runs a job on a `ClinkCluster` and manages its lifecycle
+declaratively. The job is a SQL script or a compiled job plugin (`.so`, baked into
+the runtime image).
+
+```yaml
+apiVersion: clink.dev/v1alpha1
+kind: ClinkJob
+metadata:
+  name: title-minutes
+spec:
+  clusterName: demo
+  checkpointIntervalMs: 2000    # > 0 enables checkpointing (required for savepoint upgrades)
+  parallelism: 2
+  sql: |
+    CREATE TABLE plays (title VARCHAR, ts BIGINT) WITH (
+        connector = 'kafka', brokers = 'kafka:9092', topic = 'plays',
+        format = 'json', event_time_column = 'ts', watermark_lag_ms = '5000');
+    CREATE TABLE minutes (title VARCHAR, window_start BIGINT, window_end BIGINT,
+                          plays BIGINT) WITH (
+        connector = 'kafka', brokers = 'kafka:9092', topic = 'title-minutes',
+        format = 'json');
+    INSERT INTO minutes
+    SELECT title, window_start, window_end, COUNT(*) AS plays
+    FROM plays
+    GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), title;
+```
+
+A SQL job is one script: the `CREATE TABLE` statements it reads and writes, and
+the one `INSERT INTO` that is the job. The Coordinator compiles it in a catalog of
+the script's own, so two jobs may declare the same table and the script can be sent
+again on an upgrade. A script that would make more than one job is refused before
+any of it starts.
 
 ```yaml
 apiVersion: clink.dev/v1alpha1
@@ -111,26 +190,52 @@ metadata:
 spec:
   clusterName: demo
   jobSo: /opt/clink/jobs/rescale_test_job.so
-  jobName: wordcount
   upgradeMode: savepoint        # savepoint | stateless
-  checkpointIntervalMs: 2000    # > 0 enables checkpointing (required for savepoint upgrades)
+  checkpointIntervalMs: 2000
   env:
     - CLINK_RESCALE_COUNT=20000000
 ```
 
-Changing the spec (`jobSo`, `env`, or `args` - hashed into `.status.specHash`)
-triggers an **upgrade**. In `savepoint` mode the controller runs a two-stage,
-reconcile-safe rollout:
+The controller speaks the Coordinator's HTTP API with the cluster's token: it
+submits a SQL job there, and reads every job's status and takes its savepoints and
+cancels there. A compiled job is built and submitted by the in-image `clink` CLI,
+exec'd in the leading Coordinator's pod, so it builds with `env`. That CLI reaches
+the Coordinator over the control port, which it cannot do over TLS: on a cluster
+with `tls.enabled`, a compiled job waits with a message saying so, and a SQL job
+runs.
 
-1. **drain** - trigger a savepoint on the running job, then cancel it. Recorded in
-   `.status.lastSavepoint` and guarded by `.status.upgradeToHash` so it happens
-   exactly once even if the next stage is slow or retried;
-2. **restore** - resubmit the job with `--restore-from-dir`/`--restore-from-checkpoint-id`
-   pointing at that savepoint, retried until a new job id appears (adopting an
-   already-submitted job so a retry never leaks a second one).
+`jobName` names the job on the cluster, in its lineage and under the checkpoint
+volume, and defaults to the `ClinkJob`'s own name. The controller finds its job on
+the cluster by that name, so a `ClinkJob` whose `jobName` another one on the same
+cluster already has waits until it is given its own.
+
+Changing the spec (`sql` and `parallelism`, or `jobSo`, `env` and `args`, hashed
+into `.status.specHash`) triggers an **upgrade**. In `savepoint` mode the
+controller runs a two-stage, reconcile-safe rollout:
+
+1. **drain** - trigger a savepoint on the running job, record it in
+   `.status.upgradeRestore` (and `.status.lastSavepoint`), then cancel the job,
+   guarded by `.status.upgradeToHash` so it happens exactly once even if the next
+   stage is slow or retried. Recorded before the cancel, the savepoint survives a
+   cancel whose status update is lost: the retry finds the old job no longer live
+   and restores from it;
+2. **restore** - resubmit the job restored from that savepoint, retried until the
+   Coordinator accepts it (adopting a live job of the same name, so a retry whose
+   status update was lost never leaks a second one).
 
 `stateless` mode skips the savepoint and resubmits fresh. Deleting the `ClinkJob`
 cancels the running job via a finalizer.
+
+A job the cluster stops listing is resubmitted only once it has been missing for two
+minutes (`.status.jobMissingSince`). A Coordinator that has just taken over refuses
+the job API until it has recovered its predecessor's jobs, and a recovery waiting
+for a Worker to return lists the job again when it runs; resubmitting at once would
+run it twice. A list the controller cannot read decides nothing: it asks again,
+and a job part-way through an upgrade, a park or a resume stays in that phase.
+
+SQL jobs need a Coordinator that compiles a request in a catalog of its own
+(`catalog=own` on `POST /api/v1/jobs/sql`), which clink has from the release after
+0.15.0, as it has the takeover's refusal above.
 
 Savepoints must be readable by the pod that restores them, so enable shared
 checkpoint storage on the `ClinkCluster` (a `ReadWriteMany` PVC in production, or
@@ -203,12 +308,12 @@ reporting `lag 0 < threshold`).
 
 ## Scope
 
-v1 covers the cluster lifecycle (create, scale, HA, status, garbage collection) and
-jobs (`ClinkJob` submit, status, savepoint-on-upgrade, cancel-on-delete).
+v1 covers the cluster lifecycle (create, scale, HA, token auth, TLS, status, garbage
+collection) and jobs (`ClinkJob` submit, status, savepoint-on-upgrade,
+cancel-on-delete, scale-to-zero).
 
-Not yet implemented (roadmap): HA leader-targeting for job exec (v1 targets any ready
-Coordinator pod, correct for single-coordinator clusters), and image-driven upgrades (rolling
-the runtime image as an upgrade trigger).
+Not yet implemented: image-driven upgrades (rolling the runtime image as an upgrade
+trigger), and compiled jobs on a cluster with control-plane TLS.
 
 ## Develop
 
@@ -219,5 +324,5 @@ cd deploy/operator
 go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5 object paths=./api/...
 go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5 crd paths=./api/... output:crd:dir=config/crd
 go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5 rbac:roleName=clink-operator-role paths=./internal/... output:rbac:dir=config/rbac
-go build ./...
+go build ./... && go vet ./... && go test ./...
 ```

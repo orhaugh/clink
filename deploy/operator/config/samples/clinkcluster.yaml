@@ -20,3 +20,19 @@ spec:
   # ha:
   #   enabled: true
   #   replicas: 2
+  #   type: pvc              # a ReadWriteMany claim, or hostPath on one node (kind)
+  # checkpointStorage:       # shared, so a savepoint one pod writes another restores
+  #   enabled: true
+  #   type: pvc
+  # A secured cluster: the HTTP API token, control-plane TLS (mutual with
+  # workerSecret), and connector credentials for env:// options in SQL.
+  # auth:
+  #   existingSecret: clink-auth            # key "token"
+  # tls:
+  #   enabled: true
+  #   coordinatorSecret: clink-tls-coordinator
+  #   workerSecret: clink-tls-worker
+  # worker:
+  #   envFrom:
+  #     - secretRef:
+  #         name: connector-credentials

@@ -19,7 +19,7 @@
 #   release-sql-runtime - the two live queryable-state HTTP tests, built in
 #                     Release (they need optimized throughput; the Debug gate
 #                     excludes them).                                    [gate]
-#   operator        - build + vet the Go k8s operator. Cheap, and the only
+#   operator        - build, vet and test the Go k8s operator. Cheap, and the only
 #                     thing that checks deploy/operator at all: without it a
 #                     dependency bump there merges unverified.           [gate]
 #
@@ -1027,8 +1027,9 @@ jobs:
         run: go vet ./...
       - name: Test
         working-directory: deploy/operator
-        # No test files today, so this passes trivially; it is wired now so
-        # that adding controller tests needs no workflow change.
+        # The controllers' tests: the pod builders, the Coordinator client
+        # against a fake Coordinator, and the ClinkJob state machine against
+        # a fake API server.
         run: go test ./...
 
   # The sanitizer matrix lives in its own workflow (sanitizers.yml), which runs

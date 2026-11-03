@@ -40,7 +40,7 @@ kind get clusters 2>/dev/null | grep -qx "${CLUSTER}" || kind create cluster --n
 kx wait --for=condition=Ready node --all --timeout=120s
 kind load docker-image "${OPERATOR_IMAGE}" --name "${CLUSTER}"
 kind load docker-image "${RUNTIME_IMAGE}" --name "${CLUSTER}"
-kx apply -f "${HERE}/config/crd/"
+kx apply --server-side --force-conflicts -f "${HERE}/config/crd/"
 kx apply -f "${HERE}/config/manager/manager.yaml"
 kx apply -f "${HERE}/config/rbac/"
 kx -n clink-operator-system rollout status deploy/clink-operator-controller --timeout=120s

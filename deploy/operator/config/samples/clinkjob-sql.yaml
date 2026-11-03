@@ -1,0 +1,23 @@
+apiVersion: clink.dev/v1alpha1
+kind: ClinkJob
+metadata:
+  name: title-minutes          # also the job's name on the cluster (spec.jobName)
+spec:
+  clusterName: demo
+  upgradeMode: savepoint       # a change to sql or parallelism drains to a savepoint + restores
+  checkpointIntervalMs: 2000   # > 0 required for savepoint upgrades / parks
+  parallelism: 2
+  # One script, one job: the tables it reads and writes, and one INSERT INTO,
+  # compiled by the Coordinator in a catalog of the script's own.
+  sql: |
+    CREATE TABLE plays (title VARCHAR, ts BIGINT) WITH (
+        connector = 'kafka', brokers = 'kafka:9092', topic = 'plays',
+        format = 'json', event_time_column = 'ts', watermark_lag_ms = '5000');
+    CREATE TABLE minutes (title VARCHAR, window_start BIGINT, window_end BIGINT,
+                          plays BIGINT) WITH (
+        connector = 'kafka', brokers = 'kafka:9092', topic = 'title-minutes',
+        format = 'json');
+    INSERT INTO minutes
+    SELECT title, window_start, window_end, COUNT(*) AS plays
+    FROM plays
+    GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), title;

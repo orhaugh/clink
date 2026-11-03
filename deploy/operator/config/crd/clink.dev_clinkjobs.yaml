@@ -33,7 +33,7 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          ClinkJob is a job (compiled .so plugin) run on a ClinkCluster, with
+          ClinkJob is a job (a compiled .so plugin, or a SQL script) run on a ClinkCluster, with
           declarative savepoint-on-upgrade: changing the spec drains the running job to a
           savepoint and restarts it restored from that savepoint.
         properties:
@@ -58,8 +58,9 @@ spec:
             description: ClinkJobSpec is the desired state of a job running on a ClinkCluster.
             properties:
               args:
-                description: Args are extra `clink run` flags (e.g. --parallelism).
-                  Rarely needed.
+                description: |-
+                  Args are extra `clink run` flags for a compiled job (e.g.
+                  --state-backend=rocksdb). Rarely needed.
                 items:
                   type: string
                 type: array
@@ -76,17 +77,34 @@ spec:
                 type: string
               env:
                 description: |-
-                  Env are extra environment variables passed to the job at submit (KEY=VALUE).
-                  Changing Env or JobSo triggers an upgrade.
+                  Env are extra environment variables a compiled job is built with at
+                  submit (KEY=VALUE). Changing Env, Args or JobSo triggers an upgrade.
                 items:
                   type: string
                 type: array
               jobName:
-                default: job
+                description: |-
+                  JobName is the job's name on the cluster, in its lineage and under the
+                  checkpoint volume. It defaults to the ClinkJob's own name. The operator
+                  finds its job on the cluster by this name, so each ClinkJob on a
+                  cluster needs its own.
                 type: string
               jobSo:
                 description: JobSo is the path to the compiled job plugin (.so) inside
                   the runtime image.
+                type: string
+              parallelism:
+                description: Parallelism runs a SQL job's operators this many ways
+                  (default 1).
+                format: int32
+                minimum: 1
+                type: integer
+              sql:
+                description: |-
+                  SQL is the job as a self-contained SQL script: its CREATE TABLE
+                  statements and the INSERT INTO that is the job, compiled by the
+                  Coordinator in a catalog of the script's own. Changing it triggers an
+                  upgrade, as changing jobSo does.
                 type: string
               suspend:
                 default: false
@@ -168,8 +186,15 @@ spec:
                 type: object
             required:
             - clusterName
-            - jobSo
             type: object
+            x-kubernetes-validations:
+            - message: exactly one of jobSo and sql
+              rule: has(self.jobSo) != has(self.sql)
+            - message: args and env are a compiled job's (jobSo); a SQL job takes
+                neither
+              rule: '!has(self.sql) || (!has(self.args) && !has(self.env))'
+            - message: parallelism is a SQL job's; a compiled job's is in its graph
+              rule: '!has(self.parallelism) || has(self.sql)'
           status:
             description: ClinkJobStatus is the observed state of a job.
             properties:
@@ -185,6 +210,15 @@ spec:
                   job.
                 format: int64
                 type: integer
+              jobMissingSince:
+                description: |-
+                  JobMissingSince is when the cluster stopped listing the job JobID names.
+                  The operator resubmits the job only once it has been missing for two
+                  minutes: a job a new leader is still recovering, or one parked until a
+                  Worker returns, is missing from the list for a while and then runs, and
+                  resubmitting it at once would run it twice.
+                format: date-time
+                type: string
               lastActivityTime:
                 description: LastActivityTime - see ActivityCount.
                 format: date-time
@@ -213,8 +247,9 @@ spec:
                 type: string
               specHash:
                 description: |-
-                  SpecHash is a hash of the running job's inputs (JobSo+Env+Args); a change
-                  versus the current spec is what triggers an upgrade.
+                  SpecHash is a hash of the running job's inputs (JobSo, Env and Args, or
+                  SQL and Parallelism); a change versus the current spec is what triggers
+                  an upgrade.
                 type: string
               suspendReason:
                 description: |-
@@ -236,10 +271,19 @@ spec:
                 description: SuspendedAt is when the park completed.
                 format: date-time
                 type: string
+              upgradeFromJobID:
+                description: UpgradeFromJobID is the job UpgradeRestore was taken
+                  from.
+                format: int64
+                type: integer
               upgradeRestore:
                 description: |-
                   UpgradeRestore is the savepoint the in-flight upgrade will restore from
-                  (nil for a stateless upgrade). Held across resubmit retries.
+                  (nil for a stateless upgrade). Held across resubmit retries. It is
+                  recorded before the old job is cancelled, with the job it was taken
+                  from in UpgradeFromJobID, so a cancel whose status update is lost does
+                  not lose it: a retry that finds that job no longer live restores from
+                  it rather than asking a cancelled job for another savepoint.
                 properties:
                   checkpointId:
                     format: int64

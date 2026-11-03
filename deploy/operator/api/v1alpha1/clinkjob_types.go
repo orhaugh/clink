@@ -5,17 +5,32 @@ import (
 )
 
 // ClinkJobSpec is the desired state of a job running on a ClinkCluster.
+// +kubebuilder:validation:XValidation:rule="has(self.jobSo) != has(self.sql)",message="exactly one of jobSo and sql"
+// +kubebuilder:validation:XValidation:rule="!has(self.sql) || (!has(self.args) && !has(self.env))",message="args and env are a compiled job's (jobSo); a SQL job takes neither"
+// +kubebuilder:validation:XValidation:rule="!has(self.parallelism) || has(self.sql)",message="parallelism is a SQL job's; a compiled job's is in its graph"
 type ClinkJobSpec struct {
 	// ClusterName is the ClinkCluster (same namespace) to run this job on.
 	ClusterName string `json:"clusterName"`
 	// JobSo is the path to the compiled job plugin (.so) inside the runtime image.
-	JobSo string `json:"jobSo"`
-	// +kubebuilder:default="job"
+	JobSo string `json:"jobSo,omitempty"`
+	// SQL is the job as a self-contained SQL script: its CREATE TABLE
+	// statements and the INSERT INTO that is the job, compiled by the
+	// Coordinator in a catalog of the script's own. Changing it triggers an
+	// upgrade, as changing jobSo does.
+	SQL string `json:"sql,omitempty"`
+	// JobName is the job's name on the cluster, in its lineage and under the
+	// checkpoint volume. It defaults to the ClinkJob's own name. The operator
+	// finds its job on the cluster by this name, so each ClinkJob on a
+	// cluster needs its own.
 	JobName string `json:"jobName,omitempty"`
-	// Args are extra `clink run` flags (e.g. --parallelism). Rarely needed.
+	// Parallelism runs a SQL job's operators this many ways (default 1).
+	// +kubebuilder:validation:Minimum=1
+	Parallelism int32 `json:"parallelism,omitempty"`
+	// Args are extra `clink run` flags for a compiled job (e.g.
+	// --state-backend=rocksdb). Rarely needed.
 	Args []string `json:"args,omitempty"`
-	// Env are extra environment variables passed to the job at submit (KEY=VALUE).
-	// Changing Env or JobSo triggers an upgrade.
+	// Env are extra environment variables a compiled job is built with at
+	// submit (KEY=VALUE). Changing Env, Args or JobSo triggers an upgrade.
 	Env []string `json:"env,omitempty"`
 	// CheckpointIntervalMs enables periodic checkpointing (0 = off). Must be > 0
 	// for upgradeMode=savepoint to preserve state.
@@ -94,8 +109,9 @@ type ClinkJobStatus struct {
 	Phase string `json:"phase,omitempty"`
 	// JobID is the Coordinator-assigned id of the currently-running job.
 	JobID int64 `json:"jobID,omitempty"`
-	// SpecHash is a hash of the running job's inputs (JobSo+Env+Args); a change
-	// versus the current spec is what triggers an upgrade.
+	// SpecHash is a hash of the running job's inputs (JobSo, Env and Args, or
+	// SQL and Parallelism); a change versus the current spec is what triggers
+	// an upgrade.
 	SpecHash string `json:"specHash,omitempty"`
 	// LastSavepoint is the savepoint taken on the most recent upgrade.
 	LastSavepoint *SavepointRef `json:"lastSavepoint,omitempty"`
@@ -105,8 +121,14 @@ type ClinkJobStatus struct {
 	// job. Cleared when the new job reaches Running.
 	UpgradeToHash string `json:"upgradeToHash,omitempty"`
 	// UpgradeRestore is the savepoint the in-flight upgrade will restore from
-	// (nil for a stateless upgrade). Held across resubmit retries.
+	// (nil for a stateless upgrade). Held across resubmit retries. It is
+	// recorded before the old job is cancelled, with the job it was taken
+	// from in UpgradeFromJobID, so a cancel whose status update is lost does
+	// not lose it: a retry that finds that job no longer live restores from
+	// it rather than asking a cancelled job for another savepoint.
 	UpgradeRestore *SavepointRef `json:"upgradeRestore,omitempty"`
+	// UpgradeFromJobID is the job UpgradeRestore was taken from.
+	UpgradeFromJobID int64 `json:"upgradeFromJobID,omitempty"`
 	// ObservedGeneration is the .metadata.generation last reconciled.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// Message is a short human-readable status detail.
@@ -125,6 +147,12 @@ type ClinkJobStatus struct {
 	ActivityCount int64 `json:"activityCount,omitempty"`
 	// LastActivityTime - see ActivityCount.
 	LastActivityTime *metav1.Time `json:"lastActivityTime,omitempty"`
+	// JobMissingSince is when the cluster stopped listing the job JobID names.
+	// The operator resubmits the job only once it has been missing for two
+	// minutes: a job a new leader is still recovering, or one parked until a
+	// Worker returns, is missing from the list for a while and then runs, and
+	// resubmitting it at once would run it twice.
+	JobMissingSince *metav1.Time `json:"jobMissingSince,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -135,7 +163,7 @@ type ClinkJobStatus struct {
 // +kubebuilder:printcolumn:name="JobID",type=integer,JSONPath=`.status.jobID`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// ClinkJob is a job (compiled .so plugin) run on a ClinkCluster, with
+// ClinkJob is a job (a compiled .so plugin, or a SQL script) run on a ClinkCluster, with
 // declarative savepoint-on-upgrade: changing the spec drains the running job to a
 // savepoint and restarts it restored from that savepoint.
 type ClinkJob struct {

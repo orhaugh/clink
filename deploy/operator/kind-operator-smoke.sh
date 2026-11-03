@@ -48,7 +48,7 @@ kind load docker-image "${OPERATOR_IMAGE}" --name "${CLUSTER}"
 kind load docker-image "${RUNTIME_IMAGE}" --name "${CLUSTER}"
 
 step "install CRD + RBAC + operator"
-kubectl --context "${CTX}" apply -f "${HERE}/config/crd/"
+kubectl --context "${CTX}" apply --server-side --force-conflicts -f "${HERE}/config/crd/"
 kubectl --context "${CTX}" apply -f "${HERE}/config/manager/manager.yaml"
 kubectl --context "${CTX}" apply -f "${HERE}/config/rbac/"
 

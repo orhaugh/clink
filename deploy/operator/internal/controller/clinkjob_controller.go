@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	"net"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,13 +34,17 @@ import (
 
 const clinkJobFinalizer = "clink.dev/clinkjob-finalizer"
 
-// ClinkJobReconciler runs a compiled-.so job on a ClinkCluster and drains it to a
-// savepoint + restores on upgrade. It orchestrates the clink control plane by
-// exec'ing the in-image `clink` CLI inside a Coordinator pod (submit / savepoint /
-// cancel all speak the control-plane binary protocol on 127.0.0.1) and reads job
-// status over the Coordinator's HTTP API.
+// ClinkJobReconciler runs a job, a SQL script or a compiled .so, on a
+// ClinkCluster, and drains it to a savepoint and restores it on upgrade. It
+// speaks the Coordinator's HTTP API with the cluster's token: a SQL job is
+// submitted there, and every job's status, savepoint and cancel go there. A
+// compiled job is built and submitted by the in-image `clink` CLI, exec'd in
+// the leading Coordinator's pod, so the job builds with spec.env.
 type ClinkJobReconciler struct {
 	client.Client
+	// APIReader reads the cluster's auth Secret from the API server, not the
+	// cache, so the operator never lists or watches Secrets.
+	APIReader  client.Reader
 	Scheme     *runtime.Scheme
 	Clientset  kubernetes.Interface
 	RestConfig *rest.Config
@@ -47,6 +54,7 @@ type ClinkJobReconciler struct {
 // +kubebuilder:rbac:groups=clink.dev,resources=clinkjobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=clink.dev,resources=clinkjobs/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var cj clinkv1alpha1.ClinkJob
@@ -70,8 +78,10 @@ func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if !cj.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&cj, clinkJobFinalizer) {
 			if clusterErr == nil && cj.Status.JobID != 0 {
-				if pod, err := r.readyCoordinatorPod(ctx, &cc); err == nil && pod != "" {
-					_, _, _ = r.execClink(ctx, cc.Namespace, pod, r.cancelArgs(&cc, cj.Status.JobID))
+				if api, err := newCoordinatorClient(ctx, r.APIReader, &cc); err == nil {
+					if err := api.cancel(ctx, cj.Status.JobID); err != nil {
+						log.FromContext(ctx).Info("cancel on delete failed; dropping the finalizer", "err", err.Error())
+					}
 				}
 			}
 			controllerutil.RemoveFinalizer(&cj, clinkJobFinalizer)
@@ -89,13 +99,28 @@ func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// Gate on a Running cluster with a ready coordinator pod.
+	// Gate on a Running cluster with a ready Coordinator, whose API this
+	// operator can present the cluster's token to.
 	if clusterErr != nil || cc.Status.Phase != "Running" {
-		return r.setPhase(ctx, &cj, "Pending", "waiting for ClinkCluster to be Running", 5*time.Second)
+		return r.wait(ctx, &cj, "waiting for ClinkCluster to be Running", 5*time.Second)
 	}
-	pod, err := r.readyCoordinatorPod(ctx, &cc)
-	if err != nil || pod == "" {
-		return r.setPhase(ctx, &cj, "Pending", "waiting for a ready Coordinator pod", 5*time.Second)
+	if pods, err := r.readyCoordinatorPods(ctx, &cc); err != nil || len(pods) == 0 {
+		return r.wait(ctx, &cj, "waiting for a ready Coordinator pod", 5*time.Second)
+	}
+	if other, err := r.jobNameClaimedBy(ctx, &cj); err != nil {
+		return ctrl.Result{}, err
+	} else if other != "" {
+		return r.wait(ctx, &cj, fmt.Sprintf("jobName %q on cluster %s is ClinkJob %s's; give this one its own", cj.Spec.JobName, cj.Spec.ClusterName, other), 30*time.Second)
+	}
+	api, err := newCoordinatorClient(ctx, r.APIReader, &cc)
+	if err != nil {
+		return r.wait(ctx, &cj, "cannot present the cluster's token: "+err.Error(), 15*time.Second)
+	}
+	jobs, err := api.listJobs(ctx)
+	if err != nil {
+		// Nothing is decided on a list that failed: read as empty, it would
+		// send a running job to a second submit.
+		return r.wait(ctx, &cj, "cannot list the cluster's jobs: "+firstLine(err.Error()), 10*time.Second)
 	}
 
 	wantHash := specHash(&cj)
@@ -103,19 +128,61 @@ func (r *ClinkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Scale-to-zero: an in-flight or requested park/wake takes precedence
 	// over submit/upgrade/refresh. Handled first so a Resuming job can never
 	// fall through to a fresh (state-dropping) initial submit.
-	if done, res, err := r.reconcileSuspend(ctx, &cj, &cc, pod, wantHash); done {
+	if done, res, err := r.reconcileSuspend(ctx, &cj, &cc, api, jobs, wantHash); done {
 		return res, err
 	}
 
 	// Decide: initial submit, upgrade, or steady-state status refresh.
 	switch {
 	case cj.Status.JobID == 0:
-		return r.submitInitial(ctx, &cj, &cc, pod, wantHash)
+		return r.submitInitial(ctx, &cj, &cc, api, jobs, wantHash)
 	case cj.Status.SpecHash != wantHash:
-		return r.upgrade(ctx, &cj, &cc, pod, wantHash)
+		return r.upgrade(ctx, &cj, &cc, api, jobs, wantHash)
 	default:
-		return r.refreshStatus(ctx, &cj, &cc, pod)
+		return r.refreshStatus(ctx, &cj, api, jobs)
 	}
+}
+
+// wait records why the reconcile cannot go on yet. A phase the job's state
+// machine resumes from (Upgrading, Suspending, Suspended, Resuming) is kept:
+// overwritten with Pending, a job parked on Idle would come back as a fresh
+// submit and drop the savepoint its state waits in.
+func (r *ClinkJobReconciler) wait(ctx context.Context, cj *clinkv1alpha1.ClinkJob, msg string, requeue time.Duration) (ctrl.Result, error) {
+	phase := "Pending"
+	switch cj.Status.Phase {
+	case "Upgrading", "Suspending", "Suspended", "Resuming":
+		phase = cj.Status.Phase
+	}
+	return r.setPhase(ctx, cj, phase, msg, requeue)
+}
+
+// jobNameClaimedBy names the ClinkJob that has this one's jobName on the same
+// cluster first (the older, then the lower name), or "". The operator finds a
+// job on the cluster by its name, so two ClinkJobs sharing one would adopt
+// each other's jobs; the later one waits instead.
+func (r *ClinkJobReconciler) jobNameClaimedBy(ctx context.Context, cj *clinkv1alpha1.ClinkJob) (string, error) {
+	var all clinkv1alpha1.ClinkJobList
+	if err := r.List(ctx, &all, client.InNamespace(cj.Namespace)); err != nil {
+		return "", err
+	}
+	var claims []clinkv1alpha1.ClinkJob
+	for _, o := range all.Items {
+		applyJobDefaults(&o)
+		if o.Spec.ClusterName == cj.Spec.ClusterName && o.Spec.JobName == cj.Spec.JobName && o.DeletionTimestamp.IsZero() {
+			claims = append(claims, o)
+		}
+	}
+	sort.Slice(claims, func(i, j int) bool {
+		ti, tj := claims[i].CreationTimestamp, claims[j].CreationTimestamp
+		if !ti.Equal(&tj) {
+			return ti.Before(&tj)
+		}
+		return claims[i].Name < claims[j].Name
+	})
+	if len(claims) > 0 && claims[0].Name != cj.Name {
+		return claims[0].Name, nil
+	}
+	return "", nil
 }
 
 // ---- scale-to-zero (park / wake) --------------------------------------------
@@ -128,7 +195,7 @@ const (
 // reconcileSuspend owns every park/wake transition. Returns done=false only
 // when the job is active with no suspend intent, letting the normal
 // submit/upgrade/refresh flow proceed.
-func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod, wantHash string) (bool, ctrl.Result, error) {
+func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, api *coordinatorClient, jobs []jobSummaryJSON, wantHash string) (bool, ctrl.Result, error) {
 	parking := cj.Status.Phase == "Suspending"
 	// Resuming counts as parked: its restore point is still staged, and only
 	// the resume path may submit (an initial submit would drop the state).
@@ -137,7 +204,7 @@ func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1al
 	// Finish an in-flight park (stage 2: cancel) before honouring any new
 	// intent - the savepoint is already persisted.
 	if parking {
-		res, err := r.parkCancelStage(ctx, cj, cc, pod)
+		res, err := r.parkCancelStage(ctx, cj, api)
 		return true, res, err
 	}
 
@@ -146,7 +213,7 @@ func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1al
 		case parked:
 			// A resume submit may have landed just before the re-suspend;
 			// adopt it so the park path can drain it rather than leak it.
-			if id := r.runningJobID(ctx, cc); id > 0 && id > cj.Status.JobID {
+			if id := liveJob(jobs, cj.Spec.JobName, cj.Status.JobID); id > 0 {
 				cj.Status.JobID = id
 				res, err := r.setPhase(ctx, cj, "Running", "adopted resumed job before re-suspend", time.Second)
 				return true, res, err
@@ -157,7 +224,7 @@ func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1al
 			res, err := r.setPhase(ctx, cj, "Suspended", "suspended (manual)", 60*time.Second)
 			return true, res, err
 		case cj.Status.JobID != 0:
-			res, err := r.park(ctx, cj, cc, pod, suspendReasonManual)
+			res, err := r.park(ctx, cj, api, suspendReasonManual)
 			return true, res, err
 		default:
 			// Suspended before ever submitting: nothing to drain.
@@ -173,12 +240,12 @@ func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1al
 		// when its auto-park policy is removed or the wake policy fires.
 		if cj.Status.Phase == "Resuming" || cj.Status.SuspendReason == suspendReasonManual ||
 			cj.Spec.SuspendPolicy == nil || cj.Spec.SuspendPolicy.IdleAfterSeconds <= 0 {
-			res, err := r.resume(ctx, cj, cc, pod, wantHash)
+			res, err := r.resume(ctx, cj, cc, api, jobs, wantHash)
 			return true, res, err
 		}
 		wake, detail, poll := r.wakeDue(ctx, cj)
 		if wake {
-			res, err := r.resume(ctx, cj, cc, pod, wantHash)
+			res, err := r.resume(ctx, cj, cc, api, jobs, wantHash)
 			return true, res, err
 		}
 		res, err := r.setPhase(ctx, cj, "Suspended", "parked (idle); "+detail, poll)
@@ -192,7 +259,7 @@ func (r *ClinkJobReconciler) reconcileSuspend(ctx context.Context, cj *clinkv1al
 // persists it BEFORE cancelling, so a crash between the two never loses the
 // restore point. The cancel is stage 2 (parkCancelStage) on the next
 // reconcile, keyed off the Suspending phase.
-func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod, reason string) (ctrl.Result, error) {
+func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJob, api *coordinatorClient, reason string) (ctrl.Result, error) {
 	lg := log.FromContext(ctx)
 	// A park landing mid-upgrade (old job already drained + cancelled, new
 	// one not yet up) adopts the upgrade's savepoint instead of trying to
@@ -201,6 +268,7 @@ func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJo
 		cj.Status.SuspendSavepoint = cj.Status.UpgradeRestore
 		cj.Status.UpgradeToHash = ""
 		cj.Status.UpgradeRestore = nil
+		cj.Status.UpgradeFromJobID = 0
 		cj.Status.SuspendReason = reason
 		cj.Status.JobID = 0
 		now := metav1.Now()
@@ -208,7 +276,7 @@ func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJo
 		return r.setPhase(ctx, cj, "Suspended", "parked mid-upgrade ("+reason+")", 30*time.Second)
 	}
 	if cj.Spec.UpgradeMode == "savepoint" && cj.Status.SuspendSavepoint == nil {
-		sp, err := r.triggerSavepoint(ctx, cc, pod, cj.Status.JobID)
+		sp, err := api.savepoint(ctx, cj.Status.JobID)
 		if err != nil {
 			lg.Info("suspend savepoint failed; will retry", "err", err.Error())
 			return r.setPhase(ctx, cj, cj.Status.Phase, "suspend savepoint failed: "+err.Error(), 10*time.Second)
@@ -222,11 +290,11 @@ func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJo
 
 // parkCancelStage completes a park: cancel the job (tolerating failure - the
 // job may already be gone), free its slots, and mark Suspended.
-func (r *ClinkJobReconciler) parkCancelStage(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod string) (ctrl.Result, error) {
+func (r *ClinkJobReconciler) parkCancelStage(ctx context.Context, cj *clinkv1alpha1.ClinkJob, api *coordinatorClient) (ctrl.Result, error) {
 	lg := log.FromContext(ctx)
 	if cj.Status.JobID != 0 {
-		if _, stderr, err := r.execClink(ctx, cc.Namespace, pod, r.cancelArgs(cc, cj.Status.JobID)); err != nil {
-			lg.Info("cancel during park failed; continuing", "err", err.Error(), "stderr", stderr)
+		if err := api.cancel(ctx, cj.Status.JobID); err != nil {
+			lg.Info("cancel during park failed; continuing", "err", err.Error())
 		}
 		cj.Status.JobID = 0
 	}
@@ -243,22 +311,18 @@ func (r *ClinkJobReconciler) parkCancelStage(ctx context.Context, cj *clinkv1alp
 	return r.setPhase(ctx, cj, "Suspended", msg, 15*time.Second)
 }
 
-// resume resubmits the job restored from the park savepoint. Retried until a
-// new job id appears; adopts a submit that raced status recording.
-func (r *ClinkJobReconciler) resume(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod, wantHash string) (ctrl.Result, error) {
-	if id := r.runningJobID(ctx, cc); id > 0 && id > cj.Status.JobID {
+// resume resubmits the job restored from the park savepoint, retried until it
+// is accepted; adopts a submit whose status update was lost.
+func (r *ClinkJobReconciler) resume(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, api *coordinatorClient, jobs []jobSummaryJSON, wantHash string) (ctrl.Result, error) {
+	if id := liveJob(jobs, cj.Spec.JobName, cj.Status.JobID); id > 0 {
 		msg := fmt.Sprintf("resumed as job %d (adopted)", id)
 		r.clearSuspend(cj, wantHash, id)
 		return r.setPhase(ctx, cj, "Running", msg, 20*time.Second)
 	}
 	restore := cj.Status.SuspendSavepoint
-	before := r.maxJobID(ctx, cc)
-	if ok, detail := r.doSubmit(ctx, cc, cj, pod, restore); !ok {
-		return r.setPhase(ctx, cj, "Resuming", "resume submit rejected: "+detail, 10*time.Second)
-	}
-	id := r.awaitNewJob(ctx, cc, before)
-	if id == 0 {
-		return r.setPhase(ctx, cj, "Resuming", "resubmitted; awaiting job id", 5*time.Second)
+	id, err := r.doSubmit(ctx, cj, cc, api, restore)
+	if err != nil {
+		return r.setPhase(ctx, cj, "Resuming", "resume submit rejected: "+err.Error(), 10*time.Second)
 	}
 	msg := fmt.Sprintf("resumed as job %d", id)
 	if restore != nil {
@@ -310,21 +374,18 @@ func (r *ClinkJobReconciler) wakeDue(ctx context.Context, cj *clinkv1alpha1.Clin
 
 // ---- state transitions -----------------------------------------------------
 
-func (r *ClinkJobReconciler) submitInitial(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod, wantHash string) (ctrl.Result, error) {
-	// Retry-safe: if a live job already exists (a prior submit that raced status
-	// recording, or an operator restart), adopt it instead of submitting again.
-	if id := r.runningJobID(ctx, cc); id > 0 {
+func (r *ClinkJobReconciler) submitInitial(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, api *coordinatorClient, jobs []jobSummaryJSON, wantHash string) (ctrl.Result, error) {
+	// Retry-safe: if a live job of this name already exists (a prior submit
+	// whose status update was lost, or an operator restart), adopt it instead
+	// of submitting again.
+	if id := liveJob(jobs, cj.Spec.JobName, 0); id > 0 {
 		cj.Status.JobID = id
 		cj.Status.SpecHash = wantHash
 		return r.setPhase(ctx, cj, "Running", fmt.Sprintf("adopted running job %d", id), 20*time.Second)
 	}
-	before := r.maxJobID(ctx, cc)
-	if ok, detail := r.doSubmit(ctx, cc, cj, pod, nil); !ok {
-		return r.setPhase(ctx, cj, "Submitting", "submit rejected: "+detail, 10*time.Second)
-	}
-	id := r.awaitNewJob(ctx, cc, before)
-	if id == 0 {
-		return r.setPhase(ctx, cj, "Submitting", "submitted; awaiting job id", 5*time.Second)
+	id, err := r.doSubmit(ctx, cj, cc, api, nil)
+	if err != nil {
+		return r.setPhase(ctx, cj, "Submitting", "submit rejected: "+err.Error(), 10*time.Second)
 	}
 	cj.Status.JobID = id
 	cj.Status.SpecHash = wantHash
@@ -337,23 +398,40 @@ func (r *ClinkJobReconciler) submitInitial(ctx context.Context, cj *clinkv1alpha
 // from that savepoint, retried until a new job id appears. Stage 1 must not
 // repeat on a slow/failed stage 2, or it would re-savepoint an already-cancelled
 // job (which fails).
-func (r *ClinkJobReconciler) upgrade(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod, wantHash string) (ctrl.Result, error) {
+func (r *ClinkJobReconciler) upgrade(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, api *coordinatorClient, jobs []jobSummaryJSON, wantHash string) (ctrl.Result, error) {
 	lg := log.FromContext(ctx)
 
-	// Stage 1: savepoint + cancel the old job, once per target hash.
+	// Stage 1: savepoint + cancel the old job, once per target hash. The
+	// savepoint is recorded before the cancel. A retry after a cancel whose
+	// status update was lost finds the job no longer live and restores from
+	// the recorded savepoint; one that finds it still live takes a fresh one,
+	// as the job has run on since.
 	if cj.Status.UpgradeToHash != wantHash {
 		var restore *clinkv1alpha1.SavepointRef
 		if cj.Spec.UpgradeMode == "savepoint" {
-			sp, err := r.triggerSavepoint(ctx, cc, pod, cj.Status.JobID)
-			if err != nil {
-				lg.Info("savepoint failed; will retry", "err", err.Error())
-				return r.setPhase(ctx, cj, "Upgrading", "savepoint failed: "+err.Error(), 10*time.Second)
+			old, listed := findJob(jobs, cj.Status.JobID)
+			if cj.Status.UpgradeRestore != nil && cj.Status.UpgradeFromJobID == cj.Status.JobID && (!listed || !old.live()) {
+				restore = cj.Status.UpgradeRestore
+			} else {
+				sp, err := api.savepoint(ctx, cj.Status.JobID)
+				if err != nil {
+					lg.Info("savepoint failed; will retry", "err", err.Error())
+					return r.setPhase(ctx, cj, "Upgrading", "savepoint failed: "+err.Error(), 10*time.Second)
+				}
+				cj.Status.UpgradeRestore = sp
+				cj.Status.UpgradeFromJobID = cj.Status.JobID
+				cj.Status.LastSavepoint = sp
+				cj.Status.Phase = "Upgrading"
+				cj.Status.Message = fmt.Sprintf("savepoint %s@%d taken; cancelling job %d", sp.Dir, sp.CheckpointID, cj.Status.JobID)
+				if err := r.Status().Update(ctx, cj); err != nil {
+					// Not cancelled: the retry takes a fresh savepoint.
+					return ctrl.Result{}, err
+				}
+				restore = sp
 			}
-			restore = sp
-			cj.Status.LastSavepoint = sp
 		}
-		if _, stderr, err := r.execClink(ctx, cc.Namespace, pod, r.cancelArgs(cc, cj.Status.JobID)); err != nil {
-			lg.Info("cancel during upgrade failed; continuing", "err", err.Error(), "stderr", stderr)
+		if err := api.cancel(ctx, cj.Status.JobID); err != nil {
+			lg.Info("cancel during upgrade failed; continuing", "err", err.Error())
 		}
 		// Commit stage 1: from here the old job is gone; never savepoint it again.
 		cj.Status.UpgradeToHash = wantHash
@@ -362,29 +440,27 @@ func (r *ClinkJobReconciler) upgrade(ctx context.Context, cj *clinkv1alpha1.Clin
 	}
 
 	// Stage 2: (re)submit the new job, restored from the stage-1 savepoint.
-	// Adopt an already-submitted new job on retry so a slow awaitNewJob does
-	// not leak a second job. The old (cancelled) job is not "live" so it is
+	// Adopt an already-submitted new job on retry so a lost status update does
+	// not leak a second job. The old (cancelled) job is not live, so it is
 	// skipped; only a fresh job with a higher id counts.
-	if id := r.runningJobID(ctx, cc); id > cj.Status.JobID {
+	if id := liveJob(jobs, cj.Spec.JobName, cj.Status.JobID); id > 0 {
 		cj.Status.JobID = id
 		cj.Status.SpecHash = wantHash
 		cj.Status.UpgradeToHash = ""
 		cj.Status.UpgradeRestore = nil
+		cj.Status.UpgradeFromJobID = 0
 		return r.setPhase(ctx, cj, "Running", fmt.Sprintf("upgraded to job %d (adopted)", id), 20*time.Second)
 	}
 	restore := cj.Status.UpgradeRestore
-	before := r.maxJobID(ctx, cc)
-	if ok, detail := r.doSubmit(ctx, cc, cj, pod, restore); !ok {
-		return r.setPhase(ctx, cj, "Upgrading", "resubmit rejected: "+detail, 10*time.Second)
-	}
-	id := r.awaitNewJob(ctx, cc, before)
-	if id == 0 {
-		return r.setPhase(ctx, cj, "Upgrading", "resubmitted; awaiting job id", 5*time.Second)
+	id, err := r.doSubmit(ctx, cj, cc, api, restore)
+	if err != nil {
+		return r.setPhase(ctx, cj, "Upgrading", "resubmit rejected: "+err.Error(), 10*time.Second)
 	}
 	cj.Status.JobID = id
 	cj.Status.SpecHash = wantHash
 	cj.Status.UpgradeToHash = ""
 	cj.Status.UpgradeRestore = nil
+	cj.Status.UpgradeFromJobID = 0
 	msg := fmt.Sprintf("upgraded to job %d", id)
 	if restore != nil {
 		msg += fmt.Sprintf(" restored from %s@%d", restore.Dir, restore.CheckpointID)
@@ -392,33 +468,42 @@ func (r *ClinkJobReconciler) upgrade(ctx context.Context, cj *clinkv1alpha1.Clin
 	return r.setPhase(ctx, cj, "Running", msg, 20*time.Second)
 }
 
-func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, pod string) (ctrl.Result, error) {
-	js, found := r.jobSummary(ctx, cc, cj.Status.JobID)
-	phase, msg := "Running", fmt.Sprintf("job %d running", cj.Status.JobID)
-	switch {
-	case !found:
-		phase, msg = "Pending", "job not found on cluster; will resubmit"
+// jobMissingGrace is how long the cluster may not list a job before the
+// operator resubmits it (see ClinkJobStatus.JobMissingSince).
+const jobMissingGrace = 2 * time.Minute
+
+func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha1.ClinkJob, api *coordinatorClient, jobs []jobSummaryJSON) (ctrl.Result, error) {
+	js, found := findJob(jobs, cj.Status.JobID)
+	if !found {
+		now := metav1.Now()
+		if cj.Status.JobMissingSince == nil {
+			cj.Status.JobMissingSince = &now
+		}
+		missing := now.Sub(cj.Status.JobMissingSince.Time)
+		if missing < jobMissingGrace {
+			return r.setPhase(ctx, cj, "Pending", fmt.Sprintf("job %d is not listed by the cluster (%ds); resubmitting it if it is still missing at %ds",
+				cj.Status.JobID, int(missing.Seconds()), int(jobMissingGrace.Seconds())), 10*time.Second)
+		}
+		msg := fmt.Sprintf("job %d was not listed for %ds; resubmitting", cj.Status.JobID, int(missing.Seconds()))
 		cj.Status.JobID = 0 // force resubmit next reconcile
-	case js.ErrorCount > 0:
-		phase, msg = "Failed", fmt.Sprintf("job %d has %d error(s)", cj.Status.JobID, js.ErrorCount)
-	case js.CompletionSignalled:
-		phase, msg = "Completed", fmt.Sprintf("job %d completed", cj.Status.JobID)
-	case js.CancelRequested:
-		phase, msg = "Cancelled", fmt.Sprintf("job %d cancelling", cj.Status.JobID)
+		cj.Status.JobMissingSince = nil
+		return r.setPhase(ctx, cj, "Pending", msg, time.Second)
 	}
+	cj.Status.JobMissingSince = nil
+	phase, msg := jobPhase(js)
 
 	// Idle auto-park: a healthy Running job with the policy armed parks once
 	// no operator has processed a record for the window. Activity = the sum
 	// of per-operator records_in; any change resets the clock.
-	if found && phase == "Running" && cj.Spec.SuspendPolicy != nil && cj.Spec.SuspendPolicy.IdleAfterSeconds > 0 {
+	if phase == "Running" && cj.Spec.SuspendPolicy != nil && cj.Spec.SuspendPolicy.IdleAfterSeconds > 0 {
 		idleAfter := time.Duration(cj.Spec.SuspendPolicy.IdleAfterSeconds) * time.Second
-		if count, ok := r.jobActivity(ctx, cc, cj.Status.JobID); ok {
+		if count, ok := api.recordsIn(ctx, cj.Status.JobID); ok {
 			now := metav1.Now()
 			if count != cj.Status.ActivityCount || cj.Status.LastActivityTime == nil {
 				cj.Status.ActivityCount = count
 				cj.Status.LastActivityTime = &now
 			} else if now.Time.Sub(cj.Status.LastActivityTime.Time) >= idleAfter {
-				return r.park(ctx, cj, cc, pod, suspendReasonIdle)
+				return r.park(ctx, cj, api, suspendReasonIdle)
 			}
 			msg += fmt.Sprintf("; idle %ds/%ds",
 				int(now.Time.Sub(cj.Status.LastActivityTime.Time).Seconds()),
@@ -437,41 +522,6 @@ func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha
 	return r.setPhase(ctx, cj, phase, msg, 20*time.Second)
 }
 
-// jobActivity sums per-operator records_in for a job from the Coordinator's
-// per-operator stats endpoint. false when the endpoint is unreachable or the
-// body does not parse (the idle clock then simply does not advance).
-func (r *ClinkJobReconciler) jobActivity(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, id int64) (int64, bool) {
-	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	url := fmt.Sprintf("%s/api/v1/jobs/%d/operators", r.jmBaseURL(cc), id)
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0, false
-	}
-	resp, err := (&http.Client{Timeout: 4 * time.Second}).Do(httpReq)
-	if err != nil {
-		return 0, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, false
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	var wrapper struct {
-		Operators []struct {
-			RecordsIn int64 `json:"records_in"`
-		} `json:"operators"`
-	}
-	if json.Unmarshal(body, &wrapper) != nil || wrapper.Operators == nil {
-		return 0, false
-	}
-	var sum int64
-	for _, o := range wrapper.Operators {
-		sum += o.RecordsIn
-	}
-	return sum, true
-}
-
 func (r *ClinkJobReconciler) setPhase(ctx context.Context, cj *clinkv1alpha1.ClinkJob, phase, msg string, requeue time.Duration) (ctrl.Result, error) {
 	cj.Status.Phase = phase
 	cj.Status.Message = msg
@@ -482,7 +532,79 @@ func (r *ClinkJobReconciler) setPhase(ctx context.Context, cj *clinkv1alpha1.Cli
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
-// ---- clink CLI arg builders ------------------------------------------------
+// ---- submission ------------------------------------------------------------
+
+// doSubmit starts the job, restored from restore when it is set, and returns
+// its id on the cluster.
+func (r *ClinkJobReconciler) doSubmit(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, api *coordinatorClient, restore *clinkv1alpha1.SavepointRef) (int64, error) {
+	if cj.Spec.SQL != "" {
+		return api.submitSQL(ctx, sqlSubmission{
+			Script:               cj.Spec.SQL,
+			Name:                 cj.Spec.JobName,
+			Parallelism:          cj.Spec.Parallelism,
+			CheckpointDir:        checkpointDir(cj, cc),
+			CheckpointIntervalMs: cj.Spec.CheckpointIntervalMs,
+			Restore:              restore,
+		})
+	}
+	return r.submitCompiled(ctx, cj, cc, restore)
+}
+
+// checkpointDir is where the job checkpoints on the cluster's checkpoint
+// volume, or "" when it does not checkpoint.
+func checkpointDir(cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster) string {
+	if !cc.Spec.CheckpointStorage.Enabled || cj.Spec.CheckpointIntervalMs <= 0 {
+		return ""
+	}
+	return cc.Spec.CheckpointStorage.MountPath + "/" + cj.Spec.JobName
+}
+
+// errCompiledJobOverTLS is why a compiled job is not submitted to a cluster
+// whose control plane is TLS.
+var errCompiledJobOverTLS = errors.New("a compiled job (jobSo) is submitted by the clink CLI over the control port, " +
+	"which does not speak TLS, and this cluster's control plane is TLS: run the job as SQL, or on a cluster without TLS")
+
+// submitCompiled runs `clink run` for a compiled job in the leading
+// Coordinator's pod, which alone binds the control port: the job is built
+// there, with spec.env, and submitted over that port.
+func (r *ClinkJobReconciler) submitCompiled(ctx context.Context, cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, restore *clinkv1alpha1.SavepointRef) (int64, error) {
+	if cc.Spec.TLS.Enabled {
+		return 0, errCompiledJobOverTLS
+	}
+	pod, err := r.leaderCoordinatorPod(ctx, cc)
+	if err != nil {
+		return 0, err
+	}
+	if pod == "" {
+		return 0, errors.New("no Coordinator pod says it leads")
+	}
+	stdout, stderr, err := r.execClink(ctx, cc.Namespace, pod, r.submitArgs(cj, cc, restore))
+	if id, ok := submittedJobID(stdout); ok {
+		return id, nil
+	}
+	return 0, errors.New(submitRefusal(stdout, stderr, err))
+}
+
+// submitRefusal is why `clink run` did not start the job: its "submit:" line,
+// which carries the Coordinator's reject= reason, rather than the JSON line
+// before it, which says only ok:false; else the first thing it printed.
+func submitRefusal(stdout, stderr string, err error) string {
+	for _, line := range strings.Split(stdout, "\n") {
+		if line = strings.TrimSpace(line); strings.HasPrefix(line, "submit:") {
+			return line
+		}
+	}
+	if d := firstLine(stdout); d != "" {
+		return d
+	}
+	if d := firstLine(stderr); d != "" {
+		return d
+	}
+	if err != nil {
+		return err.Error()
+	}
+	return "clink run printed nothing"
+}
 
 func (r *ClinkJobReconciler) submitArgs(cj *clinkv1alpha1.ClinkJob, cc *clinkv1alpha1.ClinkCluster, restore *clinkv1alpha1.SavepointRef) []string {
 	run := []string{
@@ -493,9 +615,9 @@ func (r *ClinkJobReconciler) submitArgs(cj *clinkv1alpha1.ClinkJob, cc *clinkv1a
 		fmt.Sprintf("--coordinator-port=%d", cc.Spec.Coordinator.ControlPort),
 		"--wait-timeout-s=0", // fire-and-forget: return after the coordinator accepts
 	}
-	if cc.Spec.CheckpointStorage.Enabled && cj.Spec.CheckpointIntervalMs > 0 {
+	if dir := checkpointDir(cj, cc); dir != "" {
 		run = append(run,
-			"--checkpoint-dir="+cc.Spec.CheckpointStorage.MountPath+"/"+cj.Spec.JobName,
+			"--checkpoint-dir="+dir,
 			fmt.Sprintf("--checkpoint-interval-ms=%d", cj.Spec.CheckpointIntervalMs))
 	}
 	if restore != nil && restore.Dir != "" {
@@ -515,110 +637,50 @@ func (r *ClinkJobReconciler) submitArgs(cj *clinkv1alpha1.ClinkJob, cc *clinkv1a
 	return []string{"sh", "-c", exports.String() + strings.Join(run, " ")}
 }
 
-func (r *ClinkJobReconciler) savepointArgs(cc *clinkv1alpha1.ClinkCluster, jobID int64) []string {
-	return []string{"clink", "savepoint",
-		fmt.Sprintf("--job-id=%d", jobID),
-		"--coordinator-host=127.0.0.1",
-		fmt.Sprintf("--coordinator-port=%d", cc.Spec.Coordinator.ControlPort)}
-}
+var submitLineRe = regexp.MustCompile(`\bjob_id=(\d+)\b.*\bok=1\b`)
 
-func (r *ClinkJobReconciler) cancelArgs(cc *clinkv1alpha1.ClinkCluster, jobID int64) []string {
-	return []string{"clink", "cancel",
-		fmt.Sprintf("--job-id=%d", jobID),
-		"--coordinator-host=127.0.0.1",
-		fmt.Sprintf("--coordinator-port=%d", cc.Spec.Coordinator.ControlPort)}
-}
-
-var savepointRe = regexp.MustCompile(`dir="([^"]*)"\s+id=(\d+)`)
-
-func (r *ClinkJobReconciler) triggerSavepoint(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, pod string, jobID int64) (*clinkv1alpha1.SavepointRef, error) {
-	stdout, stderr, err := r.execClink(ctx, cc.Namespace, pod, r.savepointArgs(cc, jobID))
-	if err != nil {
-		return nil, fmt.Errorf("savepoint exec: %v (%s)", err, firstLine(stderr))
-	}
-	// stdout: savepoint: job_id=N ok=1 dir="/path" id=42 message="..."
-	if !strings.Contains(stdout, "ok=1") {
-		return nil, fmt.Errorf("savepoint not ok: %s", firstLine(stdout))
-	}
-	m := savepointRe.FindStringSubmatch(stdout)
-	if m == nil {
-		return nil, fmt.Errorf("could not parse savepoint dir/id from: %s", firstLine(stdout))
-	}
-	var id int64
-	fmt.Sscanf(m[2], "%d", &id)
-	return &clinkv1alpha1.SavepointRef{Dir: m[1], CheckpointID: id}, nil
-}
-
-// ---- Coordinator HTTP (job status) ------------------------------------------
-
-type jobSummaryJSON struct {
-	ID                  int64 `json:"id"`
-	CompletedCount      int64 `json:"completed_count"`
-	CompletionSignalled bool  `json:"completion_signalled"`
-	CancelRequested     bool  `json:"cancel_requested"`
-	ErrorCount          int64 `json:"error_count"`
-}
-
-func (r *ClinkJobReconciler) jmBaseURL(cc *clinkv1alpha1.ClinkCluster) string {
-	return fmt.Sprintf("http://%s-coordinator.%s.svc:%d", cc.Name, cc.Namespace, cc.Spec.Coordinator.HTTPPort)
-}
-
-func (r *ClinkJobReconciler) listJobs(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) []jobSummaryJSON {
-	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, r.jmBaseURL(cc)+"/api/v1/jobs", nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := (&http.Client{Timeout: 4 * time.Second}).Do(httpReq)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	// Response is {"jobs":[...]} or a bare array; try both.
-	var wrapper struct {
-		Jobs []jobSummaryJSON `json:"jobs"`
-	}
-	if json.Unmarshal(body, &wrapper) == nil && wrapper.Jobs != nil {
-		return wrapper.Jobs
-	}
-	var arr []jobSummaryJSON
-	_ = json.Unmarshal(body, &arr)
-	return arr
-}
-
-func (r *ClinkJobReconciler) maxJobID(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) int64 {
-	var mx int64
-	for _, j := range r.listJobs(ctx, cc) {
-		if j.ID > mx {
-			mx = j.ID
+// submittedJobID reads the accepted job's id from `clink run`'s output: the
+// JSON line it prints first, or, from a CLI that predates it, the
+// "submit: ... job_id=N ... ok=1" line. The exit status says nothing here, as
+// a streaming job submitted without waiting never completes.
+func submittedJobID(stdout string) (int64, bool) {
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "{") {
+			var ack struct {
+				OK    bool  `json:"ok"`
+				JobID int64 `json:"job_id"`
+			}
+			if json.Unmarshal([]byte(line), &ack) == nil && ack.OK && ack.JobID > 0 {
+				return ack.JobID, true
+			}
+			continue
+		}
+		if m := submitLineRe.FindStringSubmatch(line); m != nil {
+			if id, err := strconv.ParseInt(m[1], 10, 64); err == nil && id > 0 {
+				return id, true
+			}
 		}
 	}
-	return mx
+	return 0, false
 }
 
-// awaitNewJob polls for a job id greater than `after` (the just-submitted job;
-// ids are monotonic and this operator serialises its own submits).
-func (r *ClinkJobReconciler) awaitNewJob(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, after int64) int64 {
-	for i := 0; i < 15; i++ {
-		if id := r.maxJobID(ctx, cc); id > after {
-			return id
-		}
-		select {
-		case <-ctx.Done():
-			return 0
-		case <-time.After(1 * time.Second):
+// ---- the cluster's jobs ----------------------------------------------------
+
+// liveJob is the newest live job on the cluster with this name and an id above
+// after, or 0. The operator adopts it rather than submitting again.
+func liveJob(jobs []jobSummaryJSON, name string, after int64) int64 {
+	var best int64
+	for _, j := range jobs {
+		if j.Name == name && j.live() && j.ID > after && j.ID > best {
+			best = j.ID
 		}
 	}
-	return 0
+	return best
 }
 
-func (r *ClinkJobReconciler) jobSummary(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, id int64) (jobSummaryJSON, bool) {
-	for _, j := range r.listJobs(ctx, cc) {
+func findJob(jobs []jobSummaryJSON, id int64) (jobSummaryJSON, bool) {
+	for _, j := range jobs {
 		if j.ID == id {
 			return j, true
 		}
@@ -626,58 +688,77 @@ func (r *ClinkJobReconciler) jobSummary(ctx context.Context, cc *clinkv1alpha1.C
 	return jobSummaryJSON{}, false
 }
 
-// runningJobID returns the newest live (not completed/cancelled/failed) job id,
-// or 0. Used to adopt a job on a retry so a submit that raced status recording
-// does not leak a second job (v1 assumes one ClinkJob per cluster).
-func (r *ClinkJobReconciler) runningJobID(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) int64 {
-	var best int64
-	for _, j := range r.listJobs(ctx, cc) {
-		if j.CompletionSignalled || j.CancelRequested || j.ErrorCount > 0 {
-			continue
-		}
-		if j.ID > best {
-			best = j.ID
-		}
+// jobPhase is the ClinkJob phase, and its message, for the job as the
+// Coordinator reports it.
+func jobPhase(js jobSummaryJSON) (string, string) {
+	phase := "Running"
+	switch {
+	case js.CancelRequested:
+		phase = "Cancelled"
+	case js.Status == "FAILED", js.Status == "" && js.ErrorCount > 0:
+		phase = "Failed"
+	case js.Status == "COMPLETED_OK", js.Status == "" && js.CompletionSignalled:
+		phase = "Completed"
+	case js.Status == "CANCELLED":
+		phase = "Cancelled"
 	}
-	return best
-}
-
-// doSubmit runs `clink run` and reports acceptance. The submit is fire-and-forget
-// (--wait-timeout-s=0), so clink run exits non-zero ("job did not complete") even
-// on success; the authoritative signal is "ok=1" in its stdout, not the exit code.
-func (r *ClinkJobReconciler) doSubmit(ctx context.Context, cc *clinkv1alpha1.ClinkCluster, cj *clinkv1alpha1.ClinkJob, pod string, restore *clinkv1alpha1.SavepointRef) (bool, string) {
-	stdout, stderr, _ := r.execClink(ctx, cc.Namespace, pod, r.submitArgs(cj, cc, restore))
-	if strings.Contains(stdout, "ok=1") {
-		return true, ""
+	switch phase {
+	case "Failed":
+		return phase, fmt.Sprintf("job %d failed with %d error(s)", js.ID, js.ErrorCount)
+	case "Completed":
+		return phase, fmt.Sprintf("job %d completed", js.ID)
+	case "Cancelled":
+		return phase, fmt.Sprintf("job %d cancelled", js.ID)
 	}
-	if d := firstLine(stdout); d != "" {
-		return false, d
+	msg := fmt.Sprintf("job %d running", js.ID)
+	if js.ErrorCount > 0 {
+		msg += fmt.Sprintf("; %d task error(s), recovered", js.ErrorCount)
 	}
-	return false, firstLine(stderr)
+	return phase, msg
 }
 
 // ---- pod discovery + exec --------------------------------------------------
 
-// readyCoordinatorPod returns the name of a Ready Coordinator pod for the cluster. In HA,
-// only the leader binds the control port; v1 targets a single-coordinator cluster (any
-// ready coordinator pod is the leader). HA leader-targeting is a follow-on.
-func (r *ClinkJobReconciler) readyCoordinatorPod(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) (string, error) {
+// readyCoordinatorPods are the cluster's Running, Ready Coordinator pods.
+// Under HA a standby is ready too: it answers the API by forwarding it.
+func (r *ClinkJobReconciler) readyCoordinatorPods(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) ([]corev1.Pod, error) {
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(cc.Namespace), client.MatchingLabels{
 		"app.kubernetes.io/instance":  cc.Name,
 		"app.kubernetes.io/component": "coordinator",
 	}); err != nil {
-		return "", err
+		return nil, err
 	}
-	for i := range pods.Items {
-		p := &pods.Items[i]
-		if p.Status.Phase != corev1.PodRunning {
+	var ready []corev1.Pod
+	for _, p := range pods.Items {
+		if p.Status.Phase != corev1.PodRunning || !p.DeletionTimestamp.IsZero() {
 			continue
 		}
 		for _, c := range p.Status.Conditions {
 			if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-				return p.Name, nil
+				ready = append(ready, p)
+				break
 			}
+		}
+	}
+	return ready, nil
+}
+
+// leaderCoordinatorPod is the Coordinator pod that leads, and so binds the
+// control port: without HA the one ready Coordinator, under HA the one whose
+// /readyz says "leader".
+func (r *ClinkJobReconciler) leaderCoordinatorPod(ctx context.Context, cc *clinkv1alpha1.ClinkCluster) (string, error) {
+	pods, err := r.readyCoordinatorPods(ctx, cc)
+	if err != nil {
+		return "", err
+	}
+	port := strconv.Itoa(int(cc.Spec.Coordinator.HTTPPort))
+	for _, p := range pods {
+		if !cc.Spec.HA.Enabled {
+			return p.Name, nil
+		}
+		if p.Status.PodIP != "" && coordinatorRole(ctx, net.JoinHostPort(p.Status.PodIP, port)) == "leader" {
+			return p.Name, nil
 		}
 	}
 	return "", nil
@@ -709,7 +790,7 @@ func (r *ClinkJobReconciler) execClink(ctx context.Context, namespace, pod strin
 
 func applyJobDefaults(cj *clinkv1alpha1.ClinkJob) {
 	if cj.Spec.JobName == "" {
-		cj.Spec.JobName = "job"
+		cj.Spec.JobName = cj.Name
 	}
 	if cj.Spec.UpgradeMode == "" {
 		cj.Spec.UpgradeMode = "savepoint"
@@ -721,6 +802,13 @@ func specHash(cj *clinkv1alpha1.ClinkJob) string {
 	io.WriteString(h, cj.Spec.JobSo+"\n")
 	io.WriteString(h, strings.Join(cj.Spec.Args, "\x00")+"\n")
 	io.WriteString(h, strings.Join(cj.Spec.Env, "\x00")+"\n")
+	// A SQL job's inputs, written only for a SQL job, so a compiled job hashes
+	// as it did before SQL jobs existed and upgrading the operator upgrades
+	// none of them.
+	if cj.Spec.SQL != "" {
+		io.WriteString(h, "sql\x00"+cj.Spec.SQL+"\n")
+		fmt.Fprintf(h, "parallelism\x00%d\n", cj.Spec.Parallelism)
+	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
@@ -736,6 +824,9 @@ func firstLine(s string) string {
 func (r *ClinkJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Scheme = mgr.GetScheme()
 	r.RestConfig = mgr.GetConfig()
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	cs, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
 		return err
