@@ -704,6 +704,14 @@ jobs:
         with:
           path: ~/.clink-deps/formal-tools
           key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - name: Sample the disk during the searches
+        # formal-check.sh deletes its work directory when a search passes, so
+        # the disk after the searches cannot show how close they came to
+        # filling it. A df every 10 s, kept in /dev/shm so that a full root
+        # disk cannot stop it, gives the peak, which the last step reports.
+        run: |
+          nohup bash -c 'while :; do df -B1 --output=used,avail / | tail -n 1; sleep 10; done' \
+            >/dev/shm/disk-samples 2>/dev/null </dev/null &
       - name: Every accepted mutant stays accepted
         run: |
           set -euo pipefail
@@ -717,9 +725,22 @@ jobs:
           # shellcheck disable=SC2086 # one argument per mutant, on purpose
           CHECK_JOBS=2 TLC_WORKERS=2 TLC_HEAP=6g TLC_EXTRA="-checkpoint 0" \
             ./scripts/formal-check.sh --mutants $accepted
-      - name: Disk after the searches
+      - name: Disk after the searches and at their peak
         if: always()
-        run: df -h /
+        run: |
+          df -h /
+          [ -s /dev/shm/disk-samples ] || exit 0
+          report=$(awk '{ used = $1 + 0; avail = $2 + 0 }
+            NR == 1 { start = used; free = avail; peak = used; low = avail }
+            used > peak { peak = used }
+            avail < low { low = avail }
+            END {
+              g = 1024 ^ 3
+              printf "disk during the searches: %.1f GiB free at the start, %.1f GiB at the lowest; ", free / g, low / g
+              printf "the searches took up to %.1f GiB (%d samples, 10 s apart)\n", (peak - start) / g, NR
+            }' /dev/shm/disk-samples)
+          echo "${report}"
+          echo "${report}" >> "$GITHUB_STEP_SUMMARY" || true
 
   formal-mutant-id-reuse:
     name: The id-reuse mutant of the exactly-once specification is refuted
@@ -747,15 +768,36 @@ jobs:
         with:
           path: ~/.clink-deps/formal-tools
           key: tla-tools-${{ hashFiles('formal/tools.env') }}
+      - name: Sample the disk during the search
+        # formal-check.sh deletes its work directory when a search passes, so
+        # the disk after the search cannot show how close it came to
+        # filling it. A df every 10 s, kept in /dev/shm so that a full root
+        # disk cannot stop it, gives the peak, which the last step reports.
+        run: |
+          nohup bash -c 'while :; do df -B1 --output=used,avail / | tail -n 1; sleep 10; done' \
+            >/dev/shm/disk-samples 2>/dev/null </dev/null &
       - name: M_id_reuse is refuted
         # No TLC checkpoints: each one copies the disk queue, and a search that
         # fails is rerun from the start in any case.
         run: |
           TLC_WORKERS=auto TLC_HEAP=10g TLC_EXTRA="-checkpoint 0" \
             ./scripts/formal-check.sh --mutants M_id_reuse
-      - name: Disk after the search
+      - name: Disk after the search and at its peak
         if: always()
-        run: df -h /
+        run: |
+          df -h /
+          [ -s /dev/shm/disk-samples ] || exit 0
+          report=$(awk '{ used = $1 + 0; avail = $2 + 0 }
+            NR == 1 { start = used; free = avail; peak = used; low = avail }
+            used > peak { peak = used }
+            avail < low { low = avail }
+            END {
+              g = 1024 ^ 3
+              printf "disk during the search: %.1f GiB free at the start, %.1f GiB at the lowest; ", free / g, low / g
+              printf "the search took up to %.1f GiB (%d samples, 10 s apart)\n", (peak - start) / g, NR
+            }' /dev/shm/disk-samples)
+          echo "${report}"
+          echo "${report}" >> "$GITHUB_STEP_SUMMARY" || true
 
   trace-validation:
     name: Recorded protocol traces are behaviours of the specification
