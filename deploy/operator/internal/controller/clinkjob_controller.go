@@ -48,6 +48,9 @@ type ClinkJobReconciler struct {
 	Scheme     *runtime.Scheme
 	Clientset  kubernetes.Interface
 	RestConfig *rest.Config
+
+	// readOffsets reads a wake policy's Kafka offsets; nil asks the brokers.
+	readOffsets kafkaOffsetReader
 }
 
 // +kubebuilder:rbac:groups=clink.dev,resources=clinkjobs,verbs=get;list;watch;create;update;patch;delete
@@ -275,6 +278,25 @@ func (r *ClinkJobReconciler) park(ctx context.Context, cj *clinkv1alpha1.ClinkJo
 		cj.Status.SuspendedAt = &now
 		return r.setPhase(ctx, cj, "Suspended", "parked mid-upgrade ("+reason+")", 30*time.Second)
 	}
+	// An idle park that a Kafka lag wakes first records where the wake
+	// topics end, in a status update of its own, so the record is durable
+	// before the savepoint is asked for. Whatever is produced after it counts
+	// towards waking the job, so nothing the savepoint left unread can be
+	// stranded. A record produced between the two was read before the
+	// savepoint and counts as well, so the job can wake once for nothing.
+	if k := wakeLag(cj); k != nil && reason == suspendReasonIdle &&
+		cj.Status.SuspendSavepoint == nil && cj.Status.WakeBaseline == nil {
+		o, err := r.offsets(ctx, k)
+		if err != nil {
+			return r.setPhase(ctx, cj, cj.Status.Phase,
+				"idle, but where the wake topics end could not be read, so the job is not parked yet: "+firstLine(err.Error()),
+				10*time.Second)
+		}
+		if b := wakeBaseline(o); len(b) > 0 {
+			cj.Status.WakeBaseline = b
+			return r.setPhase(ctx, cj, cj.Status.Phase, "idle; recorded where the wake topics end, parking next", time.Second)
+		}
+	}
 	if cj.Spec.UpgradeMode == "savepoint" && cj.Status.SuspendSavepoint == nil {
 		sp, _, err := r.endAtSavepoint(ctx, cj, api, jobs)
 		if err != nil {
@@ -341,9 +363,26 @@ func (r *ClinkJobReconciler) clearSuspend(cj *clinkv1alpha1.ClinkJob, wantHash s
 	cj.Status.SuspendSavepoint = nil
 	cj.Status.SuspendReason = ""
 	cj.Status.SuspendedAt = nil
+	cj.Status.WakeBaseline = nil
 	now := metav1.Now()
 	cj.Status.ActivityCount = 0
 	cj.Status.LastActivityTime = &now
+}
+
+// wakeLag is the job's Kafka lag wake policy, or nil.
+func wakeLag(cj *clinkv1alpha1.ClinkJob) *clinkv1alpha1.KafkaLagWakeSpec {
+	if cj.Spec.WakePolicy == nil {
+		return nil
+	}
+	return cj.Spec.WakePolicy.KafkaLag
+}
+
+// offsets reads a wake policy's Kafka offsets.
+func (r *ClinkJobReconciler) offsets(ctx context.Context, k *clinkv1alpha1.KafkaLagWakeSpec) (kafkaOffsets, error) {
+	if r.readOffsets != nil {
+		return r.readOffsets(ctx, k)
+	}
+	return readKafkaOffsets(ctx, k)
 }
 
 // wakeDue evaluates the wake policy for an Idle-parked job. Returns whether
@@ -362,10 +401,11 @@ func (r *ClinkJobReconciler) wakeDue(ctx context.Context, cj *clinkv1alpha1.Clin
 	if poll < 5*time.Second {
 		poll = 15 * time.Second
 	}
-	lag, err := kafkaGroupLag(ctx, k)
+	o, err := r.offsets(ctx, k)
 	if err != nil {
 		return false, "lag poll failed: " + firstLine(err.Error()), poll
 	}
+	lag := pendingRecords(o, cj.Status.WakeBaseline)
 	if lag >= threshold {
 		return true, fmt.Sprintf("lag %d >= threshold %d", lag, threshold), poll
 	}
@@ -502,6 +542,8 @@ func (r *ClinkJobReconciler) refreshStatus(ctx context.Context, cj *clinkv1alpha
 			if count != cj.Status.ActivityCount || cj.Status.LastActivityTime == nil {
 				cj.Status.ActivityCount = count
 				cj.Status.LastActivityTime = &now
+				// It did work, so a park would read where the topics end again.
+				cj.Status.WakeBaseline = nil
 			} else if now.Time.Sub(cj.Status.LastActivityTime.Time) >= idleAfter {
 				return r.park(ctx, cj, api, jobs, suspendReasonIdle)
 			}

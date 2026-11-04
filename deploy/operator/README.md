@@ -281,35 +281,50 @@ spec:
     idleAfterSeconds: 600      #    no operator processed a record for 10min
                                #    (watched via the coordinator's per-op records_in).
   wakePolicy:                  # 3. auto-wake an Idle-parked job:
-    kafkaLag:                  #    poll consumer-group lag while parked,
-      brokers: kafka:9092      #    resume when pending records reach the
-      topics: [orders]         #    threshold. A never-committed group counts
-      groupId: orders-job      #    from the topic start offsets.
+    kafkaLag:                  #    poll the records waiting for it while
+      brokers: kafka:9092      #    parked, and resume when they reach the
+      topics: [orders]         #    threshold (where they count from: below).
+      groupId: orders-job
       lagThreshold: 100
       pollIntervalSeconds: 15
 ```
 
 `.status.phase` moves Running -> Suspending -> Suspended (with
 `.status.suspendReason` Manual or Idle and the restore point in
-`.status.suspendSavepoint`) -> Resuming -> Running. The park is two-stage and
-crash-safe: the savepoint is persisted to status before the cancel, and a
+`.status.suspendSavepoint`) -> Resuming -> Running. The park is crash-safe: the
+Coordinator cancels the job at the savepoint, with no checkpoint completing
+after it, and a park whose status update was lost finds the job ended and
+restores from its last completed checkpoint, which is that savepoint. A
 `Resuming` job can only finish resuming (it can never fall through to a fresh,
 state-dropping submit). Setting `suspend: true` on an Idle-parked job hands the
 park to Manual; removing `suspendPolicy` from an Idle-parked job wakes it.
 Manual wake is `suspend: false`. Idle detection and lag polling both live in
 the operator - the engine is untouched.
 
-One property to design for: a lag-woken job should be the consumer of the lag
-it wakes on (the normal case - the group id is the job's own). If the woken
-job never reduces that lag, the idle policy re-parks it and the lag policy
-re-wakes it, cycling at the idle window - the same feedback rule as any
-lag-driven autoscaler.
+Where the lag counts from: clink's Kafka source keeps its offsets in its
+checkpoints and commits none to its group, so a group's committed offsets say
+nothing about where a clink job has read to. When the operator parks a job for
+being idle and a Kafka lag can wake it, it first records where each partition
+of the wake topics ends, in `.status.wakeBaseline`, in a status update of its
+own before it asks for the savepoint. The job had been idle, so it had read
+what was there, and the lag counts what is produced after the baseline. A
+record produced between the baseline and the savepoint was read before the
+savepoint and counts as well, so a job can wake once for nothing, but no
+record the savepoint left unread can be stranded. Without a baseline, a wake
+policy added to a job already parked, the lag counts from the group's
+committed offsets, or else from each partition's start.
+
+One property to design for: a lag-woken job should read the topics it wakes on.
+If the woken job never reads what woke it, the idle policy re-parks it and the
+lag policy re-wakes it, cycling at the idle window - the same feedback rule as
+any lag-driven autoscaler.
 
 `kind-suspend-smoke.sh` proves all four paths end to end: manual park (savepoint
 recorded, job cancelled on the coordinator) -> manual wake (restored, latency printed) ->
 idle auto-park (slow-tick job) -> lag wake against an in-cluster single-node
-KRaft Kafka, including the negative check (empty topic keeps it parked, status
-reporting `lag 0 < threshold`).
+KRaft Kafka, including the negative check: the ten records already on the wake
+topic when the job parked keep it parked, status reporting `lag 0 < threshold`,
+and five new ones wake it.
 
 ## Scope
 

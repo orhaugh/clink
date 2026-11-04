@@ -8,9 +8,12 @@
 #   2. MANUAL WAKE   spec.suspend=false -> resubmitted restored from the
 #                    savepoint (new job id), wake latency measured.
 #   3. IDLE PARK     suspendPolicy.idleAfterSeconds parks a job whose source
-#                    goes quiet (slow-tick upgrade), reason Idle.
-#   4. LAG WAKE      wakePolicy.kafkaLag: stays parked while lag < threshold
-#                    (asserted), wakes once produced records cross it.
+#                    goes quiet (slow-tick upgrade), reason Idle, with a
+#                    wakePolicy armed: the operator records where the wake
+#                    topic ends before the savepoint.
+#   4. LAG WAKE      wakePolicy.kafkaLag: stays parked although the topic holds
+#                    ten records from before the park (asserted: they are what
+#                    the job had read), wakes once five new ones arrive.
 #
 # Prereqs: docker, kind, kubectl + a local clink-runtime:latest image (which
 # bakes /opt/clink/jobs/rescale_test_job.so and the clink CLI). A single-node
@@ -205,10 +208,21 @@ T1=$(date +%s)
 [[ -n "$(job_field .status.lastSavepoint.dir)" ]] || fail "lastSavepoint lost"
 echo "  WOKE: J1=$J1 -> J2=$J2 in $((T1-T0))s (restored from '$SP')"
 
-step "phase 3: IDLE PARK (arm suspendPolicy.idleAfterSeconds=15)"
+step "phase 3: IDLE PARK (arm suspendPolicy.idleAfterSeconds=15 and the wake policy)"
+# The wake topic already holds ten records when the job parks: what a job
+# that reads it had read. clink's Kafka source commits no offsets to its
+# group, so only the baseline the operator records at the park keeps these
+# from waking the job at once. Recreated, so a rerun starts from ten.
+kx exec clink-kafka -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --delete --topic ${WAKE_TOPIC} 2>/dev/null || true
+sleep 2
+kx exec clink-kafka -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic ${WAKE_TOPIC} --partitions 1 --replication-factor 1 2>/dev/null || true
+seq 1 10 | kx exec -i clink-kafka -- /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic ${WAKE_TOPIC} >/dev/null 2>&1
 # Pure policy change: not part of the spec hash, so no upgrade - the operator
 # just starts watching records_in and parks when it stalls for the window.
-kx patch clinkjob ${JOB_CR} --type=merge -p '{"spec":{"suspendPolicy":{"idleAfterSeconds":15}}}'
+kx patch clinkjob ${JOB_CR} --type=merge -p "{\"spec\":{\"suspendPolicy\":{\"idleAfterSeconds\":15},\"wakePolicy\":{\"kafkaLag\":{\"brokers\":\"${KAFKA_SVC}\",\"topics\":[\"${WAKE_TOPIC}\"],\"groupId\":\"${WAKE_GROUP}\",\"lagThreshold\":3,\"pollIntervalSeconds\":5}}}}"
 for i in $(seq 1 60); do
   ph=$(job_field .status.phase); reason=$(job_field .status.suspendReason)
   echo "  phase=${ph:-<none>} reason=${reason:-} (attempt $i)"
@@ -216,17 +230,11 @@ for i in $(seq 1 60); do
   sleep 3
 done
 [[ "$(job_field .status.suspendReason)" == "Idle" ]] || fail "did not idle-park"
-echo "  IDLE-PARKED: savepoint '$(job_field .status.suspendSavepoint.dir)'"
+BASE=$(job_field '.status.wakeBaseline[0].offset')
+[[ "$BASE" == "10" ]] || fail "expected the wake baseline at offset 10, got '${BASE}'"
+echo "  IDLE-PARKED: savepoint '$(job_field .status.suspendSavepoint.dir)', wake baseline ${WAKE_TOPIC}/0@${BASE}"
 
-step "phase 4a: LAG WAKE negative - empty topic keeps it parked"
-# Recreate the topic empty so a rerun (leftover records from a prior run)
-# cannot trip the negative assertion.
-kx exec clink-kafka -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
-  --delete --topic ${WAKE_TOPIC} 2>/dev/null || true
-sleep 2
-kx exec clink-kafka -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
-  --create --topic ${WAKE_TOPIC} --partitions 1 --replication-factor 1 2>/dev/null || true
-kx patch clinkjob ${JOB_CR} --type=merge -p "{\"spec\":{\"wakePolicy\":{\"kafkaLag\":{\"brokers\":\"${KAFKA_SVC}\",\"topics\":[\"${WAKE_TOPIC}\"],\"groupId\":\"${WAKE_GROUP}\",\"lagThreshold\":3,\"pollIntervalSeconds\":5}}}}"
+step "phase 4a: LAG WAKE negative - the ten records from before the park keep it parked"
 sleep 15  # ~2-3 polls
 ph=$(job_field .status.phase); MSG=$(job_field .status.message)
 echo "  phase=$ph message='$MSG'"

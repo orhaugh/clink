@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -319,5 +321,129 @@ func TestAnUpgradeEndsTheOldJobAtASavepoint(t *testing.T) {
 				t.Errorf("restores from %+v, want checkpoint %d", cj.Status.UpgradeRestore, c.restoreFrom)
 			}
 		})
+	}
+}
+
+// edgesWithWakePolicy is a running SQL job that parks after a minute idle and
+// wakes when 100 records are waiting on cdn.edge.
+func edgesWithWakePolicy() *clinkv1alpha1.ClinkJob {
+	return &clinkv1alpha1.ClinkJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "edges", Namespace: "ns"},
+		Spec: clinkv1alpha1.ClinkJobSpec{JobName: "edges", SQL: "v1", UpgradeMode: "savepoint",
+			SuspendPolicy: &clinkv1alpha1.SuspendPolicySpec{IdleAfterSeconds: 60},
+			WakePolicy: &clinkv1alpha1.WakePolicySpec{KafkaLag: &clinkv1alpha1.KafkaLagWakeSpec{
+				Brokers: "kafka:9092", Topics: []string{"cdn.edge"}, GroupID: "playhead-edges",
+				LagThreshold: 100, PollIntervalSeconds: 5}}},
+		Status: clinkv1alpha1.ClinkJobStatus{Phase: "Running", JobID: 5},
+	}
+}
+
+// An idle park that a Kafka lag wakes records where the wake topics end, in a
+// status update of its own, before it asks for the savepoint, and the wake
+// counts only what is produced after that. A clink job's Kafka source commits
+// nothing to its group, so without the baseline the records the job read
+// before it parked would wake it at the first poll.
+func TestAnIdleParkCountsTheWakeLagFromWhereTheTopicsEnded(t *testing.T) {
+	var savepoints, cancels int
+	f := &fakeCoordinator{answer: func(r *http.Request, _ string) (int, string) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/savepoint"):
+			savepoints++
+			return 200, `{"job_id":5,"ok":true,"checkpoint_id":12,"checkpoint_dir":"/ckpt/edges/_jobs/5","message":"","cancelled":true}`
+		case strings.HasSuffix(r.URL.Path, "/cancel"):
+			cancels++
+			return 200, `{"job_id":5,"ok":true,"message":""}`
+		}
+		return 404, ""
+	}}
+	p0, p1 := topicPartition{"cdn.edge", 0}, topicPartition{"cdn.edge", 1}
+	read := kafkaOffsets{end: map[topicPartition]int64{p0: 900, p1: 600},
+		start: map[topicPartition]int64{p0: 0, p1: 0}, committed: map[topicPartition]int64{}}
+	cj := edgesWithWakePolicy()
+	k := fake.NewClientBuilder().WithScheme(jobScheme(t)).WithObjects(cj).WithStatusSubresource(cj).Build()
+	r := &ClinkJobReconciler{Client: k, readOffsets: func(context.Context, *clinkv1alpha1.KafkaLagWakeSpec) (kafkaOffsets, error) {
+		return read, nil
+	}}
+	ctx := context.Background()
+	api := f.client(t, "")
+	running := []jobSummaryJSON{{ID: 5, Name: "edges", Status: "RUNNING"}}
+	want := []clinkv1alpha1.PartitionOffset{{Topic: "cdn.edge", Partition: 0, Offset: 900}, {Topic: "cdn.edge", Partition: 1, Offset: 600}}
+
+	if _, err := r.park(ctx, cj, api, running, suspendReasonIdle); err != nil {
+		t.Fatal(err)
+	}
+	if savepoints != 0 || cj.Status.Phase != "Running" || !reflect.DeepEqual(cj.Status.WakeBaseline, want) {
+		t.Fatalf("first pass: %d savepoints, phase %q, baseline %+v", savepoints, cj.Status.Phase, cj.Status.WakeBaseline)
+	}
+	if _, err := r.park(ctx, cj, api, running, suspendReasonIdle); err != nil {
+		t.Fatal(err)
+	}
+	if savepoints != 1 || cj.Status.Phase != "Suspending" || !reflect.DeepEqual(cj.Status.WakeBaseline, want) {
+		t.Fatalf("second pass: %d savepoints, phase %q, baseline %+v", savepoints, cj.Status.Phase, cj.Status.WakeBaseline)
+	}
+	if _, err := r.parkCancelStage(ctx, cj, api); err != nil {
+		t.Fatal(err)
+	}
+	if cj.Status.Phase != "Suspended" || cj.Status.SuspendSavepoint == nil {
+		t.Fatalf("parked: phase %q, savepoint %+v", cj.Status.Phase, cj.Status.SuspendSavepoint)
+	}
+
+	if wake, detail, _ := r.wakeDue(ctx, cj); wake || detail != "lag 0 < threshold 100" {
+		t.Errorf("with only what it read before parking: wake %v, %q", wake, detail)
+	}
+	read.end[p0] = 1020
+	if wake, detail, _ := r.wakeDue(ctx, cj); !wake || detail != "lag 120 >= threshold 100" {
+		t.Errorf("after 120 more records: wake %v, %q", wake, detail)
+	}
+	if got := pendingRecords(read, nil); got != 1620 {
+		t.Errorf("without the baseline the lag would be %d, want everything there: 1620", got)
+	}
+}
+
+// A job that does work between the baseline and the savepoint is not idle: the
+// baseline goes, and a later park reads where the topics end again.
+func TestWorkBeforeTheParkDropsTheWakeBaseline(t *testing.T) {
+	f := &fakeCoordinator{answer: func(r *http.Request, _ string) (int, string) {
+		if r.URL.Path == "/api/v1/jobs/5/operators" {
+			return 200, `{"operators":[{"records_in":12},{"records_in":30}]}`
+		}
+		return 404, ""
+	}}
+	cj := edgesWithWakePolicy()
+	then := metav1.NewTime(time.Now().Add(-time.Minute))
+	cj.Status.ActivityCount = 40
+	cj.Status.LastActivityTime = &then
+	cj.Status.WakeBaseline = []clinkv1alpha1.PartitionOffset{{Topic: "cdn.edge", Partition: 0, Offset: 900}}
+	k := fake.NewClientBuilder().WithScheme(jobScheme(t)).WithObjects(cj).WithStatusSubresource(cj).Build()
+	r := &ClinkJobReconciler{Client: k}
+	if _, err := r.refreshStatus(context.Background(), cj, f.client(t, ""), []jobSummaryJSON{{ID: 5, Name: "edges", Status: "RUNNING"}}); err != nil {
+		t.Fatal(err)
+	}
+	if cj.Status.WakeBaseline != nil || cj.Status.ActivityCount != 42 || cj.Status.Phase != "Running" {
+		t.Errorf("after work: baseline %+v, activity %d, phase %q", cj.Status.WakeBaseline, cj.Status.ActivityCount, cj.Status.Phase)
+	}
+}
+
+// A job whose wake topics cannot be read is not parked: parked, it could not
+// be woken.
+func TestAnIdleJobWhoseWakeTopicsCannotBeReadKeepsRunning(t *testing.T) {
+	var savepoints int
+	f := &fakeCoordinator{answer: func(r *http.Request, _ string) (int, string) {
+		if strings.HasSuffix(r.URL.Path, "/savepoint") {
+			savepoints++
+		}
+		return 404, ""
+	}}
+	cj := edgesWithWakePolicy()
+	k := fake.NewClientBuilder().WithScheme(jobScheme(t)).WithObjects(cj).WithStatusSubresource(cj).Build()
+	r := &ClinkJobReconciler{Client: k, readOffsets: func(context.Context, *clinkv1alpha1.KafkaLagWakeSpec) (kafkaOffsets, error) {
+		return kafkaOffsets{}, errors.New("dial tcp: connection refused")
+	}}
+	if _, err := r.park(context.Background(), cj, f.client(t, ""), []jobSummaryJSON{{ID: 5, Name: "edges", Status: "RUNNING"}}, suspendReasonIdle); err != nil {
+		t.Fatal(err)
+	}
+	if savepoints != 0 || cj.Status.Phase != "Running" || cj.Status.WakeBaseline != nil ||
+		!strings.Contains(cj.Status.Message, "could not be read, so the job is not parked yet") {
+		t.Errorf("%d savepoints, phase %q, baseline %+v, message %q", savepoints, cj.Status.Phase, cj.Status.WakeBaseline, cj.Status.Message)
 	}
 }

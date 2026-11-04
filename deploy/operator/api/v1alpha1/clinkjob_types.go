@@ -73,18 +73,22 @@ type WakePolicySpec struct {
 	KafkaLag *KafkaLagWakeSpec `json:"kafkaLag,omitempty"`
 }
 
-// KafkaLagWakeSpec: while the job is parked, the operator polls the total
-// pending records for a consumer group (end offsets minus the group's
-// committed offsets; a partition the group never committed counts from its
-// start offset) and resumes the job at the threshold.
+// KafkaLagWakeSpec: while the job is parked, the operator polls the records
+// pending for it on the named topics and resumes the job at the threshold. A
+// partition's pending records are its end offset less where the job is taken
+// to have read to: where the partition ended when the park began
+// (status.wakeBaseline), or else the group's committed offset, or else the
+// partition's start offset. A clink job's Kafka source keeps its offsets in
+// its checkpoints and commits none to its group, so for a clink job it is the
+// baseline that makes the lag what arrived after it parked.
 type KafkaLagWakeSpec struct {
 	// Brokers is the bootstrap list, comma-separated (host:port,...).
 	Brokers string `json:"brokers"`
 	// Topics to measure.
 	// +kubebuilder:validation:MinItems=1
 	Topics []string `json:"topics"`
-	// GroupID whose committed offsets define the lag baseline - the group
-	// the job's Kafka source consumes with.
+	// GroupID is the group the job's Kafka source consumes with. Its
+	// committed offsets count where no baseline was recorded at the park.
 	GroupID string `json:"groupId"`
 	// LagThreshold is the total pending-record count that wakes the job.
 	// +kubebuilder:default=1
@@ -94,6 +98,13 @@ type KafkaLagWakeSpec struct {
 	// +kubebuilder:default=15
 	// +kubebuilder:validation:Minimum=5
 	PollIntervalSeconds int64 `json:"pollIntervalSeconds,omitempty"`
+}
+
+// PartitionOffset is an offset in one partition of a topic.
+type PartitionOffset struct {
+	Topic     string `json:"topic"`
+	Partition int32  `json:"partition"`
+	Offset    int64  `json:"offset"`
 }
 
 // SavepointRef records a savepoint the operator took (dir + checkpoint id).
@@ -141,6 +152,12 @@ type ClinkJobStatus struct {
 	SuspendSavepoint *SavepointRef `json:"suspendSavepoint,omitempty"`
 	// SuspendedAt is when the park completed.
 	SuspendedAt *metav1.Time `json:"suspendedAt,omitempty"`
+	// WakeBaseline is where each partition of the wake policy's topics ended
+	// when the operator decided to park the job for being idle, read before
+	// the savepoint was asked for. The wake policy counts what was produced
+	// after it. Cleared when the job runs again, and when it does work before
+	// the park begins.
+	WakeBaseline []PartitionOffset `json:"wakeBaseline,omitempty"`
 	// ActivityCount is the last observed sum of per-operator records_in for
 	// the running job; LastActivityTime is when it last changed. Together
 	// they drive suspendPolicy.idleAfterSeconds.

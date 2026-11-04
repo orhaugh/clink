@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**A job parked for being idle wakes for what arrives after it parked, not for
+what it had already read.** The operator's Kafka lag wake measured a parked
+job's lag against its consumer group's committed offsets, and counted a
+partition the group had never committed from its start. clink's Kafka source
+commits nothing to its group: its checkpoints are the only record of where it
+has read to. So for any clink job that had read its topic, the lag at the
+first poll after an idle park was everything the topic held, and the job woke
+at once, went idle and parked again, cycling at the idle window. The suspend
+smoke could not see it: its wake topic was one the job did not read, empty when
+the policy was added. Found while adding a scale-to-zero scene to the playback
+showcase. When it parks a job for being idle, the operator now first records
+where each partition of the wake topics ends, in `status.wakeBaseline`, in a
+status update of its own before it asks for the savepoint, and the lag counts
+from there; without a baseline it counts as before. Covered by
+`TestAnIdleParkCountsTheWakeLagFromWhereTheTopicsEnded` and
+`TestAParkedJobsLagCountsFromWhereItsTopicsEndedWhenItParked`, which fail
+against the previous lag, and by the suspend smoke, whose wake topic now holds
+ten records when the job parks.
+
 **A job restored from a checkpoint holds its watermark at the slowest partition
 it was waiting for.** The partition-aware watermark strategy takes the min over
 the partitions it has seen, and a restored assigner had seen none: the first

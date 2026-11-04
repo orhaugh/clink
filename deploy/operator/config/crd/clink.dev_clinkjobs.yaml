@@ -155,8 +155,8 @@ spec:
                         type: string
                       groupId:
                         description: |-
-                          GroupID whose committed offsets define the lag baseline - the group
-                          the job's Kafka source consumes with.
+                          GroupID is the group the job's Kafka source consumes with. Its
+                          committed offsets count where no baseline was recorded at the park.
                         type: string
                       lagThreshold:
                         default: 1
@@ -298,6 +298,31 @@ spec:
                   retried resubmit does not re-take a savepoint on the already-cancelled
                   job. Cleared when the new job reaches Running.
                 type: string
+              wakeBaseline:
+                description: |-
+                  WakeBaseline is where each partition of the wake policy's topics ended
+                  when the operator decided to park the job for being idle, read before
+                  the savepoint was asked for. The wake policy counts what was produced
+                  after it. Cleared when the job runs again, and when it does work before
+                  the park begins.
+                items:
+                  description: PartitionOffset is an offset in one partition of a
+                    topic.
+                  properties:
+                    offset:
+                      format: int64
+                      type: integer
+                    partition:
+                      format: int32
+                      type: integer
+                    topic:
+                      type: string
+                  required:
+                  - offset
+                  - partition
+                  - topic
+                  type: object
+                type: array
             type: object
         type: object
     served: true
