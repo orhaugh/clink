@@ -166,6 +166,26 @@ Typed C++ pipelines (the fluent `Pipeline` / `DataStream<T>` API, keyed
 process functions, windows, joins, CEP) are documented with runnable
 programs under [docs/consumer-examples/](docs/consumer-examples/).
 
+## Showcases
+
+Seven open-source applications built on clink, each in a real domain, each run
+on one machine against real systems in Docker, and each checked the same way: a
+deterministic tape, failures injected on purpose, and an independent checker
+that works out from the tape alone what every output must hold.
+
+| Showcase | The application | What it shows |
+|---|---|---|
+| [market-pulse](https://orhaugh.github.io/clink/showcases/market-pulse/) | Market data: price bars, spreads, patterns, a mistyped print | Eight SQL scenes in one process, Python, the same SQL on a cluster; state read after the job stops; incidents replayed byte for byte |
+| [card-sentry](https://orhaugh.github.io/clink/showcases/card-sentry/) | Card fraud detection and response | C++ pattern detectors; alerts exactly once into PostgreSQL and Kafka through a Worker kill; the run checked against the exactly-once specification |
+| [grounded](https://orhaugh.github.io/clink/showcases/grounded/) | Retrieval for an operations assistant | `ML_PREDICT` and filtered `VECTOR_SEARCH` in SQL, a live index, every retrieval replayable |
+| [transfer-sentry](https://orhaugh.github.io/clink/showcases/transfer-sentry/) | Fraud detection on a transaction graph in Neo4j | Seven SQL jobs keep the graph, check each event against it and decide every transfer, with no reader ever running ahead of the writer |
+| [half-time](https://orhaugh.github.io/clink/showcases/half-time/) | A delivery platform on the night of a final | Nineteen jobs over fifteen systems through a Worker kill, a live rescale, a savepoint and a Coordinator failover, every store checked |
+| [coldchain](https://orhaugh.github.io/clink/showcases/coldchain/) | Refrigerated freight monitoring | The typed C++ API with no SQL; one graph definition in one process and on a cluster, with the same answers |
+| [playhead](https://orhaugh.github.io/clink/showcases/playhead/) | Video playback analytics on Kubernetes | The operator on a secured, highly available cluster; exactly-once output to Iceberg, Kafka, GCS and Azure through an upgrade, a Worker kill and a failover |
+
+What each one does, where clink does the work and what a run proves:
+[Showcases](https://orhaugh.github.io/clink/showcases/).
+
 ## Production qualification
 
 Benchmarks say how fast an engine is; they say nothing about whether its
@@ -290,24 +310,8 @@ Everything below is published at
   into a graph through the Neo4j sink, with a windowed fan-in indicator enriched
   from reference device relationships through the Neo4j lookup, a
   Worker kill and an independent check of the graph.
-- [half-time](https://github.com/orhaugh/half-time): a delivery platform on
-  the night of a world final, as eighteen SQL jobs over fifteen systems on
-  one machine, with a Worker kill, a savepoint, a Coordinator failover and
-  a check that holds every store to a model of the night; the flight
-  recorder on a job, and what it found.
-- [coldchain](https://github.com/orhaugh/coldchain): refrigerated freight
-  monitoring on the typed C++ API with no SQL: a state machine per container
-  in event time, a cached asynchronous lookup of each cargo's specification, a
-  fleet seeded from a savepoint written offline, and the same alerts in one
-  process and on a cluster, each run checked against an independent fold of
-  the tape.
-- [playhead](https://github.com/orhaugh/playhead): a video service's playback
-  analytics on Kubernetes, run by the clink operator on a cluster with two
-  Coordinators, an API token and mutual TLS. Four SQL jobs read Avro and
-  Protobuf through a Schema Registry and write exactly once to Iceberg on S3,
-  Kafka, GCS and Azure through an upgrade at a savepoint, a Worker kill and a
-  Coordinator failover; each run holds every output to the tape, checks that
-  its traces, metrics and lineage arrived, and measures its CPU and memory.
+- [Showcases](https://orhaugh.github.io/clink/showcases/): seven applications
+  built on clink, what each one shows and what a run proves.
 - [Runnable examples](docs/consumer-examples/): every core feature as a
   standalone buildable program, from hello-pipeline to the testing
   framework and state-as-data workflows.

@@ -28,6 +28,10 @@ If you are evaluating stream processing in C++, start with the focused guides:
 - [Clink vs Apache Flink](guides/clink-vs-flink.md)
 - [Arrow-native stream processing](guides/arrow-stream-processing.md)
 
+To see it in complete applications, the [showcases](showcases/index.md) are
+seven open-source projects built on clink, each checked against an independent
+model of what its outputs must hold.
+
 This site is the deep reference for the engine, organised in three layers:
 
 ## What it can do

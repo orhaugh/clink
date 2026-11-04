@@ -62,6 +62,7 @@ exclude_docs: |
   !/consumer-examples/
   !/qualification/
   !/posts/
+  !/showcases/
   !/assets/
   consumer-examples/build/
   consumer-examples/fetchcontent/build/
@@ -91,6 +92,15 @@ nav:
   - Home: index.md
   - Tutorials:
       - Your first real Clink pipeline: tutorials/kafka-to-clickhouse.md
+  - Showcases:
+      - showcases/index.md
+      - market-pulse: showcases/market-pulse.md
+      - card-sentry: showcases/card-sentry.md
+      - grounded: showcases/grounded.md
+      - transfer-sentry: showcases/transfer-sentry.md
+      - half-time: showcases/half-time.md
+      - coldchain: showcases/coldchain.md
+      - playhead: showcases/playhead.md
   - Posts:
       - "Three checks on exactly-once, and the bug all three missed": posts/checking-exactly-once.md
   - Guides:
