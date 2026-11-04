@@ -37,6 +37,7 @@ Start with the one closest to your problem.
 | A job upgraded through a savepoint | [half-time](half-time.md), [playhead](playhead.md) |
 | A running job rescaled | [half-time](half-time.md) |
 | Kubernetes and the operator | [playhead](playhead.md) |
+| A job scaled to zero and woken by new data | [playhead](playhead.md) |
 | Change data capture | [half-time](half-time.md), from PostgreSQL and MySQL |
 | Neo4j as a sink and a lookup | [transfer-sentry](transfer-sentry.md), [half-time](half-time.md) |
 | Cloud storage and table formats | [playhead](playhead.md) with Iceberg, GCS and Azure; [half-time](half-time.md) with Parquet and Delta |

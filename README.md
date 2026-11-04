@@ -181,7 +181,7 @@ that works out from the tape alone what every output must hold.
 | [transfer-sentry](https://orhaugh.github.io/clink/showcases/transfer-sentry/) | Fraud detection on a transaction graph in Neo4j | Seven SQL jobs keep the graph, check each event against it and decide every transfer, with no reader ever running ahead of the writer |
 | [half-time](https://orhaugh.github.io/clink/showcases/half-time/) | A delivery platform on the night of a final | Nineteen jobs over fifteen systems through a Worker kill, a live rescale, a savepoint and a Coordinator failover, every store checked |
 | [coldchain](https://orhaugh.github.io/clink/showcases/coldchain/) | Refrigerated freight monitoring | The typed C++ API with no SQL; one graph definition in one process and on a cluster, with the same answers |
-| [playhead](https://orhaugh.github.io/clink/showcases/playhead/) | Video playback analytics on Kubernetes | The operator on a secured, highly available cluster; exactly-once output to Iceberg, Kafka, GCS and Azure through an upgrade, a Worker kill and a failover |
+| [playhead](https://orhaugh.github.io/clink/showcases/playhead/) | Video playback analytics on Kubernetes | The operator on a secured, highly available cluster; exactly-once output to Iceberg, Kafka, GCS and Azure through an upgrade, a Worker kill and a failover; a job that scales to zero and wakes on new data |
 
 What each one does, where clink does the work and what a run proves:
 [Showcases](https://orhaugh.github.io/clink/showcases/).
