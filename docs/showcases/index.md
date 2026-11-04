@@ -66,6 +66,15 @@ They share one discipline, which is what makes their results worth reading.
    delivered. The checks must pass anyway: a store declared exactly once must
    hold nothing twice, and a store declared at least once is checked with its
    copies counted.
+5. **Every release candidate, before the tag.** Six of the seven run their
+   checks in CI on every push, against the clink they pin. Before a clink
+   release is tagged, the same CI runs against the release candidate
+   ([`scripts/check-showcases.sh`](https://github.com/orhaugh/clink/blob/main/scripts/check-showcases.sh)):
+   the SDK and runtime image the release would publish, or the candidate's
+   source where a showcase needs a connector the SDK leaves out. A showcase
+   that fails holds the release until the cause is fixed, in clink or in the
+   showcase. half-time, whose seventeen services outgrow a hosted runner, is
+   run by hand.
 
 Each showcase's page follows the same order: what the application does, where
 clink does the work, what a run proves, what is distinctive, and how to run it.
