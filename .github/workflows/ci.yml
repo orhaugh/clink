@@ -729,6 +729,15 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        # The search keeps its disk queue under /tmp, on the root disk, and some
+        # runner images leave too little of it: a run died after 36 minutes with
+        # "No space left on device". The same three directories as
+        # formal-mutants-accepted; the job uses none of them.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h /
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -739,7 +748,14 @@ jobs:
           path: ~/.clink-deps/formal-tools
           key: tla-tools-${{ hashFiles('formal/tools.env') }}
       - name: M_id_reuse is refuted
-        run: TLC_WORKERS=auto TLC_HEAP=10g ./scripts/formal-check.sh --mutants M_id_reuse
+        # No TLC checkpoints: each one copies the disk queue, and a search that
+        # fails is rerun from the start in any case.
+        run: |
+          TLC_WORKERS=auto TLC_HEAP=10g TLC_EXTRA="-checkpoint 0" \
+            ./scripts/formal-check.sh --mutants M_id_reuse
+      - name: Disk after the search
+        if: always()
+        run: df -h /
 
   trace-validation:
     name: Recorded protocol traces are behaviours of the specification
