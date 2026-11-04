@@ -62,6 +62,8 @@
 #include "clink/sql/parser.hpp"
 #include "clink/sql/physical_plan.hpp"
 
+#include "checkpoint_markers.hpp"
+
 using namespace clink;
 using namespace std::chrono_literals;
 
@@ -199,18 +201,13 @@ CompletedCheckpoint newest_completed(const std::filesystem::path& checkpoint_dir
     for (const auto& job : std::filesystem::directory_iterator(checkpoint_dir / "_jobs", ec)) {
         std::error_code inner;
         for (const auto& f : std::filesystem::directory_iterator(job.path(), inner)) {
-            const auto name = f.path().filename().string();
-            const std::string marker = "COMPLETED-";
-            if (name.rfind(marker, 0) != 0) {
+            const auto id =
+                clink::test_markers::marker_id(f.path().filename().string(), "COMPLETED-");
+            if (!id) {
                 continue;
             }
-            const auto digits = name.substr(marker.size());
-            if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
-                continue;
-            }
-            const auto id = std::stoull(digits);
-            if (id > out.id) {
-                out.id = id;
+            if (*id > out.id) {
+                out.id = *id;
                 out.marker_dir = job.path();
             }
         }

@@ -33,6 +33,7 @@
 #include "clink/kafka/txn_resume.hpp"
 #include "clink/runtime/network/connection.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_kafka.hpp"
 
@@ -76,14 +77,12 @@ std::uint64_t latest_marker(const std::filesystem::path& root, std::string_view 
         if (ec) {
             break;
         }
-        const auto name = entry.path().filename().string();
-        if (!entry.is_regular_file() || name.rfind(prefix, 0) != 0) {
+        if (!entry.is_regular_file()) {
             continue;
         }
-        try {
-            latest = std::max(latest,
-                              static_cast<std::uint64_t>(std::stoull(name.substr(prefix.size()))));
-        } catch (const std::exception&) {
+        if (const auto id =
+                clink::test_markers::marker_id(entry.path().filename().string(), prefix)) {
+            latest = std::max(latest, *id);
         }
     }
     return latest;
@@ -394,14 +393,16 @@ std::size_t receipts_above(const std::filesystem::path& checkpoint_root, std::ui
         const auto path = it->path();
         if (it->is_regular_file(entry_ec) && !entry_ec &&
             path.parent_path().filename() == "receipts") {
+            // A receipt is sub<subtask>-<checkpoint>. Its temp file, and the
+            // .unresolved marker the recovery walk puts beside it, carry more
+            // after the id and are no receipt.
             const auto name = path.filename().string();
             const auto dash = name.rfind('-');
             if (name.rfind("sub", 0) == 0 && dash != std::string::npos) {
-                try {
-                    if (std::stoull(name.substr(dash + 1)) > floor) {
-                        ++count;
-                    }
-                } catch (const std::exception&) {
+                const auto id =
+                    clink::test_markers::marker_id(std::string_view{name}.substr(dash + 1), "");
+                if (id && *id > floor) {
+                    ++count;
                 }
             }
         }

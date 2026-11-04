@@ -26,6 +26,7 @@
 
 #include "clink/state/checkpoint_integrity.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/two_pc_output.hpp"
 
@@ -75,21 +76,11 @@ std::uint64_t latest_completed(const std::filesystem::path& ckpt_root) {
         if (!e.is_regular_file()) {
             continue;
         }
-        const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0) {
+        const auto id = clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-");
+        if (!id) {
             continue;
         }
-        try {
-            // Explicit cast, not std::max(latest, std::stoull(...)): stoull
-            // returns unsigned long long, and std::uint64_t is unsigned long
-            // on Linux/gcc but unsigned long long on macOS. The two-arg
-            // std::max cannot deduce T from mismatched types, so this builds
-            // on macOS and fails on Linux - the exact typedef trap this
-            // repository has been bitten by before.
-            const auto id = static_cast<std::uint64_t>(std::stoull(name.substr(10)));
-            latest = std::max(latest, id);
-        } catch (const std::exception&) {
-        }
+        latest = std::max(latest, *id);
     }
     return latest;
 }

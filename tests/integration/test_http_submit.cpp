@@ -34,6 +34,7 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/await_port.hpp"
 
 extern char** environ;
@@ -513,9 +514,9 @@ TEST(HttpSubmit, ASavepointThatCancelsEndsTheJobAtTheSavepoint) {
         << http_get("127.0.0.1", port, "/api/v1/jobs/1").body;
     std::uint64_t newest = 0;
     for (const auto& entry : std::filesystem::directory_iterator(ckpt_dir / "_jobs" / "1")) {
-        const auto name = entry.path().filename().string();
-        if (name.starts_with("COMPLETED-")) {
-            newest = std::max<std::uint64_t>(newest, std::stoull(name.substr(10)));
+        if (const auto id =
+                clink::test_markers::marker_id(entry.path().filename().string(), "COMPLETED-")) {
+            newest = std::max<std::uint64_t>(newest, *id);
         }
     }
     EXPECT_EQ(newest, savepoint_id) << "a checkpoint completed after the savepoint";

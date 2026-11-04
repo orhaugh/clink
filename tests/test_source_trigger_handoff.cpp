@@ -37,6 +37,7 @@
 #include "clink/cluster/worker.hpp"
 #include "clink/fault/fault_injection.hpp"
 
+#include "checkpoint_markers.hpp"
 #include "tests/test_helpers/sanitizer_slack.hpp"
 
 using namespace clink;
@@ -91,16 +92,10 @@ std::set<std::uint64_t> handoff_completed_ids(const std::filesystem::path& ckpt)
     const auto dir = ckpt / "_jobs" / "1";
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        const auto name = entry.path().filename().string();
-        constexpr std::string_view kPrefix = "COMPLETED-";
-        if (name.rfind(kPrefix, 0) != 0) {
-            continue;
+        if (const auto id =
+                clink::test_markers::marker_id(entry.path().filename().string(), "COMPLETED-")) {
+            ids.insert(*id);
         }
-        const auto digits = name.substr(kPrefix.size());
-        if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
-            continue;
-        }
-        ids.insert(std::stoull(digits));
     }
     return ids;
 }

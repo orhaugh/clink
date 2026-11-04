@@ -56,6 +56,7 @@
 #include "clink/connectors/kafka_message.hpp"
 #include "clink/connectors/kafka_sink.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_clickhouse.hpp"
 #include "tests/integration/docker_kafka.hpp"
@@ -551,12 +552,9 @@ protected:
         std::error_code ec;
         const auto dir = cluster.checkpoint_dir() / "_jobs" / "1";
         for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-            const auto name = e.path().filename().string();
-            if (name.rfind("COMPLETED-", 0) == 0) {
-                try {
-                    latest = std::max<std::uint64_t>(latest, std::stoull(name.substr(10)));
-                } catch (const std::exception&) {
-                }
+            if (const auto id =
+                    clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-")) {
+                latest = std::max(latest, *id);
             }
         }
         return latest;

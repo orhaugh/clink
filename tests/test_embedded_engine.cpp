@@ -33,6 +33,8 @@
 #include "clink/sql/catalog.hpp"
 #include "clink/sql/script_runner.hpp"
 
+#include "checkpoint_markers.hpp"
+
 #ifdef CLINK_TESTS_HAVE_ROCKSDB
 #include "clink/rocksdb/install.hpp"
 #endif
@@ -889,9 +891,9 @@ std::uint64_t highest_completed_marker(const fs::path& ckpt) {
     std::uint64_t best = 0;
     std::error_code ec;
     for (const auto& e : fs::recursive_directory_iterator(ckpt / "_jobs", ec)) {
-        const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) == 0) {
-            best = std::max<std::uint64_t>(best, std::stoull(name.substr(10)));
+        if (const auto id =
+                clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-")) {
+            best = std::max(best, *id);
         }
     }
     return best;
@@ -995,7 +997,7 @@ JobMarkers job_markers(const fs::path& ckpt, int job) {
     JobMarkers out;
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(ckpt / "_jobs" / std::to_string(job), ec)) {
-        if (e.path().filename().string().rfind("COMPLETED-", 0) != 0) {
+        if (!clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-")) {
             continue;
         }
         ++out.completed;
@@ -1101,7 +1103,7 @@ TEST(EmbeddedEngine, AJobInterruptedBeforeStateWasNamespacedByJobResumes) {
     fs::rename(ckpt / "_state" / "1" / "v1", ckpt / "v1");
     fs::remove_all(ckpt / "_state");
     for (const auto& e : fs::directory_iterator(ckpt / "_jobs" / "1")) {
-        if (e.path().filename().string().rfind("COMPLETED-", 0) != 0) {
+        if (!clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-")) {
             continue;
         }
         std::ifstream in(e.path());

@@ -55,6 +55,7 @@
 #include "clink/cluster/job_planner.hpp"
 #include "clink/config/json.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/await_port.hpp"
 #include "tests/integration/cluster_harness.hpp"
 
@@ -1513,29 +1514,17 @@ protected:
     }
 
     // The newest COMPLETED-N marker of job 1 on disk, counted as a takeover
-    // counts them: the prefix, then the id, then nothing. A marker is published
-    // by renaming its temp file (<marker>.tmp.<pid>.<n>) into place, and
-    // from_chars reads "21.tmp.74715.0" as 21, so the test once took a
-    // checkpoint at the new layout for complete while its marker was still a
-    // temp file, killed the leader before the rename, and the takeover, which
-    // found no marker for it, rightly restored the checkpoint before the
-    // rescale.
+    // counts them (checkpoint_markers.hpp): this test once took a temp file for
+    // checkpoint 21's marker, killed the leader before the rename, and the
+    // takeover, finding no marker for 21, rightly restored checkpoint 20.
     static std::uint64_t newest_completed(Cluster& c) {
-        constexpr std::string_view prefix = "COMPLETED-";
         std::uint64_t newest = 0;
         std::error_code ec;
         for (const auto& e :
              std::filesystem::directory_iterator(c.checkpoint_dir() / "_jobs" / "1", ec)) {
-            const auto name = e.path().filename().string();
-            if (name.rfind(prefix, 0) != 0) {
-                continue;
-            }
-            std::uint64_t id = 0;
-            const auto* first = name.data() + prefix.size();
-            const auto* last = name.data() + name.size();
-            if (const auto [end, err] = std::from_chars(first, last, id);
-                err == std::errc{} && end == last) {
-                newest = std::max(newest, id);
+            if (const auto id =
+                    clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-")) {
+                newest = std::max(newest, *id);
             }
         }
         return newest;

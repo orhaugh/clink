@@ -43,6 +43,7 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/await_port.hpp"
 
 extern char** environ;
@@ -208,7 +209,8 @@ bool any_completed_marker(const std::filesystem::path& ckpt_dir) {
         if (ec) {
             return false;
         }
-        if (entry.is_regular_file() && entry.path().filename().string().starts_with("COMPLETED-")) {
+        if (entry.is_regular_file() &&
+            clink::test_markers::marker_id(entry.path().filename().string(), "COMPLETED-")) {
             return true;
         }
     }

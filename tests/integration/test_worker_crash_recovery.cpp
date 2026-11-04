@@ -26,6 +26,7 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/await_port.hpp"
 
 extern char** environ;
@@ -141,21 +142,11 @@ std::uint64_t latest_completed_checkpoint(const std::filesystem::path& ckpt_dir)
         if (!e.is_regular_file()) {
             continue;
         }
-        const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0) {
+        const auto id = clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-");
+        if (!id) {
             continue;
         }
-        try {
-            // Explicit cast rather than the two-arg std::max: stoull returns
-            // unsigned long long, and std::uint64_t is unsigned long on
-            // Linux/gcc, so max() cannot deduce T from the mismatched pair.
-            const auto id = static_cast<std::uint64_t>(
-                std::stoull(name.substr(std::string{"COMPLETED-"}.size())));
-            if (id > latest) {
-                latest = id;
-            }
-        } catch (const std::exception&) {
-        }
+        latest = std::max(latest, *id);
     }
     return latest;
 }

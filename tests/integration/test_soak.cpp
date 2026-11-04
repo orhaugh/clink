@@ -44,6 +44,7 @@
 #include "clink/cluster/job_graph.hpp"
 #include "clink/core/types.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/cluster_harness.hpp"
 
 using namespace std::chrono_literals;
@@ -103,14 +104,11 @@ std::uint64_t soak_latest_completed(const std::filesystem::path& ckpt_root) {
         if (!e.is_regular_file()) {
             continue;
         }
-        const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0) {
+        const auto id = clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-");
+        if (!id) {
             continue;
         }
-        try {
-            latest = std::max(latest, static_cast<std::uint64_t>(std::stoull(name.substr(10))));
-        } catch (const std::exception&) {
-        }
+        latest = std::max(latest, *id);
     }
     return latest;
 }

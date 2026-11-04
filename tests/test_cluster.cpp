@@ -47,6 +47,7 @@
 #include "clink/runtime/network/network_bridge.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "checkpoint_markers.hpp"
 #include "tests/test_helpers/sanitizer_slack.hpp"
 
 using namespace clink;
@@ -2648,12 +2649,9 @@ std::uint64_t clink_latest_completed_marker(const std::filesystem::path& dir) {
         if (!e.is_regular_file()) {
             continue;
         }
-        const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) == 0) {
-            try {
-                latest = std::max<std::uint64_t>(latest, std::stoull(name.substr(10)));
-            } catch (...) {
-            }
+        if (const auto id =
+                clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-")) {
+            latest = std::max(latest, *id);
         }
     }
     return latest;
@@ -2733,14 +2731,8 @@ std::uint64_t clink_latest_marker(const std::filesystem::path& ckpt_dir,
         return 0;
     }
     for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-        const auto name = e.path().filename().string();
-        if (name.rfind(prefix, 0) != 0) {
-            continue;
-        }
-        try {
-            latest = std::max(latest,
-                              static_cast<std::uint64_t>(std::stoull(name.substr(prefix.size()))));
-        } catch (...) {
+        if (const auto id = clink::test_markers::marker_id(e.path().filename().string(), prefix)) {
+            latest = std::max(latest, *id);
         }
     }
     return latest;
@@ -3222,7 +3214,7 @@ TEST(Cluster, ACheckpointWrittenBeforeStateWasNamespacedByJobRestores) {
         std::filesystem::rename(ckpt / "_state" / std::to_string(run1.job_id) / "v1", ckpt / "v1");
         std::filesystem::remove_all(ckpt / "_state");
         for (const auto& e : std::filesystem::directory_iterator(jobs)) {
-            if (e.path().filename().string().rfind("COMPLETED-", 0) != 0) {
+            if (!clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-")) {
                 continue;
             }
             std::string body;

@@ -37,6 +37,7 @@
 #include "clink/core/codec.hpp"
 #include "clink/runtime/network/network_channel.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/await_port.hpp"
 
 extern char** environ;
@@ -948,13 +949,9 @@ TEST(PluginSubmission, CheckpointAndRestoreAcrossJobRuns) {
             if (!entry.is_regular_file()) {
                 continue;
             }
-            const auto fname = entry.path().filename().string();
-            if (fname.rfind("COMPLETED-", 0) == 0) {
-                try {
-                    const auto id = static_cast<std::uint64_t>(std::stoull(fname.substr(10)));
-                    completed_id = std::max<std::uint64_t>(completed_id, id);
-                } catch (...) {
-                }
+            if (const auto id = clink::test_markers::marker_id(entry.path().filename().string(),
+                                                               "COMPLETED-")) {
+                completed_id = std::max<std::uint64_t>(completed_id, *id);
             }
         }
     }

@@ -67,6 +67,8 @@
 
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "../checkpoint_markers.hpp"
+
 extern char** environ;
 
 namespace clink::itest {
@@ -856,13 +858,10 @@ public:
                     return false;
                 }
                 for (const auto& e : std::filesystem::directory_iterator(job_dir, ec)) {
-                    const auto name = e.path().filename().string();
-                    if (name.rfind("COMPLETED-", 0) == 0) {
-                        try {
-                            found = std::stoull(name.substr(10));
-                            return true;
-                        } catch (const std::exception&) {
-                        }
+                    if (const auto id = clink::test_markers::marker_id(e.path().filename().string(),
+                                                                       "COMPLETED-")) {
+                        found = *id;
+                        return true;
                     }
                 }
                 return false;

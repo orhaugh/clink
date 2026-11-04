@@ -61,6 +61,7 @@
 #include "clink/http_connector/http_request.hpp"
 #include "clink/kafka/consume_all.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_command.hpp"
 #include "tests/integration/docker_kafka.hpp"
@@ -405,12 +406,9 @@ protected:
         std::error_code ec;
         for (const auto& e :
              std::filesystem::directory_iterator(cluster.checkpoint_dir() / "_jobs" / "1", ec)) {
-            const auto name = e.path().filename().string();
-            if (name.rfind("COMPLETED-", 0) == 0) {
-                try {
-                    latest = std::max<std::uint64_t>(latest, std::stoull(name.substr(10)));
-                } catch (const std::exception&) {
-                }
+            if (const auto id =
+                    clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-")) {
+                latest = std::max(latest, *id);
             }
         }
         return latest;

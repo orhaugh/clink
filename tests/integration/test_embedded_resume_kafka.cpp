@@ -28,6 +28,7 @@
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/connectors/kafka_source.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_kafka.hpp"
 
@@ -56,13 +57,9 @@ std::uint64_t latest_completed(const fs::path& root) {
     std::uint64_t latest = 0;
     std::error_code ec;
     for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
-        const auto name = entry.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0) {
-            continue;
-        }
-        try {
-            latest = std::max<std::uint64_t>(latest, std::stoull(name.substr(10)));
-        } catch (const std::exception&) {
+        if (const auto id =
+                clink::test_markers::marker_id(entry.path().filename().string(), "COMPLETED-")) {
+            latest = std::max<std::uint64_t>(latest, *id);
         }
     }
     return latest;

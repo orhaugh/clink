@@ -36,6 +36,7 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/await_port.hpp"
 #include "tests/integration/two_pc_output.hpp"
 
@@ -151,16 +152,11 @@ std::uint64_t latest_completed_checkpoint(const std::filesystem::path& ckpt_dir,
         }
         if (!e.is_regular_file())
             continue;
-        const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0)
+        const auto id = clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-");
+        if (!id)
             continue;
-        try {
-            const auto id = static_cast<std::uint64_t>(
-                std::stoull(name.substr(std::string{"COMPLETED-"}.size())));
-            if (id > latest)
-                latest = id;
-        } catch (const std::exception&) {
-        }
+        if (*id > latest)
+            latest = *id;
     }
     return latest;
 }

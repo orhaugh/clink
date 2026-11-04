@@ -54,6 +54,7 @@
 
 #include "clink/state/checkpoint_integrity.hpp"
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/two_pc_output.hpp"
 
@@ -148,14 +149,9 @@ std::uint64_t latest_completed(const std::filesystem::path& ckpt_root) {
         if (ec) {
             break;
         }
-        const auto name = it->path().filename().string();
-        if (name.rfind("COMPLETED-", 0) == 0) {
-            // Explicit cast: strtoull returns unsigned long long, and under
-            // GCC uint64_t is unsigned long - different types, so the bare
-            // std::max fails deduction there (compiles fine on Apple clang,
-            // where the two coincide).
-            best = std::max(
-                best, static_cast<std::uint64_t>(std::strtoull(name.c_str() + 10, nullptr, 10)));
+        if (const auto id =
+                clink::test_markers::marker_id(it->path().filename().string(), "COMPLETED-")) {
+            best = std::max(best, *id);
         }
     }
     return best;

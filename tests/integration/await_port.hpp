@@ -39,6 +39,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include "../checkpoint_markers.hpp"
+
 extern "C" char** environ;
 
 namespace clink::itest {
@@ -321,7 +323,7 @@ inline pid_t spawn_logged(const std::vector<std::string>& argv,
                 continue;
             }
             const auto name = marker.path().filename().string();
-            if (!name.starts_with("COMPLETED-")) {
+            if (!clink::test_markers::marker_id(name, "COMPLETED-")) {
                 continue;
             }
             std::ifstream in(marker.path());

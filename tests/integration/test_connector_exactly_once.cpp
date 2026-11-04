@@ -32,6 +32,7 @@
 
 #include <gtest/gtest.h>
 
+#include "../checkpoint_markers.hpp"
 #include "tests/integration/cluster_harness.hpp"
 #include "tests/integration/docker_kafka.hpp"
 #include "tests/integration/docker_minio.hpp"
@@ -126,15 +127,11 @@ std::uint64_t latest_completed(const std::filesystem::path& ckpt_root) {
         if (!e.is_regular_file()) {
             continue;
         }
-        const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0) {
+        const auto id = clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-");
+        if (!id) {
             continue;
         }
-        try {
-            const auto id = static_cast<std::uint64_t>(std::stoull(name.substr(10)));
-            latest = std::max(latest, id);
-        } catch (const std::exception&) {
-        }
+        latest = std::max(latest, *id);
     }
     return latest;
 }
@@ -153,15 +150,11 @@ std::uint64_t latest_confirmed(const std::filesystem::path& ckpt_root) {
         if (!e.is_regular_file()) {
             continue;
         }
-        const auto name = e.path().filename().string();
-        if (name.rfind("CONFIRMED-", 0) != 0) {
+        const auto id = clink::test_markers::marker_id(e.path().filename().string(), "CONFIRMED-");
+        if (!id) {
             continue;
         }
-        try {
-            const auto id = static_cast<std::uint64_t>(std::stoull(name.substr(10)));
-            latest = std::max(latest, id);
-        } catch (const std::exception&) {
-        }
+        latest = std::max(latest, *id);
     }
     return latest;
 }

@@ -50,6 +50,8 @@
 #include "clink/runtime/network/network_channel.hpp"
 #include "clink/runtime/network/network_socket.hpp"
 
+#include "../checkpoint_markers.hpp"
+
 extern char** environ;
 
 namespace {
@@ -224,15 +226,11 @@ std::uint64_t latest_completed_checkpoint(const fs::path& ckpt_dir) {
         if (!e.is_regular_file()) {
             continue;
         }
-        const auto name = e.path().filename().string();
-        if (name.rfind("COMPLETED-", 0) != 0) {
+        const auto id = clink::test_markers::marker_id(e.path().filename().string(), "COMPLETED-");
+        if (!id) {
             continue;
         }
-        try {
-            const std::uint64_t id = std::stoull(name.substr(std::string{"COMPLETED-"}.size()));
-            latest = std::max(latest, id);
-        } catch (...) {
-        }
+        latest = std::max(latest, *id);
     }
     return latest;
 }
