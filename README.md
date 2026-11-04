@@ -301,6 +301,13 @@ Everything below is published at
   fleet seeded from a savepoint written offline, and the same alerts in one
   process and on a cluster, each run checked against an independent fold of
   the tape.
+- [playhead](https://github.com/orhaugh/playhead): a video service's playback
+  analytics on Kubernetes, run by the clink operator on a cluster with two
+  Coordinators, an API token and mutual TLS. Four SQL jobs read Avro and
+  Protobuf through a Schema Registry and write exactly once to Iceberg on S3,
+  Kafka, GCS and Azure through an upgrade at a savepoint, a Worker kill and a
+  Coordinator failover; each run holds every output to the tape, checks that
+  its traces, metrics and lineage arrived, and measures its CPU and memory.
 - [Runnable examples](docs/consumer-examples/): every core feature as a
   standalone buildable program, from hello-pipeline to the testing
   framework and state-as-data workflows.
