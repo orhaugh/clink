@@ -107,6 +107,9 @@ jobs:
           scripts/ack-sources-live.sh build 2>&1 | tee "${RUNNER_TEMP}/ack-sources-gate.log"
 
       - name: Keep the reports
+        # Each suite's googletest report and output, provenance.txt (the commit,
+        # the build's configuration, each broker's image) and, on failure, the
+        # brokers' logs.
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -115,4 +118,6 @@ jobs:
             ${{ runner.temp }}/ack-sources-live-reports/**
             ${{ runner.temp }}/ack-sources-gate.log
           if-no-files-found: warn
-          retention-days: 14
+          # The evidence the connector maturity table cites: kept as long as
+          # GitHub keeps an artifact of a public repository.
+          retention-days: 90

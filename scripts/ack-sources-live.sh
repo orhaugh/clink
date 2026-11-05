@@ -23,6 +23,11 @@
 # a suite that ran fewer cases than it should. A missing binary, a service that
 # never answers and a failed case fail it too.
 #
+# REPORT_DIR keeps each suite's report and output, provenance.txt (the commit,
+# whether the tree was clean, the build's configuration and each broker's
+# image) and, on failure, the broker's log. Nothing records the environment, so
+# no credential reaches it; the test brokers' are fixed test values anyway.
+#
 # Knobs:
 #   BUILD_DIR   the build to take the binaries from (argument or default build/)
 #   REPORT_DIR  where the reports and, on failure, the service logs go (default
@@ -63,9 +68,19 @@ for b in REDIS_BIN HTTP_BIN RABBITMQ_BIN NATS_BIN PULSAR_BIN MQTT_BIN; do
 done
 
 mkdir -p "${REPORT_DIR}"
-rm -f "${REPORT_DIR}"/*.json "${REPORT_DIR}"/*.log
+rm -f "${REPORT_DIR}"/*.json "${REPORT_DIR}"/*.log "${REPORT_DIR}/provenance.txt"
 # The toolchain image's user is not the runner's; let either write here.
 chmod a+rwx "${REPORT_DIR}"
+{
+    echo "commit: $(git -C "${ROOT}" rev-parse HEAD)"
+    echo "tree: $( [ -z "$(git -C "${ROOT}" status --porcelain --untracked-files=no)" ] && echo clean || echo "modified tracked files")"
+    echo "build dir: ${BUILD_DIR}"
+    for key in CMAKE_BUILD_TYPE CLINK_WITH_REDIS CLINK_WITH_HTTP CLINK_WITH_RABBITMQ \
+        CLINK_WITH_NATS CLINK_WITH_PULSAR CLINK_WITH_MQTT; do
+        grep -E "^${key}:" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null || echo "${key}: (unset)"
+    done
+    echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >"${REPORT_DIR}/provenance.txt"
 
 status=0
 container=""
@@ -95,6 +110,8 @@ start() {  # <compose service> <container port>...
         publish+=(-p "127.0.0.1::${p}")
     done
     "${COMPOSE[@]}" run -d --name "${container}" "${publish[@]}" "${service}" >/dev/null
+    echo "${service}: $(docker inspect --format '{{.Config.Image}} {{.Image}}' "${container}")" \
+        >>"${REPORT_DIR}/provenance.txt"
 }
 
 port_of() {  # <container port>
@@ -199,4 +216,5 @@ python3 "${ROOT}/scripts/check-gtest-reports.py" \
     --expect 'MqttLive.*=5' \
     --expect 'MqttSourceAckLive.*=8' \
     "${REPORT_DIR}"/{redis,pubsub,rabbitmq,nats,pulsar,mqtt}.json || status=1
+echo "finished: $(date -u +%Y-%m-%dT%H:%M:%SZ) status=${status}" >>"${REPORT_DIR}/provenance.txt"
 exit "${status}"
