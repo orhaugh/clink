@@ -46,7 +46,9 @@ TEST(SourceCapabilityRecord, TheSourceAcknowledgesAtCheckpointCompletion) {
     EXPECT_TRUE(caps->checkpoint_integrated);
     EXPECT_TRUE(caps->self_check().empty());
     EXPECT_FALSE(caps->scale_down_refusal.empty());
-    EXPECT_EQ(clink::cluster::source_scale_down_refusal("redis_source"), caps->scale_down_refusal)
+    EXPECT_TRUE(caps->scale_down_refusal_param.empty()) << "the refusal holds in every mode";
+    EXPECT_EQ(clink::cluster::source_scale_down_refusal("redis_source", {}),
+              caps->scale_down_refusal)
         << "the coordinator would not refuse a scale-down of the source";
 }
 

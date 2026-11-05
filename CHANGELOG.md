@@ -15,8 +15,14 @@ requires. An acknowledgement goes out only on the connection its message
 arrived on, and an aborted checkpoint reconnects: MQTT has no negative
 acknowledgement, and only a new connection makes the broker deliver again.
 `MqttSourceAckLive` gets every message back in each of those cases. The source
-has its own record, `mqtt_source`, now at-least-once and refusing a
-scale-down, and the sink, still on libmosquitto, keeps `mqtt`.
+has its own record, `mqtt_source`, now at-least-once, and the sink, still on
+libmosquitto, keeps `mqtt`. With `shared_group` set the source refuses a
+scale-down, since a removed subtask's session keeps what it holds; without it
+only subtask 0 subscribes, and a scale-down goes ahead. A record names the
+operator parameter its refusal depends on in `scale_down_refusal_param`, and
+the coordinator judges the operator's own parameters, as
+`SourceAckHooks.ACoordinatorRefusesAScaleDownTheSourcesRecordRulesOut` now
+checks.
 
 **The MQTT source speaks MQTT 5 unless told otherwise, and states how much
 one checkpoint can read.** With acknowledgements held, the session's in-flight

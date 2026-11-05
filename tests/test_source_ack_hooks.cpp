@@ -26,6 +26,7 @@
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/coordinator.hpp"
+#include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/runner_registry.hpp"
@@ -429,7 +430,10 @@ TEST(SourceAckHooks, ACheckpointThatNeverCompletesHasNoRecordAcknowledged) {
 // source's does: a removed subtask's consumer keeps its pending entries) is
 // refused a lower parallelism by the coordinator, with the record's reason,
 // before anything drains. The record here is a stand-in, declared for the probe
-// and removed again, so the test needs no Redis.
+// and removed again, so the test needs no Redis. It names the operator
+// parameter the refusal depends on, as the MQTT source's names shared_group,
+// and the operator sets it: the coordinator judges the operator's own
+// parameters.
 TEST(SourceAckHooks, ACoordinatorRefusesAScaleDownTheSourcesRecordRulesOut) {
     register_probe();
     probe().reset();
@@ -445,6 +449,7 @@ TEST(SourceAckHooks, ACoordinatorRefusesAScaleDownTheSourcesRecordRulesOut) {
             .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
             .scale_down_refusal =
                 "each subtask owns state on the broker that no other subtask reads",
+            .scale_down_refusal_param = "owns_state",
         });
     struct Undeclare {
         ~Undeclare() { clink::connectors::CapabilityRegistry::instance().undeclare("ack_probe"); }
@@ -456,6 +461,7 @@ TEST(SourceAckHooks, ACoordinatorRefusesAScaleDownTheSourcesRecordRulesOut) {
     g.ops[0].parallelism = 2;
     g.ops[0].min_parallelism = 1;
     g.ops[0].max_parallelism = 4;
+    g.ops[0].params["owns_state"] = "yes";
     CheckpointConfig ckpt;
     ckpt.checkpoint_dir = (root / "ckpt").string();
     ckpt.interval_ms = 100;
@@ -476,6 +482,44 @@ TEST(SourceAckHooks, ACoordinatorRefusesAScaleDownTheSourcesRecordRulesOut) {
     ASSERT_TRUE(c.coordinator.cancel_job(job).ok);
     ASSERT_TRUE(c.coordinator.await_job_completion(job, clink::test_support::scale_slack(30s)));
     std::filesystem::remove_all(root);
+}
+
+// A refusal that names a parameter holds only where the operator gives that
+// parameter a value; one that names none holds in every mode. A record that
+// names a parameter but refuses nothing is a mistake in the record.
+TEST(SourceAckHooks, ARefusalNamingAParameterHoldsOnlyWhereTheOperatorSetsIt) {
+    auto& reg = clink::connectors::CapabilityRegistry::instance();
+    clink::connectors::ConnectorCapabilities rec{
+        .name = "ack_probe",
+        .version = "1",
+        .is_source = true,
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::Acknowledgement,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .scale_down_refusal = "each subtask owns state on the broker that no other subtask reads",
+        .scale_down_refusal_param = "owns_state",
+    };
+    EXPECT_TRUE(rec.self_check().empty());
+    reg.declare(rec);
+    struct Undeclare {
+        ~Undeclare() { clink::connectors::CapabilityRegistry::instance().undeclare("ack_probe"); }
+    } undeclare;
+    using clink::cluster::source_scale_down_refusal;
+    EXPECT_EQ(source_scale_down_refusal("ack_probe", {{"owns_state", "yes"}}),
+              rec.scale_down_refusal);
+    EXPECT_EQ(source_scale_down_refusal("ack_probe", {}), "");
+    EXPECT_EQ(source_scale_down_refusal("ack_probe", {{"owns_state", ""}}), "");
+
+    rec.scale_down_refusal_param.clear();
+    reg.undeclare("ack_probe");
+    reg.declare(rec);
+    EXPECT_EQ(source_scale_down_refusal("ack_probe", {}), rec.scale_down_refusal);
+
+    rec.scale_down_refusal.clear();
+    rec.scale_down_refusal_param = "owns_state";
+    EXPECT_FALSE(rec.self_check().empty())
+        << "a record naming the parameter of a refusal it does not have passed its self-check";
 }
 
 }  // namespace

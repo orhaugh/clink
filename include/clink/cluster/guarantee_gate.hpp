@@ -27,6 +27,7 @@
 // submitter ASKED for something stronger than the pipeline can provide.
 // Everything else is reported, logged, and allowed.
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -66,9 +67,12 @@ namespace clink::cluster {
 // newest CONFIRMED checkpoint instead of the newest COMPLETED one.
 [[nodiscard]] bool op_type_needs_commit_confirmation(const std::string& op_type);
 
-// Why a source of this op type cannot be rescaled to fewer subtasks: its
-// capability record's scale_down_refusal. Empty when nothing refuses it,
-// including for an op type no record describes.
-[[nodiscard]] std::string source_scale_down_refusal(const std::string& op_type);
+// Why a source of this op type, with these operator parameters, cannot be
+// rescaled to fewer subtasks: its capability record's scale_down_refusal, when
+// the record names no scale_down_refusal_param or the parameters give that one
+// a non-empty value. Empty when nothing refuses it, including for an op type no
+// record describes.
+[[nodiscard]] std::string source_scale_down_refusal(
+    const std::string& op_type, const std::map<std::string, std::string>& params);
 
 }  // namespace clink::cluster

@@ -180,7 +180,8 @@ bool op_type_needs_commit_confirmation(const std::string& op_type) {
     return exactly_once && !rec->commit_recoverable;
 }
 
-std::string source_scale_down_refusal(const std::string& op_type) {
+std::string source_scale_down_refusal(const std::string& op_type,
+                                      const std::map<std::string, std::string>& params) {
     const auto name = connector_name_for_op_type(op_type);
     if (name.empty()) {
         return {};
@@ -188,6 +189,12 @@ std::string source_scale_down_refusal(const std::string& op_type) {
     const auto* rec = connectors::CapabilityRegistry::instance().find(name);
     if (rec == nullptr || !rec->is_source) {
         return {};
+    }
+    if (!rec->scale_down_refusal_param.empty()) {
+        const auto it = params.find(rec->scale_down_refusal_param);
+        if (it == params.end() || it->second.empty()) {
+            return {};
+        }
     }
     return rec->scale_down_refusal;
 }

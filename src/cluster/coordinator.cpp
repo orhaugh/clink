@@ -3636,7 +3636,8 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
         // subtasks: a removed Redis Streams consumer keeps its pending entries,
         // and no remaining subtask reads them. Its capability record says why.
         if (new_parallelism < old_parallelism && op_it->inputs.empty()) {
-            if (const auto why = source_scale_down_refusal(op_it->type); !why.empty()) {
+            if (const auto why = source_scale_down_refusal(op_it->type, op_it->params);
+                !why.empty()) {
                 return refuse("operator '" + op_id + "' (" + op_it->type +
                               ") cannot be rescaled below parallelism " +
                               std::to_string(old_parallelism) + ": " + why);

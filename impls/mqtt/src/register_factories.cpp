@@ -126,12 +126,16 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "not persist sessions restarted) takes what it held unacknowledged "
                         "with it",
                         "only subtask 0 subscribes unless shared_group is set",
-                        "the source cannot be rescaled to fewer subtasks"},
+                        "with shared_group set, the source cannot be rescaled to fewer "
+                        "subtasks"},
+        // Without shared_group only subtask 0 subscribes, and the subtasks a
+        // scale-down removes hold no session.
         .scale_down_refusal =
-            "an MQTT source subtask holds a persistent session, and the session of a removed "
-            "subtask keeps the messages it holds unacknowledged; with shared_group set no "
-            "remaining subtask receives them, and the broker may keep them until the session "
-            "expires, which by default is never",
+            "each subtask of a shared subscription holds a persistent session, and the session "
+            "of a removed subtask keeps the messages it holds unacknowledged, which no remaining "
+            "subtask receives; the broker may keep them until the session expires, which by "
+            "default is never",
+        .scale_down_refusal_param = "shared_group",
     });
 
     using clink::plugin::BuildContext;

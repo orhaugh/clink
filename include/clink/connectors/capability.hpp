@@ -168,6 +168,11 @@ struct ConnectorCapabilities {
     // and its pending entries) would strand a removed subtask's share. The
     // coordinator refuses such a rescale with this reason.
     std::string scale_down_refusal;
+    // When set, the refusal holds only for an operator whose parameters give
+    // this one a non-empty value: the mode in which its subtasks own that state.
+    // The MQTT source names shared_group; without one, only subtask 0
+    // subscribes, and a scale-down strands nothing.
+    std::string scale_down_refusal_param;
 
     // Options the connector requires when `delivery` is one of the
     // exactly-once levels. Checked at validation time.

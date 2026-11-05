@@ -30,8 +30,8 @@ TEST(MqttFactoryRegistration, SourceIsRegistered) {
 
 // The source and the sink carry different guarantees, so each has a record.
 // The source acknowledges a message once a completed checkpoint covers it and
-// keeps no position, so its record is the acknowledging sources' at-least-once;
-// its sessions refuse a scale-down. The sink keeps its own at-least-once.
+// keeps no position, so its record is the acknowledging sources' at-least-once.
+// The sink keeps its own at-least-once.
 TEST(MqttCapabilityRecords, TheSourceDeclaresWhatItDoesAndTheSinkKeepsItsOwn) {
     const auto& reg = clink::connectors::CapabilityRegistry::instance();
     const auto* source = reg.find("mqtt_source");
@@ -43,9 +43,6 @@ TEST(MqttCapabilityRecords, TheSourceDeclaresWhatItDoesAndTheSinkKeepsItsOwn) {
     EXPECT_EQ(source->offset_model, clink::connectors::OffsetModel::Acknowledgement);
     EXPECT_EQ(source->delivery, clink::connectors::DeliveryGuarantee::AtLeastOnce);
     EXPECT_TRUE(source->self_check().empty());
-    EXPECT_FALSE(source->scale_down_refusal.empty());
-    EXPECT_EQ(clink::cluster::source_scale_down_refusal("mqtt_source"), source->scale_down_refusal)
-        << "the coordinator would not refuse a scale-down of the source";
     const auto* sink = reg.find("mqtt");
     ASSERT_NE(sink, nullptr);
     EXPECT_FALSE(sink->is_source);
@@ -54,6 +51,23 @@ TEST(MqttCapabilityRecords, TheSourceDeclaresWhatItDoesAndTheSinkKeepsItsOwn) {
     EXPECT_TRUE(sink->self_check().empty());
     EXPECT_EQ(clink::cluster::connector_name_for_op_type("mqtt_source"), "mqtt_source");
     EXPECT_EQ(clink::cluster::connector_name_for_op_type("mqtt_sink"), "mqtt");
+}
+
+// With shared_group set, each subtask holds a session of the shared
+// subscription, and a scale-down would strand what a removed subtask's session
+// holds: the coordinator refuses it. Without shared_group only subtask 0
+// subscribes, and the subtasks a scale-down removes hold no session.
+TEST(MqttCapabilityRecords, OnlyASharedSubscriptionRefusesAScaleDown) {
+    const auto* source = clink::connectors::CapabilityRegistry::instance().find("mqtt_source");
+    ASSERT_NE(source, nullptr);
+    EXPECT_FALSE(source->scale_down_refusal.empty());
+    EXPECT_EQ(source->scale_down_refusal_param, "shared_group");
+    EXPECT_EQ(clink::cluster::source_scale_down_refusal("mqtt_source",
+                                                        {{"topic", "t"}, {"shared_group", "g"}}),
+              source->scale_down_refusal)
+        << "the coordinator would not refuse a scale-down of a shared subscription";
+    EXPECT_EQ(clink::cluster::source_scale_down_refusal("mqtt_source", {{"topic", "t"}}), "");
+    EXPECT_EQ(clink::cluster::source_scale_down_refusal("mqtt_source", {{"shared_group", ""}}), "");
 }
 
 clink::cluster::OperatorSpec gate_op(std::string type,

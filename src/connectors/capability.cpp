@@ -161,6 +161,10 @@ std::vector<std::string> ConnectorCapabilities::self_check() const {
     if (!scale_down_refusal.empty() && !is_source) {
         problems.emplace_back(name + ": a scale-down refusal is a source's, but this is no source");
     }
+    if (!scale_down_refusal_param.empty() && scale_down_refusal.empty()) {
+        problems.emplace_back(name +
+                              ": names the parameter of a scale-down refusal it does not have");
+    }
     if (!required_options_for_exactly_once.empty() && !claims_exactly_once) {
         problems.emplace_back(name +
                               ": lists options required for exactly-once but does not claim it");
@@ -397,7 +401,11 @@ std::string render_manifest_text(const BuildFacts& facts,
             os << "  limitation          " << l << "\n";
         }
         if (!c.scale_down_refusal.empty()) {
-            os << "  scale-down          refused: " << c.scale_down_refusal << "\n";
+            os << "  scale-down          refused";
+            if (!c.scale_down_refusal_param.empty()) {
+                os << " with " << c.scale_down_refusal_param << " set";
+            }
+            os << ": " << c.scale_down_refusal << "\n";
         }
     }
     return os.str();
@@ -456,6 +464,7 @@ std::string render_manifest_json(const BuildFacts& facts,
             ",\"required_options_for_exactly_once\":" + jarray(c.required_options_for_exactly_once);
         out += ",\"limitations\":" + jarray(c.limitations);
         out += ",\"scale_down_refusal\":" + jq(c.scale_down_refusal);
+        out += ",\"scale_down_refusal_param\":" + jq(c.scale_down_refusal_param);
         out += "}";
     }
     out += "]}";
