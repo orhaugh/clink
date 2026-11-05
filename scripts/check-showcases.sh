@@ -16,13 +16,27 @@
 # that runs on Kubernetes (playhead) runs that commit's runtime image,
 # ghcr.io/orhaugh/clink-runtime:sha-<first 12 of the commit>.
 #
-#   scripts/check-showcases.sh                 dry-run both on main first (about an hour)
-#   scripts/check-showcases.sh --sdk-run <id>  use a finished release-binaries dry run;
-#                                              playhead runs only if its commit's image exists
+# The seventh, half-time, outgrows a hosted runner: it is run on one machine
+# against the candidate by its evidence.sh, and the bundle that leaves is
+# judged here by scripts/check-half-time-evidence.py, before anything is
+# dispatched. A complete check needs that bundle, for exactly the candidate;
+# --partial leaves half-time out and says so, and never reports every
+# showcase passing.
+#
+#   scripts/check-showcases.sh --half-time-evidence <bundle>
+#       dry-run release-binaries and runtime-image on main first (about an hour)
+#   scripts/check-showcases.sh --sdk-run <id> --half-time-evidence <bundle>
+#       use a finished release-binaries dry run; playhead runs only if its
+#       commit's image exists
+#   scripts/check-showcases.sh [--sdk-run <id>] --partial
+#       the showcases that run in CI only
 #
 # Needs gh, signed in with permission to dispatch workflows in clink and in
-# the showcase repositories, plus curl and python3. Exits non-zero unless
-# every showcase passes.
+# the showcase repositories, plus curl and python3. Exits 0 only when every
+# showcase, half-time included, passes against the candidate; 1 when any
+# fails or half-time's evidence does not pass; 2 for a usage error; and 3
+# when a --partial check's showcases all passed, since that is not a
+# complete release check.
 set -euo pipefail
 
 OWNER=orhaugh
@@ -30,12 +44,48 @@ SDK_SHOWCASES=(market-pulse card-sentry grounded coldchain transfer-sentry)
 IMAGE_SHOWCASES=(playhead)
 IMAGE="ghcr.io/${OWNER}/clink-runtime"
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
+usage() {
+    echo "usage: $0 [--sdk-run <release-binaries run id>] (--half-time-evidence <bundle> | --partial)" >&2
+    exit 2
+}
 sdk_run=""
-case "${1:-}" in
-    --sdk-run) sdk_run="${2:?--sdk-run needs a release-binaries run id}" ;;
-    "") ;;
-    *) echo "usage: $0 [--sdk-run <release-binaries run id>]" >&2; exit 2 ;;
-esac
+evidence=""
+partial=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sdk-run) sdk_run="${2:-}"; [[ -n "${sdk_run}" ]] || usage; shift 2 ;;
+        --half-time-evidence) evidence="${2:-}"; [[ -n "${evidence}" ]] || usage; shift 2 ;;
+        --partial) partial=1; shift ;;
+        *) usage ;;
+    esac
+done
+if [[ -n "${evidence}" && ${partial} = 1 ]]; then
+    echo "check-showcases: --half-time-evidence and --partial are a complete check and a partial one; give one" >&2
+    exit 2
+fi
+if [[ -z "${evidence}" && ${partial} = 0 ]]; then
+    echo "check-showcases: a complete check needs half-time's evidence for the candidate:" >&2
+    echo "  run half-time's evidence.sh against it and pass --half-time-evidence <bundle>," >&2
+    echo "  or pass --partial to check the other showcases and say that half-time was left out" >&2
+    exit 2
+fi
+
+# Whether half-time's evidence shows it passing against the candidate. A
+# complete check stops here, before anything is dispatched, when it does not.
+half_time="not checked"
+judge_half_time() {  # <candidate commit>
+    [[ -n "${evidence}" ]] || return 0
+    local verdict
+    if verdict="$("${HERE}/check-half-time-evidence.py" "${evidence}" --candidate "$1")"; then
+        half_time=success
+        echo "   ${verdict}"
+    else
+        echo "${verdict}" >&2
+        echo "check-showcases: half-time's evidence does not pass against clink ${1:0:12}; nothing was dispatched" >&2
+        exit 1
+    fi
+}
 
 # The id of the run a dispatch just created. gh prints its URL; for an older
 # gh that does not, the newest dispatched run of the workflow with the given
@@ -77,7 +127,13 @@ image_exists() {  # <commit>
 }
 
 image_run=""
+main_commit=""
 if [[ -z "${sdk_run}" ]]; then
+    # The dry runs build main as it is when they are dispatched, so the
+    # evidence is judged against that commit first, and the runs are held to
+    # it below.
+    main_commit="$(gh api "repos/${OWNER}/clink/commits/main" --jq .sha)"
+    judge_half_time "${main_commit}"
     echo "== dry-running release-binaries and runtime-image on main"
     sdk_run="$(dispatch_clink release-binaries.yml)"
     image_run="$(dispatch_clink runtime-image.yml)"
@@ -90,6 +146,12 @@ if [[ -z "${sdk_run}" ]]; then
 fi
 commit="$(gh api "repos/${OWNER}/clink/actions/runs/${sdk_run}" --jq .head_sha)"
 echo "== candidate: clink ${commit:0:12}, SDK from release-binaries run ${sdk_run}"
+if [[ -z "${main_commit}" ]]; then
+    judge_half_time "${commit}"
+elif [[ "${commit}" != "${main_commit}" ]]; then
+    echo "check-showcases: release-binaries is building ${commit:0:12}, not ${main_commit:0:12}, whose half-time evidence was judged: main moved" >&2
+    exit 1
+fi
 if [[ -n "${image_run}" ]]; then
     image_commit="$(gh api "repos/${OWNER}/clink/actions/runs/${image_run}" --jq .head_sha)"
     if [[ "${image_commit}" != "${commit}" ]]; then
@@ -138,10 +200,19 @@ done
 for repo in ${skipped[@]+"${skipped[@]}"}; do
     printf '%-16s %-10s %s\n' "${repo}" skipped "no runtime image for the candidate"
 done
+if [[ ${partial} = 1 ]]; then
+    printf '%-16s %-10s %s\n' half-time "not checked" "left out of this check (--partial)"
+else
+    printf '%-16s %-10s %s\n' half-time "${half_time}" "evidence ${evidence}"
+fi
 echo
-total=$(( ${#names[@]} + ${#skipped[@]} ))
+ci_total=$(( ${#names[@]} + ${#skipped[@]} ))
 if [[ ${failed} -gt 0 || ${#skipped[@]} -gt 0 ]]; then
-    echo "check-showcases: ${failed} failed and ${#skipped[@]} skipped of ${total} showcases against clink ${commit:0:12}"
+    echo "check-showcases: ${failed} failed and ${#skipped[@]} skipped of the ${ci_total} showcases run in CI against clink ${commit:0:12}"
     exit 1
 fi
-echo "check-showcases: every showcase passed against clink ${commit:0:12}"
+if [[ ${partial} = 1 ]]; then
+    echo "check-showcases: PARTIAL: the ${ci_total} showcases run in CI passed against clink ${commit:0:12}; half-time was left out, so this is not a complete release check"
+    exit 3
+fi
+echo "check-showcases: all $(( ci_total + 1 )) showcases passed against clink ${commit:0:12}, half-time on its evidence"

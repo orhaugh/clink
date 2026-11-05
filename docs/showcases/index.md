@@ -71,10 +71,14 @@ They share one discipline, which is what makes their results worth reading.
    release is tagged, the same CI runs against the release candidate
    ([`scripts/check-showcases.sh`](https://github.com/orhaugh/clink/blob/main/scripts/check-showcases.sh)):
    the SDK and runtime image the release would publish, or the candidate's
-   source where a showcase needs a connector the SDK leaves out. A showcase
-   that fails holds the release until the cause is fixed, in clink or in the
-   showcase. half-time, whose seventeen services outgrow a hosted runner, is
-   run by hand.
+   source where a showcase needs a connector the SDK leaves out. half-time,
+   whose seventeen services outgrow a hosted runner, runs on one machine
+   against the candidate and leaves a bundle of evidence: which clink and
+   which half-time ran, what each fault scene did, and every check's
+   verdict. The release check accepts it only for exactly that candidate,
+   with every scene run and every check passing, and reports all seven
+   passed only then. A showcase that fails holds the release until the cause
+   is fixed, in clink or in the showcase.
 
 Each showcase's page follows the same order: what the application does, where
 clink does the work, what a run proves, what is distinctive, and how to run it.

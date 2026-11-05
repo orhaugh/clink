@@ -510,6 +510,19 @@ jobs:
         # toolchain: it runs on every push.
         run: ./scripts/check-sink-ownership.py
 
+  showcase-evidence:
+    name: The half-time evidence check refuses what it should
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validator tests
+        # scripts/check-showcases.sh reports every showcase passing only when
+        # scripts/check-half-time-evidence.py accepts half-time's bundle for
+        # the candidate. The tests build a bundle for another commit, one with
+        # a checker failing, a scene skipped or missing, a file changed after
+        # its manifest, and one that passes. No build, no toolchain.
+        run: python3 -m unittest discover -s scripts/tests -v
+
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04

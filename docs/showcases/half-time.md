@@ -130,3 +130,12 @@ CLINK_BIN_DIR=/path/to/clink/build ./run.sh
 
 The repository's README covers the rules of the night, each job, the checks in
 full, the flight recorder and the rig scripts.
+
+Before each clink release, `evidence.sh` runs half-time against the release
+candidate, built from a clean checkout of exactly that commit, and keeps a
+bundle of what ran: the commit each clink binary and the riders job were built
+from, the half-time commit, what each scene did, every checker's output and
+verdicts, and the logs around the faults, with every credential removed.
+[`scripts/check-showcases.sh`](https://github.com/orhaugh/clink/blob/main/scripts/check-showcases.sh)
+accepts it only for that candidate, with the Worker kill, the savepoint and the
+Coordinator failover all executed and every check passing.
