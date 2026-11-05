@@ -1,21 +1,27 @@
 ---
 title: Clink - C++23 Stream Processing Engine
-description: Clink is an embedded-first, Arrow-native C++23 stream processing engine with streaming SQL, event time, exactly-once checkpoints, stateful operators, distributed execution, and production connectors.
+description: "Clink is an Arrow-native C++23 stream processing engine that stays correct when processes die: streaming SQL, event time, keyed state, exactly-once delivery and twenty-plus connectors, with the same pipeline on a single machine or across a cluster."
 ---
 
 # Clink - C++23 Stream Processing Engine
 
-`clink` is an embedded-first, Arrow-native stream processing engine in modern
-C++ (C++23): stateful stream processing with engine-grade semantics - SQL,
-event time, keyed state, exactly-once checkpoints - that you run like a tool
-rather than operate like a platform.
+`clink` is an Arrow-native stream processing engine in modern C++ (C++23)
+that stays correct when processes die. You write a pipeline in SQL or typed
+C++; clink keeps its event-time windows and keyed state, checkpoints them, and
+delivers exactly once into Kafka, PostgreSQL, Iceberg and Parquet on S3, GCS or
+Azure. Kill a Worker mid-stream and the job resumes from its last checkpoint
+without losing or double-counting a record. Pipelines read from and write to
+more than twenty systems, and each sink is held to the guarantee its table
+declares.
 
-The whole engine lives in one library, and the same pipeline runs two ways.
-In-process, `clink run pipeline.sql` executes it in a single process with no
+The same pipeline runs unchanged on a single machine, inside a service or
+across a cluster. `clink run pipeline.sql` executes it in one process with no
 daemons; `libclink` embeds the engine in any service behind a pure-C ABI, and
-`pyclink` returns results as pyarrow tables. At scale, the same SQL file,
-unchanged, submits to a distributed Coordinator/Worker cluster with
-parallelism, failover, and rescale.
+`pyclink` returns results as pyarrow tables. Submitted to a Coordinator, the
+same SQL file runs across its Workers with failover, live rescale and upgrades
+through savepoints, and the cluster scales out by adding Workers. On
+Kubernetes, a Helm chart or an operator runs it on a secured, highly available
+cluster.
 
 New here? [Your first real Clink pipeline](tutorials/kafka-to-clickhouse.md)
 runs Kafka, clink and ClickHouse on your machine, kills the Worker while data

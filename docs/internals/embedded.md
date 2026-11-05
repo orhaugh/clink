@@ -21,7 +21,7 @@ until the jobs finish. Nothing about the job differs from cluster execution:
 the same planner, the same chain materialisation on the Worker, the same
 checkpointing machinery. Adding `--coordinator-host`/`--coordinator-port` to the same command
 compiles the same file and submits it to a running cluster instead - one verb
-from laptop to cluster.
+from a single machine to a cluster.
 
 Measured on a Release build (2026-07-12, 12-core Apple Silicon, 20 runs) with
 `benchmarks/embedded_footprint.py`: ~155 ms median (140 min, 166 max) from

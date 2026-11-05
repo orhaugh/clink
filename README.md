@@ -5,20 +5,33 @@
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 [![changelog](https://img.shields.io/badge/changelog-v0.15.0-lightgrey.svg)](CHANGELOG.md)
 
-`clink` is a stream processing engine for Kafka pipelines that must stay
-correct when processes die. You write the pipeline in SQL; clink keeps its
-event-time windows and keyed state, checkpoints them, and delivers
-exactly once to Kafka, Postgres, S3 and Parquet. Kill a Worker mid-stream
+`clink` is a stream processing engine that stays correct when processes die.
+You write a pipeline in SQL or typed C++; clink keeps its event-time windows
+and keyed state, checkpoints them, and delivers exactly once into Kafka,
+PostgreSQL, Iceberg and Parquet on S3, GCS or Azure. Kill a Worker mid-stream
 and the job resumes from its last checkpoint without losing or
 double-counting a record.
 
-It runs like a tool rather than a platform. The same SQL file runs in one
-process on a laptop (`clink run pipeline.sql`, first result in about
-155 ms), embedded in a service through a C ABI or from Python, or on a
-Coordinator/Worker cluster with parallelism, failover and rescale. There is
-no JVM and no separate state store to operate.
+Pipelines read from and write to more than twenty systems: brokers (Kafka,
+Pulsar, NATS, MQTT, RabbitMQ), change data capture from PostgreSQL, databases
+(ClickHouse, MySQL, Cassandra, MongoDB, Redis), lakehouse tables (Iceberg,
+Delta Lake), object storage and Neo4j graphs. Each sink is held to the
+guarantee its table declares, and a job whose pipeline cannot give it is
+refused at submission. Beyond windows and joins, the SQL has `MATCH_RECOGNIZE`
+for patterns across events, and `ML_PREDICT` and `VECTOR_SEARCH` to call a
+model or search an index from inside a query.
 
-Why you can check the claim rather than take it on trust:
+The same pipeline runs unchanged on a single machine, inside a service or
+across a cluster. `clink run pipeline.sql` runs it in one process, with a
+first result in about 155 ms, and a service embeds the engine through a C ABI
+or from Python. Submitted to a Coordinator, the same file runs across its
+Workers with failover, live rescale and upgrades through savepoints. The
+cluster scales out by adding Workers. On Kubernetes, a Helm chart or an
+operator runs it on a secured, highly available cluster. Prometheus metrics,
+OpenTelemetry traces, OpenLineage events and an operations console ship with
+it.
+
+The correctness claim is one you can check rather than take on trust:
 
 - **Qualified under faults.** The Kafka exactly-once campaign ran two hours
   of Worker and Coordinator kills inside commit windows, broker outages and
@@ -50,8 +63,8 @@ sanitizer matrix in CI are how its correctness is checked
 clink is heavily inspired by Apache Flink. Flink's model of typed operator
 DAGs, event-time processing, in-band watermarks and checkpoint barriers, keyed
 state, and exactly-once semantics is the conceptual foundation this engine
-builds on. clink reworks that model in modern C++ around Arrow-native columnar
-execution and JVM-free deployment.
+builds on. clink reworks that model in modern C++, around Arrow-native columnar
+execution.
 
 ## Try it in one command
 

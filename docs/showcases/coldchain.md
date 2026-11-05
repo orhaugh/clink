@@ -92,7 +92,7 @@ One definition, two deployments, the same answers. The pipeline is a single C++
 function: a single binary runs it in-process, a cluster runs it as a job, and
 neither knows which is happening. Because every rule is in event time and every
 figure is an integer, the checker holds both to the same exact set of alerts, so
-what is verified on a laptop is what gets deployed.
+what is verified on one machine is what gets deployed.
 
 The typed API is the other half. Rules defined by persistence and by absence are
 state machines with timers, which is what this API is for and what SQL would make

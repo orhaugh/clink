@@ -4,7 +4,7 @@
 
 ## Overview
 
-clink is an Arrow-native, stateful stream processing engine written in modern C++ (C++23). Its model of typed operator DAGs, in-band watermarks, in-band checkpoint barriers, keyed state, and exactly-once checkpointing is inspired by Apache Flink, reworked in C++ around columnar execution and JVM-free deployment. This page is the entry point to the internals reference. It orients you to the major layers and how they fit together, then links out to the dedicated pages for each subsystem. The codebase is structured so that the same operator and DAG abstractions serve both a single-process in-memory run and a distributed multi-process cluster: the engine core knows nothing about the cluster, and the cluster reuses the core's `Dag` and `LocalExecutor` to run each subtask.
+clink is an Arrow-native, stateful stream processing engine written in modern C++ (C++23). Its model of typed operator DAGs, in-band watermarks, in-band checkpoint barriers, keyed state, and exactly-once checkpointing is inspired by Apache Flink, reworked in C++ around columnar execution. This page is the entry point to the internals reference. It orients you to the major layers and how they fit together, then links out to the dedicated pages for each subsystem. The codebase is structured so that the same operator and DAG abstractions serve both a single-process in-memory run and a distributed multi-process cluster: the engine core knows nothing about the cluster, and the cluster reuses the core's `Dag` and `LocalExecutor` to run each subtask.
 
 ## Where it lives
 

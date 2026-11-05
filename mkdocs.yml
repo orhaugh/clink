@@ -7,9 +7,10 @@
 
 site_name: Clink - C++23 Stream Processing Engine
 site_description: >-
-  Clink is an embedded-first, Arrow-native C++23 stream processing engine with
-  streaming SQL, event time, exactly-once checkpoints, stateful operators,
-  distributed execution, and production connectors.
+  Clink is an Arrow-native C++23 stream processing engine that stays correct
+  when processes die: streaming SQL, event time, keyed state, exactly-once
+  delivery and twenty-plus connectors, with the same pipeline on a single
+  machine or across a cluster.
 site_url: https://orhaugh.github.io/clink/
 repo_url: https://github.com/orhaugh/clink
 repo_name: orhaugh/clink
