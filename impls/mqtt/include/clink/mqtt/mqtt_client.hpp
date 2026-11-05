@@ -33,28 +33,9 @@
 #include <thread>
 #include <utility>
 
-namespace clink::mqtt {
+#include "clink/mqtt/mqtt_options.hpp"
 
-struct ConnectOptions {
-    std::string host{"localhost"};
-    std::uint16_t port{1883};
-    std::string client_id;     // empty -> library-generated random id (forces clean_session)
-    bool clean_session{true};  // false + stable client_id = persistent session (broker queues)
-    int keepalive{60};         // seconds; clamped to >= 5 (MQTT minimum)
-    std::string username;      // empty = no auth
-    std::string password;
-    std::chrono::milliseconds connack_timeout{5000};  // bound the CONNACK wait in the ctor
-    // TLS (libmosquitto built-in OpenSSL; no separate lib). tls=true encrypts the
-    // connection. tls_ca/tls_capath give the CA (PEM file / dir) to verify the
-    // server; tls_cert+tls_key are an optional client cert for mutual TLS.
-    // tls_verify=false skips server-cert + hostname verification (self-signed dev).
-    bool tls{false};
-    std::string tls_ca;
-    std::string tls_capath;
-    std::string tls_cert;
-    std::string tls_key;
-    bool tls_verify{true};
-};
+namespace clink::mqtt {
 
 // Owns a struct mosquitto*. Move-only. Connects (+ auth/TLS + CONNACK wait) in
 // the ctor and throws on any failure.

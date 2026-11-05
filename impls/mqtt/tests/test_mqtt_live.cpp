@@ -3,7 +3,15 @@
 // delivers every record verbatim; include_topic wraps each message as a JSON
 // envelope; and a retained message is delivered to a fresh subscriber. The TLS
 // case is gated separately on CLINK_MQTT_TLS_TEST_URL.
+//
+// MqttSourceAckLive is the source's recovery contract against the broker: a
+// message is acknowledged only once a completed checkpoint covers it, so a
+// crash, an aborted checkpoint or a close delivers again exactly what no
+// completed checkpoint covers, and one checkpoint interval reads at most the
+// session's in-flight window. scripts/ack-sources-live.sh runs it and fails on a
+// skip.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -18,6 +26,7 @@
 #include "clink/config/json.hpp"
 #include "clink/core/record.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 
 #ifdef CLINK_HAS_MQTT
 #include "clink/mqtt/mqtt_client.hpp"
@@ -98,11 +107,11 @@ void drain(MqttSource& src, Captured& cap, std::size_t want, int timeout_ms) {
     }
 }
 
-void publish_records(const std::string& topic, std::size_t n, bool retain = false) {
+void publish_records(const std::string& topic, std::size_t n, bool retain = false, int qos = 1) {
     MqttSinkOptions o;
     o.conn = mqtt_conn();
     o.topic = topic;
-    o.qos = 1;
+    o.qos = qos;
     o.retain = retain;
     MqttSink sink(std::move(o));
     sink.open();
@@ -121,6 +130,8 @@ MqttSourceOptions source_opts(const std::string& topic) {
     o.topic = topic;
     o.qos = 1;
     o.block = std::chrono::milliseconds{200};
+    // The session persists; this lets the test broker forget it.
+    o.session_expiry_s = 300;
     return o;
 }
 
@@ -355,6 +366,304 @@ TEST(MqttLive, ASinkDroppedWhileIdleReconnectsForItsNextBatch) {
     drain(src, cap, 2, /*timeout_ms=*/15000);
     src.close();
     EXPECT_EQ(cap.values, (std::vector<std::string>{R"({"i":0})", R"({"i":1})"}));
+}
+
+namespace {
+
+clink::InMemoryStateBackend ack_backend;
+
+void seal(MqttSource& src, std::uint64_t id) {
+    src.snapshot_offset(ack_backend, clink::OperatorId{1}, clink::CheckpointId{id});
+}
+
+// Every record the source emits within `for_ms`, however many.
+std::vector<std::string> everything_within(MqttSource& src, int for_ms) {
+    Captured cap;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds{for_ms};
+    while (std::chrono::steady_clock::now() < until) {
+        auto em = capturing(cap);
+        src.produce(em);
+    }
+    return cap.values;
+}
+
+std::string rec(std::size_t i) {
+    return R"({"i":)" + std::to_string(i) + "}";
+}
+
+std::vector<std::string> recs(std::size_t from, std::size_t to) {
+    std::vector<std::string> out;
+    for (std::size_t i = from; i < to; ++i) {
+        out.push_back(rec(i));
+    }
+    return out;
+}
+
+std::vector<std::string> sorted(std::vector<std::string> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+// Subscribe, then let the SUBSCRIBE settle before anything is published.
+void open_settled(MqttSource& src) {
+    src.open();
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+}
+
+}  // namespace
+
+// A crash before any checkpoint completes leaves every message with the
+// session; once a checkpoint covering them completes and its acknowledgements
+// go out, the session holds nothing more.
+TEST(MqttSourceAckLive, NothingIsAcknowledgedBeforeACheckpointCompletes) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    const auto opts = source_opts(topic);
+    {
+        MqttSource src(opts);
+        open_settled(src);
+        publish_records(topic, 5);
+        Captured cap;
+        drain(src, cap, 5, 15000);
+        ASSERT_EQ(cap.values.size(), 5u);
+        seal(src, 1);
+        EXPECT_EQ(src.acknowledged_total(), 0u);
+        // destroyed without close(): a crash
+    }
+    MqttSource again(opts);
+    again.open();
+    Captured cap;
+    drain(again, cap, 5, 15000);
+    EXPECT_EQ(sorted(cap.values), recs(0, 5)) << "the crash lost what no checkpoint covered";
+    seal(again, 2);
+    again.notify_checkpoint_complete(clink::CheckpointId{2});
+    everything_within(again, 500);
+    EXPECT_EQ(again.acknowledged_total(), 5u);
+    again.close();
+
+    MqttSource after(opts);
+    after.open();
+    EXPECT_TRUE(everything_within(after, 1500).empty())
+        << "a message a completed checkpoint covers was delivered again";
+    after.close();
+}
+
+TEST(MqttSourceAckLive, ACrashAfterACompletionDeliversOnlyWhatItDidNotCover) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    const auto opts = source_opts(topic);
+    {
+        MqttSource src(opts);
+        open_settled(src);
+        publish_records(topic, 3);
+        Captured cap;
+        drain(src, cap, 3, 15000);
+        seal(src, 1);
+        publish_records(topic, 5);  // a second interval: payloads i=0 to i=4
+        drain(src, cap, 8, 15000);
+        ASSERT_EQ(cap.values.size(), 8u);
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        everything_within(src, 300);  // the acknowledgements go out
+        EXPECT_EQ(src.acknowledged_total(), 3u);
+        // destroyed without close(): a crash
+    }
+    MqttSource again(opts);
+    again.open();
+    Captured cap;
+    drain(again, cap, 5, 15000);
+    EXPECT_EQ(sorted(cap.values), recs(0, 5))
+        << "after the crash the session should hold the second interval only";
+    EXPECT_TRUE(everything_within(again, 1000).empty());
+    again.close();
+}
+
+// MQTT has no negative acknowledgement: an aborted checkpoint reconnects, and
+// the new connection delivers its messages again. Nothing of them is
+// acknowledged until a later checkpoint covering the new delivery completes.
+TEST(MqttSourceAckLive, AnAbortedIntervalIsDeliveredAgain) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    const auto opts = source_opts(topic);
+    MqttSource src(opts);
+    open_settled(src);
+    publish_records(topic, 3);
+    Captured cap;
+    drain(src, cap, 3, 15000);
+    seal(src, 1);
+    src.notify_checkpoint_aborted(clink::CheckpointId{1});
+    drain(src, cap, 6, 15000);
+    ASSERT_EQ(cap.values.size(), 6u) << "the aborted interval was not delivered again";
+    EXPECT_EQ(src.reconnects(), 1u);
+    EXPECT_EQ(src.acknowledged_total(), 0u);
+    seal(src, 2);
+    src.notify_checkpoint_complete(clink::CheckpointId{2});
+    everything_within(src, 300);
+    EXPECT_EQ(src.acknowledged_total(), 3u);
+    src.close();
+
+    MqttSource after(opts);
+    after.open();
+    EXPECT_TRUE(everything_within(after, 1500).empty());
+    after.close();
+}
+
+// close() acknowledges what completed checkpoints cover and leaves the open
+// interval with the session for the next connection.
+TEST(MqttSourceAckLive, CloseAcknowledgesTheCompletedAndLeavesTheRest) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    const auto opts = source_opts(topic);
+    {
+        MqttSource src(opts);
+        open_settled(src);
+        publish_records(topic, 2);
+        Captured cap;
+        drain(src, cap, 2, 15000);
+        seal(src, 1);
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        src.close();  // no produce() turn after the completion: close sends them
+    }
+    {
+        MqttSource src(opts);
+        src.open();
+        EXPECT_TRUE(everything_within(src, 1500).empty())
+            << "close() did not acknowledge what a completed checkpoint covered";
+        publish_records(topic, 1);
+        Captured cap;
+        drain(src, cap, 1, 15000);
+        seal(src, 2);
+        src.close();  // checkpoint 2 never completes
+    }
+    MqttSource after(opts);
+    after.open();
+    Captured cap;
+    drain(after, cap, 1, 15000);
+    EXPECT_EQ(cap.values, (std::vector<std::string>{rec(0)}));
+    after.close();
+}
+
+// The broker sends at most receive_maximum messages unacknowledged, and the
+// source acknowledges only at completion, so that many is what one checkpoint
+// interval reads.
+TEST(MqttSourceAckLive, TheReceiveMaximumIsWhatOneCheckpointCanRead) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    auto opts = source_opts(topic);
+    opts.receive_maximum = 50;
+    MqttSource src(opts);
+    open_settled(src);
+    publish_records(topic, 200);
+    EXPECT_EQ(everything_within(src, 2000).size(), 50u);
+    seal(src, 1);
+    src.notify_checkpoint_complete(clink::CheckpointId{1});
+    EXPECT_EQ(everything_within(src, 2000).size(), 50u)
+        << "the completion should release the next window and no more";
+    src.close();
+}
+
+// MQTT 3.1.1 has no Receive Maximum: the broker's own in-flight limit decides
+// how much one checkpoint interval reads. The test broker runs mosquitto's
+// default, 20.
+TEST(MqttSourceAckLive, UnderMqtt311TheBrokersInFlightLimitIsWhatOneCheckpointCanRead) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    auto opts = source_opts(topic);
+    opts.protocol_version = clink::mqtt::protocol::kMqtt311;
+    MqttSource src(opts);
+    open_settled(src);
+    publish_records(topic, 100);
+    EXPECT_EQ(everything_within(src, 2000).size(), 20u);
+    seal(src, 1);
+    src.notify_checkpoint_complete(clink::CheckpointId{1});
+    EXPECT_EQ(everything_within(src, 2000).size(), 20u);
+    src.close();
+}
+
+// QoS 2: the PUBREC is what hands a message over, so it waits for completion
+// as a PUBACK does, and a crash before it delivers the message again.
+TEST(MqttSourceAckLive, AQos2MessageIsDeliveredAgainUntilItsCheckpointCompletes) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    auto opts = source_opts(topic);
+    opts.qos = 2;
+    {
+        MqttSource src(opts);
+        open_settled(src);
+        publish_records(topic, 2, /*retain=*/false, /*qos=*/2);
+        Captured cap;
+        drain(src, cap, 2, 15000);
+        ASSERT_EQ(cap.values.size(), 2u);
+        seal(src, 1);
+        // destroyed without close(): a crash
+    }
+    MqttSource again(opts);
+    again.open();
+    Captured cap;
+    drain(again, cap, 2, 15000);
+    EXPECT_EQ(sorted(cap.values), recs(0, 2));
+    seal(again, 2);
+    again.notify_checkpoint_complete(clink::CheckpointId{2});
+    everything_within(again, 500);  // PUBREC, then the PUBREL is answered
+    again.close();
+
+    MqttSource after(opts);
+    after.open();
+    EXPECT_TRUE(everything_within(after, 1500).empty());
+    after.close();
+}
+
+// Under MQTT 5 retained messages come only with a subscription that is new, so
+// a source that resumes its session does not receive a retained message again
+// once a completed checkpoint covered it.
+TEST(MqttSourceAckLive, AResumedSessionDoesNotReceiveARetainedMessageAgain) {
+    if (!mqtt_configured()) {
+        GTEST_SKIP() << "set CLINK_MQTT_TEST_URL";
+    }
+    const std::string topic = unique_topic();
+    publish_records(topic, 1, /*retain=*/true);
+    const auto opts = source_opts(topic);
+    {
+        MqttSource src(opts);
+        src.open();
+        Captured cap;
+        drain(src, cap, 1, 15000);
+        ASSERT_EQ(cap.values.size(), 1u);
+        seal(src, 1);
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        src.close();
+    }
+    MqttSource again(opts);
+    again.open();
+    EXPECT_TRUE(everything_within(again, 1500).empty())
+        << "the retained message came again with a subscription the session already held";
+    again.close();
+
+    // Clear the retained message so the topic leaks nothing to other runs.
+    MqttSinkOptions clr;
+    clr.conn = mqtt_conn();
+    clr.topic = topic;
+    clr.retain = true;
+    MqttSink sink(std::move(clr));
+    sink.open();
+    Batch<std::string> empty_b;
+    empty_b.emplace("");
+    sink.on_data(empty_b);
+    sink.flush();
+    sink.close();
 }
 
 #endif  // CLINK_HAS_MQTT

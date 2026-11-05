@@ -1,8 +1,10 @@
-# clink::mqtt - MQTT connectors (mqtt_source via SUBSCRIBE, mqtt_sink via PUBLISH)
-# built against libmosquitto. Dep-gated: builds only when libmosquitto is found.
-# TLS is built into libmosquitto (OpenSSL), so unlike redis there is no separate
-# SSL library to discover - tls=true works whenever the found libmosquitto was
-# compiled with TLS support (else it fails at connect with a clear error).
+# clink::mqtt - MQTT connectors: mqtt_sink publishes through libmosquitto, and
+# mqtt_source subscribes through the impl's own MQTT 5 / 3.1.1 client
+# (mqtt_subscriber.cpp), which holds each acknowledgement until its caller sends
+# it. Dep-gated on libmosquitto, which the sink needs. The sink's TLS is
+# libmosquitto's own (OpenSSL); the source's needs OpenSSL found here - without
+# it the source still builds and tls=true fails at connect saying the build
+# lacks TLS.
 
 if(CLINK_WITH_MQTT STREQUAL "OFF")
     message(STATUS "clink::mqtt - CLINK_WITH_MQTT=OFF; target not defined")
@@ -62,6 +64,8 @@ find_path(_mqtt_cjson_inc NAMES cjson/cJSON.h
 
 add_library(clink_mqtt STATIC
     src/register_factories.cpp
+    src/mqtt_source.cpp
+    src/mqtt_subscriber.cpp
 )
 add_library(clink::mqtt ALIAS clink_mqtt)
 
@@ -82,6 +86,18 @@ target_link_libraries(clink_mqtt
     PUBLIC  clink::core
     PRIVATE ${_mqtt_target}
 )
+# The source's TLS: OpenSSL is confined to mqtt_subscriber.cpp (PRIVATE), as the
+# websocket impl confines it to its client.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    target_compile_definitions(clink_mqtt PRIVATE CLINK_MQTT_TLS)
+    target_link_libraries(clink_mqtt PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    set(_mqtt_source_tls "source TLS enabled")
+    set(_mqtt_openssl_dep "\nfind_dependency(OpenSSL)")
+else()
+    set(_mqtt_source_tls "source without TLS (OpenSSL not found)")
+    set(_mqtt_openssl_dep "")
+endif()
 clink_set_warnings(clink_mqtt)
 
 # The manual-probe INTERFACE wrapper is a local target and must be exported with
@@ -89,23 +105,27 @@ clink_set_warnings(clink_mqtt)
 # emit a find_dependency line.
 if(TARGET clink_mosquitto_external)
     install(TARGETS clink_mosquitto_external EXPORT ${CLINK_EXPORT_NAME})
-    clink_install_impl(TARGET clink_mqtt NAME mqtt)
+    if(OpenSSL_FOUND)
+        clink_install_impl(TARGET clink_mqtt NAME mqtt FIND_DEP "find_dependency(OpenSSL)")
+    else()
+        clink_install_impl(TARGET clink_mqtt NAME mqtt)
+    endif()
 elseif(TARGET PkgConfig::LIBMOSQUITTO)
     # pkg-config tier: recreate the exact imported target the exported
     # clink_mqtt links (see the kafka impl for the pattern).
     clink_install_impl(
         TARGET   clink_mqtt
         NAME     mqtt
-        FIND_DEP "find_dependency(PkgConfig)\npkg_check_modules(LIBMOSQUITTO REQUIRED IMPORTED_TARGET GLOBAL libmosquitto)")
+        FIND_DEP "find_dependency(PkgConfig)\npkg_check_modules(LIBMOSQUITTO REQUIRED IMPORTED_TARGET GLOBAL libmosquitto)${_mqtt_openssl_dep}")
 else()
     clink_install_impl(
         TARGET   clink_mqtt
         NAME     mqtt
-        FIND_DEP "find_dependency(mosquitto CONFIG)")
+        FIND_DEP "find_dependency(mosquitto CONFIG)${_mqtt_openssl_dep}")
 endif()
 
 if(CLINK_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-message(STATUS "clink::mqtt - enabled")
+message(STATUS "clink::mqtt - enabled (${_mqtt_source_tls})")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The live gate for the sources that acknowledge their broker at checkpoint
-# completion: Redis Streams, Pub/Sub, RabbitMQ, NATS JetStream and Pulsar. Each
-# connector's live suites run against the service of docker/integration-services.yml,
+# completion: Redis Streams, Pub/Sub, RabbitMQ, NATS JetStream, Pulsar and MQTT.
+# Each connector's live suites run against the service of docker/integration-services.yml,
 # one service at a time, then a check that nothing was skipped and that every
 # required suite ran in full.
 #
@@ -11,12 +11,12 @@
 # free loopback ports, so a broker already on the machine is left alone; the
 # container goes, with its volumes, when its suites end or the script exits.
 # For each source it runs the connector's round trip (RedisLive, PubSubLive,
-# RabbitMqLive, NatsLive, PulsarLive) and its acknowledgement contract
+# RabbitMqLive, NatsLive, PulsarLive, MqttLive) and its acknowledgement contract
 # (<Connector>SourceAckLive): an aborted checkpoint, crashes before and after a
 # completion, notifications out of order, close after a cancel, the bound on
 # what is held, and per connector the leases, a failed acknowledgement and a
-# scale-down. The Redis TLS case needs a TLS server this gate does not start
-# and is left out.
+# scale-down. The Redis and MQTT TLS cases need a TLS server this gate does not
+# start and are left out.
 #
 # A live case skips when its service is not named and googletest counts that
 # as a pass, so scripts/check-gtest-reports.py fails the run on any skip and on
@@ -35,7 +35,7 @@
 # CLINK_PUBSUB_EMULATOR_HOST, CLINK_RABBITMQ_TEST_ENDPOINT,
 # CLINK_RABBITMQ_TEST_PORT, CLINK_RABBITMQ_TEST_USER,
 # CLINK_RABBITMQ_TEST_PASSWORD, CLINK_NATS_TEST_ENDPOINT,
-# CLINK_PULSAR_TEST_ENDPOINT.
+# CLINK_PULSAR_TEST_ENDPOINT, CLINK_MQTT_TEST_URL.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,11 +52,12 @@ HTTP_BIN="$(find_bin clink_http_connector_tests)"
 RABBITMQ_BIN="$(find_bin clink_rabbitmq_tests)"
 NATS_BIN="$(find_bin clink_nats_tests)"
 PULSAR_BIN="$(find_bin clink_pulsar_tests)"
-for b in REDIS_BIN HTTP_BIN RABBITMQ_BIN NATS_BIN PULSAR_BIN; do
+MQTT_BIN="$(find_bin clink_mqtt_tests)"
+for b in REDIS_BIN HTTP_BIN RABBITMQ_BIN NATS_BIN PULSAR_BIN MQTT_BIN; do
     if [ -z "${!b}" ]; then
         echo "ack-sources-live: clink_redis_tests, clink_http_connector_tests," \
-            "clink_rabbitmq_tests, clink_nats_tests and clink_pulsar_tests must be built" \
-            "under ${BUILD_DIR}" >&2
+            "clink_rabbitmq_tests, clink_nats_tests, clink_pulsar_tests and" \
+            "clink_mqtt_tests must be built under ${BUILD_DIR}" >&2
         exit 1
     fi
 done
@@ -176,6 +177,14 @@ export CLINK_PULSAR_TEST_ENDPOINT="pulsar://127.0.0.1:${port}"
 run pulsar "${PULSAR_BIN}" --gtest_filter='PulsarLive.*:PulsarSourceAckLive.*'
 stop
 
+start mqtt 1883
+await mqtt 60 docker exec "${container}" mosquitto_sub -h 127.0.0.1 -t clink/ready -E -W 2
+port="$(port_of 1883)"
+export CLINK_MQTT_TEST_URL="mqtt://127.0.0.1:${port}"
+run mqtt "${MQTT_BIN}" \
+    --gtest_filter='MqttLive.*:MqttSourceAckLive.*:-MqttLive.TlsConnectionRoundTrip'
+stop
+
 python3 "${ROOT}/scripts/check-gtest-reports.py" \
     --expect 'RedisLive.*=5' \
     --expect 'RedisSourceAckLive.*=9' \
@@ -187,5 +196,7 @@ python3 "${ROOT}/scripts/check-gtest-reports.py" \
     --expect 'NatsSourceAckLive.*=6' \
     --expect 'PulsarLive.*=2' \
     --expect 'PulsarSourceAckLive.*=4' \
-    "${REPORT_DIR}"/{redis,pubsub,rabbitmq,nats,pulsar}.json || status=1
+    --expect 'MqttLive.*=5' \
+    --expect 'MqttSourceAckLive.*=8' \
+    "${REPORT_DIR}"/{redis,pubsub,rabbitmq,nats,pulsar,mqtt}.json || status=1
 exit "${status}"

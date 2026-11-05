@@ -8,20 +8,32 @@
 // sensors/+/temperature). include_topic assumes UTF-8 text payloads; for binary
 // payloads use the verbatim mode.
 //
-// DELIVERY: MQTT has no replayable offset/cursor (unlike Kafka or the Redis
-// stream PEL). Durability is the BROKER SESSION: the source always runs with a
-// stable per-subtask client_id and a PERSISTENT session (clean_session is forced
-// off by the factory), so the broker retains the subscription and queues QoS 1/2
-// messages for this client while it is disconnected, redelivering un-acked ones on
-// reconnect - which gives at-least-once across a reconnect. libmosquitto auto-acks
-// a QoS 1/2 message when
-// the on_message callback returns, so a process crash AFTER the callback but
-// BEFORE the next checkpoint loses those in-flight messages - i.e. delivery is
-// at-least-once for clean reconnects and best-effort across a hard crash. A
-// downstream idempotent/keyed-dedup consumer is the robust path. This source
-// therefore does not implement a checkpoint offset (there is none to persist);
-// it relies on the broker session, so snapshot_offset/restore_offset are the
-// no-op base defaults.
+// DELIVERY: MQTT has no position a source could store, so recovery is the
+// broker's: the source holds a persistent session under a stable per-subtask
+// client id, and the broker delivers again, when the session reconnects, every
+// QoS 1 or 2 message it holds unacknowledged. The source therefore acknowledges
+// a message (PUBACK, or PUBREC for QoS 2) only once a completed checkpoint
+// covers it: snapshot_offset seals what arrived since the last barrier as that
+// checkpoint's, notify_checkpoint_complete makes it ready, and the next
+// produce() or close() sends the acknowledgements, in the order the messages
+// arrived as MQTT requires. A crash before that leaves them unacknowledged, and
+// they are delivered again.
+//
+// An acknowledgement belongs to the connection its message arrived on: after a
+// reconnect the broker sends every unacknowledged message again, under packet
+// identifiers it may since have reused, so what is still held from an earlier
+// connection is never acknowledged on a later one. An aborted checkpoint
+// reconnects for the same reason: MQTT has no negative acknowledgement, and
+// only a new connection gets the broker to deliver those messages again. Both
+// deliver again messages a later checkpoint may already cover, so the
+// guarantee is at least once.
+//
+// How much one checkpoint interval can read is the session's in-flight window:
+// the broker sends at most that many messages unacknowledged. Under MQTT 5 the
+// source states it (receive_maximum); under MQTT 3.1.1 the broker's own setting
+// decides (mosquitto's max_inflight_messages, 20 unless configured). Meanwhile
+// the broker queues what it cannot send, and a broker that bounds that queue
+// drops what overflows it.
 //
 // PARALLELISM: MQTT delivers every matching message to every subscriber, so a
 // naive parallel subscription would duplicate. Two modes:
@@ -37,27 +49,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <stdexcept>
 #include <string>
-#include <thread>
-#include <utility>
-#include <vector>
 
-#include "clink/config/json.hpp"
-#include "clink/metrics/connector_metrics.hpp"
-#include "clink/mqtt/mqtt_client.hpp"
+#include "clink/mqtt/mqtt_options.hpp"
+#include "clink/mqtt/mqtt_protocol.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::mqtt {
 
 struct MqttSourceOptions {
-    ConnectOptions conn;
+    ConnectOptions conn;       // clean_session is not read: the session always persists
     std::string topic;         // topic filter to subscribe to (required)
     int qos{1};                // subscription QoS (0/1/2)
     std::string shared_group;  // non-empty -> "$share/<group>/<topic>" shared subscription
     bool include_topic{
         false};  // true -> emit {"topic":...,"payload":...} JSON, else payload verbatim
-    std::chrono::milliseconds block{500};  // mosquitto_loop wait (bounds cancel latency)
+    std::chrono::milliseconds block{500};  // longest wait for a message (bounds cancel latency)
+    // 5 (MQTT 5) or 4 (MQTT 3.1.1).
+    std::uint8_t protocol_version{protocol::kMqtt5};
+    // MQTT 5: how many messages the broker may send unacknowledged, which bounds
+    // what one checkpoint interval can read; and how long the broker keeps the
+    // session once its connection ends.
+    std::uint16_t receive_maximum{10000};
+    std::uint32_t session_expiry_s{protocol::kSessionNeverExpires};
     std::uint32_t subtask_idx{0};
     std::uint32_t parallelism{1};
     std::string name{"mqtt_source"};
@@ -65,120 +79,32 @@ struct MqttSourceOptions {
 
 class MqttSource : public Source<std::string> {
 public:
-    explicit MqttSource(MqttSourceOptions opts)
-        : opts_(std::move(opts)), dormant_(opts_.subtask_idx != 0 && opts_.shared_group.empty()) {
-        if (opts_.topic.empty()) {
-            throw std::runtime_error(opts_.name + ": 'topic' is required");
-        }
-        if (opts_.qos < 0 || opts_.qos > 2) {
-            throw std::runtime_error(opts_.name + ": 'qos' must be 0, 1 or 2");
-        }
-        if (opts_.block.count() <= 0) {
-            opts_.block = std::chrono::milliseconds{500};
-        }
-    }
+    explicit MqttSource(MqttSourceOptions opts);
+    ~MqttSource() override;
 
-    void open() override {
-        if (dormant_) {
-            return;
-        }
-        conn_ = std::make_unique<MqttConnection>(opts_.conn);
-        // The synchronous loop dispatches on_message inline on the produce()
-        // thread, so this buffer needs no lock.
-        conn_->set_message_cb([this](const char* topic, const void* payload, std::size_t len) {
-            received_.emplace_back(topic == nullptr ? std::string{} : std::string(topic),
-                                   std::string(static_cast<const char*>(payload), len));
-        });
-        // subscribe() awaits the SUBACK, so the subscription is registered on the
-        // broker before the first produce() returns (any messages that arrive
-        // during the wait are buffered into received_ and drained below, not lost).
-        conn_->subscribe(subscribe_topic_(), opts_.qos);
-    }
-
-    bool produce(Emitter<std::string>& out) override {
-        if (dormant_) {
-            if (this->cancelled()) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds{200});
-            return !this->cancelled();
-        }
-        if (this->cancelled() || conn_ == nullptr) {
-            return false;
-        }
-
-        int rc = conn_->loop(static_cast<int>(opts_.block.count()), /*max_packets=*/1);
-        // A user callback that threw during this loop() (e.g. bad_alloc growing the
-        // receive buffer) was caught at the C boundary; surface it as a produce()
-        // error so the job replays from the last checkpoint.
-        if (std::string cb_err; conn_->consume_callback_error(cb_err)) {
-            clink::metrics::connector::error_inc("mqtt", "source");
-            throw std::runtime_error(opts_.name + ": message callback failed: " + cb_err);
-        }
-        if (rc != MOSQ_ERR_SUCCESS) {
-            // Connection lost / no connection: try a single reconnect. The source
-            // requires a persistent broker session (clean_session=false, forced by
-            // the factory), so the broker retains the subscription across the
-            // reconnect and redelivers un-acked messages. If reconnect also fails,
-            // surface it so the job restarts from the last checkpoint.
-            clink::metrics::connector::error_inc("mqtt", "source");
-            if (conn_->reconnect() != MOSQ_ERR_SUCCESS) {
-                throw std::runtime_error(opts_.name + ": connection lost and reconnect failed: " +
-                                         mosquitto_strerror(rc));
-            }
-            return !this->cancelled();
-        }
-
-        if (!received_.empty()) {
-            Batch<std::string> batch;
-            std::uint64_t bytes = 0;
-            for (auto& [topic, payload] : received_) {
-                std::string rec =
-                    opts_.include_topic ? envelope_(topic, payload) : std::move(payload);
-                bytes += rec.size();
-                batch.emplace(std::move(rec));
-            }
-            received_.clear();  // drained; clear AFTER emit so nothing is dropped
-            const auto n = batch.size();
-            clink::metrics::connector::records_in_inc("mqtt", n);
-            clink::metrics::connector::bytes_in_inc("mqtt", bytes);
-            out.emit_data(std::move(batch));
-        }
-        return !this->cancelled();
-    }
-
-    void cancel() override { Source<std::string>::cancel(); }
-
-    void close() override { conn_.reset(); }
+    void open() override;
+    bool produce(Emitter<std::string>& out) override;
+    void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt_id) override;
+    bool restore_offset(StateBackend& backend, OperatorId op_id) override;
+    void notify_checkpoint_complete(CheckpointId ckpt_id) override;
+    void notify_checkpoint_aborted(CheckpointId ckpt_id) override;
+    void close() override;
 
     [[nodiscard]] bool is_bounded() const noexcept override { return false; }
+    std::string name() const override;
 
-    std::string name() const override { return opts_.name; }
-
-    // Test/observability accessor: the effective topic this subtask subscribes to.
-    [[nodiscard]] std::string subscribe_topic() const { return subscribe_topic_(); }
-    [[nodiscard]] bool dormant() const noexcept { return dormant_; }
+    // The effective topic this subtask subscribes to.
+    [[nodiscard]] std::string subscribe_topic() const;
+    [[nodiscard]] bool dormant() const noexcept;
+    // Messages delivered and not yet acknowledged, and acknowledgements sent.
+    [[nodiscard]] std::size_t unacknowledged() const;
+    [[nodiscard]] std::uint64_t acknowledged_total() const noexcept;
+    // Connections made after the first: a lost connection, or an aborted checkpoint.
+    [[nodiscard]] std::uint64_t reconnects() const noexcept;
 
 private:
-    std::string subscribe_topic_() const {
-        if (opts_.shared_group.empty()) {
-            return opts_.topic;
-        }
-        return "$share/" + opts_.shared_group + "/" + opts_.topic;
-    }
-
-    static std::string envelope_(const std::string& topic, const std::string& payload) {
-        clink::config::JsonObject obj;
-        obj["topic"] = clink::config::JsonValue{topic};
-        obj["payload"] = clink::config::JsonValue{payload};
-        return clink::config::JsonValue{std::move(obj)}.serialize(0);
-    }
-
-    MqttSourceOptions opts_;
-    bool dormant_{false};
-    std::unique_ptr<MqttConnection> conn_;
-    std::vector<std::pair<std::string, std::string>>
-        received_;  // (topic, payload) filled by the cb
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace clink::mqtt

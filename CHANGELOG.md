@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+**The MQTT source acknowledges a message only once a completed checkpoint
+covers it.** libmosquitto acknowledges a message when its callback returns and
+cannot hold that back, so a crash, an aborted checkpoint or a close lost what
+no completed checkpoint covered. Against the previous source, a resumed
+session got none of five messages back after a crash, none of three after an
+abort, none of two at QoS 2 and none after a close. The source now subscribes
+through the impl's own MQTT client (`impls/mqtt/src/mqtt_subscriber.cpp`),
+which sends a PUBACK, or a PUBREC at QoS 2, only when asked, and acknowledges
+through `CheckpointAckLedger` in the order the messages arrived, as MQTT
+requires. An acknowledgement goes out only on the connection its message
+arrived on, and an aborted checkpoint reconnects: MQTT has no negative
+acknowledgement, and only a new connection makes the broker deliver again.
+`MqttSourceAckLive` gets every message back in each of those cases. The source
+has its own record, `mqtt_source`, now at-least-once and refusing a
+scale-down, and the sink, still on libmosquitto, keeps `mqtt`.
+
+**The MQTT source speaks MQTT 5 unless told otherwise, and states how much
+one checkpoint can read.** With acknowledgements held, the session's in-flight
+window is the most a checkpoint interval reads. Under MQTT 3.1.1 the broker
+sets it: mosquitto 2.1.2 in its default configuration sent a subscriber
+holding its acknowledgements 20 of 3,000 messages, and once the subscriber
+reconnected and acknowledged everything, 1,040 came back; the broker had
+dropped the rest. Under MQTT 5 the source states the window as its Receive
+Maximum, `receive_maximum` (default 10,000), and the session's lifetime as
+`session_expiry_s` (default never). `protocol_version='3.1.1'` keeps MQTT
+3.1.1 for a broker without MQTT 5. `MqttSourceAckLive` holds both windows.
+
 **A RabbitMQ source no longer acknowledges an aborted checkpoint's messages
 with a later one.** It acknowledged with one cumulative
 `basic.ack(multiple=true)` up to the highest tag a completed checkpoint
@@ -30,18 +57,11 @@ resets each held message's AckWait with `natsMsg_InProgress` at half that
 period, for at most `max_lease_s` (default 3600). `ack_wait_s`,
 `max_lease_s` and `max_ack_pending` are validated.
 
-**The MQTT source's record says at-most-once.** libmosquitto acknowledges a
-message when the message callback returns, before any checkpoint covers it,
-so a crash loses what arrived since the last checkpoint; one record for both
-ends claimed at-least-once, which the analyser could not credit. The source
-now has its own record (`mqtt_source`: at-most-once, no checkpoint
-participation) and the sink keeps `mqtt` (at-least-once).
-
-**All five acknowledging sources pass one live gate in CI.**
+**The six acknowledging sources run through one live gate in CI.**
 `scripts/ack-sources-live.sh`, renamed from `redis-pubsub-live.sh`, runs the
-Redis Streams, Pub/Sub, RabbitMQ, NATS and Pulsar live suites, each against a
-one-off container of its compose service, and the new `ack-sources` workflow
-runs it. The integration services' RabbitMQ healthcheck now waits for the
+Redis Streams, Pub/Sub, RabbitMQ, NATS, Pulsar and MQTT live suites, each
+against a one-off container of its compose service, and the new `ack-sources`
+workflow runs it. The integration services' RabbitMQ healthcheck now waits for the
 server's Erlang cookie: a check that came first wrote one as root and stopped
 the server with `eacces`.
 

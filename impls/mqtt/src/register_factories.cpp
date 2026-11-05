@@ -4,12 +4,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "clink/connectors/capability.hpp"
 #include "clink/mqtt/install.hpp"
 #include "clink/mqtt/mqtt_client.hpp"
+#include "clink/mqtt/mqtt_protocol.hpp"
 #include "clink/mqtt/mqtt_sink.hpp"
 #include "clink/mqtt/mqtt_source.hpp"
 #include "clink/operators/sink_operator.hpp"
@@ -85,19 +87,20 @@ void install(clink::plugin::PluginRegistry& reg) {
         .version = "1",
         .is_source = true,
         .is_sink = false,
-        .build_dependencies = {"libmosquitto"},
-        .runtime_dependencies = {"mqtt broker >= 3.1.1"},
+        // The source speaks MQTT through the impl's own client; the impl builds
+        // only where libmosquitto, which the sink uses, is found.
+        .build_dependencies = {"in-tree MQTT 5 / 3.1.1 client", "libmosquitto (the impl's sink)"},
+        .runtime_dependencies = {"mqtt broker >= 3.1.1 (MQTT 5 by default)"},
         .formats = {"text", "bytes", "json"},
         .boundedness = clink::connectors::Boundedness::Unbounded,
-        // No position of its own, and libmosquitto acknowledges a QoS 1/2
-        // message (PUBACK / PUBCOMP) when the message callback returns, before
-        // any checkpoint covers it. The persistent session redelivers only what
-        // was not acknowledged, so a crash loses what arrived since the last
-        // checkpoint: nothing it does waits for a checkpoint.
+        // Recovery is the persistent session's redelivery of what was not
+        // acknowledged, and a message is acknowledged once a completed
+        // checkpoint covers it. There is no position to replay from, and a
+        // checkpoint acknowledged late is delivered again.
         .replayable = false,
-        .offset_model = clink::connectors::OffsetModel::None,
-        .checkpoint_integrated = false,
-        .delivery = clink::connectors::DeliveryGuarantee::AtMostOnce,
+        .offset_model = clink::connectors::OffsetModel::Acknowledgement,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .auth_methods = {"none", "password"},
         .tls = true,
@@ -105,14 +108,30 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {},
         .available_in_sql = false,  // no connector='mqtt' binding in the SQL planner
-        .limitations = {"each message is acknowledged to the broker on receipt, before any "
-                        "checkpoint covers it: a crash loses what arrived since the last "
-                        "checkpoint, and deferring the acknowledgement needs another client",
-                        "a reconnect, clean or after a crash, receives what the persistent "
-                        "session still holds unacknowledged",
-                        "qos=0 is fire-and-forget",
-                        "a clean session discards the redelivery state recovery depends on",
-                        "only subtask 0 subscribes unless shared_group is set"},
+        .limitations = {"qos=0 is fire-and-forget (at-most-once)",
+                        "messages a completed checkpoint covers whose acknowledgement had not "
+                        "gone out are delivered again after a crash (duplicates)",
+                        "an aborted checkpoint or a lost connection reconnects, and the broker "
+                        "delivers again everything the session holds unacknowledged, including "
+                        "messages a later checkpoint covers (duplicates)",
+                        "a restore from a checkpoint older than one the source acknowledged "
+                        "(commit-confirmed restore, a savepoint) does not see that "
+                        "checkpoint's messages again",
+                        "one checkpoint interval reads at most the session's in-flight window: "
+                        "receive_maximum under MQTT 5, the broker's own setting under MQTT "
+                        "3.1.1 (mosquitto's is 20 unless configured)",
+                        "while acknowledgements wait, the broker queues what it cannot send, "
+                        "and a broker that bounds that queue drops what overflows it",
+                        "a session the broker no longer holds (expired, or a broker that does "
+                        "not persist sessions restarted) takes what it held unacknowledged "
+                        "with it",
+                        "only subtask 0 subscribes unless shared_group is set",
+                        "the source cannot be rescaled to fewer subtasks"},
+        .scale_down_refusal =
+            "an MQTT source subtask holds a persistent session, and the session of a removed "
+            "subtask keeps the messages it holds unacknowledged; with shared_group set no "
+            "remaining subtask receives them, and the broker may keep them until the session "
+            "expires, which by default is never",
     });
 
     using clink::plugin::BuildContext;
@@ -145,9 +164,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<MqttSink>(std::move(o));
         });
 
-    // mqtt_source: SUBSCRIBE to a topic filter and emit each message. Delivery is
-    // broker-session at-least-once (persistent session); no replayable offset.
-    // Params:
+    // mqtt_source: SUBSCRIBE to a topic filter and emit each message. At least
+    // once: a message is acknowledged once a completed checkpoint covers it, and
+    // the persistent session delivers again what was not. Params:
     //   host/port/username/password/keepalive + tls*
     //   client_id (default "clink-mqtt-source"; subtask index appended)
     //   topic (required)              - topic filter to subscribe to
@@ -156,22 +175,47 @@ void install(clink::plugin::PluginRegistry& reg) {
     //                                   parallel subtasks share the load (else only
     //                                   subtask 0 is active, others dormant)
     //   include_topic (default false) - true -> emit {"topic":..,"payload":..} JSON
-    //   block_ms (default 500)        - mosquitto_loop wait (bounds cancel latency)
+    //   block_ms (default 500)        - longest wait for a message (bounds cancel latency)
+    //   protocol_version (default 5)  - 5 (MQTT 5) or 3.1.1
+    //   receive_maximum (10000)       - MQTT 5: 1..65535 messages the broker may send
+    //                                   unacknowledged, so the most read per checkpoint
+    //   session_expiry_s (never)      - MQTT 5: how long the broker keeps the session
+    //                                   after its connection ends (at least 1)
     reg.register_source<std::string>(
         "mqtt_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             MqttSourceOptions o;
             o.conn = conn_options_from(ctx);
             o.conn.client_id = client_id_for(ctx, "clink-mqtt-source");
-            // The source's recovery model REQUIRES a persistent broker session: on a
-            // reconnect the broker must still hold the subscription and redeliver
-            // un-acked messages. A clean session would silently deliver nothing
-            // after a reconnect, so it is forced off (not a user-tunable param).
-            o.conn.clean_session = false;
+            // The session always persists (the source does not read clean_session):
+            // recovery is the broker delivering again what was not acknowledged.
             o.topic = ctx.param_or("topic");
             o.qos = static_cast<int>(ctx.param_int64_or("qos", 1));
             o.shared_group = ctx.param_or("shared_group", "");
             o.include_topic = ctx.param_or("include_topic", "") == "true";
             o.block = std::chrono::milliseconds{ctx.param_int64_or("block_ms", 500)};
+            const auto version = ctx.param_or("protocol_version", "5");
+            if (version == "5") {
+                o.protocol_version = protocol::kMqtt5;
+            } else if (version == "3.1.1") {
+                o.protocol_version = protocol::kMqtt311;
+            } else {
+                throw std::runtime_error("mqtt_source: 'protocol_version' must be '5' or '3.1.1'");
+            }
+            const auto receive_maximum = ctx.param_int64_or("receive_maximum", 10000);
+            if (receive_maximum < 1 || receive_maximum > 65535) {
+                throw std::runtime_error(
+                    "mqtt_source: 'receive_maximum' must be between 1 and 65535 (the messages "
+                    "the broker may send unacknowledged, so the most read per checkpoint)");
+            }
+            o.receive_maximum = static_cast<std::uint16_t>(receive_maximum);
+            const auto expiry =
+                ctx.param_int64_or("session_expiry_s", protocol::kSessionNeverExpires);
+            if (expiry < 1 || expiry > protocol::kSessionNeverExpires) {
+                throw std::runtime_error(
+                    "mqtt_source: 'session_expiry_s' must be between 1 and 4294967295 (never): "
+                    "a session that ends with its connection delivers nothing again");
+            }
+            o.session_expiry_s = static_cast<std::uint32_t>(expiry);
             o.subtask_idx = ctx.subtask_idx;
             o.parallelism = ctx.parallelism;
             o.name = "mqtt_source";

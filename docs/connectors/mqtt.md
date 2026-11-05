@@ -1,28 +1,31 @@
 # MQTT connector
 
-> A source (`mqtt_source`, via SUBSCRIBE) and a sink (`mqtt_sink`, via PUBLISH) for MQTT brokers, exchanging string payloads over libmosquitto.
+> A source (`mqtt_source`, via SUBSCRIBE) and a sink (`mqtt_sink`, via PUBLISH) for MQTT brokers, exchanging string payloads. The sink publishes through libmosquitto; the source subscribes through its own MQTT 5 / 3.1.1 client, which acknowledges a message only once a completed checkpoint covers it.
 
 ## Overview
 
-The MQTT connector integrates an MQTT broker (for example Mosquitto) over the libmosquitto synchronous client API. The sink PUBLISHes each input record to a fixed topic; the source SUBSCRIBEs to a topic filter and emits each received message. Both operate on the `std::string` channel: the payload is treated as an opaque string and published or emitted verbatim, with no Arrow or Parquet encoding. The source can optionally wrap each message as a JSON envelope (`{"topic":...,"payload":...}`) so that a wildcard subscription can carry the per-message topic. The client wrapper is shared by both sides and handles connection, authentication, optional TLS, and the CONNACK/SUBACK waits.
+The MQTT connector integrates an MQTT broker (for example Mosquitto). The sink PUBLISHes each input record to a fixed topic; the source SUBSCRIBEs to a topic filter and emits each received message. Both operate on the `std::string` channel: the payload is treated as an opaque string and published or emitted verbatim, with no Arrow or Parquet encoding. The source can optionally wrap each message as a JSON envelope (`{"topic":...,"payload":...}`) so that a wildcard subscription can carry the per-message topic.
+
+The two sides use different clients. The sink publishes over the libmosquitto synchronous client API (`mqtt_client.hpp`). The source subscribes through the impl's own client (`mqtt_subscriber.hpp`, `src/mqtt_subscriber.cpp`, with the packet codec in `mqtt_protocol.hpp`), because libmosquitto, like Paho, acknowledges a message as soon as it hands it over and cannot hold the acknowledgement until a checkpoint covers the message. The source's client speaks MQTT 5 by default and MQTT 3.1.1 when asked, over TCP or TLS.
 
 ## Dependency and version
 
 | Component | Provenance | Version |
 | --- | --- | --- |
-| libmosquitto | System package via apt (Debian, `libmosquitto-dev`) / brew (macOS, `mosquitto`) | Not pinned by clink |
+| libmosquitto (the sink) | System package via apt (Debian, `libmosquitto-dev`) / brew (macOS, `mosquitto`) | Not pinned by clink |
+| OpenSSL (the source's TLS) | System package | Not pinned by clink |
 
-TLS is built into libmosquitto (OpenSSL), so there is no separate SSL library to discover. `tls=true` works whenever the installed libmosquitto was compiled with TLS support; if not, the connection fails at connect time with libmosquitto's own error. The connector does not link Arrow.
+The sink's TLS is built into libmosquitto (OpenSSL): `tls=true` works whenever the installed libmosquitto was compiled with TLS support, and otherwise fails at connect time with libmosquitto's own error. The source's TLS needs OpenSSL found at build time; without it the source still builds, and `tls=true` fails at connect saying the build has no TLS. The connector does not link Arrow.
 
 ## Enabling it
 
 The connector is gated by the CMake option `CLINK_WITH_MQTT`, with values `AUTO` (default), `ON`, or `OFF`.
 
-- `AUTO`: built only if libmosquitto is found; otherwise the impl is silently skipped.
+- `AUTO`: built only if libmosquitto is found; otherwise the impl is silently skipped. The source needs no client library of its own, but builds as part of the impl.
 - `ON`: configuration fails if libmosquitto is not found.
 - `OFF`: the target is not defined.
 
-CMake discovers libmosquitto three ways, most portable first: a pkg-config imported target (`libmosquitto.pc`, shipped by `libmosquitto-dev`), mosquitto's own CONFIG package, then a manual header/library probe (covering a Homebrew keg or a bare Linux install with no pkg-config tool). `scripts/install-connector-deps.sh` installs `libmosquitto-dev`, so the toolchain image builds the connector: CI's build of commit 6ad5168a on 2026-11-05 built `clink_mqtt_tests` and passed its 12 in-process cases, skipping the 6 that need a broker. On a host, install the library first:
+CMake discovers libmosquitto three ways, most portable first: a pkg-config imported target (`libmosquitto.pc`, shipped by `libmosquitto-dev`), mosquitto's own CONFIG package, then a manual header/library probe (covering a Homebrew keg or a bare Linux install with no pkg-config tool). `scripts/install-connector-deps.sh` installs `libmosquitto-dev`, so the toolchain image builds the connector (CI's build of commit 6ad5168a on 2026-11-05 built `clink_mqtt_tests`). On a host, install the library first:
 
 ```bash
 # Debian/Ubuntu
@@ -57,11 +60,11 @@ Both factories share the connection options. `topic` is required on both sides; 
 | `username` | No | (empty) | Username for broker authentication; empty means no auth. |
 | `password` | No | (empty) | Password for broker authentication. |
 | `client_id` | No | `clink-mqtt-source` / `clink-mqtt-sink` | Client id base; the subtask index is appended so parallel subtasks hold distinct ids. |
-| `tls` | No | `false` | `true` enables TLS encryption (libmosquitto built-in OpenSSL). |
+| `tls` | No | `false` | `true` enables TLS encryption (the sink through libmosquitto's OpenSSL, the source through OpenSSL found at build time). Without `tls_ca` or `tls_capath`, the source verifies against the system's default CAs. |
 | `tls_ca` | No | (empty) | CA certificate file (PEM) used to verify the server. |
 | `tls_capath` | No | (empty) | Directory of CA certificates. |
 | `tls_cert` | No | (empty) | Client certificate file for mutual TLS. |
-| `tls_key` | No | (empty) | Client private key file for mutual TLS. |
+| `tls_key` | No | (empty) | Client private key file for mutual TLS (the source reads the key from `tls_cert` when this is empty). |
 | `tls_verify` | No | `true` | `false` skips server-certificate and hostname verification (self-signed dev only). |
 
 ### `mqtt_sink` options
@@ -85,9 +88,12 @@ Both factories share the connection options. `topic` is required on both sides; 
 | `qos` | No | `1` | Subscription QoS. Must be 0, 1 or 2. |
 | `shared_group` | No | (empty) | Non-empty subscribes to `$share/<group>/<topic>` so the broker load-balances across parallel subtasks. Empty means only subtask 0 is active. |
 | `include_topic` | No | `false` | `true` emits each message as `{"topic":...,"payload":...}` JSON; otherwise the payload is emitted verbatim. |
-| `block_ms` | No | `500` | libmosquitto loop wait in milliseconds (bounds cancellation latency); a value of 0 or less is reset to 500. |
+| `block_ms` | No | `500` | Longest wait for a message in one `produce()` call, in milliseconds (bounds cancellation latency); a value of 0 or less is reset to 500. |
+| `protocol_version` | No | `5` | `5` (MQTT 5) or `3.1.1`. A broker that does not speak MQTT 5 refuses the connection, and the error names this option. |
+| `receive_maximum` | No | `10000` | MQTT 5: how many QoS 1 and 2 messages the broker may send unacknowledged, 1 to 65535. The source acknowledges only at checkpoint completion, so this is the most one subtask reads per checkpoint interval. Not sent under MQTT 3.1.1. |
+| `session_expiry_s` | No | `4294967295` (never) | MQTT 5: how long the broker keeps the session after its connection ends, at least 1. A session that ends with its connection would deliver nothing again. |
 
-The source forces `clean_session=false` (a persistent broker session is required for its recovery model and is not a user-tunable parameter).
+The source always holds a persistent session (clean session or clean start off) under its client id; it has no `clean_session` option, since its recovery is the broker delivering again what the session holds unacknowledged.
 
 Authentication-related options are `username` and `password` (broker auth) and the `tls_*` group (TLS, including `tls_cert`/`tls_key` for mutual TLS and `tls_verify`).
 
@@ -133,15 +139,25 @@ src_opts.topic = "clink/demo";
 src_opts.qos = 1;
 MqttSource src(std::move(src_opts));
 src.open();
-// src.produce(emitter) drives one libmosquitto loop iteration per call,
-// emitting any messages received during that iteration.
+// src.produce(emitter) reads what arrives within block_ms and emits it. In a
+// checkpointing job each message is acknowledged once a completed checkpoint
+// covers it; run on its own like this, nothing is acknowledged, and the
+// session delivers everything again on the next connection.
 ```
 
 Via the registry, the factories are reached as `mqtt_sink` and `mqtt_source` on the `string` channel, with `host`, `port`, `topic`, `qos` and the other keys above supplied as `BuildContext` params (see `impls/mqtt/src/register_factories.cpp` and `impls/mqtt/tests/test_factory_registration.cpp`).
 
 ## Delivery semantics
 
-Source. MQTT has no replayable offset or cursor, so the source persists no checkpoint offset (`snapshot_offset`/`restore_offset` are the no-op base defaults). Durability comes from the broker session: the source always runs with a stable per-subtask client id and a persistent session (`clean_session` is forced off by the factory), so the broker retains the subscription and queues QoS 1/2 messages for this client while it is disconnected, redelivering un-acked messages on reconnect. This gives at-least-once across a clean reconnect. libmosquitto auto-acks a QoS 1/2 message when the `on_message` callback returns, so a process crash after the callback but before the next checkpoint loses those in-flight messages, making delivery best-effort across a hard crash. A downstream idempotent or keyed-dedup consumer is the robust path. The source's capability record (`mqtt_source`, apart from the sink's `mqtt`) says what that amounts to: libmosquitto acknowledges each QoS 1/2 message when the message callback returns, before any checkpoint covers it, so a crash loses what arrived since the last checkpoint. The record declares at-most-once and no checkpoint participation, and the delivery analyser reports a job over the source as `AT_MOST_ONCE_SOURCE`, refusing a stronger request; one shared record used to claim at-least-once for both. Deferring the acknowledgement to checkpoint completion needs a client that does not acknowledge on its own.
+Source. MQTT has no position a source could store, so recovery is the broker's: the source holds a persistent session under a stable per-subtask client id, and when the session reconnects the broker delivers again every QoS 1 or 2 message it holds unacknowledged. The source therefore acknowledges a message only once a completed checkpoint covers it. `snapshot_offset` seals what arrived since the last barrier as that checkpoint's (through `CheckpointAckLedger`, persisting nothing), `notify_checkpoint_complete` makes it ready, and the next `produce()` or `close()` sends the PUBACKs, in the order the messages arrived, as MQTT requires. At QoS 2 the deferred packet is the PUBREC, which is what hands the message over; the PUBREL that follows is answered with PUBCOMP at once. A crash before the acknowledgements go out leaves the messages with the session, and they are delivered again. The record (`mqtt_source`) declares `OffsetModel::Acknowledgement`, and the delivery analyser reports a job over the source as `AT_LEAST_ONCE_SOURCE`: a sink may declare `at_least_once`, and `exactly_once` is refused.
+
+Two rules come from MQTT itself. An acknowledgement goes out only on the connection its message arrived on: after a reconnect the broker sends every unacknowledged message again, under packet identifiers it may since have reused, so what the source still holds from an earlier connection is never acknowledged on a later one, and the copy delivered again is acknowledged instead. And MQTT has no negative acknowledgement, so an aborted checkpoint reconnects: only a new connection gets the broker to deliver that checkpoint's messages again. A message after the aborted ones is not acknowledged on the old connection either, since that would break the order. Both deliver again messages a later checkpoint may already cover, so the guarantee is at least once. `close()` acknowledges what completed checkpoints cover and leaves the rest with the session.
+
+How much one checkpoint interval reads is the session's in-flight window, since the broker sends at most that many messages unacknowledged. Under MQTT 5 the source states it as its Receive Maximum (`receive_maximum`, default 10,000). Under MQTT 3.1.1 the broker's own setting decides: mosquitto's `max_inflight_messages` is 20 unless configured, so at 10-second checkpoints a subtask reads about two messages a second. While acknowledgements wait, the broker queues what it cannot yet send, and a broker that bounds that queue drops what overflows it: mosquitto's `max_queued_messages` defaults to 1,000. Measured against mosquitto 2.1.2 in its default configuration, an MQTT 3.1.1 subscriber holding its acknowledgements received 20 of 3,000 messages, and once it reconnected and acknowledged everything, 1,040 came back; the broker logged that it was dropping the rest. Size `receive_maximum`, and the broker's queue limits, for what arrives in one checkpoint interval.
+
+Under MQTT 5 the source subscribes with Retain Handling 1, so retained messages come only with a subscription that is new: a source that resumes its session does not receive a retained message again. MQTT 3.1.1 has no such option, and a restart receives the retained message again.
+
+Recovery stands on the session. A session the broker no longer holds, because it expired or because a broker that does not persist sessions restarted, takes what it held unacknowledged with it; on such a reconnect the source logs that the session was gone and subscribes again. The session never expires by default (`session_expiry_s`), so a job that is deleted leaves its sessions queueing messages on the broker until they are removed there. A subtask's session also holds its messages when the subtask goes, so the coordinator refuses to rescale the source to fewer subtasks: with `shared_group` set no remaining subtask receives what a removed subtask's session holds, and the broker may keep it until the session expires.
 
 Sink. At QoS 1 (the default) and QoS 2 the sink is at-least-once end to end. `flush()` (called on the batch thresholds, on linger, and on every checkpoint barrier) waits until every buffered message is acknowledged, PUBACK at QoS 1 and PUBCOMP at QoS 2, so everything buffered is durable in the broker by the barrier. A flush that fails after some messages have reached the broker is replayed from the last checkpoint, re-publishing those messages, so duplicates are possible and must be absorbed downstream. At QoS 0 the sink is at-most-once: the broker acknowledges nothing, so the flush returns once the messages are written to the connection, and a message lost with a connection that drops after that is gone while the checkpoint completes. On a flush error the sink drops and rebuilds its connection on re-open to avoid a desynced in-flight window.
 
@@ -149,25 +165,29 @@ The sink keeps its connection while it has nothing to publish. A broker drops a 
 
 ## Limitations
 
-- The source acknowledges each message to the broker on receipt, before any checkpoint covers it, so it is at-most-once across a crash; its record and the delivery analyser say so.
+- The source is at-least-once at QoS 1 and 2: messages a completed checkpoint covers whose acknowledgements had not gone out are delivered again after a crash, and an aborted checkpoint or a lost connection delivers again everything the session holds unacknowledged. At QoS 0 nothing is acknowledged and nothing delivered again.
+- A restore from a checkpoint older than one the source acknowledged (commit-confirmed restore, a savepoint) does not see that checkpoint's messages again.
+- One checkpoint interval reads at most the session's in-flight window, and while acknowledgements wait a broker that bounds its queue drops what overflows it (see above).
+- The source cannot be rescaled to fewer subtasks.
 - The sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - String channel only: payloads are opaque `std::string` values, published and emitted verbatim. There is no Arrow or Parquet encoding and no typed (for example int64) channel.
 - The sink publishes to a single fixed `topic`; there is no per-record topic routing.
 - `include_topic=true` assumes UTF-8 text payloads; for binary payloads use the default verbatim mode.
 - Source parallelism: by default (no `shared_group`) only subtask 0 subscribes and emits, with other subtasks dormant, so it is best run at parallelism 1. Spreading load across subtasks requires `shared_group`, which in turn requires a broker that supports shared subscriptions (`$share/...`).
-- No exactly-once end-to-end: the sink is at-least-once at QoS 1 and 2 and at-most-once at QoS 0, and the source is at-least-once across clean reconnects but best-effort across a hard crash (no replayable offset).
+- No exactly-once end-to-end: the sink is at-least-once at QoS 1 and 2 and at-most-once at QoS 0, and so is the source.
+- The source's client has no WebSocket transport and no MQTT 5 enhanced authentication (AUTH).
 - Retained-message clearing and other broker housekeeping are the operator's responsibility, not the connector's.
 
 ## Testing
 
 A live integration test, `impls/mqtt/tests/test_mqtt_live.cpp`, is skipped unless an environment variable points it at a real broker:
 
-- `CLINK_MQTT_TEST_URL` (for example `mqtt://localhost:1883`) enables the plaintext round-trip tests: a sink-to-source round-trip delivering every record verbatim, the `include_topic` JSON envelope, retained-message delivery to a fresh subscriber, and the idle sink at a five-second keepalive: `AnIdleSinkStaysConnectedAcrossItsBarriers` idles it for twelve seconds with a barrier every half second and requires its next batch to go out without a reconnect, and `ASinkDroppedWhileIdleReconnectsForItsNextBatch` idles it as long with no barrier, so the broker drops it, and requires the next batch to reconnect once and arrive.
+- `CLINK_MQTT_TEST_URL` (for example `mqtt://localhost:1883`) enables the plaintext tests. `MqttLive` covers a sink-to-source round-trip delivering every record verbatim, the `include_topic` JSON envelope, retained-message delivery to a fresh subscriber, and the idle sink at a five-second keepalive: `AnIdleSinkStaysConnectedAcrossItsBarriers` idles it for twelve seconds with a barrier every half second and requires its next batch to go out without a reconnect, and `ASinkDroppedWhileIdleReconnectsForItsNextBatch` idles it as long with no barrier, so the broker drops it, and requires the next batch to reconnect once and arrive. `MqttSourceAckLive` is the source's recovery contract, judged by what a later source on the same session receives: a crash before any completion and one after a completion, an aborted checkpoint, `close()`, QoS 2, the window under MQTT 5 (`receive_maximum`) and under MQTT 3.1.1 (mosquitto's default of 20), and a resumed session that does not receive a retained message again.
 - `CLINK_MQTT_TLS_TEST_URL` (a `host:port` pointing at a TLS-enabled broker) enables the TLS round-trip test. `CLINK_MQTT_TLS_CA` may supply the CA certificate (PEM); without it, verification is skipped (self-signed dev cert: encrypt but do not authenticate).
 
-`docker/integration-services.yml` defines an `mqtt` service (`eclipse-mosquitto:2` on port 1883), and `ONLY=mqtt scripts/run-all-live.sh` runs `MqttLive` against it inside the toolchain image. No CI workflow runs it, and nothing provides the TLS broker the TLS case needs.
+`docker/integration-services.yml` defines an `mqtt` service (`eclipse-mosquitto:2` on port 1883). `scripts/ack-sources-live.sh` runs `MqttLive` and `MqttSourceAckLive` against a one-off container of it, with the other acknowledging sources, and fails on a skipped case or a short suite; the `ack-sources` CI workflow runs that script. The TLS case is left out there, since nothing provides the TLS broker it needs. `ONLY=mqtt scripts/run-all-live.sh` runs the live suites by hand inside the toolchain image.
 
-In-process unit tests run without a broker: `test_factory_registration.cpp` checks that `mqtt_source` and `mqtt_sink` are registered on the `string` channel, and `test_mqtt_sink_logic.cpp` / `test_mqtt_source_logic.cpp` exercise the sink and source logic. The test executable is `clink_mqtt_tests`, labelled `mqtt`:
+In-process tests run without a broker. `test_mqtt_protocol.cpp` holds each packet the source's client sends, byte for byte, and the malformed ones it refuses; `test_mqtt_source_ack.cpp` runs the source against an in-process broker (`fake_mqtt_broker.hpp`) that records every acknowledgement in the order it came, covering the same cases as `MqttSourceAckLive` plus a message sent again on the same connection, a refused connection and the keepalive's ping. `test_factory_registration.cpp` checks the registrations, both records and the analyser's verdicts, and `test_mqtt_sink_logic.cpp` / `test_mqtt_source_logic.cpp` exercise the sink and source options. The test executable is `clink_mqtt_tests`, labelled `mqtt`:
 
 ```bash
 ctest --test-dir build -L mqtt

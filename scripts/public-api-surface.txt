@@ -257,8 +257,11 @@ impls/mongodb/include/clink/mongodb/mongo_client.hpp
 impls/mongodb/include/clink/mongodb/mongo_event.hpp
 impls/mongodb/include/clink/mongodb/mongo_sink.hpp
 impls/mqtt/include/clink/mqtt/mqtt_client.hpp
+impls/mqtt/include/clink/mqtt/mqtt_options.hpp
+impls/mqtt/include/clink/mqtt/mqtt_protocol.hpp
 impls/mqtt/include/clink/mqtt/mqtt_sink.hpp
 impls/mqtt/include/clink/mqtt/mqtt_source.hpp
+impls/mqtt/include/clink/mqtt/mqtt_subscriber.hpp
 impls/mysql/include/clink/mysql/mysql_cdc_source.hpp
 impls/mysql/include/clink/mysql/mysql_client.hpp
 impls/mysql/include/clink/mysql/mysql_json.hpp

@@ -7,7 +7,9 @@
 add_executable(clink_mqtt_tests
     register.cpp
     test_factory_registration.cpp
+    test_mqtt_protocol.cpp
     test_mqtt_sink_logic.cpp
+    test_mqtt_source_ack.cpp
     test_mqtt_source_logic.cpp
     test_mqtt_live.cpp
 )
