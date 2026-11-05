@@ -219,6 +219,7 @@ add_executable(clink_core_tests
     test_pipe_throughput_floor.cpp
     test_source_replay.cpp
     test_checkpoint_ack_ledger.cpp
+    test_source_ack_hooks.cpp
     test_keyed_state_ttl.cpp
     test_keyed_state_ttl_depth.cpp
     test_typed_state_ttl.cpp

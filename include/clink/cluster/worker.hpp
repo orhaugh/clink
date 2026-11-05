@@ -504,6 +504,13 @@ private:
     void release_held_source_triggers_locked_(JobId job_id,
                                               std::uint32_t sub,
                                               const std::shared_ptr<HeldSourceTriggers>& held);
+    // Register a subtask's source barrier injectors, replaying into them every
+    // trigger held for it since its Deploy, oldest first: the single-op source
+    // path's registration, and a chain's with a fused source.
+    void register_source_injectors_(JobId job_id,
+                                    std::uint32_t sub,
+                                    const std::shared_ptr<HeldSourceTriggers>& held_triggers,
+                                    std::vector<RunnerContext::SourceInjectorFn> injectors);
     // The generation each job is currently deployed at on this worker (F84).
     std::unordered_map<JobId, std::uint64_t> per_job_generation_;
 

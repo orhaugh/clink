@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**A source fused into its chain receives its checkpoint barriers.** With
+`CLINK_PLAN_FUSE_PAR1=1` the worker registered no barrier injector for a
+source fused into a chain, so the source never saw a barrier, nothing
+acknowledged the checkpoint, and no checkpoint of the job ever completed: the
+fused completion hooks the messaging sources rely on had nothing to deliver.
+The chain now registers its source's injectors as a single-op source does,
+and the Deploy holds its triggers until it has.
+`SourceAckHooks.CompletionsReachASourceFusedIntoItsChain` failed with 291
+checkpoints triggered and none complete, and passes.
+
 **A job parked for being idle wakes for what arrives after it parked, not for
 what it had already read.** The operator's Kafka lag wake measured a parked
 job's lag against its consumer group's committed offsets, and counted a

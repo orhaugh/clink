@@ -433,11 +433,13 @@ SubtaskRunner make_int64_int64_match_join_runner() {
 }
 
 // Whether a generic subtask running `chain` hands the worker barrier
-// injectors: only the single-op source path of run_generic_subtask_ does. A
-// source fused into a chain registers none.
+// injectors: the single-op source path of run_generic_subtask_, and a chain
+// with a source fused into it. A fused source used to register none, so no
+// barrier reached it and no checkpoint of its job ever completed.
 bool registers_source_injectors(const OperatorChainSpec& chain) {
-    return chain.ops.size() == 1 && chain.ops[0].kind == OperatorKind::Source &&
-           !chain.fused_source.has_value() && !chain.fused_sink.has_value();
+    return (chain.ops.size() == 1 && chain.ops[0].kind == OperatorKind::Source &&
+            !chain.fused_source.has_value() && !chain.fused_sink.has_value()) ||
+           chain.fused_source.has_value();
 }
 
 }  // namespace
@@ -2164,6 +2166,50 @@ void Worker::run_task_(JobId job_id,
     cv_.notify_all();
 }
 
+void Worker::register_source_injectors_(JobId job_id,
+                                        std::uint32_t sub,
+                                        const std::shared_ptr<HeldSourceTriggers>& held_triggers,
+                                        std::vector<RunnerContext::SourceInjectorFn> injectors) {
+    CLINK_FAULT_POINT(clink::fault::points::kWorkerBeforeSourceInjectors);
+    std::lock_guard lock(mu_);
+    auto& entry = per_job_injectors_[job_id][sub];
+    entry.injectors = std::move(injectors);
+    if (!held_triggers) {
+        return;
+    }
+    release_held_source_triggers_locked_(job_id, sub, held_triggers);
+    std::uint64_t current_gen = 0;
+    if (auto g = per_job_generation_.find(job_id); g != per_job_generation_.end()) {
+        current_gen = g->second;
+    }
+    for (const auto& t : held_triggers->triggers) {
+        // Re-validate at REPLAY time (F84): a deploy can land between
+        // holding and this drain, and a trigger stamped for the old
+        // generation replayed into the new one writes the old id into
+        // the new generation's directories.
+        if (t.generation != 0 && current_gen != 0 && t.generation != current_gen) {
+            log::warn("worker.checkpoint",
+                      "dropping held checkpoint trigger " + std::to_string(t.checkpoint_id) +
+                          " for job " + std::to_string(job_id) + ": stamped generation " +
+                          std::to_string(t.generation) + ", deployed generation " +
+                          std::to_string(current_gen));
+            continue;
+        }
+        const CheckpointBarrier barrier(CheckpointId{t.checkpoint_id},
+                                        t.barrier_mode_plus1 == 2
+                                            ? CheckpointBarrier::Mode::Unaligned
+                                            : CheckpointBarrier::Mode::Aligned);
+        for (auto& fn : entry.injectors) {
+            try {
+                fn(barrier);
+            } catch (...) {
+                // Best-effort, as on the direct path.
+            }
+        }
+    }
+    held_triggers->triggers.clear();
+}
+
 void Worker::run_generic_subtask_(JobId job_id,
                                   const DeploymentTask& task,
                                   const std::string& checkpoint_dir,
@@ -2624,45 +2670,7 @@ void Worker::run_generic_subtask_(JobId job_id,
             // when the trigger arrived.
             auto register_injectors = [this, job_id, sub = task.subtask_idx, held_triggers](
                                           std::vector<RunnerContext::SourceInjectorFn> injectors) {
-                CLINK_FAULT_POINT(clink::fault::points::kWorkerBeforeSourceInjectors);
-                std::lock_guard lock(mu_);
-                auto& entry = per_job_injectors_[job_id][sub];
-                entry.injectors = std::move(injectors);
-                if (!held_triggers) {
-                    return;
-                }
-                release_held_source_triggers_locked_(job_id, sub, held_triggers);
-                std::uint64_t current_gen = 0;
-                if (auto g = per_job_generation_.find(job_id); g != per_job_generation_.end()) {
-                    current_gen = g->second;
-                }
-                for (const auto& t : held_triggers->triggers) {
-                    // Re-validate at REPLAY time (F84): a deploy can land between
-                    // holding and this drain, and a trigger stamped for the old
-                    // generation replayed into the new one writes the old id into
-                    // the new generation's directories.
-                    if (t.generation != 0 && current_gen != 0 && t.generation != current_gen) {
-                        log::warn("worker.checkpoint",
-                                  "dropping held checkpoint trigger " +
-                                      std::to_string(t.checkpoint_id) + " for job " +
-                                      std::to_string(job_id) + ": stamped generation " +
-                                      std::to_string(t.generation) + ", deployed generation " +
-                                      std::to_string(current_gen));
-                        continue;
-                    }
-                    const CheckpointBarrier barrier(CheckpointId{t.checkpoint_id},
-                                                    t.barrier_mode_plus1 == 2
-                                                        ? CheckpointBarrier::Mode::Unaligned
-                                                        : CheckpointBarrier::Mode::Aligned);
-                    for (auto& fn : entry.injectors) {
-                        try {
-                            fn(barrier);
-                        } catch (...) {
-                            // Best-effort, as on the direct path.
-                        }
-                    }
-                }
-                held_triggers->triggers.clear();
+                register_source_injectors_(job_id, sub, held_triggers, std::move(injectors));
             };
             // 2PC commit-callback registration. Sink runners that
             // implement the 2PC protocol register one or more callbacks
@@ -3338,6 +3346,12 @@ void Worker::run_generic_subtask_(JobId job_id,
             .runner_job_id = job_id,
         };
         rctx.cancel_token = subtask_cancel_token;
+        // A fused source takes its barriers from the worker as a single-op
+        // source does; the Deploy held every trigger since for it.
+        if (chain.fused_source.has_value()) {
+            register_source_injectors_(
+                job_id, task.subtask_idx, held_triggers, dag.source_injectors());
+        }
         LocalExecutor exec(std::move(dag), clink::plugin::detail::make_subtask_job_config(rctx));
         // Constructed after exec so reverse destruction retires the commit
         // dispatch gate - draining any in-flight CommitCheckpoint/
