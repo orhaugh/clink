@@ -247,10 +247,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         .runtime_dependencies = {"google cloud pub/sub (or emulator)"},
         .formats = {"text", "json", "bytes"},
         .boundedness = clink::connectors::Boundedness::Unbounded,
-        // The subscription's ack state is the position: unacked messages
-        // redeliver after ackDeadline, acks happen at the checkpoint.
+        // The subscription's ack state is the position: the source acknowledges
+        // once the checkpoint that covers a message completes, and the server
+        // delivers again whatever was not acknowledged.
         .replayable = false,
-        .offset_model = clink::connectors::OffsetModel::None,
+        .offset_model = clink::connectors::OffsetModel::Acknowledgement,
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
@@ -262,7 +263,18 @@ void install(clink::plugin::PluginRegistry& reg) {
         .available_in_sql = true,
         .limitations = {"publish has no dedup key: a replay re-publishes",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
-                        "another sink beside it"},
+                        "another sink beside it",
+                        "source messages a completed checkpoint covers but whose acknowledge had "
+                        "not landed are delivered again after a crash (duplicates)",
+                        "a source message held past max_lease is delivered again under a new "
+                        "ackId (a duplicate)",
+                        "a restore from a checkpoint older than one the source acknowledged "
+                        "(commit-confirmed restore, a savepoint) does not see that "
+                        "checkpoint's messages again",
+                        "the source holds at most max_outstanding unacknowledged messages per "
+                        "subtask; a job that completes no checkpoint stops pulling there",
+                        "on_decode_error='drop' acknowledges and drops a message whose data is "
+                        "not base64; the default 'fail' stops the subtask instead"},
     });
 
     using clink::plugin::BuildContext;
@@ -529,18 +541,23 @@ void install(clink::plugin::PluginRegistry& reg) {
         });
 
     // pubsub_source: pull from a Google Cloud Pub/Sub subscription via the REST
-    // :pull API, emit each message's base64-decoded data, and :acknowledge on
-    // each checkpoint (the ack is the offset commit). At-least-once: unacked
-    // messages are redelivered by the server after the subscription ackDeadline,
-    // which is also crash recovery. Multiple subtasks pull the SAME subscription;
-    // Pub/Sub load-balances messages across them (no client-side sharding).
+    // :pull API, emit each message's base64-decoded data, and :acknowledge once
+    // the checkpoint that covers it completes (the ack is the offset commit).
+    // At-least-once: the source holds each message's lease until then, and the
+    // server delivers again whatever was not acknowledged, which is also crash
+    // recovery. Multiple subtasks pull the SAME subscription; Pub/Sub
+    // load-balances messages across them (no client-side sharding).
     // Params:
     //   project (required), subscription (required)
     //   endpoint / auth_token / headers / verify_tls - as pubsub_sink
     //   max_messages (default 1000; capped at 1000) - Pull maxMessages
     //   return_immediately ("true" [default] | "false")
     //   poll_interval_ms (default 500) - sleep after an empty pull
-    //   max_retries (default 4; clamped to [0, 20]) - transient-pull retries
+    //   max_retries (default 4; clamped to [0, 20]) - transient pull/ack retries
+    //   ack_deadline_s (default 60; 10 to 600) - lease taken and renewed per message
+    //   max_lease_s (default 3600) - how long one message's lease is renewed
+    //   max_outstanding (default 10000) - messages held unacknowledged before pulls pause
+    //   on_decode_error ("fail" [default] | "drop") - data that is not base64
     reg.register_source<std::string>(
         "pubsub_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             PubSubSourceOptions o;
@@ -554,6 +571,32 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
             o.retry_base_backoff =
                 std::chrono::milliseconds{ctx.param_int64_or("retry_base_backoff_ms", 200)};
+            const auto ack_deadline_s = ctx.param_int64_or("ack_deadline_s", 60);
+            if (ack_deadline_s < 10 || ack_deadline_s > 600) {
+                throw std::runtime_error(
+                    "pubsub_source: 'ack_deadline_s' must be between 10 and 600 seconds");
+            }
+            o.ack_deadline = std::chrono::seconds{ack_deadline_s};
+            const auto max_lease_s = ctx.param_int64_or("max_lease_s", 3600);
+            if (max_lease_s < ack_deadline_s) {
+                throw std::runtime_error(
+                    "pubsub_source: 'max_lease_s' must be at least 'ack_deadline_s'");
+            }
+            o.max_lease = std::chrono::seconds{max_lease_s};
+            const auto max_outstanding = ctx.param_int64_or("max_outstanding", 10000);
+            if (max_outstanding < 1) {
+                throw std::runtime_error("pubsub_source: 'max_outstanding' must be at least 1");
+            }
+            o.max_outstanding = static_cast<std::size_t>(max_outstanding);
+            const std::string on_decode_error = ctx.param_or("on_decode_error", "fail");
+            if (on_decode_error != "fail" && on_decode_error != "drop") {
+                throw std::runtime_error(
+                    "pubsub_source: 'on_decode_error' must be 'fail' or 'drop', not '" +
+                    on_decode_error + "'");
+            }
+            o.on_decode_error = on_decode_error == "drop"
+                                    ? PubSubSourceOptions::OnDecodeError::Drop
+                                    : PubSubSourceOptions::OnDecodeError::Fail;
             o.name = "pubsub_source";
             return std::make_shared<PubSubPullSource>(std::move(o));
         });

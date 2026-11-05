@@ -83,6 +83,7 @@ With `tls_verify` on, the handshake checks both that the server's certificate ch
 | `count` | No | `500` | `XREADGROUP COUNT` per call. Values below 1 are clamped to 1. |
 | `block_ms` | No | `500` | `XREADGROUP BLOCK` in milliseconds; bounds cancel latency. Non-positive values are normalised to 500 (a `BLOCK 0` would block forever and wedge the runner thread). |
 | `start_id` | No | `$` | Group-create position: `$` reads new entries only, `0` reads existing history. |
+| `max_pending` | No | `100000` | Most entries a subtask holds delivered but unacknowledged, each waiting for the checkpoint that covers it to complete. At the bound the source stops reading until one completes. Must be at least 1. |
 
 ## SQL usage
 
@@ -165,9 +166,26 @@ Sink (`redis_sink`): `XADD` is append-only with no producer dedup key. Records a
 
 Upsert sink (`redis_upsert_sink`, `mode='upsert'`): a separate key-value view (not Streams). Maintains one Redis key per PRIMARY KEY tuple - `SET <key_prefix><pk>` for insert/update_after, where a text key is its own characters, a number its digits, and the columns of a composite key are joined by the unit separator (0x1f), `DEL` for delete/update_before - netted by key within a flush and pipelined. Effectively-once on the keyspace for a stable PRIMARY KEY and a deterministic defining query (SET/DEL are keyed and idempotent, so a replay converges). The stored value is the row's JSON with the synthetic `__row_kind` removed. Lets a retracting query maintain a Redis key-value view.
 
-Source: the consumer group's per-consumer pending-entries list (PEL) is the durable cursor. On `open()` each consumer first re-drains its PEL (id `0`), re-delivering anything delivered-but-not-acked before a crash, then switches to new entries (`>`). `XACK` is the offset commit and rides `snapshot_offset()`, so entries delivered since the last checkpoint are acknowledged when the checkpoint is taken.
+Source: the consumer group's per-consumer pending-entries list (PEL) is the durable cursor. On `open()` each consumer first re-drains its PEL (id `0`), re-delivering anything delivered but not acknowledged before a crash, then switches to new entries (`>`).
 
-Honest caveat (stated in `redis_source.hpp`): `XACK` is an external side effect that is not transactional with the global checkpoint. If `snapshot_offset` acks a batch and the global checkpoint then fails, those entries are gone from the PEL and not replayed, which is at-most-once for that one batch. Strict exactly-once would need a source on-commit hook, which is deferred. A reply-level `XACK` error keeps the ids buffered so the next checkpoint retries, and the entries remain in the PEL meanwhile, preserving at-least-once either way.
+`XACK` waits for the checkpoint that covers an entry to complete. `snapshot_offset()` seals the entries delivered since the last barrier as that checkpoint's, `notify_checkpoint_complete()` makes every interval at or below the completed id ready, and the source's next `produce()` turn, or its `close()`, sends the `XACK`. Every Redis call stays on the source thread; the notification, which arrives on the worker's commit-dispatch thread, only moves entries between lists (`include/clink/connectors/checkpoint_ack_ledger.hpp`). A repeated, late or out-of-order notification moves nothing twice and nothing sealed above the id it names. An aborted checkpoint's entries, and those of a checkpoint that never completes, stay pending, and the restart reads them again. So:
+
+- Nothing in flight is lost on a crash, a cancel or a failed checkpoint.
+- A checkpoint that completed but whose `XACK` had not landed when the process died is delivered again after the restart, as duplicates. A failed `XACK`, or one whose reply is lost, fails the subtask; the restart reads again exactly what is still pending.
+- Completion is not commit confirmation. A job that restores from a checkpoint older than one the source acknowledged (a job with a commit-confirmed sink such as the Kafka transactional sink, whose restore selects the newest confirmed checkpoint, or an operator restoring a savepoint) does not see that checkpoint's entries again. The delivery analyser warns about the commit-confirmed combination.
+- A subtask holds at most `max_pending` unacknowledged entries. A job that completes no checkpoint (no checkpointing, or a `LocalExecutor` run, where nothing dispatches completions) acknowledges nothing, so it reads `max_pending` entries and then waits, logging why.
+
+The capability record declares the position model as `acknowledgement`, so the delivery analyser reports a job over this source as `AT_LEAST_ONCE_SOURCE`: a sink in it may declare `delivery_guarantee='at_least_once'`, and `exactly_once` is refused. Before this contract the source acknowledged at the barrier, an entry acknowledged by a checkpoint that then failed was not delivered again, and the analyser reported such a job as `AT_MOST_ONCE_SOURCE`.
+
+### Rescaling the source
+
+A consumer is named `<prefix>-<subtask_idx>`, and a restart reads only its own PEL, so a scale-down would leave the removed subtasks' consumers holding pending entries that no remaining subtask reads. The source does not claim them: Redis keeps no lease on a consumer, so a consumer whose subtask has gone looks the same as one whose process is still reading (a zombie worker, or another job on the same group and prefix), and claiming from a consumer that is only slow would hand its entries to two readers. Instead:
+
+- The capability record declares a scale-down refusal, and the coordinator refuses an operator rescale of a `redis_source` to fewer subtasks, from the CLI, the HTTP API or the autoscaler, before anything drains. SQL declares no rescale bounds on sources, so a SQL job cannot rescale one at all; a C++ job can, upwards.
+- A source that opens beside entries pending on a consumer outside its layout (a run at a lower parallelism than the one before, started fresh) refuses to start and names the consumers, the entries they hold and the parallelism that reads them again. Run at that parallelism, or move the entries to a consumer the job runs (`XCLAIM`) or drop them (`XGROUP DELCONSUMER`), then start again.
+- A job submitted with a restore (a savepoint or an explicit checkpoint) keeps the layout it was taken at; any job's restore at another layout is refused at submit (see [fault tolerance and rescale](../internals/fault-tolerance-and-rescale.md)).
+
+Same-parallelism restarts and scale-up are unaffected.
 
 ## Limitations
 
@@ -175,22 +193,24 @@ Honest caveat (stated in `redis_source.hpp`): `XACK` is an external side effect 
 - String channel only; record type is fixed to `std::string` for both factories.
 - The Streams sink is append-only at-least-once with no two-phase commit and no producer dedup; `mode='upsert'` selects the key-value sink instead.
 - A source entry round-trips verbatim only when it carries the single configured `field` (default `v`); any other entry is rendered as a JSON object of all field/value pairs, with all values string-typed (Redis bulk strings).
-- An `XDEL`-tombstoned entry that is still pending is acknowledged and paged past but not emitted.
-- The `XACK`-on-checkpoint commit is not transactional with the global checkpoint, so a single batch can be at-most-once if a checkpoint fails after the ack (see Delivery semantics).
-- Rescale caveat: a consumer is named `<prefix>-<subtask_idx>` and a restart re-drains only its own PEL. On a scale-down the removed subtasks' consumers are never recreated, so their un-acked (pending) entries are orphaned in the group and not redelivered. Reclaiming them would need `XAUTOCLAIM` over the dropped consumers and is not done; op-level rescale is not currently reachable from the SQL path. Same-parallelism and scale-up restarts are unaffected.
+- An `XDEL`-tombstoned entry that is still pending is paged past but not emitted, and acknowledged with its checkpoint.
+- The source acknowledges at checkpoint completion, so a crash between a completion and its `XACK` delivers that interval again (duplicates), and a restore from a checkpoint older than one it acknowledged does not see that checkpoint's entries again (see Delivery semantics).
+- A job that completes no checkpoint reads at most `max_pending` entries per subtask and then waits.
+- The source cannot be rescaled to fewer subtasks; the coordinator refuses it, and a source that finds entries stranded by a lower parallelism refuses to start (see Rescaling the source).
 - TLS is available only when the build finds `libhiredis_ssl` and OpenSSL (`CLINK_REDIS_TLS`); otherwise `tls=true` is rejected at runtime, and `clink connectors` reports the connector without TLS.
 
 ## Testing
 
-The connector has in-process logic tests (`test_redis_sink_logic.cpp`, `test_redis_source_logic.cpp`), server-certificate tests (`test_redis_tls.cpp`), and an env-gated live integration test (`test_redis_live.cpp`).
+The connector has in-process logic tests (`test_redis_sink_logic.cpp`, `test_redis_source_logic.cpp`, which include the rule for which consumers a lower parallelism strands), capability-record tests (`test_factory_registration.cpp`: the acknowledgement model, `AT_LEAST_ONCE_SOURCE`, `exactly_once` refused, the scale-down refusal), server-certificate tests (`test_redis_tls.cpp`), and env-gated live integration tests (`test_redis_live.cpp`). The acknowledgement ledger the source shares with the Pub/Sub source has its own tests (`tests/test_checkpoint_ack_ledger.cpp`), and `tests/test_source_ack_hooks.cpp` runs a source acknowledging through it in an in-process cluster, with and without par-1 fusion and across a checkpoint that never completes, judging every acknowledgement against the coordinator's `COMPLETED` markers.
 
 The certificate tests run in every TLS-enabled build without a Redis server: they connect to a local TLS listener (`tests/test_helpers/tls_handshake_server.hpp`), since the handshake completes before the client sends any command. They cover a certificate that names the address, one that names another host (refused, with the error), `tls_sni` as the name checked, wildcards, the hostname opt-out still checking the chain, and `tls_verify=false`.
 
-The live test is skipped unless `CLINK_REDIS_TEST_URL` is set (for example `redis://localhost:6379`). The integration service is the `redis:7` Docker image defined in `docker/integration-services.yml`. It covers a sink-to-source round-trip, PEL replay of an un-acked consumer on restart, that acked entries are not replayed, multi-field JSON-object rendering, and idempotent `XGROUP CREATE`.
+The live tests are skipped unless `CLINK_REDIS_TEST_URL` is set (for example `redis://localhost:6379`). The integration service is the `redis:7` Docker image defined in `docker/integration-services.yml`. `RedisLive` covers a sink-to-source round-trip, PEL replay of an un-acked consumer on restart, that acknowledged entries are not replayed, multi-field JSON-object rendering, and idempotent `XGROUP CREATE`. `RedisSourceAckLive` holds the source to its acknowledgement contract against the server, judged by `XPENDING` and by what a restarted consumer reads: an aborted checkpoint, a crash after the barrier, a crash after completion before the `XACK`, a killed connection at the `XACK`, an `XACK` whose reply is lost, intervals and notifications out of order, the `max_pending` bound, close after a cancel, and a scale-down beside stranded entries.
+
+`scripts/redis-pubsub-live.sh [build-dir]` is the required gate for both sources: it runs these suites and the Pub/Sub ones against one-off containers of the compose services, one service at a time on free loopback ports, and fails on a missing binary, a service that never answers, a failed or skipped case, or a suite that ran fewer cases than it should.
 
 ```bash
-export CLINK_REDIS_TEST_URL=redis://localhost:6379
-ctest --test-dir build -L redis -R Live --output-on-failure
+scripts/redis-pubsub-live.sh build
 ```
 
 The TLS round-trip test additionally requires `CLINK_REDIS_TLS_TEST_URL` (set to a TLS-enabled redis `host:port`) and a build with `CLINK_REDIS_TLS`. The `-L redis` label runs the connector's test executable.

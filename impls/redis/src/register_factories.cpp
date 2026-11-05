@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -88,10 +89,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         .runtime_dependencies = {"redis >= 5 (streams)"},
         .formats = {"text", "json"},
         .boundedness = clink::connectors::Boundedness::Unbounded,
-        // The source is a consumer-group reader: recovery is PEL replay
-        // plus XACK at the checkpoint, not a client-side offset.
+        // The source is a consumer-group reader with no client-side offset:
+        // XACK waits for the checkpoint that covers an entry to complete, and
+        // the pending-entries list delivers again whatever was not acknowledged.
         .replayable = false,
-        .offset_model = clink::connectors::OffsetModel::None,
+        .offset_model = clink::connectors::OffsetModel::Acknowledgement,
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
@@ -103,7 +105,20 @@ void install(clink::plugin::PluginRegistry& reg) {
         .available_in_sql = true,
         .limitations = {"XADD has no dedup: a replayed tail is re-appended to the stream",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
-                        "another sink beside it"},
+                        "another sink beside it",
+                        "source entries a completed checkpoint covers but whose XACK had not "
+                        "landed are delivered again after a crash (duplicates)",
+                        "a restore from a checkpoint older than one the source acknowledged "
+                        "(commit-confirmed restore, a savepoint) does not see that "
+                        "checkpoint's entries again",
+                        "the source holds at most max_pending unacknowledged entries per "
+                        "subtask; a job that completes no checkpoint stops reading there",
+                        "the source cannot be rescaled to fewer subtasks"},
+        .scale_down_refusal =
+            "a Redis Streams source subtask is a consumer of its group, and a removed "
+            "subtask's consumer keeps its pending entries, which no remaining subtask reads "
+            "again; the source cannot claim them safely, since Redis cannot tell a consumer "
+            "that has gone from one that is still reading",
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "redis_upsert",
@@ -176,7 +191,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         });
 
     // redis_source: XREADGROUP from a stream via a consumer group; each subtask is
-    // one group consumer. At-least-once (PEL replay + XACK-on-checkpoint). Params:
+    // one group consumer. At-least-once (PEL replay + XACK at checkpoint
+    // completion). Params:
     //   host/port/username/password/db
     //   stream (required), group (required)
     //   consumer_prefix (default "clink") - consumer = "<prefix>-<subtask_idx>"
@@ -184,6 +200,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   count (default 500)       - XREADGROUP COUNT
     //   block_ms (default 500)    - XREADGROUP BLOCK (bounds cancel latency)
     //   start_id (default "$")    - group create position ("$" new-only | "0" history)
+    //   max_pending (default 100000) - entries held unacknowledged before reading pauses
     reg.register_source<std::string>(
         "redis_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             RedisSourceOptions o;
@@ -195,6 +212,11 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.count = static_cast<int>(ctx.param_int64_or("count", 500));
             o.block = std::chrono::milliseconds{ctx.param_int64_or("block_ms", 500)};
             o.start_id = ctx.param_or("start_id", "$");
+            const auto max_pending = ctx.param_int64_or("max_pending", 100000);
+            if (max_pending < 1) {
+                throw std::runtime_error("redis_source: 'max_pending' must be at least 1");
+            }
+            o.max_pending = static_cast<std::size_t>(max_pending);
             o.subtask_idx = ctx.subtask_idx;
             o.parallelism = ctx.parallelism;
             o.name = "redis_source";

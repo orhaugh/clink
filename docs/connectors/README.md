@@ -120,14 +120,18 @@ Guarantees vary by connector and are stated on each page. In summary:
   checkpoint on recovery; the exact mechanism (Kafka offsets, Postgres LSN,
   object index, row index) and any caveats are documented per connector.
 - Messaging sources whose only position is the broker's (RabbitMQ, NATS,
-  Pulsar) acknowledge once the checkpoint that captured a message has
-  completed, never at the barrier, so an aborted checkpoint leaves its
-  messages to be redelivered. Their records declare
+  Pulsar, Redis Streams, Pub/Sub) acknowledge once the checkpoint that
+  captured a message has completed, never at the barrier, so an aborted
+  checkpoint leaves its messages to be redelivered. Their records declare
   `OffsetModel::Acknowledgement`, and the delivery analyser reports a job
   over them as `AT_LEAST_ONCE_SOURCE`: nothing in flight is lost, a
   checkpoint acknowledged late is delivered again, and a sink in the job may
-  declare `at_least_once` but not `exactly_once`. Pub/Sub and Redis Streams
-  acknowledge at the barrier, with the caveat their pages state.
+  declare `at_least_once` but not `exactly_once`. A restore from a checkpoint
+  older than one such a source acknowledged (the commit-confirmed protocol, a
+  savepoint) does not see that checkpoint's messages again. The Redis Streams
+  and Pub/Sub sources bound what they hold and stop reading at the bound
+  until a checkpoint completes, and the Redis Streams source cannot be
+  rescaled to fewer subtasks; their pages give the detail.
 
 ## NaN and infinity in JSON output
 

@@ -1,8 +1,11 @@
 // Redis Streams LIVE integration test. SKIPPED unless CLINK_REDIS_TEST_URL is set
-// (e.g. redis://localhost:6379 from docker/integration-services.yml). Proves
+// (e.g. redis://localhost:6379 from docker/integration-services.yml); the live
+// gate, scripts/redis-pubsub-live.sh, sets it and fails on any skip. Proves
 // against a real redis-server: a sink->source round-trip delivers every record
 // verbatim; an un-acked consumer re-delivers its PEL on restart (at-least-once);
-// and XGROUP CREATE is idempotent across re-opens.
+// XGROUP CREATE is idempotent across re-opens; and the source's acknowledgement
+// contract (RedisSourceAckLive), judged by the server's own pending-entries list
+// and by what a restarted consumer reads, never by the source's counters.
 
 #include <chrono>
 #include <cstdint>
@@ -151,8 +154,9 @@ TEST(RedisLive, SinkThenSourceRoundTrip) {
     }
 }
 
-// XACK at snapshot_offset is the offset commit: after acking, a restart of the
-// SAME consumer must NOT replay them (the complement of the PEL-replay test).
+// XACK once the checkpoint completes is the offset commit: after acking, a
+// restart of the SAME consumer must NOT replay them (the complement of the
+// PEL-replay test).
 TEST(RedisLive, AckedEntriesAreNotReplayed) {
     if (!redis_configured()) {
         GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
@@ -168,8 +172,9 @@ TEST(RedisLive, AckedEntriesAreNotReplayed) {
         s1.open();
         Captured cap;
         drain(s1, cap, kM, /*timeout_ms=*/15000);
-        s1.snapshot_offset(backend, op, clink::CheckpointId{1});  // XACK all delivered
-        s1.close();
+        s1.snapshot_offset(backend, op, clink::CheckpointId{1});
+        s1.notify_checkpoint_complete(clink::CheckpointId{1});
+        s1.close();  // XACKs what the completed checkpoint covers
         ASSERT_EQ(std::set<std::string>(cap.values.begin(), cap.values.end()).size(), kM);
     }
     std::size_t replayed = 0;
@@ -262,6 +267,336 @@ TEST(RedisLive, GroupCreateIsIdempotent) {
     a.close();
     b.close();
     cleanup(stream);
+}
+
+// --- the source's acknowledgement contract --------------------------------
+
+namespace {
+
+void write_tagged(const std::string& stream, const std::string& tag, std::size_t n) {
+    RedisSink sink(sink_opts(stream));
+    sink.open();
+    Batch<std::string> b;
+    for (std::size_t i = 0; i < n; ++i) {
+        b.emplace(tag + std::to_string(i));
+    }
+    sink.on_data(b);
+    sink.flush();
+    sink.close();
+}
+
+std::vector<std::string> tagged(const std::string& tag, std::size_t n) {
+    std::vector<std::string> v;
+    for (std::size_t i = 0; i < n; ++i) {
+        v.push_back(tag + std::to_string(i));
+    }
+    return v;
+}
+
+// The group's pending entries, as the server counts them.
+long long pending(const std::string& stream, const std::string& group) {
+    Connection c{redis_conn()};
+    auto r = c.command({"XPENDING", stream, group});
+    if (!r || r->type != REDIS_REPLY_ARRAY || r->elements < 1 || r->element[0] == nullptr) {
+        return -1;
+    }
+    return r->element[0]->integer;
+}
+
+std::set<std::string> as_set(const std::vector<std::string>& v) {
+    return {v.begin(), v.end()};
+}
+
+// What a restart of the same consumer reads back from its PEL.
+std::set<std::string> replay(const RedisSourceOptions& o, std::size_t want) {
+    RedisSource s(o);
+    s.open();
+    Captured cap;
+    drain(s, cap, want, /*timeout_ms=*/5000);
+    s.close();
+    return as_set(cap.values);
+}
+
+struct LiveStream {
+    LiveStream() : name(unique_stream()) {}
+    ~LiveStream() { cleanup(name); }
+    std::string name;
+};
+
+}  // namespace
+
+TEST(RedisSourceAckLive, ASnapshotThenAbortLeavesEntriesPendingForTheRestart) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    write_tagged(st.name, "a", 6);
+    const auto o = source_opts(st.name, "gab");
+    InMemoryStateBackend backend;
+    {
+        RedisSource src(o);
+        src.open();
+        Captured cap;
+        drain(src, cap, 6, 15000);
+        ASSERT_EQ(cap.values.size(), 6u);
+        src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{1});
+        src.notify_checkpoint_aborted(clink::CheckpointId{1});
+        drain(src, cap, 7, 300);  // turns in which an XACK would run
+        src.close();
+    }
+    EXPECT_EQ(pending(st.name, "gab"), 6) << "an aborted checkpoint acknowledged its entries";
+    EXPECT_EQ(replay(o, 6), as_set(tagged("a", 6)));
+}
+
+TEST(RedisSourceAckLive, ACrashAfterTheSnapshotLeavesEntriesPending) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    write_tagged(st.name, "b", 5);
+    const auto o = source_opts(st.name, "gcs");
+    InMemoryStateBackend backend;
+    {
+        RedisSource src(o);
+        src.open();
+        Captured cap;
+        drain(src, cap, 5, 15000);
+        ASSERT_EQ(cap.values.size(), 5u);
+        src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{1});
+        // The process dies here: no completion, no close.
+    }
+    EXPECT_EQ(pending(st.name, "gcs"), 5);
+    EXPECT_EQ(replay(o, 5), as_set(tagged("b", 5)));
+}
+
+TEST(RedisSourceAckLive, ACompletionAcknowledgesOnlyTheIntervalsItCovers) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    const auto o = source_opts(st.name, "gci");
+    InMemoryStateBackend backend;
+    RedisSource src(o);
+    src.open();
+    Captured cap;
+    write_tagged(st.name, "x", 3);
+    drain(src, cap, 3, 15000);
+    src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{1});
+    write_tagged(st.name, "y", 2);
+    drain(src, cap, 5, 15000);
+    src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{2});
+    write_tagged(st.name, "z", 1);
+    drain(src, cap, 6, 15000);  // after the last barrier
+    ASSERT_EQ(cap.values.size(), 6u);
+
+    src.notify_checkpoint_complete(clink::CheckpointId{1});
+    drain(src, cap, 7, 300);
+    EXPECT_EQ(pending(st.name, "gci"), 3) << "checkpoint 1's completion reached past its interval";
+
+    src.notify_checkpoint_complete(clink::CheckpointId{2});
+    src.notify_checkpoint_complete(clink::CheckpointId{1});  // late
+    src.notify_checkpoint_complete(clink::CheckpointId{2});  // repeated
+    src.notify_checkpoint_aborted(clink::CheckpointId{1});   // late and contradictory
+    src.notify_checkpoint_complete(clink::CheckpointId{9});  // above anything sealed
+    drain(src, cap, 7, 300);
+    EXPECT_EQ(pending(st.name, "gci"), 1) << "only the open interval's entry stays pending";
+
+    src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{10});
+    src.notify_checkpoint_complete(clink::CheckpointId{10});
+    drain(src, cap, 7, 300);
+    EXPECT_EQ(pending(st.name, "gci"), 0);
+    EXPECT_EQ(src.acknowledged_total(), 6u) << "an entry was acknowledged twice";
+    src.close();
+}
+
+TEST(RedisSourceAckLive, ACrashAfterCompletionBeforeTheXackReplaysTheInterval) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    write_tagged(st.name, "d", 4);
+    const auto o = source_opts(st.name, "gcc");
+    InMemoryStateBackend backend;
+    {
+        RedisSource src(o);
+        src.open();
+        Captured cap;
+        drain(src, cap, 4, 15000);
+        src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{1});
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        // The process dies before the source's next turn sends the XACK.
+    }
+    EXPECT_EQ(pending(st.name, "gcc"), 4);
+    EXPECT_EQ(replay(o, 4), as_set(tagged("d", 4))) << "duplicates, not a loss";
+}
+
+// The source's connection dies between the completion and the XACK: the turn
+// that would send it fails the subtask, and the restart reads the entries again.
+TEST(RedisSourceAckLive, AFailedXackAfterCompletionFailsTheSubtaskAndLosesNothing) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    write_tagged(st.name, "e", 4);
+    const auto o = source_opts(st.name, "gfx");
+    InMemoryStateBackend backend;
+    {
+        RedisSource src(o);
+        src.open();
+        Captured cap;
+        drain(src, cap, 4, 15000);
+        src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{1});
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        // Kill the source's connection: the client whose last command was its
+        // XREADGROUP on this stream's group.
+        Connection admin{redis_conn()};
+        auto list = admin.command({"CLIENT", "LIST", "TYPE", "normal"});
+        ASSERT_TRUE(static_cast<bool>(list));
+        const std::string clients(list->str, list->len);
+        int killed = 0;
+        std::size_t pos = 0;
+        while ((pos = clients.find("id=", pos)) != std::string::npos) {
+            const auto eol = clients.find('\n', pos);
+            const auto line = clients.substr(pos, eol - pos);
+            if (line.find("cmd=xreadgroup") != std::string::npos) {
+                const auto id = line.substr(3, line.find(' ') - 3);
+                admin.command({"CLIENT", "KILL", "ID", id});
+                ++killed;
+            }
+            pos = eol;
+        }
+        ASSERT_GE(killed, 1) << "found no source connection to kill:\n" << clients;
+        EXPECT_EQ(pending(st.name, "gfx"), 4) << "the entries were not in flight";
+        auto em = capturing(cap);
+        EXPECT_THROW(src.produce(em), std::runtime_error) << "a failed XACK went unnoticed";
+    }
+    EXPECT_EQ(pending(st.name, "gfx"), 4);
+    EXPECT_EQ(replay(o, 4), as_set(tagged("e", 4)));
+}
+
+// The XACK reaches the server but its reply does not reach the source (the
+// server holds writes past the client's timeout). Whether it applied or not,
+// the restart reads again exactly the entries still pending, and every entry is
+// either acknowledged or read again.
+TEST(RedisSourceAckLive, AnXackWhoseReplyIsLostLeavesNothingUnrecoverable) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    write_tagged(st.name, "f", 4);
+    const auto o = source_opts(st.name, "gam");  // block 200 ms: a 2.4 s command timeout
+    InMemoryStateBackend backend;
+    {
+        RedisSource src(o);
+        src.open();
+        Captured cap;
+        drain(src, cap, 4, 15000);
+        src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{1});
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        Connection admin{redis_conn()};
+        admin.command({"CLIENT", "PAUSE", "3500", "WRITE"});
+        auto em = capturing(cap);
+        EXPECT_THROW(src.produce(em), std::runtime_error) << "a lost XACK reply went unnoticed";
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1500});  // the pause ends
+    const auto still = pending(st.name, "gam");
+    ASSERT_TRUE(still == 0 || still == 4) << still;
+    const auto back = replay(o, static_cast<std::size_t>(still));
+    EXPECT_EQ(back.size(), static_cast<std::size_t>(still));
+    if (still == 4) {
+        EXPECT_EQ(back, as_set(tagged("f", 4)));
+    }
+}
+
+TEST(RedisSourceAckLive, TheBoundPausesReadingUntilACheckpointCompletes) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    write_tagged(st.name, "p", 7);
+    auto o = source_opts(st.name, "gbd");
+    o.max_pending = 3;
+    InMemoryStateBackend backend;
+    RedisSource src(o);
+    src.open();
+    Captured cap;
+    drain(src, cap, 7, 1500);
+    EXPECT_EQ(cap.values.size(), 3u) << "the source read past max_pending";
+    EXPECT_EQ(pending(st.name, "gbd"), 3);
+    src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{1});
+    src.notify_checkpoint_complete(clink::CheckpointId{1});
+    drain(src, cap, 7, 1500);
+    EXPECT_EQ(cap.values.size(), 6u);
+    EXPECT_EQ(pending(st.name, "gbd"), 3);
+    src.close();
+}
+
+TEST(RedisSourceAckLive, CloseAcknowledgesCompletedIntervalsOnly) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    const auto o = source_opts(st.name, "gcl");
+    InMemoryStateBackend backend;
+    {
+        RedisSource src(o);
+        src.open();
+        Captured cap;
+        write_tagged(st.name, "g", 2);
+        drain(src, cap, 2, 15000);
+        src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{1});
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        write_tagged(st.name, "h", 2);
+        drain(src, cap, 4, 15000);
+        src.snapshot_offset(backend, OperatorId{1}, clink::CheckpointId{2});  // never completes
+        write_tagged(st.name, "k", 1);
+        drain(src, cap, 5, 15000);  // after the last barrier
+        ASSERT_EQ(cap.values.size(), 5u);
+        src.cancel();
+        src.close();
+    }
+    EXPECT_EQ(pending(st.name, "gcl"), 3)
+        << "close acknowledged what no completed checkpoint covers";
+    EXPECT_EQ(replay(o, 3), (std::set<std::string>{"h0", "h1", "k0"}));
+}
+
+// A run at parallelism 2 leaves entries pending on its second consumer. A run at
+// parallelism 1 would never read them again, so it refuses to start; a run at
+// parallelism 2 starts and its second subtask reads them again.
+TEST(RedisSourceAckLive, AScaleDownIsRefusedWhileARemovedConsumerHoldsPendingEntries) {
+    if (!redis_configured()) {
+        GTEST_SKIP() << "set CLINK_REDIS_TEST_URL";
+    }
+    LiveStream st;
+    auto at = [&](std::uint32_t parallelism, std::uint32_t subtask) {
+        auto o = source_opts(st.name, "gsd");
+        o.parallelism = parallelism;
+        o.subtask_idx = subtask;
+        return o;
+    };
+    write_tagged(st.name, "s", 5);
+    {
+        RedisSource second(at(2, 1));
+        second.open();
+        Captured cap;
+        drain(second, cap, 5, 15000);
+        ASSERT_EQ(cap.values.size(), 5u);
+        // Dies holding them: never acknowledged.
+    }
+    ASSERT_EQ(pending(st.name, "gsd"), 5);
+    {
+        RedisSource lone(at(1, 0));
+        try {
+            lone.open();
+            ADD_FAILURE() << "a source at parallelism 1 started beside clink-1's pending entries";
+        } catch (const std::runtime_error& e) {
+            const std::string what = e.what();
+            EXPECT_NE(what.find("clink-1 (5 pending)"), std::string::npos) << what;
+            EXPECT_NE(what.find("parallelism 2 or more"), std::string::npos) << what;
+        }
+    }
+    EXPECT_EQ(pending(st.name, "gsd"), 5) << "the refused source touched the pending entries";
+    EXPECT_EQ(replay(at(2, 1), 5), as_set(tagged("s", 5)));
 }
 
 #ifdef CLINK_REDIS_TLS

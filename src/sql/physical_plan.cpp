@@ -659,13 +659,14 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
     if (connector == "pubsub") {
         // Google Cloud Pub/Sub source (REST Pull): each message's base64-decoded
         // data is a JSON object string (string channel) bridged to Row.
-        // At-least-once (ack-on-checkpoint + server redelivery after ackDeadline).
+        // At-least-once (acknowledged at checkpoint completion; the server
+        // delivers again what was not acknowledged).
         return RowConnectorBinding{"pubsub_source", kChannelString, "json_string_to_row"};
     }
     if (connector == "redis") {
         // Redis Streams source (XREADGROUP consumer group): each entry is a JSON
         // object string (string channel) bridged to Row. At-least-once (PEL
-        // replay + XACK-on-checkpoint).
+        // replay + XACK at checkpoint completion).
         return RowConnectorBinding{"redis_source", kChannelString, "json_string_to_row"};
     }
     if (connector == "mysql") {

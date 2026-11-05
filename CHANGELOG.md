@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+**The Redis Streams and Pub/Sub sources acknowledge a record only once the
+checkpoint that covers it has completed.** Both acknowledged inside
+`snapshot_offset()`, at the barrier, so a checkpoint that failed after it left
+the batch acknowledged and never delivered again: at-most-once for that
+batch, and the delivery analyser reported a job over either source as
+`AT_MOST_ONCE_SOURCE`, refusing even `delivery_guarantee='at_least_once'`.
+Each now seals the records of an interval at the barrier and acknowledges
+them from its own thread once a checkpoint at or above it completes, through
+a shared ledger (`include/clink/connectors/checkpoint_ack_ledger.hpp`); an
+aborted or never-completed checkpoint leaves its records for the broker to
+deliver again, and close acknowledges only what completed. Both records now
+declare the acknowledgement model, so a job over them is
+`AT_LEAST_ONCE_SOURCE` and `exactly_once` is still refused. Each bounds what
+it holds (`max_pending`, `max_outstanding`), and the Pub/Sub source holds the
+lease of every message it waits on (`ack_deadline_s`, `max_lease_s`). A job
+that completes no checkpoint now reads up to the bound and waits, where it
+used to read on with nothing ever acknowledged. Pinned by the ledger's tests,
+`PubSubSourceAck` against a stub of the REST API, and `RedisSourceAckLive`
+and `PubSubSourceAckLive`, which `scripts/redis-pubsub-live.sh` runs against
+Redis and the emulator and fails on any skip.
+
+**Pub/Sub data that is not base64 stops the source by default.** The source
+acknowledged and dropped such a message with no option to do otherwise, while
+its record claimed at-least-once. `on_decode_error` now chooses: `fail`, the
+default, stops the subtask without acknowledging the message, so it is
+delivered again until it is removed or the subscription's dead-letter policy
+moves it aside; `drop` acknowledges it with its checkpoint and counts it in
+`dropped_events_total`.
+
+**A Redis Streams source cannot be scaled down.** Each subtask is a consumer
+of its group, and a removed subtask's consumer kept its pending entries with
+nothing to read them again. Redis cannot tell a consumer that has gone from
+one still reading, so the source does not claim them. A capability record can
+now name a reason a source refuses a scale-down (`scale_down_refusal`), the
+coordinator refuses such an operator rescale, from any client or the
+autoscaler, before anything drains, and the Redis source refuses to start
+beside entries pending on a consumer outside its layout, naming them and the
+parallelism that reads them. Pinned by
+`SourceAckHooks.ACoordinatorRefusesAScaleDownTheSourcesRecordRulesOut` and
+`RedisSourceAckLive.AScaleDownIsRefusedWhileARemovedConsumerHoldsPendingEntries`.
+
 **A source fused into its chain receives its checkpoint barriers.** With
 `CLINK_PLAN_FUSE_PAR1=1` the worker registered no barrier injector for a
 source fused into a chain, so the source never saw a barrier, nothing
