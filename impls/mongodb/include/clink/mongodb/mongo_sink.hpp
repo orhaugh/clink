@@ -2,23 +2,34 @@
 
 // MongoDB sink: each input record is a JSON object string (row_to_json_string on
 // the SQL path) parsed to BSON and bulk-written into a collection. Records are
-// buffered and flushed on a count / linger threshold and on every checkpoint
-// barrier.
+// buffered and flushed on a count, byte or linger threshold and on every
+// checkpoint barrier, and a checkpoint completes only once its barrier's flush
+// returned.
 //
-// DELIVERY = AT-LEAST-ONCE (a failed flush throws -> the job replays the buffered
-// batch from the last checkpoint). With on_duplicate='replace' the write is a
-// replace_one(filter={key_field: value}, doc).upsert(true), which is idempotent on
-// replay (effectively-once by key). A plain insert is at-least-once: a record
-// without an _id gets a fresh one from the driver, so a replay inserts it again,
-// and a record that carries its own _id and is already stored exactly as it
-// arrives is the write made before the restore, so it is written without error
-// (a replay used to fail on the duplicate key after every restore). A different
-// document under a stored _id, or a duplicate key on another unique index, still
-// fails the flush. Inserts are written unordered, so every record is attempted
-// and every error reported; upserts stay ordered, so a key written twice in one
-// batch ends as its later record. NOTE: with on_duplicate='replace' a record
-// that LACKS key_field falls back to a plain insert (it cannot be matched), so
-// such a record is at-least-once, not idempotent.
+// DELIVERY = AT-LEAST-ONCE. Every write uses w=majority (a write acknowledged
+// by fewer members can be rolled back in a failover after the checkpoint that
+// covers it completed), so open() refuses a URI asking for w=0, w=1, a node
+// count or a tag. Any failure fails the flush, and the job replays from the
+// last completed checkpoint: a batch the server partly applied, a write concern
+// error, or a network failure whose outcome is unknown. Nothing of a failed
+// batch counts as written.
+//
+// Two modes:
+//   - insert (the default): an unordered insert of each record. A record
+//     without an _id gets a fresh one from the driver, so a replay inserts it
+//     again. A record that carries its own _id and is already stored exactly as
+//     it arrives is the write made before the restore and is written without
+//     error; a different document under a stored _id, or a duplicate on any
+//     other unique index, fails the flush, naming the _id.
+//   - replace (on_duplicate='replace'): an ordered replace_one(filter={key_field:
+//     value}).upsert(true) per record, so a key written twice in a batch ends as
+//     its later record, and a replay writes each key again in the same order.
+//     Every record of a batch must carry key_field as a string, a 32- or 64-bit
+//     integer or an ObjectId, checked before anything of the batch is written;
+//     and a key_field other than _id needs a unique index on that field alone
+//     (open() checks), so a key matches at most one document. Within one sink
+//     subtask a replay converges each key to its last record; across parallel
+//     subtasks it does so only when the stream is partitioned by key_field.
 
 #include <chrono>
 #include <cstddef>
@@ -34,9 +45,13 @@ struct MongoSinkOptions {
     std::string database;             // required
     std::string collection;           // required
     bool upsert{false};               // on_duplicate='replace' -> replace_one upsert by key_field
-    std::string key_field{"_id"};     // upsert match key
+    std::string key_field{"_id"};     // upsert match key: a top-level field
     std::size_t batch_records{1000};  // flush after this many buffered records
-    std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old (0 = off)
+    std::size_t max_bytes{16 * 1024 * 1024};  // flush once the buffered JSON reaches this size
+    std::chrono::milliseconds max_age{0};     // linger: flush a partial batch this old (0 = off)
+    // wtimeout for the majority write concern, unless the URI sets one: a batch
+    // that cannot reach a majority fails within this bound.
+    std::chrono::milliseconds write_timeout{30000};
     std::string name{"mongo_sink"};
 };
 

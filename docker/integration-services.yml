@@ -146,7 +146,10 @@ services:
   # discovers it. CLINK_MONGODB_TEST_URI: "mongodb://mongodb:27017/?replicaSet=rs0"
   mongodb:
     image: mongo:7
-    command: ["--replSet", "rs0", "--bind_ip_all"]
+    # enableTestCommands lets the live tests arm the server's failCommand fail
+    # point (write concern errors, dropped connections). Test-only, as is the
+    # service.
+    command: ["--replSet", "rs0", "--bind_ip_all", "--setParameter", "enableTestCommands=1"]
     ports:
       - "27017:27017"
     healthcheck:

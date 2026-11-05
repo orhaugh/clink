@@ -2,6 +2,86 @@
 
 ## Unreleased
 
+**A MongoDB source's checkpoint covers only the change events it handed to the
+job.** A pass that stopped at its cap of 1,024 events advanced the driver's
+iterator past the last event it emitted, which read the next one into the
+driver, and the resume token taken then covered that event: a restore from a
+checkpoint taken there skipped it. Against the previous source, a restore from
+a checkpoint at the cap delivered events 1026 to 1100 and lost 1025. A pass now
+reads one event at a time and never one it does not emit
+(`impls/mongodb/src/change_pass.hpp`). `MongoChangePass` holds the rule against
+a stand-in cursor, and
+`MongoSourceRecoveryLive.ACheckpointAtThePerPassCapCoversOnlyWhatWasEmitted`
+restores 1025 to 1100 exactly.
+
+**A MongoDB source's pass ends within `max_await_ms`, so a steady flow of
+changes no longer holds back its checkpoints.** Barriers go in between the
+source's passes, and while changes kept arriving the stream always had one
+more, so a pass read until its cap of 1,024 events filled: at about 400 changes
+a second a pass held back the barriers for 4.2 seconds, and a trickle stretched
+it further. A pass now also ends once `max_await_ms` has passed.
+`MongoSourceRecoveryLive.APassEndsWithinItsBudgetWhileChangesKeepArriving`
+holds every pass under a second at a 200 ms budget.
+
+**A MongoDB source never starts at the current time when it should resume.**
+A checkpoint taken before the source's first pass held no token, and a restore
+from it started at the current time: against the previous source, it delivered
+none of the two changes made after the checkpoint. A job restarted before any
+checkpoint completed did the same: a cluster run lost 480 of 3,000 documents.
+The source now takes the stream's position when it opens, and in a
+checkpointed cluster job records where each run's stream started, in the job's
+checkpoint directory, so a restart before the first checkpoint resumes from
+there. A restore whose state holds no token, or a token the server cannot
+resume from, fails the job naming why. Pinned by
+`MongoSourceRecoveryLive.ACheckpointBeforeTheFirstPassHoldsAToken`,
+`MongoSourceRestore` and
+`MongoRecovery.AWorkerKilledBeforeAnyCheckpointResumesWhereTheRunStarted`.
+
+**A MongoDB source stops at a drop, rename, dropDatabase or invalidate, and
+refuses a field named like its metadata.** It skipped those events, and after
+an invalidate its stream had ended, so it went quiet for good and reported
+nothing. It now fails naming the event, and how to start again. A document
+field named `__op`, `__ns` or `__id` used to keep its own value and pass for
+change metadata; it now fails the source too. A new `__image` field says what
+a row's document fields are: the full document, an `updateLookup` image read
+after the event, the fields a partial update set, or a delete's key.
+`full_document` takes `whenAvailable` and `required` for post-images and
+refuses a value it does not know.
+
+**The MongoDB sinks check what their guarantee depends on before writing.**
+A replacement record without its key was inserted instead, beside the document
+it should have replaced; every record of a replacement batch must now carry the
+key as a string, an integer or an ObjectId, checked before anything of the
+batch is written, and a key other than `_id` needs a unique index on it alone,
+checked at open. Every write is now `w=majority` with a bounded `wtimeout`, and
+a URI asking for less is refused: a write acknowledged by fewer members can be
+rolled back after the checkpoint covering it completed. A write concern error,
+a dropped connection and a batch stopped part way each fail the flush, and the
+replay converges, which `MongoSinkLive` shows with the server's `failCommand`
+fail point. `max_bytes` bounds what is buffered, and an unknown `on_duplicate`
+is refused rather than read as an insert. The replacement mode is its own
+factory, `mongo_upsert_sink`, and the source and the two sinks have a record
+each (`mongo_cdc`, `mongo`, `mongo_upsert`): only the replacement claims that
+duplicates collapse, on its key, never exactly once.
+
+**A short MongoDB outage no longer spends a job's restart budget.** The
+source and the sink each held a single driver client, which gives up on server
+selection at its first failed try: with the server stopped for about ten
+seconds, every restart failed at once, the job spent all eight and failed, with
+1,035 of 3,000 documents copied. Each now connects through a client pool of its
+own, which waits for a server up to `serverSelectionTimeoutMS`, so the change
+stream resumes itself and a write waits. `MongoRecovery.AServerRestartWhileTheJobRunsLosesNothing`
+restarts the server under a running job.
+
+**MongoDB has a live gate, with recovery cells.** `scripts/mongodb-live.sh`
+runs every MongoDB suite against a single-member replica set and the
+`MongoRecovery` cells, a coordinator and two workers running a change stream
+into MongoDB with a worker killed before a write, after a write, with events in
+flight and before any checkpoint, and the server restarted, each verified by
+reading MongoDB directly. It fails on a skip, a short suite or a missing binary,
+and keeps provenance and the cells' logs. The new `mongodb` workflow runs it.
+The integration services' `mongodb` runs with `enableTestCommands`.
+
 **The MQTT source acknowledges a message only once a completed checkpoint
 covers it.** libmosquitto acknowledges a message when its callback returns and
 cannot hold that back, so a crash, an aborted checkpoint or a close lost what

@@ -18,6 +18,7 @@
 
 #include <mongocxx/client.hpp>
 #include <mongocxx/instance.hpp>
+#include <mongocxx/pool.hpp>
 #include <mongocxx/uri.hpp>
 
 namespace clink::mongodb {
@@ -28,11 +29,32 @@ inline void ensure_instance() {
 }
 
 // Build a connected client. mongocxx::client is cheap, pools connections
-// internally, and is move-assignable, so the source/sink hold one directly and
-// assign the result of this in open().
+// internally, and is move-assignable. Tests use it for their own reads and
+// writes; the source and sink use Connection.
 inline mongocxx::client make_client(const std::string& uri) {
     ensure_instance();
     return mongocxx::client{mongocxx::uri{uri}};
 }
+
+// The source's and sink's connection: a client from a pool of its own. A
+// single client gives up on server selection at its first failed try, so a
+// server that is down for seconds failed every attempt at once, and a job
+// spent its whole restart budget inside one short outage. A pooled client
+// waits for a server for up to serverSelectionTimeoutMS (30 s unless the URI
+// says otherwise), so the driver rides out an outage that ends within it: a
+// change stream resumes itself, and a write is sent once a server is back.
+class Connection {
+public:
+    explicit Connection(const std::string& uri)
+        : pool_((ensure_instance(), mongocxx::uri{uri})), entry_(pool_.acquire()) {}
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
+
+    mongocxx::client& client() { return *entry_; }
+
+private:
+    mongocxx::pool pool_;  // outlives entry_, which is declared after it
+    mongocxx::pool::entry entry_;
+};
 
 }  // namespace clink::mongodb

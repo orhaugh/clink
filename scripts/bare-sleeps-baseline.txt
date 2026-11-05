@@ -31,6 +31,11 @@
 #    it is started again, and the proxy blackholes the connection for 15s, a
 #    span chosen to be shorter than the sink's retry window. The length of
 #    the outage is what each cell tests, so there is no condition to wait on.
+#  * test_mongodb_recovery's outage cell holds the MongoDB server stopped for
+#    5s ON PURPOSE, an outage shorter than the driver's server selection
+#    timeout, before it is started again: the length of the outage is what
+#    the cell tests.
 2      tests/integration/test_clickhouse_native_recovery.cpp
+1      tests/integration/test_mongodb_recovery.cpp
 1      tests/integration/test_postgres_pipeline.cpp
 1      tests/integration/test_soak.cpp

@@ -78,7 +78,7 @@ const std::map<std::string, std::vector<std::string>> kExpectedRecords = {
     {"redis", {"redis", "redis_upsert"}},
     {"mysql", {"mysql", "mysql_upsert"}},
     {"mqtt", {"mqtt", "mqtt_source"}},
-    {"mongodb", {"mongo"}},
+    {"mongodb", {"mongo_cdc", "mongo", "mongo_upsert"}},
     {"iceberg", {"iceberg"}},
     {"rabbitmq", {"rabbitmq"}},
     {"nats", {"nats"}},

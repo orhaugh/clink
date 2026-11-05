@@ -7,8 +7,11 @@
 add_executable(clink_mongodb_tests
     register.cpp
     test_factory_registration.cpp
+    test_mongo_change_pass.cpp
     test_mongo_event.cpp
     test_mongo_live.cpp
+    test_mongo_recovery_live.cpp
+    test_mongo_sink_rules.cpp
 )
 target_link_libraries(clink_mongodb_tests PRIVATE
     clink::core
@@ -16,6 +19,9 @@ target_link_libraries(clink_mongodb_tests PRIVATE
     GTest::gtest_main
     ${_mongo_target}
 )
+# The sink's rules and the source's read pass are internal headers beside the
+# sources, tested here without a server.
+target_include_directories(clink_mongodb_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_definitions(clink_mongodb_tests PRIVATE CLINK_HAS_MONGODB)
 clink_set_warnings(clink_mongodb_tests)
 gtest_discover_tests(clink_mongodb_tests

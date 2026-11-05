@@ -476,6 +476,14 @@ if(CLINK_INTEGRATION_TESTS)
     if(TARGET clink::neo4j AND TARGET clink::kafka)
         target_sources(clink_integration_tests PRIVATE integration/test_neo4j_recovery.cpp)
     endif()
+    # The MongoDB connector's recovery cells: a coordinator and two workers
+    # running a change-stream job into MongoDB, against the replica set that
+    # scripts/mongodb-live.sh starts, with faults at the connector's own points
+    # and a verifier that reads MongoDB through the driver. They skip without it.
+    if(TARGET clink::mongodb AND TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_mongodb_recovery.cpp)
+        target_link_libraries(clink_integration_tests PRIVATE clink_mongodb_driver)
+    endif()
     target_link_libraries(clink_integration_tests PRIVATE
         clink::clink
         GTest::gtest_main

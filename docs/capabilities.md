@@ -112,7 +112,7 @@ embedded or submits to a cluster, unchanged.
 
 Twenty-plus sources and sinks, each documented with dependencies, factory
 names, options, and SQL usage in the [connector catalogue](connectors/README.md):
-Kafka, Postgres (snapshot, CDC, sink), MySQL, ClickHouse, Cassandra, MongoDB,
+Kafka, Postgres (snapshot, CDC, sink), MySQL, ClickHouse, Cassandra, MongoDB (change streams, changes only; insert and replace-by-key sinks),
 Redis, Neo4j (sink: a Cypher statement per batch, at least once; read-only lookup joins, current-state), S3 and S3 Parquet, GCS Parquet, Azure Parquet, WebHDFS Parquet,
 Iceberg, Delta Lake (sink), Avro, HTTP, MQTT, NATS, Pulsar, RabbitMQ, file
 and built-ins; on

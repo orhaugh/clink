@@ -81,6 +81,17 @@ target_link_libraries(clink_mongodb
 )
 clink_set_warnings(clink_mongodb)
 
+# The driver, for test code that reads MongoDB itself (the recovery cells'
+# verifier in tests/integration). Not installed. An imported target is visible
+# only in the directory that found it, so it is promoted to global first.
+if(TARGET mongo::mongocxx_shared)
+    set_target_properties(mongo::mongocxx_shared PROPERTIES IMPORTED_GLOBAL TRUE)
+elseif(TARGET PkgConfig::LIBMONGOCXX)
+    set_target_properties(PkgConfig::LIBMONGOCXX PROPERTIES IMPORTED_GLOBAL TRUE)
+endif()
+add_library(clink_mongodb_driver INTERFACE)
+target_link_libraries(clink_mongodb_driver INTERFACE ${_mongo_target})
+
 if(TARGET clink_mongocxx_external)
     install(TARGETS clink_mongocxx_external EXPORT ${CLINK_EXPORT_NAME})
     clink_install_impl(TARGET clink_mongodb NAME mongodb)
