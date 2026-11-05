@@ -77,7 +77,7 @@ const std::map<std::string, std::vector<std::string>> kExpectedRecords = {
      {"http", "elasticsearch", "opensearch", "influxdb", "prometheus", "splunk_hec", "pubsub"}},
     {"redis", {"redis", "redis_upsert"}},
     {"mysql", {"mysql", "mysql_upsert"}},
-    {"mqtt", {"mqtt"}},
+    {"mqtt", {"mqtt", "mqtt_source"}},
     {"mongodb", {"mongo"}},
     {"iceberg", {"iceberg"}},
     {"rabbitmq", {"rabbitmq"}},

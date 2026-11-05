@@ -30,6 +30,13 @@ resets each held message's AckWait with `natsMsg_InProgress` at half that
 period, for at most `max_lease_s` (default 3600). `ack_wait_s`,
 `max_lease_s` and `max_ack_pending` are validated.
 
+**The MQTT source's record says at-most-once.** libmosquitto acknowledges a
+message when the message callback returns, before any checkpoint covers it,
+so a crash loses what arrived since the last checkpoint; one record for both
+ends claimed at-least-once, which the analyser could not credit. The source
+now has its own record (`mqtt_source`: at-most-once, no checkpoint
+participation) and the sink keeps `mqtt` (at-least-once).
+
 **The Redis Streams and Pub/Sub sources acknowledge a record only once the
 checkpoint that covers it has completed.** Both acknowledged inside
 `snapshot_offset()`, at the barrier, so a checkpoint that failed after it left

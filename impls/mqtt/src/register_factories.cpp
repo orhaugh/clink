@@ -51,19 +51,22 @@ std::string client_id_for(const clink::plugin::BuildContext& ctx, const char* fa
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    // The sink and the source carry different guarantees, so each has its own
+    // record (as kafka and kafka_2pc do): the analyser reads the record whose
+    // name is the longest prefix of the op type.
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "mqtt",
         .version = "1",
-        .is_source = true,
+        .is_source = false,
         .is_sink = true,
         .build_dependencies = {"libmosquitto"},
         .runtime_dependencies = {"mqtt broker >= 3.1.1"},
         .formats = {"text", "bytes"},
         .boundedness = clink::connectors::Boundedness::Unbounded,
-        // Recovery is the broker's persistent session redelivering unacked
-        // messages, not a client-side offset: nothing to replay from.
         .replayable = false,
         .offset_model = clink::connectors::OffsetModel::None,
+        // The sink waits at every barrier for the broker to acknowledge what it
+        // published (PUBACK / PUBCOMP).
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
@@ -73,10 +76,43 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = false,
         .timeout_options = {"ack_timeout_ms"},
         .available_in_sql = false,  // no connector='mqtt' binding in the SQL planner
-        .limitations = {"qos=0 is fire-and-forget (at-most-once) on both sides",
-                        "a clean session discards the redelivery state recovery depends on",
+        .limitations = {"qos=0 is fire-and-forget (at-most-once)",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "mqtt_source",
+        .version = "1",
+        .is_source = true,
+        .is_sink = false,
+        .build_dependencies = {"libmosquitto"},
+        .runtime_dependencies = {"mqtt broker >= 3.1.1"},
+        .formats = {"text", "bytes", "json"},
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // No position of its own, and libmosquitto acknowledges a QoS 1/2
+        // message (PUBACK / PUBCOMP) when the message callback returns, before
+        // any checkpoint covers it. The persistent session redelivers only what
+        // was not acknowledged, so a crash loses what arrived since the last
+        // checkpoint: nothing it does waits for a checkpoint.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
+        .checkpoint_integrated = false,
+        .delivery = clink::connectors::DeliveryGuarantee::AtMostOnce,
+        .transactional = false,
+        .auth_methods = {"none", "password"},
+        .tls = true,
+        .backpressure = true,
+        .retries = false,
+        .timeout_options = {},
+        .available_in_sql = false,  // no connector='mqtt' binding in the SQL planner
+        .limitations = {"each message is acknowledged to the broker on receipt, before any "
+                        "checkpoint covers it: a crash loses what arrived since the last "
+                        "checkpoint, and deferring the acknowledgement needs another client",
+                        "a reconnect, clean or after a crash, receives what the persistent "
+                        "session still holds unacknowledged",
+                        "qos=0 is fire-and-forget",
+                        "a clean session discards the redelivery state recovery depends on",
+                        "only subtask 0 subscribes unless shared_group is set"},
     });
 
     using clink::plugin::BuildContext;
