@@ -121,7 +121,7 @@ The data-plane machinery under this lives in three seams, each unit-tested with 
 
 The replan stops the job and re-derives it:
 
-1. Validate the request against the job's retained graph - the operator exists, it declares `[min_parallelism, max_parallelism]` bounds and the target is inside them, the target is an integer multiple or divisor of what the operator currently runs, a checkpoint has completed, and the cluster has slots for any growth. Everything answerable from the request and the graph is answered before anything is disturbed, because the next step stops the job.
+1. Validate the request against the job's retained graph - the operator exists, it declares `[min_parallelism, max_parallelism]` bounds and the target is inside them, the target is an integer multiple or divisor of what the operator currently runs, a source being scaled down has no scale-down refusal in its capability record, a checkpoint has completed, and the cluster has slots for any growth. Everything answerable from the request and the graph is answered before anything is disturbed, because the next step stops the job.
 2. Drain the job. `CancelJob` goes to every worker hosting a task; the existing `awaiting_restart` machinery collects the acks.
 3. When the last ack lands, `restart_job_locked_` parses `graph_json`, sets the requested parallelism on that operator, and runs `plan_job` over the result using the job's own registries. The plan is the post-rescale task set in full - chain specs, edge fan-out, key-group ranges - derived the same way a fresh submit derives them.
 4. Redeploy from `latest_completed_checkpoint_id`, with each new subtask told which parent's snapshot it inherits.
@@ -286,6 +286,7 @@ Scope and honesty: Row-channel operators (the SQL frontend's set - GROUP BY, win
 - **A per-operator rescale stops the job.** It drains, replans and redeploys from the last completed checkpoint. There is no seamless cutover, so a rescale costs a restart's worth of latency and reprocesses whatever was in flight past the checkpoint. Exactly-once across it depends on a replayable source and a transactional sink, exactly as a failover does.
 
 - **An operator must declare rescale bounds to be scalable.** `min_parallelism == 0 && max_parallelism == 0` means "nobody said what range is safe", and the request is refused rather than guessed at. Declare them with `.rescalable(min, max)` on the stream or on the `OperatorSpec`.
+- **A source whose subtasks own broker-side state cannot be scaled down.** A capability record's `scale_down_refusal` names why, and `request_operator_rescale` refuses a source of that connector a lower parallelism with that reason, for a request from the CLI, the HTTP API or the autoscaler alike, before anything drains. Scale-up is unaffected.
 
 - **Whole-job rescale by role is for single-operator jobs.** On a multi-operator job the shared role covers every subtask, so a single parallelism for it cannot express the job graph; the request is refused. Use per-operator rescale.
 

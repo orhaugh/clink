@@ -180,6 +180,18 @@ bool op_type_needs_commit_confirmation(const std::string& op_type) {
     return exactly_once && !rec->commit_recoverable;
 }
 
+std::string source_scale_down_refusal(const std::string& op_type) {
+    const auto name = connector_name_for_op_type(op_type);
+    if (name.empty()) {
+        return {};
+    }
+    const auto* rec = connectors::CapabilityRegistry::instance().find(name);
+    if (rec == nullptr || !rec->is_source) {
+        return {};
+    }
+    return rec->scale_down_refusal;
+}
+
 connectors::PipelineFacts pipeline_facts_from_graph(const JobGraphSpec& graph,
                                                     const CheckpointConfig& checkpoint) {
     ensure_built_ins_registered();

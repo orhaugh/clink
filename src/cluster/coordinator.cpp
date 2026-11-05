@@ -3632,6 +3632,16 @@ RescaleCoordinator::RequestResult Coordinator::request_operator_rescale(
             return refuse("operator '" + op_id +
                           "' requires a global SQL view and must remain at parallelism 1");
         }
+        // A source whose subtasks each own broker-side state cannot lose
+        // subtasks: a removed Redis Streams consumer keeps its pending entries,
+        // and no remaining subtask reads them. Its capability record says why.
+        if (new_parallelism < old_parallelism && op_it->inputs.empty()) {
+            if (const auto why = source_scale_down_refusal(op_it->type); !why.empty()) {
+                return refuse("operator '" + op_id + "' (" + op_it->type +
+                              ") cannot be rescaled below parallelism " +
+                              std::to_string(old_parallelism) + ": " + why);
+            }
+        }
         // Integer factor only, and refused HERE rather than discovered after
         // the job has already drained. The same helper the redeploy uses.
         if (const auto mapping = rescale_parent_mapping(old_parallelism, new_parallelism, 0);

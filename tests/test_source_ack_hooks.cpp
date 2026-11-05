@@ -31,6 +31,7 @@
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
 #include "clink/cluster/worker.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/connectors/checkpoint_ack_ledger.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/operators/operator_base.hpp"
@@ -421,6 +422,59 @@ TEST(SourceAckHooks, ACheckpointThatNeverCompletesHasNoRecordAcknowledged) {
         }
     }
     EXPECT_GE(never_completed, 1u) << "the first incarnation sealed no checkpoint that failed";
+    std::filesystem::remove_all(root);
+}
+
+// A source whose capability record refuses a scale-down (the Redis Streams
+// source's does: a removed subtask's consumer keeps its pending entries) is
+// refused a lower parallelism by the coordinator, with the record's reason,
+// before anything drains. The record here is a stand-in, declared for the probe
+// and removed again, so the test needs no Redis.
+TEST(SourceAckHooks, ACoordinatorRefusesAScaleDownTheSourcesRecordRulesOut) {
+    register_probe();
+    probe().reset();
+    FusionEnv env(false);
+    clink::connectors::CapabilityRegistry::instance().declare(
+        clink::connectors::ConnectorCapabilities{
+            .name = "ack_probe",
+            .version = "1",
+            .is_source = true,
+            .replayable = false,
+            .offset_model = clink::connectors::OffsetModel::Acknowledgement,
+            .checkpoint_integrated = true,
+            .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+            .scale_down_refusal =
+                "each subtask owns state on the broker that no other subtask reads",
+        });
+    struct Undeclare {
+        ~Undeclare() { clink::connectors::CapabilityRegistry::instance().undeclare("ack_probe"); }
+    } undeclare;
+    const auto root = scratch("rescale");
+    ProbeCluster c(/*max_restarts=*/0);
+    ASSERT_TRUE(c.coordinator.await_registrations(clink::test_support::scale_slack(5s)));
+    auto g = probe_graph();
+    g.ops[0].parallelism = 2;
+    g.ops[0].min_parallelism = 1;
+    g.ops[0].max_parallelism = 4;
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = (root / "ckpt").string();
+    ckpt.interval_ms = 100;
+    const auto job = c.coordinator.submit_job(
+        g, OperatorRegistry::default_instance(), std::vector<PluginBinary>{}, ckpt);
+    ASSERT_TRUE(await([] { return completions_seen() >= 2; },
+                      clink::test_support::scale_slack(std::chrono::milliseconds{30000})));
+    const auto r = c.coordinator.request_operator_rescale(job, "src", 1);
+    EXPECT_FALSE(r.ok);
+    EXPECT_NE(r.reason.find("cannot be rescaled below parallelism 2"), std::string::npos)
+        << r.reason;
+    EXPECT_NE(r.reason.find("each subtask owns state on the broker"), std::string::npos)
+        << r.reason;
+    {
+        std::lock_guard lk(probe().mu);
+        EXPECT_EQ(probe().incarnations, 2) << "a refused rescale redeployed the source";
+    }
+    ASSERT_TRUE(c.coordinator.cancel_job(job).ok);
+    ASSERT_TRUE(c.coordinator.await_job_completion(job, clink::test_support::scale_slack(30s)));
     std::filesystem::remove_all(root);
 }
 

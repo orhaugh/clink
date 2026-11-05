@@ -163,6 +163,12 @@ struct ConnectorCapabilities {
     // Anything a user would be annoyed to discover at 3am.
     std::vector<std::string> limitations;
 
+    // Non-empty when the source cannot be rescaled to fewer subtasks: why. A
+    // source whose subtasks each own broker-side state (a Redis Streams consumer
+    // and its pending entries) would strand a removed subtask's share. The
+    // coordinator refuses such a rescale with this reason.
+    std::string scale_down_refusal;
+
     // Options the connector requires when `delivery` is one of the
     // exactly-once levels. Checked at validation time.
     std::vector<std::string> required_options_for_exactly_once;

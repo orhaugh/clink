@@ -66,4 +66,9 @@ namespace clink::cluster {
 // newest CONFIRMED checkpoint instead of the newest COMPLETED one.
 [[nodiscard]] bool op_type_needs_commit_confirmation(const std::string& op_type);
 
+// Why a source of this op type cannot be rescaled to fewer subtasks: its
+// capability record's scale_down_refusal. Empty when nothing refuses it,
+// including for an op type no record describes.
+[[nodiscard]] std::string source_scale_down_refusal(const std::string& op_type);
+
 }  // namespace clink::cluster
