@@ -133,6 +133,49 @@ Guarantees vary by connector and are stated on each page. In summary:
   until a checkpoint completes, and the Redis Streams source cannot be
   rescaled to fewer subtasks; their pages give the detail.
 
+## Maturity
+
+What each source and sink factory, or materially different mode, is shown to
+do, kept apart from what its capability record declares. The columns say
+whether a test exists, whether it ran and where, and whether a recovery was
+demonstrated: a round trip shows a connector works, not that it recovers. A
+row marked not reviewed repeats the record and the test entry points, nothing
+more, and claims no result.
+
+In-process tests run in the `ci` workflow's full ctest, which builds every
+connector module and ran each one's in-process cases on commit 6ad5168a
+(2026-11-05), all passing; live cases skip there. *run-all-live* is
+`scripts/run-all-live.sh`, run by hand, which provisions each connector's
+services in turn. A gate is a script that fails on a skipped case, a short
+suite or a missing binary. A qualification campaign is retained evidence for
+the engine version it ran, not a current result.
+
+| Factory or mode | Surface | As implemented | Material limitations | Tests | Live run | Recovery demonstrated | Reviewed |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `redis_source` | SQL `redis`, C++ | Acknowledges at checkpoint completion; the consumer's pending entries are redelivered. At-least-once. | Duplicates after a crash between completion and `XACK`; a restore from an older checkpoint misses that checkpoint's entries; a job with no completed checkpoint stops at `max_pending`; no scale-down | `RedisSourceLogic`, `SourceCapabilityRecord`, `CheckpointAckLedger`, `SourceAckHooks`; live `RedisSourceAckLive`, `RedisLive` | Gate `scripts/redis-pubsub-live.sh`, by hand: passed 2026-11-05 on the uncommitted change, not in CI | Yes, against `redis:7`, locally: abort, crash after the barrier, crash after completion, a killed and a paused `XACK`, scale-down refused. None retained. | 2026-11-05 |
+| `pubsub_source` | SQL `pubsub`, C++ | Acknowledges at checkpoint completion, holding each message's lease up to `max_lease_s`; the server redelivers. At-least-once. | As Redis, plus duplicates past `max_lease_s`; REST pull only; `on_decode_error='drop'` loses undecodable messages by choice | `PubSubSourceAck` (a stub of the REST API), `SourceCapabilityRecord`; live `PubSubSourceAckLive`, `PubSubLive` | Same gate, against the emulator | Yes, against the stub and the emulator: abort, crashes, failed acknowledges, a checkpoint delayed past the deadline. None retained. | 2026-11-05 |
+| `rabbitmq_source_string` | SQL `rabbitmq` | Record: acknowledgement at completion | See its page | In-process; live `RabbitMqLive` | run-all-live | Not assessed | Not reviewed |
+| `nats_source_string` | SQL `nats` | Record: acknowledgement at completion | See its page | In-process; live `NatsLive` | run-all-live | Not assessed | Not reviewed |
+| `pulsar_source_*`, Shared and Exclusive | SQL `pulsar` | Record: acknowledgement at completion; Exclusive also seeks back to the recorded message | See its page | In-process; live `PulsarLive` | run-all-live | Not assessed | Not reviewed |
+| `mqtt_source` | C++ only | Record: no position model, declared at-least-once; the analyser reports `AT_MOST_ONCE_SOURCE` | See its page | In-process; live `MqttLive` | run-all-live (TLS case needs a broker of your own) | Not assessed | Not reviewed |
+| `kafka_source_*` | SQL `kafka` | Record: replays from log offsets | See its page | In-process; live suites | `docker-suites` gate in CI | Suites exist (exactly-once, window recovery, source ownership); [QUAL-01](../qualification/qual-01-kafka-exactly-once.md) | Not reviewed |
+| PostgreSQL CDC, `changelog_mode` | SQL `postgres` | Record: replays from the LSN; slot confirmed at completion | See its page | In-process; `PostgresCdcContractLive`, recovery cells | `postgres-cdc` gate in CI | Suites exist | Not reviewed |
+| MySQL CDC | SQL `mysql` | Record: replays from a log position | See its page | In-process; live `MysqlCdcLive` | run-all-live | Not assessed | Not reviewed |
+| `kinesis_source` | SQL `kinesis` | Record: replays from a cursor it keeps (opaque token) | Resharding order caveat | In-process; live `KinesisLive` | run-all-live | Not assessed | Not reviewed |
+| MongoDB change stream | C++ only | Record: replays from a cursor it keeps (opaque token) | See its page | In-process; live `MongoLive` | run-all-live | Not assessed | Not reviewed |
+| Parquet and file sources (`file`, `parquet`, `s3_parquet`, `gcs_parquet`, `azure_parquet`, `webhdfs_parquet`) | SQL | Record: replays from file offsets | See their pages | In-process; live suites for each store | run-all-live | Not assessed | Not reviewed |
+| `iceberg` source | SQL `iceberg` | Record: replays from a cursor it keeps (opaque token) | See its page | In-process; live `IcebergRestLive`, `IcebergS3Live` | run-all-live | Not assessed | Not reviewed |
+| `http_poll_source` | SQL `http_poll` | Record: replays from a cursor | Needs an exclusive, ascending cursor server-side | In-process only | None | Not assessed | Not reviewed |
+| `websocket_source` | SQL `websocket` | Record: no replay, at-most-once | See its page | In-process | None | Not assessed | Not reviewed |
+| `kafka_2pc_sink_string` | SQL `exactly_once` | Record: two-phase commit on the commit-confirmed protocol | See its page | In-process; exactly-once suites, fault matrix | `docker-suites` gate in CI | Suites exist; [QUAL-01](../qualification/qual-01-kafka-exactly-once.md) | Not reviewed |
+| `postgres_2pc_sink` | SQL `exactly_once` | Record: two-phase commit | See its page | In-process; `PostgresExactlyOnceTest` | `docker-suites` and `postgres-cdc` gates in CI | Suites exist; [QUAL-02](../qualification/qual-02-postgres-two-phase-commit.md) | Not reviewed |
+| Object-store `_2pc` Parquet sinks | SQL `exactly_once` | Record: atomic publish at completion | See their pages | In-process; `S3ExactlyOnceTest`, live suites | `docker-suites` gate in CI (S3); run-all-live for the others | Suites exist; [QUAL-03](../qualification/qual-03-s3-staged-commits.md) (S3) | Not reviewed |
+| ClickHouse sinks (`clickhouse_sink`, `clickhouse_native_sink`) | SQL `clickhouse` | Record: at-least-once | See its page | In-process; live and recovery suites | ClickHouse live suite in `ci`; recovery matrix nightly | Suites exist | Not reviewed |
+| `neo4j` sink and lookup | SQL `neo4j`, lookup | Record: at-least-once | See its page | In-process; live and recovery suites | `neo4j` gate in CI | Suites exist | Not reviewed |
+| Upsert sinks (`postgres_upsert_sink`, `mysql_upsert_sink`, `redis_upsert_sink`, `cassandra` upsert, `dynamodb_sink`) | SQL `mode='upsert'` | Record: effectively-once on a stable key | See their pages | In-process; `UpsertContractSuite` per store | `postgres-cdc` gate in CI (PostgreSQL); run-all-live for the others | Not assessed | Not reviewed |
+| Append sinks, at-least-once (Kafka, RabbitMQ, NATS, Pulsar, MQTT, Redis Streams, Pub/Sub, the HTTP family, Kinesis, Firehose, Cassandra, MySQL, PostgreSQL, Iceberg, Delta, rolling Parquet) | SQL, except MQTT | Record: at-least-once; a replay duplicates | See their pages | In-process; live suites where a page lists them | Mostly run-all-live | Not assessed | Not reviewed |
+| `s3` raw objects | SQL `s3` | Record: at-most-once | See its page | In-process; live suites | run-all-live | Not assessed | Not reviewed |
+
 ## NaN and infinity in JSON output
 
 JSON has no token for NaN or an infinity, so every sink that writes JSON

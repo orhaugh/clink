@@ -18,7 +18,7 @@ The module links the per-component imported targets `aws-cpp-sdk-kinesis`, `aws-
 
 The CMake knob is `CLINK_WITH_AWS` with values `AUTO` (default), `ON`, or `OFF` (`CMakeLists.txt`). On `AUTO` the module configures only if the kinesis, firehose and dynamodb SDK components are all found; otherwise the target is silently not defined. On `ON` a missing component is a fatal configure error. On `OFF` the target is skipped entirely.
 
-The module needs the kinesis, firehose and dynamodb SDK components specifically. The from-source SDK built by `scripts/install-system-deps.sh` (and baked into the `clink-build:latest` Debian image) is configured with `BUILD_ONLY="config;s3;transfer;identity-management;sts"`, which does **not** include those three components. As a result, `clink::aws` is not built in that image (confirmed by `scripts/sanitize_connectors_in_image.sh`). To build it, the kinesis/firehose/dynamodb components must be present, for example via a full aws-sdk-cpp install such as the macOS Homebrew package, against which the module is validated.
+The module needs the kinesis, firehose and dynamodb SDK components specifically. The from-source SDK that `scripts/install-system-deps.sh` builds (and the toolchain image bakes in) is configured with `BUILD_ONLY="config;s3;transfer;identity-management;sts;kinesis;firehose;dynamodb"`, so the module builds there: CI's build of commit 6ad5168a on 2026-11-05 built `clink_aws_tests` and passed its 22 in-process cases, skipping the 2 that need LocalStack. A host build needs the same components, for example the macOS Homebrew aws-sdk-cpp, which ships them all; an SDK built with a narrower `BUILD_ONLY` leaves the module out under `AUTO`.
 
 ```bash
 cmake -S . -B build -DCLINK_WITH_AWS=ON
@@ -184,7 +184,7 @@ None of the sinks offer two-phase-commit exactly-once. On exhausted retries each
 ## Limitations
 
 - Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
-- Module only configures when the kinesis, firehose and dynamodb SDK components are present; the prebuilt `clink-build:latest` image ships only the s3 component, so the module is not built there.
+- Module only configures when the kinesis, firehose and dynamodb SDK components are present. The toolchain image has them; an SDK built with only the s3 component leaves the module out under `AUTO`.
 - String channel only; every record is a string (JSON object string on the SQL path). No int64 channel, no Arrow/Parquet encoding on this path.
 - Firehose, DynamoDB and the Kinesis source/sink are the four registered factories; there is no Kinesis Firehose source and no DynamoDB source.
 - `dynamodb_sink`: each record must be a JSON object; the partition key (and sort key, if configured) must be present, non-null and scalar, or the record is rejected. `BatchWriteItem` is capped at 25 items per call. JSON numbers are mapped to DynamoDB `N`.

@@ -22,7 +22,7 @@ The connector is gated by the CMake option `CLINK_WITH_MQTT`, with values `AUTO`
 - `ON`: configuration fails if libmosquitto is not found.
 - `OFF`: the target is not defined.
 
-CMake discovers libmosquitto three ways, most portable first: a pkg-config imported target (`libmosquitto.pc`, shipped by `libmosquitto-dev`), mosquitto's own CONFIG package, then a manual header/library probe (covering a Homebrew keg or a bare Linux install with no pkg-config tool). libmosquitto is not installed by the project's Docker build-env scripts, so to build the connector you install it yourself first:
+CMake discovers libmosquitto three ways, most portable first: a pkg-config imported target (`libmosquitto.pc`, shipped by `libmosquitto-dev`), mosquitto's own CONFIG package, then a manual header/library probe (covering a Homebrew keg or a bare Linux install with no pkg-config tool). `scripts/install-connector-deps.sh` installs `libmosquitto-dev`, so the toolchain image builds the connector: CI's build of commit 6ad5168a on 2026-11-05 built `clink_mqtt_tests` and passed its 12 in-process cases, skipping the 6 that need a broker. On a host, install the library first:
 
 ```bash
 # Debian/Ubuntu
@@ -164,7 +164,7 @@ A live integration test, `impls/mqtt/tests/test_mqtt_live.cpp`, is skipped unles
 - `CLINK_MQTT_TEST_URL` (for example `mqtt://localhost:1883`) enables the plaintext round-trip tests: a sink-to-source round-trip delivering every record verbatim, the `include_topic` JSON envelope, retained-message delivery to a fresh subscriber, and the idle sink at a five-second keepalive: `AnIdleSinkStaysConnectedAcrossItsBarriers` idles it for twelve seconds with a barrier every half second and requires its next batch to go out without a reconnect, and `ASinkDroppedWhileIdleReconnectsForItsNextBatch` idles it as long with no barrier, so the broker drops it, and requires the next batch to reconnect once and arrive.
 - `CLINK_MQTT_TLS_TEST_URL` (a `host:port` pointing at a TLS-enabled broker) enables the TLS round-trip test. `CLINK_MQTT_TLS_CA` may supply the CA certificate (PEM); without it, verification is skipped (self-signed dev cert: encrypt but do not authenticate).
 
-There is no dedicated MQTT broker Docker image wired into the test harness; point the environment variable at a broker you run yourself (for example a local `eclipse-mosquitto` container).
+`docker/integration-services.yml` defines an `mqtt` service (`eclipse-mosquitto:2` on port 1883), and `ONLY=mqtt scripts/run-all-live.sh` runs `MqttLive` against it inside the toolchain image. No CI workflow runs it, and nothing provides the TLS broker the TLS case needs.
 
 In-process unit tests run without a broker: `test_factory_registration.cpp` checks that `mqtt_source` and `mqtt_sink` are registered on the `string` channel, and `test_mqtt_sink_logic.cpp` / `test_mqtt_source_logic.cpp` exercise the sink and source logic. The test executable is `clink_mqtt_tests`, labelled `mqtt`:
 

@@ -93,7 +93,7 @@ CONNECTORS=(
   "webhdfs@@webhdfs@@clink_webhdfs_tests@@WebHdfsParquetLive"
   "iceberg@@localstack iceberg-rest@@clink_iceberg_tests@@IcebergRestLive|IcebergS3Live"
   "etcd@@etcd@@clink_etcd_tests@@EtcdHaCoordinator"
-  # Reported BLOCKED unless the image gains the SDK components (see header):
+  # Reported BLOCKED if an image without the SDK components builds no clink_aws_tests:
   "aws-kinesis@@localstack@@clink_aws_tests@@KinesisLive"
 )
 
