@@ -44,6 +44,7 @@ include/clink/connectors/builtin_capabilities.hpp
 include/clink/connectors/capability.hpp
 include/clink/connectors/cdc_event.hpp
 include/clink/connectors/cdc_json.hpp
+include/clink/connectors/checkpoint_ack_ledger.hpp
 include/clink/connectors/columnar_parquet.hpp
 include/clink/connectors/columnar_parquet_factories.hpp
 include/clink/connectors/committing_sink.hpp

@@ -365,6 +365,7 @@ include/clink/connectors/arrow_s3_lifecycle.hpp
 include/clink/connectors/aws_sdk_init.hpp
 include/clink/connectors/builtin_capabilities.hpp
 include/clink/connectors/cdc_json.hpp
+include/clink/connectors/checkpoint_ack_ledger.hpp
 include/clink/connectors/columnar_parquet.hpp
 include/clink/connectors/columnar_parquet_factories.hpp
 include/clink/connectors/delta_log.hpp
