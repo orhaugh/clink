@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -194,4 +195,174 @@ TEST(PulsarLive, AnExclusiveSubscriptionReplaysInOrderFromItsCheckpointedPositio
     }
     EXPECT_EQ(got, want) << "the restore did not replay the topic in order from the checkpoint";
     restored.close();
+}
+
+// --- the source's acknowledgement contract ----------------------------------
+//
+// Judged by what another consumer of the same Shared subscription receives once
+// the source has gone (Pulsar redelivers a closed consumer's unacknowledged
+// messages to the others), never by the source's own counters.
+
+namespace {
+
+struct AckTopic {
+    AckTopic()
+        : topic("clink-ack-" + unique_suffix()), subscription("clink-ack-sub-" + unique_suffix()) {}
+    void publish(const std::string& tag, int n) const {
+        PulsarSink::Options ko;
+        ko.conn.service_url = pulsar_url();
+        ko.topic = topic;
+        PulsarSink sink(std::move(ko));
+        sink.open();
+        Batch<std::string> b;
+        for (int i = 0; i < n; ++i) {
+            b.emplace(tag + std::to_string(i));
+        }
+        sink.on_data(b);
+        sink.flush();
+        sink.close();
+    }
+    PulsarSource::Options source() const {
+        PulsarSource::Options o;
+        o.conn.service_url = pulsar_url();
+        o.topic = topic;
+        o.subscription = subscription;
+        o.receive_timeout = std::chrono::milliseconds{200};
+        return o;
+    }
+    std::string topic;
+    std::string subscription;
+};
+
+std::vector<std::string> tagged(const std::string& tag, int n) {
+    std::vector<std::string> v;
+    for (int i = 0; i < n; ++i) {
+        v.push_back(tag + std::to_string(i));
+    }
+    return v;
+}
+
+std::set<std::string> set_of(std::vector<std::string> a, const std::vector<std::string>& b = {}) {
+    a.insert(a.end(), b.begin(), b.end());
+    return {a.begin(), a.end()};
+}
+
+std::vector<std::string> drain(PulsarSource& src, std::size_t want, int ms) {
+    std::vector<std::string> got;
+    Emitter<std::string> em([&](StreamElement<std::string> e) -> bool {
+        if (e.is_data()) {
+            for (const auto& rec : e.as_data()) {
+                got.push_back(rec.value());
+            }
+        }
+        return true;
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{ms};
+    while (got.size() < want && std::chrono::steady_clock::now() < deadline) {
+        src.produce(em);
+    }
+    return got;
+}
+
+std::set<std::string> left_in(const AckTopic& t) {
+    PulsarSource judge(t.source());
+    judge.open();
+    const auto got = drain(judge, 1000000, 3000);
+    judge.close();
+    return {got.begin(), got.end()};
+}
+
+}  // namespace
+
+TEST(PulsarSourceAckLive, AnAbortedCheckpointsMessagesAreDeliveredAgain) {
+    if (!pulsar_configured()) {
+        GTEST_SKIP() << "set CLINK_PULSAR_TEST_ENDPOINT";
+    }
+    const AckTopic t;
+    clink::InMemoryStateBackend backend;
+    {
+        PulsarSource src(t.source());
+        src.open();
+        t.publish("a", 6);
+        ASSERT_EQ(drain(src, 6, 15000).size(), 6u);
+        src.snapshot_offset(backend, clink::OperatorId{1}, clink::CheckpointId{1});
+        src.notify_checkpoint_aborted(clink::CheckpointId{1});
+        drain(src, 7, 300);
+        src.close();
+    }
+    EXPECT_EQ(left_in(t), set_of(tagged("a", 6)));
+}
+
+TEST(PulsarSourceAckLive, ACrashAfterCompletionBeforeTheAckDeliversAgain) {
+    if (!pulsar_configured()) {
+        GTEST_SKIP() << "set CLINK_PULSAR_TEST_ENDPOINT";
+    }
+    const AckTopic t;
+    clink::InMemoryStateBackend backend;
+    {
+        PulsarSource src(t.source());
+        src.open();
+        t.publish("c", 4);
+        ASSERT_EQ(drain(src, 4, 15000).size(), 4u);
+        src.snapshot_offset(backend, clink::OperatorId{1}, clink::CheckpointId{1});
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        // Dies before a turn sends the acks: no produce, no close.
+    }
+    EXPECT_EQ(left_in(t), set_of(tagged("c", 4))) << "duplicates, not a loss";
+}
+
+TEST(PulsarSourceAckLive, EachCompletionAcknowledgesOnlyTheIntervalsItCovers) {
+    if (!pulsar_configured()) {
+        GTEST_SKIP() << "set CLINK_PULSAR_TEST_ENDPOINT";
+    }
+    const AckTopic t;
+    clink::InMemoryStateBackend backend;
+    {
+        PulsarSource src(t.source());
+        src.open();
+        t.publish("x", 3);
+        ASSERT_EQ(drain(src, 3, 15000).size(), 3u);
+        src.snapshot_offset(backend, clink::OperatorId{1}, clink::CheckpointId{1});
+        t.publish("y", 2);
+        ASSERT_EQ(drain(src, 2, 15000).size(), 2u);
+        src.snapshot_offset(backend, clink::OperatorId{1}, clink::CheckpointId{2});
+        t.publish("z", 1);
+        ASSERT_EQ(drain(src, 1, 15000).size(), 1u);  // after the last barrier
+        src.notify_checkpoint_complete(clink::CheckpointId{2});
+        src.notify_checkpoint_complete(clink::CheckpointId{1});  // late
+        src.notify_checkpoint_complete(clink::CheckpointId{2});  // repeated
+        src.notify_checkpoint_aborted(clink::CheckpointId{1});   // late and contradictory
+        src.notify_checkpoint_complete(clink::CheckpointId{9});  // above anything sealed
+        drain(src, 1, 300);
+        // Dies here: only the open interval's message is unacknowledged.
+    }
+    EXPECT_EQ(left_in(t), set_of(tagged("z", 1)));
+}
+
+TEST(PulsarSourceAckLive, CloseAcknowledgesCompletedIntervalsOnly) {
+    if (!pulsar_configured()) {
+        GTEST_SKIP() << "set CLINK_PULSAR_TEST_ENDPOINT";
+    }
+    const AckTopic t;
+    clink::InMemoryStateBackend backend;
+    {
+        PulsarSource src(t.source());
+        src.open();
+        t.publish("f", 2);
+        ASSERT_EQ(drain(src, 2, 15000).size(), 2u);
+        src.snapshot_offset(backend, clink::OperatorId{1}, clink::CheckpointId{1});
+        t.publish("g", 2);
+        ASSERT_EQ(drain(src, 2, 15000).size(), 2u);
+        src.snapshot_offset(
+            backend, clink::OperatorId{1}, clink::CheckpointId{2});  // never completes
+        t.publish("h", 1);
+        ASSERT_EQ(drain(src, 1, 15000).size(), 1u);
+        // Checkpoint 1 completes as the job is cancelled: no produce turn
+        // follows, so only close() can acknowledge it.
+        src.notify_checkpoint_complete(clink::CheckpointId{1});
+        src.cancel();
+        src.close();
+    }
+    EXPECT_EQ(left_in(t), set_of(tagged("g", 2), tagged("h", 1)))
+        << "close acknowledged what no completed checkpoint covers, or not what one does";
 }

@@ -17,14 +17,22 @@ namespace clink::nats {
 // redelivers any left unacked after a failure (the durable consumer's ack floor persists
 // server-side, so recovery needs no local state - restore_offset is a no-op).
 //
-// The ack is deferred to CHECKPOINT COMMIT, not the barrier. snapshot_offset() buckets the
+// The ack is deferred to CHECKPOINT COMPLETION, not the barrier. snapshot_offset() buckets the
 // messages emitted before each barrier against that checkpoint id; notify_checkpoint_complete()
-// (driven from the cluster's CommitCheckpoint path) marks a bucket's messages safe to ack, and
-// the next produce() turn issues their natsMsg_Ack - so a message is acked only after the
-// checkpoint that captured it is globally durable. All nats.c calls stay on the produce() thread
-// (one subscription, not thread-safe). notify_checkpoint_aborted() releases the bucket WITHOUT
-// acking, so AckWait lapses and JetStream redelivers. Keep AckWait larger than the checkpoint
-// interval so held (unacked) messages are not redelivered before their checkpoint commits.
+// (driven from the cluster's CommitCheckpoint path) marks every bucket at or below the completed
+// id safe to ack, and the next produce() turn, or close(), issues their natsMsg_Ack - so a message
+// is acked only after the checkpoint that captured it is globally durable. All nats.c calls stay
+// on the produce() thread (one subscription, not thread-safe). notify_checkpoint_aborted()
+// releases the bucket WITHOUT acking, so JetStream redelivers it.
+//
+// While a message waits for its checkpoint the source keeps it in progress: natsMsg_InProgress
+// resets its AckWait at half that period, for at most max_lease from receipt, so a checkpoint
+// slower than AckWait does not have its messages redelivered. Past max_lease, or for an aborted
+// checkpoint's messages, JetStream redelivers once AckWait runs out. close() acknowledges what
+// completed checkpoints cover and Naks everything else, so JetStream redelivers it at once. The
+// durable consumer's MaxAckPending bounds what is held unacknowledged, across every subtask that
+// shares the durable: none is acknowledged before its checkpoint completes, so that is the most
+// the job reads per checkpoint.
 //
 // Core NATS pub/sub is fire-and-forget (at-most-once); this connector targets JetStream, which
 // is the persistent, ack'd streaming layer. nats.c types do not appear here (pImpl).
@@ -37,8 +45,9 @@ public:
         std::string durable{"clink"};  // durable consumer name (shared across subtasks)
         int batch{256};                // messages per Fetch
         std::chrono::milliseconds fetch_timeout{1000};  // Fetch wait (also the cancel latency)
-        std::chrono::seconds ack_wait{60};              // consumer AckWait (> checkpoint interval)
-        int max_ack_pending{2048};                      // bounds held-unacked messages
+        std::chrono::seconds ack_wait{60};  // consumer AckWait; held messages are kept in progress
+        std::chrono::seconds max_lease{3600};  // how long one message is kept in progress
+        int max_ack_pending{2048};  // the durable's bound on held-unacked messages, all subtasks
         std::string name{"nats_source"};
     };
 

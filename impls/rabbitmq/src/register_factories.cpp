@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "clink/connectors/capability.hpp"
@@ -65,9 +66,11 @@ void install(clink::plugin::PluginRegistry& reg) {
     using clink::plugin::BuildContext;
 
     // rabbitmq_source_string: basic.consume from a queue, emit each body as a string.
-    // At-least-once (manual ack at the checkpoint barrier; broker redelivers unacked on restart).
+    // At-least-once (manual ack once the checkpoint completes; the broker redelivers what was not
+    // acknowledged).
     // Params: host (localhost), port (5672), vhost (/), user/password (guest), queue (required),
-    //   consumer_tag, prefetch (256), poll_timeout_ms (100), batch_size (256).
+    //   consumer_tag, prefetch (10000; 1..65535: the most held unacknowledged, so the most read per
+    //   checkpoint), poll_timeout_ms (100), batch_size (256).
     reg.register_source<std::string>(
         "rabbitmq_source_string",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
@@ -76,7 +79,13 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.queue = ctx.param_or("queue");
             o.consumer_tag = ctx.param_or("consumer_tag", "");
             o.declare_queue = ctx.param_or("declare_queue", "true") != "false";
-            o.prefetch = static_cast<std::uint16_t>(ctx.param_int64_or("prefetch", 256));
+            const auto prefetch = ctx.param_int64_or("prefetch", 10000);
+            if (prefetch < 1 || prefetch > 65535) {
+                throw std::runtime_error(
+                    "rabbitmq_source_string: 'prefetch' must be between 1 and "
+                    "65535 (basic.qos prefetch_count; 0 would be unlimited)");
+            }
+            o.prefetch = static_cast<std::uint16_t>(prefetch);
             o.poll_timeout = std::chrono::milliseconds{ctx.param_int64_or("poll_timeout_ms", 100)};
             o.max_batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
             o.name = "rabbitmq_source";

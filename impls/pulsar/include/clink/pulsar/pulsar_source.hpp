@@ -29,10 +29,11 @@ namespace clink::pulsar {
 // The ack is deferred to CHECKPOINT COMMIT, not the barrier. snapshot_offset() buckets the
 // messages emitted before each barrier against that checkpoint id; notify_checkpoint_complete()
 // (driven from the cluster's CommitCheckpoint path) marks a bucket's messages safe to ack, and
-// the next produce() turn issues their pulsar_consumer_acknowledge - so a message is acked only
-// after the checkpoint that captured it is globally durable. All pulsar C calls stay on the
-// produce() thread (one consumer). notify_checkpoint_aborted() frees the bucket WITHOUT acking,
-// so Pulsar redelivers. The receiver-queue size bounds the held-unacked buffer.
+// the next produce() turn, or close(), issues their pulsar_consumer_acknowledge - so a message is
+// acked only after the checkpoint that captured it is globally durable, and close() acknowledges
+// nothing else. All pulsar C calls stay on the produce() thread (one consumer).
+// notify_checkpoint_aborted() frees the bucket WITHOUT acking, so Pulsar redelivers it when the
+// consumer closes. The broker's per-consumer unacknowledged limit bounds what is held.
 //
 // libpulsar types do not appear here (the pulsar C API is confined to the .cpp via a pImpl).
 class PulsarSource final : public Source<std::string> {

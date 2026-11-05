@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+**A RabbitMQ source no longer acknowledges an aborted checkpoint's messages
+with a later one.** It acknowledged with one cumulative
+`basic.ack(multiple=true)` up to the highest tag a completed checkpoint
+covered, so when checkpoint 1 aborted and checkpoint 2 completed in the same
+run, checkpoint 1's messages were acknowledged too and never delivered again.
+It now acknowledges through `CheckpointAckLedger`, cumulatively only while no
+aborted tag lies below, tag by tag otherwise. `RabbitMqSourceAckLive.AnAbortedIntervalIsNotAcknowledgedByALaterCompletion`
+found the queue empty before, and finds checkpoint 1's messages after.
+
+**RabbitMQ's default prefetch is 10,000, not 256.** None of a source's
+messages is acknowledged before its checkpoint completes, so prefetch is the
+most a subtask reads per checkpoint: measured against a broker, 256, about 25
+messages a second at 10 s checkpoints. `prefetch` is now refused outside 1 to
+65535, where it used to wrap silently to 16 bits (0 is unlimited in AMQP).
+
+**The RabbitMQ, NATS and Pulsar sources acknowledge at close what completed
+checkpoints cover.** Each released those messages unacknowledged, so the final
+checkpoint of a stop, whose completion arrives before the source closes, was
+delivered again on the next run. The NATS source also hands everything else
+back with a Nak, so JetStream redelivers it at once rather than after AckWait.
+
+**A NATS source keeps the messages it holds in progress while their checkpoint
+is out.** It relied on AckWait outlasting the checkpoint: with a 2 s AckWait
+and a 6 s checkpoint, three messages were delivered again nine times. It now
+resets each held message's AckWait with `natsMsg_InProgress` at half that
+period, for at most `max_lease_s` (default 3600). `ack_wait_s`,
+`max_lease_s` and `max_ack_pending` are validated.
+
 **The Redis Streams and Pub/Sub sources acknowledge a record only once the
 checkpoint that covers it has completed.** Both acknowledged inside
 `snapshot_offset()`, at the barrier, so a checkpoint that failed after it left

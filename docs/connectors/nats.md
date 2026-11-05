@@ -60,8 +60,9 @@ All options are parsed in `impls/nats/src/register_factories.cpp` and map onto t
 | `durable` | No | `clink` | Durable consumer name, shared across subtasks. |
 | `batch` | No | `256` | Messages fetched per pull. |
 | `fetch_timeout_ms` | No | `1000` | Fetch wait in milliseconds; also bounds cancel latency. |
-| `ack_wait_s` | No | `60` | Consumer AckWait in seconds. Keep larger than the checkpoint interval. |
-| `max_ack_pending` | No | `2048` | Upper bound on held, unacked messages. |
+| `ack_wait_s` | No | `60` | Consumer AckWait in seconds. A message waiting for its checkpoint is kept in progress (`natsMsg_InProgress`) at half this period. At least 1. |
+| `max_lease_s` | No | `3600` | How long one message is kept in progress; past it JetStream redelivers it once AckWait runs out. At least `ack_wait_s`. |
+| `max_ack_pending` | No | `2048` | The durable consumer's bound on held, unacknowledged messages, shared by every subtask on the durable. None is acknowledged before its checkpoint completes, so this is the most the job reads per checkpoint. At least 1. |
 
 ### Sink (`nats_sink_string`)
 
@@ -144,7 +145,7 @@ A JetStream stream bound to the subject must already exist; the connectors do no
 
 Both directions are at-least-once.
 
-- Source: a durable explicit-ack pull consumer. The ack is deferred to checkpoint COMMIT, not the barrier: `snapshot_offset` buckets the messages emitted before each barrier against that checkpoint id, `notify_checkpoint_complete` (driven from the cluster's `CommitCheckpoint` dispatch) queues a committed bucket for ack, and the next `produce()` turn issues each `natsMsg_Ack` - so a message is acked only after the checkpoint that captured it is globally durable. `notify_checkpoint_aborted` releases a bucket without acking, so an aborted checkpoint (or a crash before commit) leaves those messages for redelivery (JetStream redelivers after `AckWait`). Until acked JetStream holds them (bounded by `max_ack_pending`); all nats.c calls stay on the `produce()` thread. The durable consumer's ack floor is persisted server-side, so recovery needs no local state and `restore_offset` is a no-op. Keep `ack_wait_s` larger than the checkpoint interval so held, unacked messages are not redelivered before their checkpoint commits.
+- Source: a durable explicit-ack pull consumer, and the ack waits for the checkpoint that covers a message to complete. `snapshot_offset` buckets the messages emitted before each barrier against that checkpoint id, `notify_checkpoint_complete` (from the cluster's `CommitCheckpoint` dispatch) queues every bucket at or below the completed id for ack, and the next `produce()` turn, or `close()`, issues each `natsMsg_Ack`. `notify_checkpoint_aborted` releases a bucket without acking, so JetStream redelivers it. While a message waits, the source keeps it in progress: `natsMsg_InProgress` resets its AckWait at half that period, for at most `max_lease_s`, so a checkpoint slower than `ack_wait_s` no longer has its messages redelivered (it did: with a 2 s AckWait and a 6 s checkpoint, three messages were delivered again nine times). `close()` acknowledges what completed checkpoints cover and Naks everything else, held, uncommitted or aborted, so JetStream redelivers it at once; it used to acknowledge nothing and leave the rest to AckWait. A crash before completion, or between a completion and its ack, leaves the messages for redelivery after AckWait (duplicates). All nats.c calls stay on the `produce()` thread. The durable consumer's ack floor is persisted server-side, so recovery needs no local state and `restore_offset` is a no-op. `max_ack_pending` is the durable's bound on what is held, across every subtask, and so the most the job reads per checkpoint.
 - Sink: records are published asynchronously (`js_PublishAsync`) for throughput; `flush()` / `on_barrier()` call `js_PublishAsyncComplete` to block until the server has answered every pending publish, and throw on timeout so the job replays from the last checkpoint rather than dropping data. An answer can be a refusal (a negative PubAck, such as a stream limit, or no stream bound to the subject), which leaves the message in no stream: the sink counts refusals in a publish error handler and fails the flush when there was one, naming the subject and the server's reason. Before the handler, nats.c dropped a refused message and counted the publish as complete, so the flush succeeded over it. JetStream de-dup via `Nats-Msg-Id` is not set, so replay can duplicate. The SQL planner therefore rejects `exactly_once` and `upsert`.
 
 The capability record declares the source's position model as `acknowledgement`, and clink's delivery analyser reports a job over this source as `AT_LEAST_ONCE_SOURCE`: a sink in it may declare `delivery_guarantee='at_least_once'`, and `exactly_once` is refused, because a checkpoint acknowledged late is delivered again.
@@ -155,18 +156,19 @@ The capability record declares the source's position model as `acknowledgement`,
 - String record type only; there is no int64 or Arrow channel for this connector.
 - Sink requires a pre-existing JetStream stream bound to the target subject; stream provisioning is not performed by the connector.
 - No producer dedup key (`Nats-Msg-Id`) is set, so exactly-once and upsert are unsupported (enforced by the SQL planner).
-- The source acks at checkpoint commit (not the barrier), so the earlier crash-window drop is closed; duplicates on replay remain the at-least-once trade-off. This relies on the cluster's per-checkpoint `CommitCheckpoint` dispatch, wired for both the default (non-fused) deployment and the opt-in par-1 chain fusion (`CLINK_PLAN_FUSE_PAR1=1`).
+- The source acknowledges at checkpoint completion, so a crash between a completion and its ack delivers that interval again (duplicates), and a restore from a checkpoint older than one it acknowledged (commit-confirmed, a savepoint) does not see that checkpoint's messages again.
+- `max_ack_pending` is shared by every subtask on the durable and caps what the job reads per checkpoint; a message held past `max_lease_s` is redelivered (a duplicate).
 - `subject` is required for both source and sink; construction throws if it is empty.
 
 ## Testing
 
 Offline tests in `impls/nats/tests/test_nats.cpp` cover required-parameter validation and clean failure against a dead endpoint; they need no broker.
 
-The publish-then-consume round-trip lives in `impls/nats/tests/test_nats_live.cpp` and is skipped unless `CLINK_NATS_TEST_ENDPOINT` is set to a JetStream-enabled NATS URL (for example `nats://localhost:4222`). The live test creates the stream up front via the nats.c API, publishes through the sink (acks awaited), then reads the messages back through the source's durable pull consumer.
+The live tests in `impls/nats/tests/test_nats_live.cpp` are skipped unless `CLINK_NATS_TEST_ENDPOINT` is set to a JetStream-enabled NATS URL (for example `nats://localhost:4222`); each creates its stream up front. `NatsLive` covers the round trip and the sink's refusal. `NatsSourceAckLive` holds the source to its acknowledgement contract, judged by what another subscriber of the same durable receives once the source has gone, with a 2 s AckWait: an aborted checkpoint, a crash after a completion and before its ack, notifications out of order, close after a cancel, the `max_ack_pending` bound, and a checkpoint three times as slow as AckWait. The close and slow-checkpoint cases failed against the source before this contract, and pass.
+
+`scripts/ack-sources-live.sh` runs both suites against the `nats` service of `docker/integration-services.yml` (`nats:2.10` with JetStream), as a one-off container on free loopback ports, and fails on a skipped case or a short suite; the `ack-sources` CI workflow runs it.
 
 ```bash
-CLINK_NATS_TEST_ENDPOINT=nats://localhost:4222 \
-  ctest --test-dir build -L nats
+ctest --test-dir build -L nats          # offline cases; the live ones skip
+scripts/ack-sources-live.sh build       # every acknowledging source, live
 ```
-
-The tests do not pin a Docker image; run any JetStream-enabled NATS server and point `CLINK_NATS_TEST_ENDPOINT` at it.

@@ -20,6 +20,7 @@
 #include <pulsar/c/string_list.h>
 
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
 
 #include "pulsar_conn.hpp"
 
@@ -305,6 +306,28 @@ bool PulsarSource::restore_offset(StateBackend& backend, OperatorId op_id) {
 }
 
 void PulsarSource::close() {
+    // Acknowledge what completed checkpoints cover, and nothing else: whether this is a cancel, a
+    // failure or the end of a stop, every other message is freed unacknowledged, and Pulsar
+    // redelivers a closed consumer's unacknowledged messages. Best effort: an ack that fails here
+    // is a redelivery, a duplicate.
+    std::vector<pulsar_message_t*> to_ack;
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        to_ack.swap(impl_->ack_ready);
+    }
+    std::size_t failed = 0;
+    for (pulsar_message_t* m : to_ack) {
+        if (impl_->consumer == nullptr ||
+            pulsar_consumer_acknowledge(impl_->consumer, m) != pulsar_result_Ok) {
+            ++failed;
+        }
+        pulsar_message_free(m);
+    }
+    if (failed > 0) {
+        clink::log::warn("pulsar.source",
+                         impl_->opts.name + ": " + std::to_string(failed) +
+                             " acknowledges at close failed; those messages are redelivered");
+    }
     impl_->free_unacked();  // unacked on close -> Pulsar redelivers them (at-least-once)
     if (impl_->consumer != nullptr) {
         pulsar_consumer_close(impl_->consumer);

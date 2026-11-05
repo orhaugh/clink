@@ -1,14 +1,16 @@
 #include "clink/rabbitmq/rabbitmq_source.hpp"
 
-#include <atomic>
+#include <algorithm>
 #include <cstdint>
-#include <map>
-#include <mutex>
+#include <exception>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+#include "clink/connectors/checkpoint_ack_ledger.hpp"
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
 
 #include "amqp_conn.hpp"
 
@@ -29,28 +31,43 @@ struct timeval to_timeval(std::chrono::milliseconds ms) {
 struct RabbitMqSource::Impl {
     Options opts;
     amqp_connection_state_t conn{nullptr};
-    std::uint64_t highest_tag{0};  // latest consumed delivery tag (emitted downstream)
-    std::uint64_t last_acked{0};   // highest tag already basic.ack'd (produce thread only)
-    // Highest tag whose capturing checkpoint has globally committed - safe to ack. Written by
-    // notify_checkpoint_complete (commit-dispatch thread), drained by produce() (produce thread).
-    std::atomic<std::uint64_t> commit_watermark{0};
-    // checkpoint id -> highest tag emitted before that barrier. Written by snapshot_offset
-    // (produce thread), read/erased by notify_checkpoint_* (commit thread); guarded by mu.
-    std::mutex mu;
-    std::map<std::uint64_t, std::uint64_t> pending;
+    // Delivery tags awaiting basic.ack, each held until the checkpoint that covers it completes
+    // (snapshot_offset seals, notify_checkpoint_* move, produce/close take on this thread).
+    clink::connectors::CheckpointAckLedger<std::uint64_t> ledger;
+    // Every tag at or below this is acknowledged, so a basic.ack(multiple) up to a tag above it
+    // acknowledges only the tags between them (produce thread only).
+    std::uint64_t acked_floor{0};
+    // Tags of aborted checkpoints. Never acknowledged on this channel; the broker requeues them
+    // when it closes. While one sits above acked_floor a cumulative ack would take it too, so
+    // later tags are acknowledged one by one (produce thread only).
+    std::set<std::uint64_t> released;
     explicit Impl(Options o) : opts(std::move(o)) {}
 
-    // Ack everything up to the committed watermark, on the produce() thread. Returns false on a
-    // broker ack failure. ack(multiple=true) confirms every tag up to the watermark in one frame.
+    // Acknowledge, on the produce() thread, what completed checkpoints cover. Returns false on a
+    // broker ack failure.
     bool drain_acks() {
-        const std::uint64_t safe = commit_watermark.load(std::memory_order_acquire);
-        if (conn == nullptr || safe <= last_acked) {
+        auto handover = ledger.take();
+        released.insert(handover.released.begin(), handover.released.end());
+        auto& ready = handover.ready;
+        if (ready.empty() || conn == nullptr) {
             return true;
         }
-        if (amqp_basic_ack(conn, kChannel, safe, 1 /*multiple*/) != AMQP_STATUS_OK) {
-            return false;
+        std::sort(ready.begin(), ready.end());
+        const bool contiguous =
+            ready.front() == acked_floor + 1 && ready.back() - ready.front() + 1 == ready.size();
+        const bool released_below = !released.empty() && *released.begin() <= ready.back();
+        if (contiguous && !released_below) {
+            if (amqp_basic_ack(conn, kChannel, ready.back(), 1 /*multiple*/) != AMQP_STATUS_OK) {
+                return false;
+            }
+            acked_floor = ready.back();
+            return true;
         }
-        last_acked = safe;
+        for (const std::uint64_t tag : ready) {
+            if (amqp_basic_ack(conn, kChannel, tag, 0 /*multiple*/) != AMQP_STATUS_OK) {
+                return false;
+            }
+        }
         return true;
     }
 };
@@ -115,7 +132,7 @@ bool RabbitMqSource::produce(Emitter<std::string>& out) {
             std::string body(static_cast<const char*>(env.message.body.bytes),
                              env.message.body.len);
             bytes += body.size();
-            impl_->highest_tag = env.delivery_tag;
+            impl_->ledger.delivered(env.delivery_tag);
             batch.emplace(std::move(body));
             amqp_destroy_envelope(&env);
             continue;
@@ -149,35 +166,22 @@ bool RabbitMqSource::produce(Emitter<std::string>& out) {
 void RabbitMqSource::snapshot_offset(StateBackend& /*backend*/,
                                      OperatorId /*op_id*/,
                                      CheckpointId ckpt_id) {
-    // Record (not ack) the highest tag emitted before this barrier against the checkpoint id.
-    // The ack is deferred to notify_checkpoint_complete so a message is confirmed to the broker
-    // only after the checkpoint that captured it is globally durable - an aborted checkpoint
-    // must not consume it. Runs on the produce() thread; nothing is persisted to state (AMQP has
-    // no seekable offset, recovery relies on broker redelivery of unacked messages).
-    std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->pending[ckpt_id.value()] = impl_->highest_tag;
+    // Seal the tags delivered since the last barrier as this checkpoint's (no ack yet). Nothing is
+    // persisted to state: AMQP has no seekable offset, and recovery is the broker's redelivery of
+    // whatever was not acknowledged.
+    impl_->ledger.seal(ckpt_id.value());
 }
 
 void RabbitMqSource::notify_checkpoint_complete(CheckpointId ckpt_id) {
-    // A checkpoint committed: everything captured up to it is now safe to ack. Advance the
-    // watermark to the highest tag of any pending checkpoint <= the committed id, dropping those
-    // records. The produce() thread issues the basic.ack(multiple=true) on its next turn.
-    std::lock_guard<std::mutex> lk(impl_->mu);
-    std::uint64_t safe = impl_->commit_watermark.load(std::memory_order_relaxed);
-    for (auto it = impl_->pending.begin();
-         it != impl_->pending.end() && it->first <= ckpt_id.value();) {
-        safe = std::max(safe, it->second);
-        it = impl_->pending.erase(it);
-    }
-    impl_->commit_watermark.store(safe, std::memory_order_release);
+    // Every interval sealed at or below the completed id is safe to acknowledge; the next
+    // produce() turn (or close) sends the basic.ack. Commit-dispatch thread: no AMQP call here.
+    impl_->ledger.complete(ckpt_id.value());
 }
 
 void RabbitMqSource::notify_checkpoint_aborted(CheckpointId ckpt_id) {
-    // The checkpoint aborted: drop its pending record without acking. Those messages stay unacked
-    // and the broker redelivers them on reconnect (or a later committed checkpoint that captured a
-    // higher tag acks past them via multiple=true).
-    std::lock_guard<std::mutex> lk(impl_->mu);
-    impl_->pending.erase(ckpt_id.value());
+    // The interval is released, never acknowledged on this channel: the broker redelivers it
+    // once the channel closes, and no later completion acknowledges it with a cumulative ack.
+    impl_->ledger.abort(ckpt_id.value());
 }
 
 bool RabbitMqSource::restore_offset(StateBackend& /*backend*/, OperatorId /*op_id*/) {
@@ -185,6 +189,19 @@ bool RabbitMqSource::restore_offset(StateBackend& /*backend*/, OperatorId /*op_i
 }
 
 void RabbitMqSource::close() {
+    // Acknowledge what completed checkpoints cover, and nothing else: closing the channel hands
+    // every other unacknowledged message back to the queue, whether this is a cancel, a failure
+    // or the end of a stop. Best effort: what fails here is delivered again.
+    try {
+        if (!impl_->drain_acks()) {
+            clink::log::warn("rabbitmq.source",
+                             impl_->opts.name +
+                                 ": basic.ack at close failed; the messages a "
+                                 "completed checkpoint covers are delivered again");
+        }
+    } catch (const std::exception& e) {
+        clink::log::warn("rabbitmq.source", impl_->opts.name + ": ack at close: " + e.what());
+    }
     detail::close_and_destroy(impl_->conn, kChannel);
     impl_->conn = nullptr;
 }

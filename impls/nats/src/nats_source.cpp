@@ -1,14 +1,18 @@
 #include "clink/nats/nats_source.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
 
 #include "nats_conn.hpp"
 
@@ -19,6 +23,7 @@ constexpr const char* kLabel = "nats";
 }  // namespace
 
 struct NatsSource::Impl {
+    using Clock = std::chrono::steady_clock;
     Options opts;
     natsConnection* conn{nullptr};
     jsCtx* js{nullptr};
@@ -31,12 +36,22 @@ struct NatsSource::Impl {
     std::mutex mu;
     std::map<std::uint64_t, std::vector<natsMsg*>> pending;  // ckpt id -> captured messages
     std::vector<natsMsg*> ack_ready;                         // committed: ack then destroy
-    std::vector<natsMsg*> abort_drop;  // aborted: destroy without ack (-> JetStream redelivers)
+    std::vector<natsMsg*> abort_drop;  // aborted: never acked (-> JetStream redelivers)
+    // Produce thread only. Every message held or bucketed and not yet resolved, and when its
+    // AckWait is next due to be reset with natsMsg_InProgress (at half AckWait, for at most
+    // max_lease from receipt).
+    struct Lease {
+        Clock::time_point received;
+        Clock::time_point extend_at;
+    };
+    std::unordered_map<natsMsg*, Lease> leases;
+    // An aborted checkpoint's messages, kept until their AckWait has run out, so close() can hand
+    // them back at once rather than leave them to the timer (produce thread only).
+    std::vector<std::pair<natsMsg*, Clock::time_point>> released;
     explicit Impl(Options o) : opts(std::move(o)) {}
 
-    // Destroy every not-yet-acked message (held + bucketed + queued) WITHOUT acking, so JetStream
-    // redelivers them after AckWait (at-least-once). Called from close()/dtor after the runner
-    // thread has stopped, so no locking is needed.
+    // Destroy every message still held, WITHOUT acking or handing it back, so JetStream redelivers
+    // it after AckWait: a crash. Runs from the destructor, after the runner thread has stopped.
     void destroy_unacked() {
         auto wipe = [](std::vector<natsMsg*>& v) {
             for (natsMsg* m : v) {
@@ -51,6 +66,40 @@ struct NatsSource::Impl {
         pending.clear();
         wipe(ack_ready);
         wipe(abort_drop);
+        for (auto& [m, _] : released) {
+            natsMsg_Destroy(m);
+        }
+        released.clear();
+        leases.clear();
+    }
+
+    // Reset the AckWait of every held message that is due, up to max_lease from receipt; forget
+    // released messages whose AckWait has run out. Produce thread. A failed reset is not an
+    // error: its cost is a redelivery, a duplicate rather than a loss.
+    void extend_leases() {
+        const auto now = Clock::now();
+        const auto half = std::chrono::duration_cast<Clock::duration>(opts.ack_wait) / 2;
+        for (auto it = leases.begin(); it != leases.end();) {
+            if (now < it->second.extend_at) {
+                ++it;
+                continue;
+            }
+            if (now - it->second.received >= opts.max_lease) {
+                it = leases.erase(it);  // no longer extended: JetStream redelivers it
+                continue;
+            }
+            (void)natsMsg_InProgress(it->first, nullptr);
+            it->second.extend_at = now + half;
+            ++it;
+        }
+        for (auto it = released.begin(); it != released.end();) {
+            if (now >= it->second) {
+                natsMsg_Destroy(it->first);
+                it = released.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 };
 
@@ -116,16 +165,29 @@ bool NatsSource::produce(Emitter<std::string>& out) {
             if (s != NATS_OK && first_err == NATS_OK) {
                 first_err = s;
             }
+            impl_->leases.erase(m);
             natsMsg_Destroy(m);
         }
+        // Never acked: JetStream redelivers each once its AckWait, last reset by the lease, runs
+        // out. Kept until then for close() to hand back.
+        const auto now = Impl::Clock::now();
+        const auto half =
+            std::chrono::duration_cast<Impl::Clock::duration>(impl_->opts.ack_wait) / 2;
         for (natsMsg* m : to_drop) {
-            natsMsg_Destroy(m);  // no ack -> JetStream redelivers after AckWait
+            auto lease = impl_->leases.find(m);
+            const auto expires =
+                lease != impl_->leases.end() ? lease->second.extend_at + half : now + 2 * half;
+            if (lease != impl_->leases.end()) {
+                impl_->leases.erase(lease);
+            }
+            impl_->released.emplace_back(m, expires);
         }
         if (first_err != NATS_OK) {
             clink::metrics::connector::error_inc(kLabel, "source");
             throw std::runtime_error(impl_->opts.name + ": ack: " + natsStatus_GetText(first_err));
         }
     }
+    impl_->extend_leases();
     natsMsgList list;
     list.Msgs = nullptr;
     list.Count = 0;
@@ -148,8 +210,12 @@ bool NatsSource::produce(Emitter<std::string>& out) {
         std::string body(natsMsg_GetData(m), static_cast<std::size_t>(len < 0 ? 0 : len));
         bytes += body.size();
         batch.emplace(std::move(body));
-        impl_->held.push_back(m);  // keep the message alive until the barrier ack
-        list.Msgs[i] = nullptr;    // transfer ownership out of the list
+        impl_->held.push_back(m);  // keep the message alive until its checkpoint resolves
+        const auto received = Impl::Clock::now();
+        impl_->leases[m] = Impl::Lease{
+            received,
+            received + std::chrono::duration_cast<Impl::Clock::duration>(impl_->opts.ack_wait) / 2};
+        list.Msgs[i] = nullptr;  // transfer ownership out of the list
     }
     natsMsgList_Destroy(&list);  // frees the array; the nulled entries are skipped
 
@@ -203,7 +269,43 @@ bool NatsSource::restore_offset(StateBackend& /*backend*/, OperatorId /*op_id*/)
 }
 
 void NatsSource::close() {
-    impl_->destroy_unacked();  // unacked on close -> JetStream redelivers them (at-least-once)
+    // Acknowledge what completed checkpoints cover, and hand every other message back (Nak) so
+    // JetStream redelivers it at once rather than after AckWait: held, bucketed under a checkpoint
+    // that has not completed, or released by an abort. Whether this is a cancel, a failure or the
+    // end of a stop, no message a completed checkpoint does not cover is acknowledged. Best
+    // effort: what fails here is redelivered once its AckWait runs out.
+    std::vector<natsMsg*> to_ack;
+    std::vector<natsMsg*> to_return;
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        to_ack.swap(impl_->ack_ready);
+        to_return.swap(impl_->abort_drop);
+        for (auto& [ckpt, msgs] : impl_->pending) {
+            to_return.insert(to_return.end(), msgs.begin(), msgs.end());
+        }
+        impl_->pending.clear();
+    }
+    to_return.insert(to_return.end(), impl_->held.begin(), impl_->held.end());
+    impl_->held.clear();
+    for (auto& [m, _] : impl_->released) {
+        to_return.push_back(m);
+    }
+    impl_->released.clear();
+    impl_->leases.clear();
+    std::size_t failed = 0;
+    for (natsMsg* m : to_ack) {
+        failed += natsMsg_Ack(m, nullptr) != NATS_OK ? 1 : 0;
+        natsMsg_Destroy(m);
+    }
+    if (failed > 0) {
+        clink::log::warn("nats.source",
+                         impl_->opts.name + ": " + std::to_string(failed) +
+                             " acks at close failed; those messages are redelivered");
+    }
+    for (natsMsg* m : to_return) {
+        (void)natsMsg_Nak(m, nullptr);
+        natsMsg_Destroy(m);
+    }
     natsSubscription_Destroy(impl_->sub);
     impl_->sub = nullptr;
     jsCtx_Destroy(impl_->js);
