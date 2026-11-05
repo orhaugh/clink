@@ -37,6 +37,14 @@ ends claimed at-least-once, which the analyser could not credit. The source
 now has its own record (`mqtt_source`: at-most-once, no checkpoint
 participation) and the sink keeps `mqtt` (at-least-once).
 
+**All five acknowledging sources pass one live gate in CI.**
+`scripts/ack-sources-live.sh`, renamed from `redis-pubsub-live.sh`, runs the
+Redis Streams, Pub/Sub, RabbitMQ, NATS and Pulsar live suites, each against a
+one-off container of its compose service, and the new `ack-sources` workflow
+runs it. The integration services' RabbitMQ healthcheck now waits for the
+server's Erlang cookie: a check that came first wrote one as root and stopped
+the server with `eacces`.
+
 **The Redis Streams and Pub/Sub sources acknowledge a record only once the
 checkpoint that covers it has completed.** Both acknowledged inside
 `snapshot_offset()`, at the barrier, so a checkpoint that failed after it left
@@ -55,7 +63,7 @@ lease of every message it waits on (`ack_deadline_s`, `max_lease_s`). A job
 that completes no checkpoint now reads up to the bound and waits, where it
 used to read on with nothing ever acknowledged. Pinned by the ledger's tests,
 `PubSubSourceAck` against a stub of the REST API, and `RedisSourceAckLive`
-and `PubSubSourceAckLive`, which `scripts/redis-pubsub-live.sh` runs against
+and `PubSubSourceAckLive`, which `scripts/ack-sources-live.sh` runs against
 Redis and the emulator and fails on any skip.
 
 **Pub/Sub data that is not base64 stops the source by default.** The source

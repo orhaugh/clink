@@ -1,0 +1,116 @@
+name: ack-sources
+
+# The live gate for the sources that acknowledge their broker at checkpoint
+# completion (scripts/ack-sources-live.sh): Redis Streams, Pub/Sub, RabbitMQ,
+# NATS JetStream and Pulsar, each against the service of
+# docker/integration-services.yml, one at a time. Every connector's round trip
+# and its acknowledgement contract: an aborted checkpoint, crashes before and
+# after a completion, notifications out of order, close after a cancel, the
+# bound on what is held, and per connector the leases, a failed acknowledgement
+# and a scale-down. The live cases skip in the ci workflow, which starts no
+# brokers, and gtest counts a skip as a pass; this gate fails on any skip and on
+# a suite that ran fewer cases than it has.
+#
+# Plain runner steps that `docker run` the toolchain image, as the neo4j
+# workflow does: the services run as one-off containers of the compose file on
+# the runner's Docker, published on free loopback ports, and the test binaries
+# reach them through the host network.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ack-sources-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: The acknowledging sources hold their contracts against real brokers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      TOOLCHAIN: ghcr.io/${{ github.repository_owner }}/clink-build:main
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Report what is under test
+        run: |
+          echo "commit under test: $(git rev-parse HEAD)"
+          docker pull -q "${TOOLCHAIN}"
+          df -h /
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-ack-sources-${{ github.run_id }}
+          restore-keys: ccache-ack-sources-
+
+      # ON, not AUTO: a connector whose client library went missing from the
+      # image fails the configure rather than leaving the gate a binary short.
+      - name: Build the five connectors' tests
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ccache"
+          docker run --rm --user root \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
+            -v "${RUNNER_TEMP}/ccache:/root/.ccache" \
+            -e CLINK_DEPS_PREFIX=/usr/local -e CCACHE_DIR=/root/.ccache -e CCACHE_MAXSIZE=1500M \
+            -e CMAKE_C_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "${TOOLCHAIN}" bash -c '
+              set -euo pipefail
+              git config --global --add safe.directory "*"
+              apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=OFF \
+                -DCLINK_INTEGRATION_TESTS=OFF -DCLINK_WITH_REDIS=ON -DCLINK_WITH_HTTP=ON \
+                -DCLINK_WITH_RABBITMQ=ON -DCLINK_WITH_NATS=ON -DCLINK_WITH_PULSAR=ON \
+                -DCMAKE_C_FLAGS_DEBUG=-g0 -DCMAKE_CXX_FLAGS_DEBUG=-g0 \
+                -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
+              cmake --build build --target clink_redis_tests clink_http_connector_tests \
+                clink_rabbitmq_tests clink_nats_tests clink_pulsar_tests -j "$(( $(nproc) / 2 + 1 ))"
+              ccache -s | tail -3'
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-ack-sources-${{ github.run_id }}
+
+      - name: Run the gate
+        run: |
+          set -euo pipefail
+          export REPORT_DIR="${RUNNER_TEMP}/ack-sources-live-reports"
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_REDIS_TEST_URL -e CLINK_PUBSUB_EMULATOR_HOST \
+            -e CLINK_RABBITMQ_TEST_ENDPOINT -e CLINK_RABBITMQ_TEST_PORT \
+            -e CLINK_RABBITMQ_TEST_USER -e CLINK_RABBITMQ_TEST_PASSWORD \
+            -e CLINK_NATS_TEST_ENDPOINT -e CLINK_PULSAR_TEST_ENDPOINT \
+            ${TOOLCHAIN}"
+          scripts/ack-sources-live.sh build 2>&1 | tee "${RUNNER_TEMP}/ack-sources-gate.log"
+
+      - name: Keep the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ack-sources-gate
+          path: |
+            ${{ runner.temp }}/ack-sources-live-reports/**
+            ${{ runner.temp }}/ack-sources-gate.log
+          if-no-files-found: warn
+          retention-days: 14

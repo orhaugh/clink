@@ -207,10 +207,10 @@ The certificate tests run in every TLS-enabled build without a Redis server: the
 
 The live tests are skipped unless `CLINK_REDIS_TEST_URL` is set (for example `redis://localhost:6379`). The integration service is the `redis:7` Docker image defined in `docker/integration-services.yml`. `RedisLive` covers a sink-to-source round-trip, PEL replay of an un-acked consumer on restart, that acknowledged entries are not replayed, multi-field JSON-object rendering, and idempotent `XGROUP CREATE`. `RedisSourceAckLive` holds the source to its acknowledgement contract against the server, judged by `XPENDING` and by what a restarted consumer reads: an aborted checkpoint, a crash after the barrier, a crash after completion before the `XACK`, a killed connection at the `XACK`, an `XACK` whose reply is lost, intervals and notifications out of order, the `max_pending` bound, close after a cancel, and a scale-down beside stranded entries.
 
-`scripts/redis-pubsub-live.sh [build-dir]` is the required gate for both sources: it runs these suites and the Pub/Sub ones against one-off containers of the compose services, one service at a time on free loopback ports, and fails on a missing binary, a service that never answers, a failed or skipped case, or a suite that ran fewer cases than it should.
+`scripts/ack-sources-live.sh [build-dir]` is the required gate for every source that acknowledges at checkpoint completion (Redis Streams, Pub/Sub, RabbitMQ, NATS and Pulsar): it runs their live suites against one-off containers of the compose services, one service at a time on free loopback ports, and fails on a missing binary, a service that never answers, a failed or skipped case, or a suite that ran fewer cases than it should. The `ack-sources` CI workflow runs it.
 
 ```bash
-scripts/redis-pubsub-live.sh build
+scripts/ack-sources-live.sh build
 ```
 
 The TLS round-trip test additionally requires `CLINK_REDIS_TLS_TEST_URL` (set to a TLS-enabled redis `host:port`) and a build with `CLINK_REDIS_TLS`. The `-L redis` label runs the connector's test executable.
