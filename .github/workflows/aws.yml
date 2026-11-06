@@ -24,9 +24,18 @@ name: aws
 # checkpoint covers and killed, each table checked against the last record
 # written for every item.
 #
+# scripts/firehose-live.sh, the Firehose sink: the request accounting against the
+# SDK's own JSON, the response judge, and the sink's write path against a model
+# of PutRecordBatch (record and request limits, partial acceptance, retry bounds,
+# responses that do not account for their request, permanent errors, a lost
+# reply, cancellation, the failed state); the live cases, reading the delivery
+# stream's S3 destination back record by record; and the recovery cells, a
+# worker killed after an acceptance no checkpoint covers or before a send, each
+# bucket checked for every record at least once and nothing else.
+#
 # A live test skips when its endpoint or binary is missing and gtest counts that
 # as a pass, so each gate fails on any skip and on any required suite that did
-# not run. The DynamoDB gate runs even when the Kinesis gate fails.
+# not run. Each gate runs even when an earlier one fails.
 #
 # The scripts run on the runner, where they start and remove the emulator with
 # Docker; the test binaries run inside the toolchain image through PIN_RUNNER,
@@ -48,7 +57,7 @@ concurrency:
 
 jobs:
   live:
-    name: The Kinesis source and the DynamoDB sink hold their contracts against the emulator and the models
+    name: The Kinesis source and the DynamoDB and Firehose sinks hold their contracts against the emulator and the models
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -126,6 +135,19 @@ jobs:
             -e AWS_EC2_METADATA_DISABLED \
             ${TOOLCHAIN}"
           scripts/dynamodb-live.sh build 2>&1 | tee "${RUNNER_TEMP}/dynamodb-gate.log"
+      - name: Run the Firehose gate
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          export REPORT_DIR="${RUNNER_TEMP}/firehose-live-reports"
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_FIREHOSE_TEST_ENDPOINT -e CLINK_FIREHOSE_RECOVERY_LOG_DIR \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION -e AWS_REGION \
+            -e AWS_EC2_METADATA_DISABLED \
+            ${TOOLCHAIN}"
+          scripts/firehose-live.sh build 2>&1 | tee "${RUNNER_TEMP}/firehose-gate.log"
       - name: Keep the Kinesis reports and the cells' evidence
         # The reports carry every case's result; the gate log and each run's log
         # carry the recovery cells' verdict lines and the fault framework's
@@ -150,6 +172,16 @@ jobs:
           path: |
             ${{ runner.temp }}/dynamodb-live-reports/**
             ${{ runner.temp }}/dynamodb-gate.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Keep the Firehose reports and the cells' evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firehose-gate
+          path: |
+            ${{ runner.temp }}/firehose-live-reports/**
+            ${{ runner.temp }}/firehose-gate.log
           if-no-files-found: warn
           retention-days: 90
       - name: Upload the harness logs on failure
