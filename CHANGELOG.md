@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+**The Kinesis source gives every shard exactly one owner, finds reshards as they
+happen, and reads a split's or merge's children after their parents.** Shards
+were assigned by their position in a sorted listing and kept across listings, so
+subtasks that listed the stream at different moments could both read a shard or
+leave one unread. The owner is now a hash of the ShardId alone. The stream was
+listed again only after an idle round in which an owned shard had ended, and
+never by a subtask that owned no shard; it is now listed on an interval
+(`discovery_interval_ms`, new) and soon after an owned shard ends. A child waits
+until every parent its subtask owns is read to its end, so at parallelism 1 the
+records of one key keep their order across splits and merges. Above parallelism
+1 a parent on another subtask is not waited for and the order holds within each
+shard, which the connector page now states. Covered by `KinesisSourceDiscovery`,
+`KinesisSourceLineage` and the `KinesisLive` reshard cases against LocalStack.
+
+**The Kinesis source stops instead of skipping records when it cannot continue a
+shard, and bounds its retries.** In latest mode an iterator that expired before a
+shard's first record, or a restore from a checkpoint taken before it, started
+again at the tip and skipped what had arrived. Latest mode now starts at the
+first start's time (`AT_TIMESTAMP`), which the checkpoint keeps. A restore
+resumes at the saved record and requires the stream to return it, so a position
+lost to retention, a shard no longer listed or a recreated stream fails the task
+with the cause. A failed `GetShardIterator` was retried forever without a word.
+Every failure is now classed as throttling, transient, an expired iterator or
+token, a lost position or permanent: the first three are retried with a backoff
+for up to `retry_timeout_ms` (new, default five minutes), the others fail at once
+with what to check. The checkpoint rows changed: an earlier release's checkpoint
+restores at parallelism 1 and is refused above it, and a restore at another
+parallelism needs every previous subtask's rows, which `file://` provides; the
+source refuses one that lacks them. `max_records_per_poll` outside 1 to 10000 is
+rejected instead of coerced. Covered by `KinesisSourceRestore`,
+`KinesisSourceRescale`, `KinesisSourceFailures`, `KinesisSourceCancel` and the
+`KinesisRecovery` cluster cells; gate `scripts/kinesis-live.sh`, run by the new
+`kinesis` workflow.
+
 **A hot cutover that loses a worker part-way through its drain falls back to the
 replan instead of failing the job.** A hot cutover counts each old subtask's exit
 at the cutover checkpoint as a drain. An exit counted after that checkpoint
