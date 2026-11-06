@@ -11,6 +11,8 @@ add_executable(clink_aws_tests
     register.cpp
     test_factory_registration.cpp
     test_dynamodb_item.cpp
+    test_dynamodb_sink.cpp
+    test_dynamodb_live.cpp
     test_kinesis_firehose_sink.cpp
     test_kinesis_source.cpp
     test_kinesis_live.cpp

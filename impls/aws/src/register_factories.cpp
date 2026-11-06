@@ -113,8 +113,9 @@ void install(clink::plugin::PluginRegistry& reg) {
         .replayable = false,
         .offset_model = clink::connectors::OffsetModel::None,
         .checkpoint_integrated = true,
-        // PutItem overwrites by key, so replays collapse - conditional on
-        // the user's partition_key actually identifying the record.
+        // PutItem overwrites by key, so a replayed record rewrites its item -
+        // conditional on the table's key identifying the record, and on every
+        // record of a key reaching one sink subtask in order.
         .delivery = clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent,
         .transactional = false,
         .idempotency_key_option = "partition_key",
@@ -122,34 +123,66 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {},
+        .timeout_options = {"connect_timeout_ms", "request_timeout_ms", "retry_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"UnprocessedItems are retried max_retries times, then the flush fails",
+        .limitations = {"at-least-once writes: a restart replays every record after the last "
+                        "completed checkpoint, and an item can show an older record's value until "
+                        "the replay passes the newer one",
+                        "the final state is the last record per item only when every record of an "
+                        "item reaches one sink subtask in order; two subtasks or an outside writer "
+                        "can leave an older value",
+                        "S and N keys only: a binary (B) key table is refused at open",
+                        "numbers keep at most 38 significant digits, as DynamoDB does; a record "
+                        "with a wider number is refused",
+                        "a refused record or a failed write fails the sink, and the job's restart "
+                        "replays the record",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
 
     using clink::plugin::BuildContext;
 
-    // dynamodb_sink: upsert JSON-object records into a DynamoDB table via
-    // BatchWriteItem. At-least-once; effectively-once when the primary key is
-    // stable (PutItem overwrites). Params:
-    //   table (required)          - target table
+    // dynamodb_sink: JSON-object records written as items via BatchWriteItem,
+    // after DescribeTable has given the table's key schema. At-least-once; a
+    // replay rewrites the same items. Params:
+    //   table (required)          - target table name or ARN
     //   partition_key (required)  - the table's partition-key attribute name
-    //   sort_key                  - the sort-key attribute name (composite tables)
+    //   sort_key                  - the sort-key attribute name (required when the table has one)
     //   region, endpoint_override - endpoint_override targets LocalStack/custom
-    //   batch_records (default 25; clamped to [1, 25])
-    //   max_retries (default 8)   - UnprocessedItems resubmit attempts
+    //   connect_timeout_ms (default 3000), request_timeout_ms (default 10000)
+    //   batch_records (default 25; 1 to 25)
+    //   max_retries (default 8; 0 to 20) - attempts in a row that write nothing
+    //   retry_timeout_ms (default 60000) - the most one batch's retries may take
+    //   linger_ms (default 0)     - flush a partial batch this old
     reg.register_sink<std::string>(
         "dynamodb_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            // Each number is range-checked here, before it is narrowed.
+            const auto ranged =
+                [&ctx](const char* key, std::int64_t fallback, std::int64_t lo, std::int64_t hi) {
+                    const auto v = ctx.param_int64_or(key, fallback);
+                    if (v < lo || v > hi) {
+                        throw std::runtime_error(std::string{"dynamodb_sink: '"} + key +
+                                                 "' must be " + std::to_string(lo) + " to " +
+                                                 std::to_string(hi) + "; it is " +
+                                                 std::to_string(v));
+                    }
+                    return v;
+                };
             DynamoDbSinkOptions o;
             o.table = ctx.param_or("table");
             o.partition_key = ctx.param_or("partition_key");
             o.sort_key = ctx.param_or("sort_key", "");
             o.client = client_options_from(ctx);
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 25));
-            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
-            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+            o.client.connect_timeout_ms = static_cast<int>(
+                ranged("connect_timeout_ms", o.client.connect_timeout_ms, 1, 600000));
+            o.client.request_timeout_ms = static_cast<int>(
+                ranged("request_timeout_ms", o.client.request_timeout_ms, 1, 600000));
+            o.batch_records = static_cast<std::size_t>(ranged("batch_records", 25, 1, 25));
+            o.max_retries =
+                static_cast<int>(ranged("max_retries", 8, 0, DynamoDbSink::kMaxRetries));
+            o.retry_timeout =
+                std::chrono::milliseconds{ranged("retry_timeout_ms", 60000, 1, 3600000)};
+            o.max_age = std::chrono::milliseconds{ranged("linger_ms", 0, 0, 3600000)};
             o.name = "dynamodb_sink";
             return std::make_shared<DynamoDbSink>(std::move(o));
         });

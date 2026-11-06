@@ -31,6 +31,9 @@ if(NOT (TARGET aws-cpp-sdk-core AND TARGET aws-cpp-sdk-kinesis AND
 endif()
 
 add_library(clink_aws STATIC
+    src/dynamodb_item.cpp
+    src/dynamodb_sdk_service.cpp
+    src/dynamodb_sink.cpp
     src/kinesis_sdk_service.cpp
     src/kinesis_source.cpp
     src/register_factories.cpp

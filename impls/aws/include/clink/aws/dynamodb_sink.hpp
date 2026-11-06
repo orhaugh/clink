@@ -1,307 +1,318 @@
 #pragma once
 
-// DynamoDB sink (BatchWriteItem). SDK-dependent; compiled only with the AWS SDK.
+// DynamoDB sink: JSON-object records written as items with BatchWriteItem.
 //
-// Each input record is a JSON object string (e.g. SQL row_to_json_string) mapped
-// to a DynamoDB item (PutRequest). Delivery is AT-LEAST-ONCE but EFFECTIVELY-ONCE
-// when the primary key is stable and deterministic from the record: PutItem is an
-// UPSERT, so re-delivery on replay overwrites the same item rather than
-// duplicating. The batch is deduped by primary key (DynamoDB rejects a batch with
-// two items sharing a key) last-write-wins, which matches the upsert model.
+// Each record is a JSON object (SQL's row_to_json_string writes one per row)
+// mapped to an item: a string to S, a number to N, true and false to BOOL, null
+// to NULL, an object to M and an array to L. A number keeps the digits it was
+// written with; nothing passes through a double. The sink reads the table's key
+// schema with DescribeTable when it opens and checks every record against it and
+// against DynamoDB's documented limits before buffering it, so a record the
+// service would refuse is refused here, by name, and never replaces a buffered
+// one.
+//
+// Buffered records are keyed by item identity (DynamoDbItemKey): the key
+// attributes' types and values, a string by its UTF-8 bytes and a number by its
+// value, as DynamoDB compares them (1, 1.0 and 10E-1 name one item). A later
+// record for a buffered item replaces it, so a batch never names an item twice,
+// which the service refuses, and the item ends at the later record's value.
+// Buffered items go out in BatchWriteItem calls of at most 25 items and 16 MiB;
+// the items a call returns as UnprocessedItems, and only those, are sent again
+// with exponential backoff until written or the retry budget is spent. A
+// barrier returns only once everything received before it is written, so a
+// checkpoint never covers a write still outstanding, and a sink that has failed
+// refuses every later barrier.
+//
+// Delivery is at-least-once: a restart replays the records after the last
+// completed checkpoint and each replayed put overwrites its item. The ordering
+// and final-state contract is in docs/connectors/aws.md ("The DynamoDB sink").
 
-#include <charconv>
 #include <chrono>
-#include <cmath>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
+#include <string_view>
 #include <utility>
 #include <vector>
 
-#include <aws/dynamodb/DynamoDBClient.h>
-#include <aws/dynamodb/model/AttributeValue.h>
-#include <aws/dynamodb/model/BatchWriteItemRequest.h>
-#include <aws/dynamodb/model/PutRequest.h>
-#include <aws/dynamodb/model/WriteRequest.h>
-
 #include "clink/aws/aws_client.hpp"
-#include "clink/config/json.hpp"
-#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::aws {
 
-// A JSON number -> DynamoDB N (carried as a string). Integral and within int64
-// range renders as a plain integer (the range guard avoids the float->int64 UB
-// and the INT64_MAX saturation collapse); otherwise the shortest round-trip
-// double text. (DynamoDB N cannot be NaN/Inf, which valid JSON never produces.)
-inline std::string ddb_number_text(double d) {
-    constexpr double kInt64Lo = -9223372036854775808.0;          // -2^63
-    constexpr double kInt64HiExclusive = 9223372036854775808.0;  //  2^63
-    if (std::isfinite(d) && d >= kInt64Lo && d < kInt64HiExclusive &&
-        d == static_cast<double>(static_cast<std::int64_t>(d))) {
-        return std::to_string(static_cast<std::int64_t>(d));
-    }
-    char buf[64];
-    auto res = std::to_chars(buf, buf + sizeof(buf), d);
-    return std::string(buf, res.ptr);
-}
+// ---- DynamoDB's limits ----------------------------------------------------------------
+//
+// From the service documentation (Constraints, item sizes and formats,
+// BatchWriteItem). Sizes are binary: 1 KB = 1024 bytes.
 
-// The N text of a JSON number. An integer is written from its exact value: a
-// double holds integers only up to 2^53, so widening one would round it, and
-// two keys a little past 2^53 would collapse into one item.
-inline std::string ddb_number_text(const clink::config::JsonValue& v) {
-    if (v.is_integral_number()) {
-        return std::to_string(v.as_int());
-    }
-    return ddb_number_text(v.as_number());
-}
+inline constexpr std::size_t kDynamoDbMaxItemBytes = 400 * 1024;
+inline constexpr std::size_t kDynamoDbMaxPartitionKeyBytes = 2048;
+inline constexpr std::size_t kDynamoDbMaxSortKeyBytes = 1024;
+inline constexpr std::size_t kDynamoDbMaxAttributeNameBytes = 64 * 1024;
+inline constexpr std::size_t kDynamoDbMaxBatchWrites = 25;
+// What one BatchWriteItem may carry over the network, its JSON included.
+inline constexpr std::size_t kDynamoDbMaxRequestBytes = 16 * 1024 * 1024;
+inline constexpr int kDynamoDbMaxNumberDigits = 38;
+// The documented 32 levels count the item itself: a map or list may sit at most
+// 31 levels below its attribute (an attribute's own value is level 1).
+inline constexpr int kDynamoDbMaxContainerDepth = 31;
 
-// Map a JSON value to a DynamoDB AttributeValue (S/N/BOOL/NULL/M/L). Empty
-// strings are kept (DynamoDB allows them on NON-key attributes since 2020; an
-// empty KEY value is rejected by DynamoDB with a clear error).
-inline Aws::DynamoDB::Model::AttributeValue json_to_attribute_value(
-    const clink::config::JsonValue& v) {
-    using AV = Aws::DynamoDB::Model::AttributeValue;
-    AV av;
-    if (v.is_null()) {
-        av.SetNull(true);
-    } else if (v.is_bool()) {
-        av.SetBool(v.as_bool());
-    } else if (v.is_number()) {
-        av.SetN(ddb_number_text(v));
-    } else if (v.is_string()) {
-        av.SetS(v.as_string());
-    } else if (v.is_array()) {
-        // L (list): preserves heterogeneity and order. Built via shared_ptr
-        // entries, which is the SDK's AddLItem signature.
-        for (const auto& e : v.as_array()) {
-            av.AddLItem(Aws::MakeShared<AV>("clink-ddb", json_to_attribute_value(e)));
-        }
-        // An empty array still needs the L type set, not left as an unset AV.
-        if (v.as_array().empty()) {
-            av.SetL(Aws::Vector<std::shared_ptr<AV>>{});
-        }
-    } else if (v.is_object()) {
-        for (const auto& [k, val] : v.as_object()) {
-            av.AddMEntry(k, Aws::MakeShared<AV>("clink-ddb", json_to_attribute_value(val)));
-        }
-        if (v.as_object().empty()) {
-            av.SetM(Aws::Map<Aws::String, const std::shared_ptr<AV>>{});
-        }
-    }
-    return av;
-}
+// ---- items --------------------------------------------------------------------------
 
-// Build the DynamoDB item map from a parsed JSON object.
-inline Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValue> json_object_to_item(
-    const clink::config::JsonObject& obj) {
-    Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValue> item;
-    for (const auto& [k, v] : obj) {
-        item.emplace(k, json_to_attribute_value(v));
-    }
-    return item;
-}
+// An attribute value as the sink writes it.
+struct DynamoDbValue {
+    enum class Kind : std::uint8_t { S, N, Bool, Null, M, L };
+    Kind kind{Kind::Null};
+    std::string text;  // S: the UTF-8 bytes; N: the canonical numeral (DynamoDbNumber::text)
+    bool flag{false};  // Bool
+    // M: the members in name order, each name once. L: the elements in order,
+    // with empty names.
+    std::vector<std::pair<std::string, DynamoDbValue>> members;
+
+    friend bool operator==(const DynamoDbValue&, const DynamoDbValue&) = default;
+};
+
+// An item: its attributes in name order, each name once.
+using DynamoDbItem = std::vector<std::pair<std::string, DynamoDbValue>>;
+
+// A DynamoDB number: the significant digits without leading or trailing zeros,
+// and the power of ten of the last one. Zero has no digits and is never
+// negative. Two numerals denote the same number exactly when they parse to
+// equal DynamoDbNumbers, which is how DynamoDB compares N values.
+struct DynamoDbNumber {
+    bool negative{false};
+    std::string digits;
+    std::int64_t exponent{0};
+
+    // The numeral the sink sends: plain decimal where that is at most 40
+    // characters, otherwise d.dddE+x. An integer's text is its decimal digits.
+    [[nodiscard]] std::string text() const;
+    // Its size in an item, without the attribute name: one byte per pair of
+    // digits, pairs aligned on the decimal point, plus one. The documentation
+    // gives "1 byte per two significant digits, plus 1" as an approximation;
+    // the aligned count is never smaller, and is what DynamoDB Local charges.
+    [[nodiscard]] std::size_t size_bytes() const;
+
+    friend bool operator==(const DynamoDbNumber&, const DynamoDbNumber&) = default;
+};
+
+// Parses a numeral. With `json` true the text must follow JSON's number grammar,
+// as a record's numbers do; with it false the leading '+', leading zeros and a
+// bare '.' that DynamoDB's own numerals may carry are accepted too. Returns
+// nullopt, with the reason in *why when given, for text that is not a numeral,
+// a number with more than 38 significant digits, or one outside DynamoDB's
+// range (a magnitude of 1E-130 to 9.9999999999999999999999999999999999999E+125).
+[[nodiscard]] std::optional<DynamoDbNumber> parse_dynamodb_number(std::string_view text,
+                                                                  bool json,
+                                                                  std::string* why = nullptr);
+
+// ---- keys and identity --------------------------------------------------------------
+
+enum class DynamoDbKeyType : std::uint8_t { S, N, B };
+
+struct DynamoDbKeyAttribute {
+    std::string name;
+    DynamoDbKeyType type{DynamoDbKeyType::S};
+};
+
+// A table's primary key, as DescribeTable reports it.
+struct DynamoDbKeySchema {
+    DynamoDbKeyAttribute partition;
+    std::optional<DynamoDbKeyAttribute> sort;
+};
+
+// One key attribute's value: its type and, for S, its UTF-8 bytes or, for N, its
+// canonical numeral. Compared member by member, so distinct values never share a
+// representation: no byte of a string is a separator, and the string "1" and the
+// number 1 differ by type.
+struct DynamoDbKeyValue {
+    DynamoDbKeyType type{DynamoDbKeyType::S};
+    std::string bytes;
+
+    friend auto operator<=>(const DynamoDbKeyValue&, const DynamoDbKeyValue&) = default;
+};
+
+// An item's identity: two records name the same item exactly when their keys
+// compare equal.
+struct DynamoDbItemKey {
+    DynamoDbKeyValue partition;
+    std::optional<DynamoDbKeyValue> sort;
+
+    friend auto operator<=>(const DynamoDbItemKey&, const DynamoDbItemKey&) = default;
+};
+
+// A key for an error message: each value JSON-quoted, at most 64 bytes of it.
+[[nodiscard]] std::string describe_dynamodb_key(const DynamoDbItemKey& key);
+
+// ---- records ------------------------------------------------------------------------
+
+class DynamoDbRecordError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+struct DynamoDbPreparedItem {
+    DynamoDbItemKey key;
+    DynamoDbItem item;
+    std::size_t item_bytes{0};     // DynamoDB's size of the item
+    std::size_t request_bytes{0};  // at most this many bytes of a BatchWriteItem's JSON
+};
+
+// Maps one record to an item and checks it against `schema` and DynamoDB's
+// limits: a JSON object with valid UTF-8 and no U+0000 in any string (the AWS
+// SDK for C++ cuts a string there), no attribute name empty, longer than
+// 64 KB or repeated, no map or list deeper than 31 levels, every number within
+// DynamoDB's precision and range, the key attributes present with the table's
+// types and non-empty within their size limits, and the item within 400 KB.
+// Throws DynamoDbRecordError naming the first rule the record breaks.
+[[nodiscard]] DynamoDbPreparedItem prepare_dynamodb_item(std::string_view record,
+                                                         const DynamoDbKeySchema& schema);
+
+// DynamoDB's size of an item: each attribute's name bytes and value, a string by
+// its bytes, a number by DynamoDbNumber::size_bytes, a boolean or null 1, a map or
+// list 3 plus its elements, each element 1 more (a member also its name bytes).
+[[nodiscard]] std::size_t dynamodb_item_bytes(const DynamoDbItem& item);
+
+// An upper bound on the bytes the item adds to a BatchWriteItem request as the
+// AWS SDK writes it, its PutRequest wrapper included: the SDK indents the JSON
+// with a tab per level, so a nested value costs more than its text, and every
+// byte of a string may be escaped.
+[[nodiscard]] std::size_t dynamodb_request_bytes(const DynamoDbItem& item);
+
+// The identity of an item the service handed back, or nullopt when a key
+// attribute is missing, has the wrong type or is not a valid key value.
+[[nodiscard]] std::optional<DynamoDbItemKey> dynamodb_item_key(const DynamoDbItem& item,
+                                                               const DynamoDbKeySchema& schema);
+
+// ---- the calls the sink makes -------------------------------------------------------
+
+enum class DynamoDbFault : std::uint8_t {
+    None,
+    Throttled,  // nothing was written: back off and send again
+    Transient,  // the request may or may not have been applied: back off and send again
+    Permanent,  // configuration, access, a missing table or a refused request: fail now
+    Cancelled,  // the task was cancelled while the call was in flight
+};
+
+struct DynamoDbCallError {
+    DynamoDbFault fault{DynamoDbFault::None};
+    std::string code;     // the service's error code, e.g. ProvisionedThroughputExceededException
+    std::string message;  // the service's message
+    int http_status{0};   // 0 when no response arrived
+    [[nodiscard]] bool ok() const noexcept { return fault == DynamoDbFault::None; }
+};
+
+struct DynamoDbTableDescription {
+    DynamoDbCallError error;
+    std::string status;  // ACTIVE, CREATING, UPDATING, DELETING, ...
+    DynamoDbKeySchema key;
+    // The table's name and ARN: a response may name the table either way,
+    // whichever the request used.
+    std::string name;
+    std::string arn;
+};
+
+// One entry of a response's UnprocessedItems, as the service sent it.
+struct DynamoDbUnprocessed {
+    enum class Kind : std::uint8_t { Put, Delete, Neither };
+    std::string table;  // the RequestItems key it was listed under
+    Kind kind{Kind::Put};
+    DynamoDbItem item;  // Put: the item; Delete: the key
+    // False when the entry carries a value of a type the sink never writes
+    // (binary or a set), so it cannot be one of the sink's puts.
+    bool recognised{true};
+};
+
+struct DynamoDbBatchResult {
+    DynamoDbCallError error;
+    std::vector<DynamoDbUnprocessed> unprocessed;
+};
+
+// The calls the sink makes. make_dynamodb_sdk_service is the production
+// implementation; tests substitute a model of the service.
+class DynamoDbWriteService {
+public:
+    virtual ~DynamoDbWriteService() = default;
+    virtual DynamoDbTableDescription describe_table(const std::string& table) = 0;
+    // One BatchWriteItem with a PutRequest per item, every one for `table`.
+    virtual DynamoDbBatchResult batch_write(const std::string& table,
+                                            const std::vector<const DynamoDbItem*>& items) = 0;
+    // From another thread: end the call in flight, and every later one, at once.
+    virtual void abort() noexcept {}
+};
+
+// The AWS SDK's DynamoDB client with its own retries off, so every failure
+// reaches the sink, which classifies, paces and bounds them.
+[[nodiscard]] std::shared_ptr<DynamoDbWriteService> make_dynamodb_sdk_service(
+    const AwsClientOptions& client);
+
+// How the sink treats an error, from its code, HTTP status (0 when no response
+// arrived) and whether the SDK would have retried it.
+[[nodiscard]] DynamoDbFault classify_dynamodb_error(std::string_view code,
+                                                    int http_status,
+                                                    bool sdk_retryable);
+
+// ---- the sink -----------------------------------------------------------------------
 
 struct DynamoDbSinkOptions {
-    std::string table;          // required
-    std::string partition_key;  // required - attribute name present in every record
-    std::string sort_key;       // optional - composite-key tables
+    std::string table;          // required: a table name or ARN
+    std::string partition_key;  // required: the table's partition key attribute
+    std::string sort_key;       // the table's sort key attribute; required when it has one
     AwsClientOptions client;
-    std::size_t batch_records{25};  // BatchWriteItem hard max is 25
-    int max_retries{8};             // UnprocessedItems resubmit attempts
+    std::size_t batch_records{25};  // items per BatchWriteItem, 1 to 25
+    // Attempts in a row that write nothing (a failed request, or UnprocessedItems
+    // that did not shrink) before a flush fails, 0 to kMaxRetries.
+    int max_retries{8};
     std::chrono::milliseconds retry_base_backoff{100};
+    std::chrono::milliseconds max_backoff{10000};
+    // The longest one BatchWriteItem's items, or the open's DescribeTable, may
+    // take with every retry and wait.
+    std::chrono::milliseconds retry_timeout{60000};
     std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old (0 = off)
     std::string name{"dynamodb_sink"};
+    // The calls the sink makes; empty means the AWS SDK.
+    std::shared_ptr<DynamoDbWriteService> service;
 };
 
 class DynamoDbSink : public Sink<std::string> {
 public:
-    static constexpr int kMaxRetries = 20;  // bound the backoff shift + attempt loop
+    static constexpr int kMaxRetries = 20;
 
-    explicit DynamoDbSink(DynamoDbSinkOptions opts) : opts_(std::move(opts)) {
-        if (opts_.table.empty()) {
-            throw std::runtime_error(opts_.name + ": 'table' is required");
-        }
-        if (opts_.partition_key.empty()) {
-            throw std::runtime_error(opts_.name + ": 'partition_key' is required");
-        }
-        if (opts_.batch_records == 0 || opts_.batch_records > 25) {
-            opts_.batch_records = 25;  // DynamoDB BatchWriteItem ceiling
-        }
-        if (opts_.max_retries < 0) {
-            opts_.max_retries = 0;
-        } else if (opts_.max_retries > kMaxRetries) {
-            opts_.max_retries = kMaxRetries;  // else 1u<<(attempt-1) overflows
-        }
-    }
+    // Checks the options; touches no service.
+    explicit DynamoDbSink(DynamoDbSinkOptions opts);
+    ~DynamoDbSink() override;
+    DynamoDbSink(const DynamoDbSink&) = delete;
+    DynamoDbSink& operator=(const DynamoDbSink&) = delete;
+    DynamoDbSink(DynamoDbSink&&) = delete;
+    DynamoDbSink& operator=(DynamoDbSink&&) = delete;
 
-    void open() override {
-        ensure_aws_initialized();
-        client_ = std::make_unique<Aws::DynamoDB::DynamoDBClient>(make_client_config(opts_.client));
-        pending_.clear();
-    }
-
-    void on_data(const Batch<std::string>& batch) override {
-        for (const auto& rec : batch) {
-            ingest_(rec.value());
-            if (pending_.size() >= opts_.batch_records || linger_elapsed_()) {
-                flush();
-            }
-        }
-    }
-
-    void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+    // Reads the table's key schema and checks the options against it.
+    void open() override;
+    void close() override;
+    // Checks every record of the batch before buffering any: a batch with a
+    // record the sink refuses adds nothing, and the sink fails.
+    void on_data(const Batch<std::string>& batch) override;
+    void on_barrier(CheckpointBarrier b) override;
     // Its barrier hook writes out everything it received before the barrier,
     // which is its guarantee only while it owns its chain's checkpoint, so
     // Dag::add_sink refuses another sink beside it.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+    void flush() override;
+    std::string name() const override;
 
-    void flush() override {
-        if (pending_.empty()) {
-            return;
-        }
-        const std::size_t n = pending_.size();
-        const auto t0 = std::chrono::steady_clock::now();
-        // Emit in chunks of <= batch_records; pending_ is already key-deduped so
-        // no chunk carries two items with the same primary key.
-        std::vector<Aws::DynamoDB::Model::WriteRequest> chunk;
-        chunk.reserve(opts_.batch_records);
-        try {
-            for (auto& [key, item] : pending_) {
-                Aws::DynamoDB::Model::PutRequest put;
-                put.SetItem(std::move(item));
-                Aws::DynamoDB::Model::WriteRequest wr;
-                wr.SetPutRequest(std::move(put));
-                chunk.push_back(std::move(wr));
-                if (chunk.size() >= opts_.batch_records) {
-                    write_with_retry_(std::move(chunk));
-                    chunk.clear();
-                    chunk.reserve(opts_.batch_records);
-                }
-            }
-            if (!chunk.empty()) {
-                write_with_retry_(std::move(chunk));
-            }
-        } catch (...) {
-            clink::metrics::connector::error_inc("dynamodb", "sink");
-            pending_.clear();
-            throw;
-        }
-        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-        clink::metrics::connector::records_out_inc("dynamodb", n);
-        clink::metrics::connector::commit_latency_observe("dynamodb",
-                                                          static_cast<std::uint64_t>(dt));
-        pending_.clear();
-    }
-
-    std::string name() const override { return opts_.name; }
+    // Distinct items buffered and not yet written.
+    [[nodiscard]] std::size_t pending_items() const;
+    // True once a refused record or a failed write has stopped this instance;
+    // it then refuses every call that would write or acknowledge a barrier.
+    [[nodiscard]] bool failed() const;
 
 private:
-    void ingest_(const std::string& rec) {
-        clink::config::JsonValue j;
-        try {
-            j = clink::config::parse(rec);
-        } catch (...) {
-            throw std::runtime_error(opts_.name + ": record is not valid JSON");
-        }
-        if (!j.is_object()) {
-            throw std::runtime_error(opts_.name + ": record must be a JSON object");
-        }
-        const auto& obj = j.as_object();
-        std::string key = scalar_key_(obj, opts_.partition_key);
-        if (!opts_.sort_key.empty()) {
-            key.push_back('\x00');
-            key += scalar_key_(obj, opts_.sort_key);
-        }
-        if (pending_.empty()) {
-            first_buffered_at_ = std::chrono::steady_clock::now();  // linger age clock
-        }
-        pending_[key] = json_object_to_item(obj);  // dedup: last write wins
-    }
-
-    // Extract a record field's scalar value as a dedup-key string. The key
-    // attribute must be present and non-empty (DynamoDB rejects an empty/missing
-    // key value); fail fast with a clear message rather than an opaque
-    // ValidationException from the service.
-    std::string scalar_key_(const clink::config::JsonObject& obj, const std::string& field) {
-        auto it = obj.find(field);
-        if (it == obj.end() || it->second.is_null()) {
-            throw std::runtime_error(opts_.name + ": key attribute '" + field +
-                                     "' is missing or null in the record");
-        }
-        const auto& v = it->second;
-        std::string s;
-        if (v.is_string()) {
-            s = v.as_string();
-        } else if (v.is_number()) {
-            s = ddb_number_text(v);
-        } else if (v.is_bool()) {
-            s = v.as_bool() ? "true" : "false";
-        } else {
-            throw std::runtime_error(opts_.name + ": key attribute '" + field +
-                                     "' must be a scalar (string/number/bool)");
-        }
-        if (s.empty()) {
-            throw std::runtime_error(opts_.name + ": key attribute '" + field + "' is empty");
-        }
-        return s;
-    }
-
-    // BatchWriteItem + the documented UnprocessedItems loop: resubmit only the
-    // items the service did not process, with exponential backoff, until the map
-    // is empty. Throws on a whole-request failure or when attempts are exhausted
-    // so the job replays from the last checkpoint (at-least-once, no silent drop).
-    void write_with_retry_(std::vector<Aws::DynamoDB::Model::WriteRequest> writes) {
-        Aws::Map<Aws::String, Aws::Vector<Aws::DynamoDB::Model::WriteRequest>> request_items;
-        request_items[opts_.table] =
-            Aws::Vector<Aws::DynamoDB::Model::WriteRequest>(std::move(writes));
-
-        for (int attempt = 0; attempt <= opts_.max_retries; ++attempt) {
-            if (attempt > 0) {
-                auto backoff = opts_.retry_base_backoff * (1u << (attempt - 1));
-                constexpr std::chrono::milliseconds kMaxBackoff{30000};
-                if (backoff > kMaxBackoff) {
-                    backoff = kMaxBackoff;
-                }
-                std::this_thread::sleep_for(backoff);
-            }
-            Aws::DynamoDB::Model::BatchWriteItemRequest req;
-            req.SetRequestItems(request_items);
-            auto outcome = client_->BatchWriteItem(req);
-            if (!outcome.IsSuccess()) {
-                // The SDK's retry strategy already retried transient throttles;
-                // a surfaced failure is either non-retryable (validation / bad
-                // table) or persistent. Fail loudly.
-                throw std::runtime_error(opts_.name + ": BatchWriteItem failed: " +
-                                         std::string(outcome.GetError().GetMessage().c_str()));
-            }
-            request_items = outcome.GetResult().GetUnprocessedItems();
-            if (request_items.empty()) {
-                return;  // all items written
-            }
-        }
-        throw std::runtime_error(opts_.name + ": BatchWriteItem left items unprocessed after " +
-                                 std::to_string(opts_.max_retries + 1) + " attempts");
-    }
-
-    bool linger_elapsed_() const {
-        return opts_.max_age.count() > 0 && !pending_.empty() &&
-               std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
-    }
-
-    DynamoDbSinkOptions opts_;
-    std::unique_ptr<Aws::DynamoDB::DynamoDBClient> client_;
-    // primary-key string -> item; dedups a batch (DynamoDB rejects duplicate
-    // keys in one BatchWriteItem) last-write-wins.
-    std::map<std::string, Aws::Map<Aws::String, Aws::DynamoDB::Model::AttributeValue>> pending_;
-    std::chrono::steady_clock::time_point first_buffered_at_{};
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace clink::aws
