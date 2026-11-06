@@ -66,7 +66,7 @@ CTEST_TIMEOUT="${CTEST_TIMEOUT:-300}"
 
 # --- connector registry -----------------------------------------------------
 # One entry per connector, run in this order (light/fast services first so a
-# problem surfaces early; the slow-to-start cassandra + elasticsearch are last).
+# problem surfaces early; the slow-to-start cassandra + elasticsearch/opensearch are last).
 # Fields, separated by '@@':  name @@ compose-services @@ test-target @@ ctest-regex
 # The ctest-regex is the exact gtest suite name(s) whose tests require the live
 # service; '|' inside it is regex alternation.
@@ -82,7 +82,8 @@ CONNECTORS=(
   "rocksdb-s3@@localstack@@clink_rocksdb_s3_tests@@S3RocksdbSchemes"
   # The SQL GROUP BY on remote-read:// state, restored in a fresh cluster (WITH_SQL=1).
   "sql-remote-read@@localstack@@clink_sql_s3_e2e_tests@@SqlRemoteReadE2E"
-  "elasticsearch@@elasticsearch@@clink_http_connector_tests@@ElasticsearchLive"
+  "elasticsearch@@elasticsearch@@clink_http_connector_tests@@Elasticsearch/SearchSinkLive"
+  "opensearch@@opensearch@@clink_http_connector_tests@@OpenSearch/SearchSinkLive"
   "pubsub@@pubsub@@clink_http_connector_tests@@PubSubLive"
   "cassandra@@cassandra@@clink_cassandra_tests@@CassandraLive|CassandraUpsertSinkLive|UpsertContractSuite"
   "influxdb@@influxdb@@clink_http_connector_tests@@InfluxDbLive"
@@ -129,6 +130,7 @@ set_env() {
     iceberg)       ENVARGS=(-e "CLINK_ICEBERG_REST_URI=http://iceberg-rest:8181" -e "CLINK_ICEBERG_REST_WAREHOUSE=s3://clink-iceberg-rest/wh" -e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-iceberg-rest" "${AWS_ENV[@]}") ;;
     etcd)          ENVARGS=(-e "CLINK_ETCD_ENDPOINT=http://etcd:2379") ;;
     elasticsearch) ENVARGS=(-e "CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://elasticsearch:9200") ;;
+    opensearch)    ENVARGS=(-e "CLINK_OPENSEARCH_TEST_ENDPOINT=http://opensearch:9200") ;;
     pubsub)        ENVARGS=(-e "CLINK_PUBSUB_EMULATOR_HOST=pubsub:8085") ;;
     s3|rocksdb-s3|sql-remote-read) ENVARGS=(-e "CLINK_S3_TEST_ENDPOINT=http://localstack:4566" -e "CLINK_S3_TEST_BUCKET=clink-live-test" "${AWS_ENV[@]}") ;;
     aws-kinesis)   ENVARGS=(-e "CLINK_KINESIS_TEST_ENDPOINT=http://localstack:4566" "${AWS_ENV[@]}") ;;

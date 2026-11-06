@@ -56,6 +56,11 @@ struct BulkResult {
     bool ok{false};
     std::vector<std::size_t> failed_transient;  // resend (429/503/outage)
     std::vector<std::size_t> failed_permanent;  // DLQ under Drop / throw under Fail (4xx)
+    // What the handler made of a response it did not accept, such as the item
+    // failures it read or why it could not read the body; carried into the
+    // sink's error and its dead-letter reports. Empty when there is nothing to
+    // add to the HTTP status.
+    std::string detail;
 };
 
 // Inspects a bulk response and returns the per-record verdict. `record_count` is
@@ -85,7 +90,7 @@ inline BulkResult whole_batch_result(const HttpResponse& res,
                                      const ResponseValidator& validator) {
     const bool ok = validator ? validator(res) : (res.status >= 200 && res.status < 300);
     if (ok) {
-        return BulkResult{true, {}, {}};
+        return BulkResult{true, {}, {}, {}};
     }
     std::vector<std::size_t> all(record_count);
     for (std::size_t i = 0; i < record_count; ++i) {

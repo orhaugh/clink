@@ -26,9 +26,13 @@ target_link_libraries(clink_http_connector_tests PRIVATE
     GTest::gtest_main
     $<BUILD_INTERFACE:httplib::httplib>
 )
+# The live search-sink cases write through the fault proxies under
+# tests/integration/ (bulk_fault_proxy.hpp, tcp_fault_proxy.hpp).
+target_include_directories(clink_http_connector_tests PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_definitions(clink_http_connector_tests PRIVATE CLINK_HAS_HTTP_CONNECTOR)
 clink_set_warnings(clink_http_connector_tests)
 gtest_discover_tests(clink_http_connector_tests
     DISCOVERY_MODE PRE_TEST
-    PROPERTIES TIMEOUT 30 LABELS http_connector
+    # 120s: the live search-sink cases wait on retries and a server's refresh.
+    PROPERTIES TIMEOUT 120 LABELS http_connector
 )

@@ -129,8 +129,16 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"effectively-once only when document_id is set; without it replays "
-                        "index duplicate documents",
+        .limitations = {"without document_id a resend or a replay indexes duplicate documents",
+                        "with document_id a replay rewrites each id from the checkpoint on, so a "
+                        "document can show an older record until the replay reaches its latest; "
+                        "records of one id are ordered only within one sink subtask, and not "
+                        "against other writers",
+                        "a batch counts as written only when the bulk response confirms every "
+                        "operation; anything else is resent and then fails the job",
+                        "document_id takes a non-empty string of at most 512 bytes, an integer, a "
+                        "number exact to six decimal places or a boolean; any other value is "
+                        "refused",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -156,8 +164,16 @@ void install(clink::plugin::PluginRegistry& reg) {
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"effectively-once only when document_id is set; without it replays "
-                        "index duplicate documents",
+        .limitations = {"without document_id a resend or a replay indexes duplicate documents",
+                        "with document_id a replay rewrites each id from the checkpoint on, so a "
+                        "document can show an older record until the replay reaches its latest; "
+                        "records of one id are ordered only within one sink subtask, and not "
+                        "against other writers",
+                        "a batch counts as written only when the bulk response confirms every "
+                        "operation; anything else is resent and then fails the job",
+                        "document_id takes a non-empty string of at most 512 bytes, an integer, a "
+                        "number exact to six decimal places or a boolean; any other value is "
+                        "refused",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -336,12 +352,12 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     // elasticsearch_sink / opensearch_sink: bulk-index JSON-object records into
     // Elasticsearch / OpenSearch (identical _bulk API) via the NDJSON action+doc
-    // protocol. At-least-once; idempotent (effectively-once on replay) when
-    // document_id is set. Params:
+    // protocol. At-least-once; with document_id each record replaces its id's
+    // document, so a replay converges (make_es_bulk_sink has the contract). Params:
     //   url (required)        - scheme://host[:port], e.g. https://es:9200
     //   index (required)      - target index for the _index action metadata
-    //   document_id           - record field name to use as the _id (optional;
-    //                           idempotent overwrite on re-delivery)
+    //   document_id           - record field whose value names the _id (optional;
+    //                           replacement by id; es_document_id has the rules)
     //   path (default "/_bulk")
     //   headers               - "K: V; ..." (e.g. "Authorization: ApiKey abc")
     //   batch_records (default 500), batch_bytes (default 4194304)

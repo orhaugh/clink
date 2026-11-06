@@ -79,8 +79,68 @@ Identical `_bulk` API; records are framed as NDJSON action+doc pairs.
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `index` | Yes | (none) | Target index for the `_index` action metadata. |
-| `document_id` | No | (empty) | Record field used as the document `_id`; setting it makes re-delivery an idempotent overwrite. Every record then needs the field: a record without it, or with it null, is refused (dead-lettered under `dlq='drop'`, otherwise the job fails) rather than indexed under a generated `_id` that a replay would duplicate. An integer id is used exactly, past 2^53 included. |
+| `document_id` | No | (empty) | Record field whose value names the document `_id`, so a record replaces its id's document rather than adding one. Every record then needs a value the [id rules](#document-ids) accept: a record without one is refused (dead-lettered under `dlq='drop'`, otherwise the job fails) rather than indexed under a generated `_id` that a replay would duplicate. |
 | `path` | No | `/_bulk` | Bulk endpoint path. |
+
+The two factories are the same sink; the gates run it against Elasticsearch 8.13.4 and OpenSearch 2.17.1 (see [Testing](#testing)).
+
+#### Records
+
+Each record must be one JSON object on one line, which the sink sends as the source document after its action line. A record that is not an object, or that spans lines, is refused before it is sent, like a record without a usable id: under `dlq='drop'` it is dead-lettered and the rest of the batch is written, otherwise the job fails. Sent, a record spanning lines breaks the `_bulk` framing and both servers fail the whole request with HTTP 400; a record that is not an object fails on its own, with 400 from OpenSearch but 500 from Elasticsearch.
+
+#### Document ids
+
+With `document_id`, the field's value becomes the `_id` as text:
+
+| Value | `_id` |
+| --- | --- |
+| String | Itself. Refused when empty or longer than 512 bytes: the servers refuse an empty `_id` for its record and a longer one for the whole request. |
+| Integer | Its exact decimal digits at any size, however the record writes it: `42`, `42.0` and `4.2e1` all give `42`; `18446744073709551615` gives `18446744073709551615`. |
+| Number with a fraction | Six decimal places (`0.5` gives `0.500000`), when the record's number has at most six decimal places and a double holds it to six places. Refused otherwise, since that form would give it the `_id` of a different number. |
+| Boolean | `true` or `false`. |
+| Null, absent, object or array | Refused. |
+
+The `_id` is text in one namespace, so values of different JSON types can name the same document: the number `42` and the string `"42"`, `0.5` and `"0.500000"`, `true` and `"true"`. Give the field one type when that matters.
+
+Ids are written as they were before for every value that already had a single `_id` of its own, so replaying older records still replaces the documents they wrote. Three kinds of value changed:
+- A number written with a fraction or exponent and past 2^63, or one between 2^53 and 2^63 that a double could not hold exactly, now gives its exact digits. Before, it was rounded through a double, so neighbouring values shared one `_id`, and past 2^63 the `_id` was the double printed to six decimals. A replay of such a record writes a new document beside the one it wrote before.
+- A fraction with more than six decimal places, and an object or array, are now refused where they used to be written. The six-decimal form had rounded the fraction onto another number's `_id`; an object or array was written under its JSON text.
+- An empty string or one over 512 bytes is now refused before it is sent. The server refused it before too, and a long one failed the whole request with it.
+
+#### When a batch counts as written
+
+`_bulk` answers HTTP 200 even when operations fail, listing each operation's outcome in `items`. A batch counts as written only when the response confirms every operation it sent. That means a JSON object with a boolean `errors` and an `items` array of exactly one entry per operation, each a single `index` result with an HTTP status, and `errors` agreeing with those statuses. Any other 2xx is unconfirmed, for example:
+- a body that is not JSON or is cut short;
+- a body that is not an object;
+- a missing or short `items`, or an entry for another action;
+- an item without a status;
+- an `errors` that contradicts the items.
+
+The whole batch is then resent, and once `max_retries` run out the job fails and replays from its last checkpoint. Nothing unconfirmed is ever dead-lettered, and a barrier whose flush is unconfirmed fails, so its checkpoint does not complete.
+
+| Outcome | What the sink does |
+| --- | --- |
+| Item 2xx | Written. |
+| Item 400, 409 or 422 about the record (a mapping or parse failure, a version conflict) | Dead-lettered under `dlq='drop'`, otherwise the job fails. |
+| Item 400 about the index (`index_closed_exception`, `invalid_index_name_exception`), 403 (a write block), 404 (a missing index), 429, 5xx | Resent with backoff; once `max_retries` run out, the job fails. Never dead-lettered. |
+| Whole request answered with any non-2xx, or no response | Resent whole; once `max_retries` run out, the job fails. Never dead-lettered. |
+| 2xx that does not confirm every operation | As above. |
+
+A 400 for the whole request used to dead-letter the whole batch under `dlq='drop'`, and the two index-level 400s dead-lettered every record written while the index was closed or misnamed. An HTTP 200 whose body was not an object, or that said `"errors":false` without listing every operation, used to count as written.
+
+The pause before each retry ends early when the task is cancelled; the flush then fails with its batch still pending. This holds for every sink built on the shared bulk base.
+
+#### Ordering
+
+Within one sink subtask, records naming the same `document_id` are applied in the order the subtask received them, and once a flush succeeds each of its ids holds its latest record from that flush. Within one request the servers apply operations on one `_id` in order. When an operation fails and is resent, the sink resends it together with every later record of the same flush that names the same id, in order, so the resend cannot land after them and leave the older value. Before, the failed operation was resent alone, so a document could end at an earlier record's value while the flush reported success. Flushes go one at a time, each finishing before the next is sent. Without `document_id` only the failed operations are resent, since each record is a document of its own.
+
+The scope ends there:
+- **Across subtasks.** Records of one id are ordered only when they reach the same sink subtask in order: in SQL, when the source already partitions them by that id. The sink does not repartition its input.
+- **Other writers.** Writes from outside the job to the same index are not ordered against the sink's; the later write wins.
+- **During a replay.** After a failure the job replays from its last checkpoint, rewriting each id from there. A document can therefore show an older record's value until the replay reaches its latest, then converges.
+- **A request the sink gave up on** (a timeout or a dropped connection) may still be applied by the server after the sink has resent it. Every request that writes an id carries that id's latest record of the flush, so the outcome only differs when the abandoned request's later write for an id fails while its earlier one succeeds.
+
+None of this is exactly-once; the delivery analyser reports these sinks as at-least-once and refuses `exactly_once`.
 
 ### `splunk_hec_sink`
 
@@ -272,7 +332,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 ## Delivery semantics
 
 - Sinks (`http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, `prometheus_sink`, `pubsub_sink`) are at-least-once. The shared `BatchedHttpBulkSink` flushes on every checkpoint barrier (before the sink acks), on the size and linger thresholds, and at end-of-stream. On permanent failure with retries exhausted it throws rather than dropping, so the job replays from the last checkpoint. There is no two-phase commit, so a replay re-delivers buffered records.
-- `elasticsearch_sink` / `opensearch_sink` upgrade toward effectively-once when `document_id` is set: a replayed document overwrites the same `_id` rather than duplicating, and a record without the field is refused rather than given a generated `_id`. The `_bulk` response is parsed per item, so a failed item is resent alone. An item the index refuses as a document (400 mapping, 409 version, 422) is dead-lettered or thrown per the `dlq` policy; any other item failure, such as 403 for an index with a write block or 404 for one that does not exist, is resent and then fails the job, never dead-lettered.
+- `elasticsearch_sink` / `opensearch_sink` are at-least-once. Without `document_id` a resend or a replay indexes the record again; a reply lost after the server applied the request is enough to duplicate a batch. With `document_id` each record replaces its id's document, so a replay converges on each id's latest record, ordered within a sink subtask as [Ordering](#ordering) describes. A batch counts as written only when the bulk response confirms every operation, and failures are classified as [the table above](#when-a-batch-counts-as-written) sets out.
 - `influxdb_sink` is effectively-once when `timestamp_field` is set, since an identical point is idempotent.
 - `splunk_hec_sink` and `prometheus_sink` are at-least-once with no dedup key; HEC ingestion is append, and the Pushgateway stores the latest value per series (last-write-wins within a push). Each push is a POST, which replaces every series of the metric in its group with the series the push carries, and a push carries the series of the records since the previous one. So a series no record has named since the previous push disappears from the gateway rather than keeping its last value; give every series a record in each checkpoint interval if they must all stay visible.
 - `pubsub_sink` is at-least-once with no producer dedup; a replay re-publishes.
@@ -293,6 +353,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - All connectors carry records as `std::string` only; there is no int64 or typed-Arrow channel. On the SQL path rows are serialised to JSON strings.
 - No two-phase commit on any sink; exactly-once delivery is not offered. The SQL planner rejects `exactly_once` and `upsert` modes on these sinks.
+- `elasticsearch_sink` / `opensearch_sink`: records of one `document_id` are ordered only within one sink subtask, and not against other writers; a replay can show a document at an older record's value until it reaches the latest; `document_id` values outside [the id rules](#document-ids) are refused. Only the `index` action is written: no update, delete or external versioning.
 - HTTPS works only if cpp-httplib was built with OpenSSL; otherwise an `https://` URL is rejected at construction.
 - `prometheus_sink` targets a Pushgateway, which is a latest-value store for low-cardinality service metrics, not a high-throughput event TSDB. Records whose `value_field` is missing or non-numeric are dropped (no sample). Remote-write is not implemented.
 - `http_poll_source` requires the API to return records ascending by `cursor_field`; it has no client-side ordering or de-duplication beyond the cursor.
@@ -309,21 +370,27 @@ The module's tests live in `impls/http_connector/tests/` and carry the ctest lab
 ctest --test-dir build -L http_connector
 ```
 
-Three live integration tests are skipped unless their endpoint environment variable is set, and gate on the `Live` name filter. The sidecar services are defined in `docker/integration-services.yml`:
+The live integration tests are skipped unless their endpoint environment variable is set. The sidecar services are defined in `docker/integration-services.yml`:
 
 | Test | Env var(s) | Service / image |
 | --- | --- | --- |
-| Elasticsearch (`test_elasticsearch_sink_live.cpp`) | `CLINK_ELASTICSEARCH_TEST_ENDPOINT` (e.g. `http://localhost:9200`) | `docker.elastic.co/elasticsearch/elasticsearch:8.13.4` |
+| Elasticsearch (`Elasticsearch/SearchSinkLive`, `test_elasticsearch_sink_live.cpp`) | `CLINK_ELASTICSEARCH_TEST_ENDPOINT` | `docker.elastic.co/elasticsearch/elasticsearch:8.13.4` |
+| OpenSearch (`OpenSearch/SearchSinkLive`, same file) | `CLINK_OPENSEARCH_TEST_ENDPOINT` | `opensearchproject/opensearch:2.17.1`, security plugin off |
 | InfluxDB (`test_influxdb_live.cpp`) | `CLINK_INFLUXDB_TEST_ENDPOINT`, plus optional `CLINK_INFLUXDB_TEST_ORG` / `_BUCKET` / `_TOKEN` (defaults `clink` / `clink` / `clink-token`) | `influxdb:2` |
 | Pub/Sub (`test_pubsub_live.cpp`) | `CLINK_PUBSUB_EMULATOR_HOST` (e.g. `localhost:8085`) | `gcr.io/google.com/cloudsdktool/cloud-sdk:emulators` |
 
-```bash
-docker compose -f docker/integration-services.yml up -d
-export CLINK_ELASTICSEARCH_TEST_ENDPOINT=http://localhost:9200
-ctest --test-dir build -L http_connector -R Live --output-on-failure
-docker compose -f docker/integration-services.yml down -v
-```
-
-There is no live test for `splunk_hec_sink`, `prometheus_sink`, or `http_poll_source`; these are covered by in-process and mock tests only.
+There is no live test for `splunk_hec_sink`, `prometheus_sink`, or `http_poll_source`; these are covered by in-process and mock tests (`http_poll_source` also feeds the search recovery cells, from a feed the test serves).
 
 `pubsub_source`'s acknowledgement contract is tested in process by `PubSubSourceAck` (`test_pubsub.cpp`), against a stub of the REST endpoints that leases each delivery under a new ackId, honours `modifyAckDeadline`, acknowledges only through a current ackId and can fail acknowledges: an aborted checkpoint, crashes after the barrier and after completion, failed and retried acknowledges, notifications out of order, leases held across a delayed checkpoint and given up past `max_lease`, the `max_outstanding` bound, close after a cancel, and both `on_decode_error` policies. `PubSubSourceAckLive` (`test_pubsub_live.cpp`) repeats the abort, the crash after completion and the delayed checkpoint against the emulator. `test_factory_registration.cpp` pins the capability record and the analyser's verdict. `scripts/ack-sources-live.sh [build-dir]` is the required gate: it runs `PubSubLive` and `PubSubSourceAckLive` against a one-off emulator container, with the other acknowledging sources' suites, and fails on a missing binary, an emulator that never answers, a failed or skipped case, or a short suite (see the [Redis page](redis.md#testing)). The `ack-sources` CI workflow runs it.
+
+### Elasticsearch and OpenSearch
+
+`scripts/search-live.sh elasticsearch [build-dir]` and `scripts/search-live.sh opensearch [build-dir]` are the sinks' gates, one per product, run one after the other. Each starts the product's pinned server on a free loopback port, runs the suites below against it, and fails on a skipped case, a suite that ran fewer cases than it has, a missing binary, a server that never answers, or a server that is not the product named. It keeps each run's report and output, the recovery cells' coordinator and worker logs, and a `provenance.txt` naming the commit, the build's configuration, the server's version, image and digest. The servers run without authentication, so no credentials are set or kept. The `search` CI workflow runs both gates.
+
+| Suite | Binary | What it checks |
+| --- | --- | --- |
+| `ElasticsearchSink`, `EsBulkResult`, `EsDocumentId` | `clink_http_connector_tests`, offline | Against a model of the `_bulk` endpoint that applies operations as the servers do: the body; the id rules; every malformed or incomplete 2xx reply resending the batch and never dead-lettering; item and whole-request classification; a resend carrying the later writes of its document; repeated ids across retries and batches; throttling; cancellation |
+| `<Product>/SearchSinkLive` | `clink_http_connector_tests`, live | Against the real server, reading the index back: 300 documents equal to their records; 500 records over 37 ids in batches of 23 ending at each id's latest; an earlier write withheld and reported 429 resent with the later one (with a control that resends it alone and leaves the older value); a reply lost after the server applied the batch; garbled replies keeping the batch pending; a closed, write-blocked, missing and misnamed index failing the flush without dead-lettering; a mapping failure dead-lettered; a long id, a multi-line record and a non-object refused alone (with the server's whole-request 400 shown directly); the id rules; throttling; cancellation |
+| `<Product>/SearchRecovery` | `clink_integration_tests`, cluster | A coordinator and two workers polling a feed (`http_poll_source`, 3,000 records over 200 ids, each written 15 times at a rising value) into the sink: a worker killed before a write, a worker killed after the server confirmed a flush, replies that confirm nothing for 8 seconds (no checkpoint completes, the job restarts, nothing is lost), and a reply lost after the server applied a flush with the worker killed while it was held; each ends with every id at its latest record |
+
+Where a case needs a fault the server will not produce on demand, it writes through a proxy and says so in its `[search-live]` or `[search-recovery]` line. `BulkFaultProxy` (`tests/integration/bulk_fault_proxy.hpp`) withholds an operation and reports it failed, garbles a reply after the server applied the request, or refuses requests with a status. `TcpFaultProxy` withholds a reply after the server applied the request, then resets the connection. What the index holds afterwards is always read from the server. The index-level refusals, the mapping failure, the whole-request 400 for a long `_id` and the products' different answers to a non-object record are the servers' own behaviour.

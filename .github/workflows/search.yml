@@ -1,0 +1,129 @@
+name: search
+
+# The Elasticsearch and OpenSearch bulk sink's gate (scripts/search-live.sh), run
+# once per product, one after the other, each against its pinned server from
+# docker/integration-services.yml (elasticsearch 8.13.4, opensearch 2.17.1): the
+# sink's offline suites against a model of the _bulk endpoint; the product's live
+# suite, which reads back what the index holds (contents, ids repeated within
+# and across batches, item failures, unconfirmed replies, a reply lost after the
+# server applied the request, index-level refusals, throttling, cancellation);
+# and the recovery cells, a coordinator and two workers polling a feed into the
+# sink with a worker killed at the sink's fault points, replies that confirm
+# nothing, and a reply lost after the server applied a flush, each verified by
+# reading the index. A live test skips when its server or binary is missing and
+# gtest counts that as a pass, so each gate fails on any skip and on any required
+# suite that did not run in full.
+#
+# The script runs on the runner, where it starts and removes the server with
+# Docker; the test binaries run inside the toolchain image through PIN_RUNNER,
+# on the runner's network.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: search-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: The Elasticsearch and OpenSearch sinks hold their contracts against each server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      TOOLCHAIN: ghcr.io/${{ github.repository_owner }}/clink-build:main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report what is under test
+        run: |
+          echo "commit under test: $(git rev-parse HEAD)"
+          docker pull -q "${TOOLCHAIN}"
+          df -h /
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-search-${{ github.run_id }}
+          restore-keys: ccache-search-
+      # ON, not AUTO: a missing HTTP module fails the configure rather than
+      # leaving the gate without its binary. Debug without DWARF and stripped,
+      # as the build job builds.
+      - name: Build the HTTP connector tests, the recovery cells and the node binary
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ccache"
+          docker run --rm --user root \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
+            -v "${RUNNER_TEMP}/ccache:/root/.ccache" \
+            -e CLINK_DEPS_PREFIX=/usr/local -e CCACHE_DIR=/root/.ccache -e CCACHE_MAXSIZE=1500M \
+            -e CMAKE_C_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "${TOOLCHAIN}" bash -c '
+              set -euo pipefail
+              git config --global --add safe.directory "*"
+              apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
+                -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_HTTP=ON -DCMAKE_C_FLAGS_DEBUG=-g0 \
+                -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
+              cmake --build build --target clink_http_connector_tests clink_integration_tests \
+                clink_node -j "$(( $(nproc) / 2 + 1 ))"
+              ccache -s | tail -3'
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-search-${{ github.run_id }}
+      - name: Run the Elasticsearch gate, then the OpenSearch gate
+        run: |
+          set -euo pipefail
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_ELASTICSEARCH_TEST_ENDPOINT -e CLINK_OPENSEARCH_TEST_ENDPOINT \
+            -e CLINK_SEARCH_RECOVERY_LOG_DIR \
+            ${TOOLCHAIN}"
+          status=0
+          for product in elasticsearch opensearch; do
+            REPORT_DIR="${RUNNER_TEMP}/search-live-reports/${product}" \
+              scripts/search-live.sh "${product}" build 2>&1 \
+              | tee "${RUNNER_TEMP}/search-gate-${product}.log" || status=1
+          done
+          exit "${status}"
+      - name: Keep the reports and the cells' evidence
+        # The reports carry every case's result; each gate log and each run's
+        # log carry the "[search-live]" and "[search-recovery]" verdict lines
+        # and the fault framework's witness lines; recovery-logs/ holds every
+        # cell's coordinator and worker logs; provenance.txt names the commit,
+        # the build's configuration and the server. On failure a product's
+        # report directory also holds the server's own log.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-gate
+          path: |
+            ${{ runner.temp }}/search-live-reports/**
+            ${{ runner.temp }}/search-gate-*.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Upload the harness logs on failure
+        # The harness keeps its scratch tree, with every Coordinator and Worker
+        # log, when a recovery cell fails.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-harness-logs
+          path: /tmp/clink_it_*/logs/**
+          if-no-files-found: ignore
+          retention-days: 14

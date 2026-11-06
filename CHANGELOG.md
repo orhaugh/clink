@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+**An Elasticsearch or OpenSearch batch counts as written only when the bulk
+response confirms every operation.** `_bulk` answers 200 with each operation's
+outcome in `items`, and the sink took a 200 whose body was not a JSON object, or
+that said `"errors":false` without listing the operations, as success: the batch
+was cleared and the barrier that asked for it acknowledged without the server
+having confirmed a record. The response must now hold a boolean `errors` and one
+`index` result with an HTTP status per operation, agreeing with `errors`. Any
+other 2xx resends the batch and, once retries run out, fails the job; it is never
+dead-lettered (`impls/http_connector/include/clink/http_connector/bulk_sink_builders.hpp`).
+`EsBulkResult.AResponseThatDoesNotConfirmEveryOperationIsNeverSuccess` covers 27
+such bodies, and the test stub no longer answers every batch with an empty
+`items`. `SearchRecovery.NoCheckpointCompletesWhileTheServerConfirmsNothing`
+answers a cluster job's requests that way for eight seconds against each server:
+no checkpoint completed, the job restarted, and every document ended at its
+latest record.
+
+**A resent Elasticsearch or OpenSearch write no longer leaves a document at an
+older record.** When the earlier of two records with one `document_id` failed
+transiently and the later one was written, the sink resent the earlier one
+alone, and the server applied it last: the document kept the older value and the
+flush reported success. A resend now carries every later record of the same id
+from the flush, in order. Against Elasticsearch 8.13.4 and OpenSearch 2.17.1,
+`SearchSinkLive.AWriteFailedForThrottlingIsResentWithTheLaterWritesOfItsDocument`
+withholds the earlier write behind a proxy that reports it 429, and reads the
+later value back; its control, which resends the failed write alone as before,
+leaves the older one. Records of one id are ordered within one sink subtask; the
+connector page sets out the scope.
+
+**Elasticsearch and OpenSearch refusals about the index are no longer
+dead-lettered.** Both servers answer a write to a closed index, or to an invalid
+index name, with a 400 for each item. `dlq='drop'` dead-lettered those as bad
+documents, dropping every record written while the index refused them, and a 400
+for the whole request dead-lettered the whole batch. Those item failures, and
+any HTTP error for the whole request, are now resent and then fail the job.
+`SearchSinkLive.AnIndexThatRefusesWritesFailsTheFlushAndDropsNothing` closes,
+write-blocks, removes and misnames the index on each server: each flush fails,
+nothing is dead-lettered, and the records are written once the index takes them.
+
+**An Elasticsearch or OpenSearch record that would fail the whole request, or
+fail on every replay, is refused alone.** Both servers refuse a request holding
+one `_id` over 512 bytes, or a record spanning lines, with a 400 for the whole
+request, which dead-lettered or failed every record sent with it. A record that
+is not a JSON object got a 500 from Elasticsearch, retried until the job failed
+and again on every replay. These are now refused before they are sent, like a
+record without its id: dead-lettered under `dlq='drop'`, otherwise the job
+fails. `SearchSinkLive.RecordsTheServerWouldRefuseForTheWholeRequestAreRefusedAlone`
+shows each server's 400 for a long `_id`, then writes the rest of such a batch.
+
+**An Elasticsearch or OpenSearch document id is one text per value, and a value
+that would share another's is refused.** A `document_id` number with a fraction
+was printed to six decimal places, so 0.1234567 and 0.1234568 shared one
+document. A number past 2^53 written with a fraction or exponent went through a
+double, so neighbouring values shared one too. Integers now give their exact
+digits at any size. A fraction keeps its six-decimal form where that is exact
+and is refused otherwise. An object, an array, an empty string or a string over
+512 bytes is refused. Every value that had an `_id` of its own keeps it, so a
+replay of older records still replaces what they wrote; a number written with a
+fraction or exponent that a double rounded now gets its exact digits instead.
+`EsDocumentId` and `SearchSinkLive.DocumentIdsAreStoredUnderTheIdsTheContractGives`
+pin the rules, which `docs/connectors/http.md` lists.
+
+**The HTTP bulk sinks stop retrying when their task is cancelled.** The pause
+before each retry slept through a cancellation, each pause doubling up to 30
+seconds, so a cancelled job, or one restarting after another task failed, could
+wait out every remaining retry. The pause now ends when the task is cancelled,
+and the flush fails with its batch still pending.
+`ElasticsearchSink.CancellationCutsTheRetryPauseShort` covers the Elasticsearch
+sink and the plain bulk sink the other HTTP sinks build on.
+
+**The Elasticsearch and OpenSearch sinks have a gate each.**
+`scripts/search-live.sh elasticsearch` and `scripts/search-live.sh opensearch`
+start the pinned server: Elasticsearch 8.13.4, or OpenSearch 2.17.1, which is
+new in `docker/integration-services.yml`. Each runs the offline suites, the
+product's live suite and four recovery cells against it. It fails on a skipped
+case, a short suite, a missing binary or a server that is not the product named,
+and keeps provenance, every case's verdict line and the cells' logs. The new
+`search` CI workflow runs both gates; it has not yet run.
+
 **A MongoDB source's checkpoint covers only the change events it handed to the
 job.** A pass that stopped at its cap of 1,024 events advanced the driver's
 iterator past the last event it emitted, which read the next one into the

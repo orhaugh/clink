@@ -484,6 +484,14 @@ if(CLINK_INTEGRATION_TESTS)
         target_sources(clink_integration_tests PRIVATE integration/test_mongodb_recovery.cpp)
         target_link_libraries(clink_integration_tests PRIVATE clink_mongodb_driver)
     endif()
+    # The Elasticsearch and OpenSearch sinks' recovery cells: a coordinator and
+    # two workers polling a feed the test serves into the product's bulk sink,
+    # against the server scripts/search-live.sh starts, with faults at the sink's
+    # own points and through the fault proxies. They skip without it.
+    if(TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_search_recovery.cpp)
+        target_link_libraries(clink_integration_tests PRIVATE $<BUILD_INTERFACE:httplib::httplib>)
+    endif()
     target_link_libraries(clink_integration_tests PRIVATE
         clink::clink
         GTest::gtest_main
