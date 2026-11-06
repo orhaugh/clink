@@ -72,15 +72,18 @@ The sink also flushes on an internal byte threshold (just under the 5 MiB reques
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `delivery_stream` | Yes | (none) | Firehose delivery stream name. |
-| `delimiter` | No | `\n` | Appended to each record's `Data` so the destination can split records. Empty string appends nothing. |
-| `batch_records` | No | `500` | Records per `PutRecordBatch` call. Coerced to `500` if 0 or above 500. |
-| `max_retries` | No | `8` | Failed-subset resend attempts. Clamped to `0..20`. |
-| `linger_ms` | No | `0` | Flush a partial batch once it is this old (0 disables linger). |
+| `delivery_stream` | Yes | (none) | Firehose stream name: 1 to 64 characters from `a-z`, `A-Z`, `0-9`, `_`, `.` and `-`. |
+| `delimiter` | No | `\n` | Appended to each record's data, and counted in its size, so the destination can split records. Empty appends nothing. |
+| `batch_records` | No | `500` | Records per `PutRecordBatch` call, 1 to 500. |
+| `max_retries` | No | `8` | Retries in a row that accept nothing (a failed request, or failed entries that did not shrink) before the sink fails, 0 to 20; 0 fails at the first such attempt. |
+| `retry_timeout_ms` | No | `60000` | The longest one request's records may take with every retry and wait. |
+| `linger_ms` | No | `0` | Flush a partial batch once its oldest record is this old, checked when a record arrives (0 disables linger). |
 | `region` | No | SDK default | AWS region. |
-| `endpoint_override` | No | (none) | Custom endpoint URL. |
+| `endpoint_override` | No | (none) | Custom endpoint: an `http://` or `https://` URL without user information. |
+| `connect_timeout_ms` | No | `3000` | The SDK's connect timeout, 1 to 600000. |
+| `request_timeout_ms` | No | `10000` | The SDK's request timeout, 1 to 600000. |
 
-The sink also flushes on an internal byte threshold (just under the 4 MiB request cap); this is not a configurable param.
+A value outside its range fails the job's build with the rule it breaks. The C++ options also take `max_bytes`, the most one request may carry counted as sent (see [the Firehose sink](#the-firehose-sink)), from what the largest record needs alone up to 4 MiB, the default. The sink needs `firehose:PutRecordBatch` on its stream.
 
 ### `dynamodb_sink`
 
@@ -183,7 +186,7 @@ The factories are also reachable through the registry by their registered names 
 
 - **`kinesis_source`**: at-least-once. Each shard has one owning subtask; the last record handed downstream from each shard is checkpointed, and a restore resumes right after it once the service has shown that record is still in the stream. A replay re-reads the records emitted after the last completed checkpoint. See [the Kinesis source](#the-kinesis-source) for ordering, start positions, rescaling and failures.
 - **`kinesis_sink`**: at-least-once. Kinesis has no producer dedup key. `PutRecords` is partial-success; on a partial failure only the failed entries (by response index) are resent, so already-committed records are not re-sent within a call, but a barrier replay can duplicate.
-- **`firehose_sink`**: at-least-once, with no partition key and no ordering guarantee. `PutRecordBatch` is partial-success; only failed entries are resent.
+- **`firehose_sink`**: at-least-once into Firehose, with no partition key, no ordering and no producer deduplication. A checkpoint covers acceptance by Firehose, not delivery to the destination. See [the Firehose sink](#the-firehose-sink) for limits, responses, retries and duplicates.
 - **`dynamodb_sink`**: at-least-once writes. A replayed record rewrites its item rather than add one, and an item ends at the last record written for it when every record of the item reaches one sink subtask in order; it is not exactly-once and does not guard against other writers. See [the DynamoDB sink](#the-dynamodb-sink) for identity, limits, retries and the exact contract.
 
 None of the sinks offer two-phase-commit exactly-once. On exhausted retries each sink throws so the job replays from the last checkpoint rather than silently dropping records.
@@ -355,6 +358,64 @@ The sink's input and output formats are unchanged for every record an earlier re
 - **The table is read at open.** The sink needs `dynamodb:DescribeTable`, refuses a table with a binary key, which never worked, and checks the key names it is given.
 
 """
+## The Firehose sink
+
+The sink sends each record, as opaque bytes, as one Firehose record with `PutRecordBatch`. It never parses a record: SQL hands it JSON, but any bytes are sent as they are. The logic is `impls/aws/src/firehose_sink.cpp`; the AWS SDK call is behind the `FirehoseWriteService` interface in `impls/aws/src/firehose_sdk_service.cpp`.
+
+### Records and requests
+
+Each record's data is the record's bytes with the delimiter appended. Firehose concatenates records at the destination and adds no boundary of its own, so the delimiter is what lets a reader split them again. The limits, from the service's documentation:
+
+| Limit | Value | How the sink counts it |
+| --- | --- | --- |
+| Record | 1,000 KiB (1,024,000 bytes) before base64 encoding | The record's bytes and its delimiter. A record over it is refused when it arrives, by its position and size. |
+| Records per request | 500 | `batch_records`, at most 500. |
+| Request | 4 MiB | The request as the SDK sends it: every record's data base64-encoded (4 bytes per 3, rounded up), inside its indented JSON object. |
+
+The documentation states 4 MiB per call without saying whether base64 counts. Counting the request as sent keeps the sink within either reading; it also means requests of large records hold fewer of them than the raw-data reading would allow: three records of 1,000 KiB, not four. An empty record is allowed (with no delimiter, its data is empty). The buffer is sent before a record that would take the next request past its count or byte limit is added, so no request is ever built over a limit.
+
+### Responses
+
+A response counts only when it accounts for every record sent: one entry per record, in request order, each holding a `RecordId` (accepted) or an `ErrorCode` (failed), never both or neither, and a `FailedPutCount` equal to the entries that failed. The SDK reads a response without `FailedPutCount` as 0, which the entries then contradict if any failed. When a response counts, the records whose entries failed, and only those, are sent again. Any other response is ambiguous: the sink cannot tell which records Firehose accepted, so it fails rather than count them accepted. It never reads a response entry past the request's records.
+
+### Failures and retries
+
+| Answer | Handling |
+| --- | --- |
+| Every entry accepted | The records are accepted. |
+| Some entries failed (`ServiceUnavailableException`, `InternalFailure`) | Send those records again after a backoff. Firehose says such a record "might have failed", so it can arrive twice. |
+| Throttled: `ServiceUnavailableException`, `ThrottlingException`, HTTP 429 | Nothing was accepted. Send the request again after a backoff. |
+| Transient: `InternalFailure`, `ResourceInUseException`, other 5xx, no response | The request may or may not have been accepted. Send it again after a backoff; its records can arrive twice. |
+| A response that does not account for its request | Ambiguous. Fail. |
+| Permanent: `InvalidArgumentException`, `ResourceNotFoundException`, `InvalidKMSResourceException`, access, signature and credential errors, other 4xx the SDK would not retry | Fail at once, with what to check. |
+| The task is cancelled | The backoff ends at once, the call in flight is aborted, and the sink fails. |
+
+The backoff starts at 100 ms and doubles to 10 s. A request's records fail the sink once `max_retries` retries in a row have accepted nothing (an attempt that accepts some resets the count), or once `retry_timeout_ms` has passed since the first attempt. The SDK's own retries are off, so these are the only ones. The service's messages are logged with access key ids and signed request values removed. The sink reports `records_out`, `bytes_out`, the latency of each flush and errors under the connector name `firehose`; its `firehose.sink` log names the stream and the request limits at open, each retry at its first and every power-of-two attempt, and each failure with its cause.
+
+### What a checkpoint covers
+
+A barrier returns only once every record received before it has been accepted by Firehose, so a checkpoint never covers a record that is outstanding, being retried, or ambiguous. Accepted means accepted into the stream: a successful `PutRecordBatch` is not proof that the destination has the record. Firehose buffers records and delivers them to the destination on its own schedule, retries failed deliveries by the destination's rules, and keeps undelivered data for 24 hours; those are the service's, and the sink does not observe or wait for them.
+
+When the sink fails, by a refused record, an exhausted retry budget, a permanent error, an ambiguous response or a cancellation, it drops what it buffered and refuses every later record, flush and barrier, so it cannot acknowledge a checkpoint over records it dropped. `open()` starts it afresh, with an empty buffer, as a restart does; `close()` sends nothing. At a clean end of input the runtime flushes before closing, so everything buffered is sent. The sink checks a whole input batch before buffering any of it, so a batch with a refused record adds nothing; records accepted by earlier sends stay accepted.
+
+### Duplicates and order
+
+Delivery into Firehose is at-least-once. A record can be accepted twice:
+
+- when a reply is lost after Firehose accepted the request, or a failed entry's record had in fact been processed, and the sink sends it again;
+- when the job restarts: every record after the last completed checkpoint is sent again, including records Firehose had already accepted.
+
+Firehose keeps no producer identity, so nothing removes a duplicate before the destination: deduplicate there if it matters, by a field of the record. Records carry no partition key and no order: Firehose may deliver them in any order, and the sink makes no attempt to keep one.
+
+### Earlier releases
+
+The sink sends the same bytes for every record an earlier release sent. What changes:
+
+- **Responses are checked.** A response with `FailedPutCount` 0 used to count as success whatever its entries said, and a failed entry past the request's records was read out of bounds; both now fail the sink as ambiguous. A response with failed entries but no error codes used to resend the whole batch.
+- **Records over the limit are refused when they arrive,** by their position, where they used to fail their whole request with the service's message. A request is no longer built past its limit: the byte threshold used to be checked only after a record was added.
+- **Retries are bounded and cancellable.** Permanent errors fail at once instead of being retried. Waits are cut short by a cancellation, and the SDK's own retries no longer stack under the sink's.
+- **Options are checked.** `batch_records` outside 1 to 500 and `max_retries` outside 0 to 20 fail the build instead of being clamped. `max_retries` counts retries in a row that accept nothing. `max_bytes` (C++ only) now counts the request as sent and must lie between what the largest record needs alone and 4 MiB; it used to count raw bytes plus a fixed 16 per record. `retry_timeout_ms`, `connect_timeout_ms` and `request_timeout_ms` are new.
+
 ## Limitations
 
 - Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
@@ -368,7 +429,10 @@ The sink's input and output formats are unchanged for every record an earlier re
 - `dynamodb_sink`: the 400 KB check does not count local secondary index entries, so such a table can still refuse an item, which fails the sink.
 - `dynamodb_sink`: puts only. With `changelog='true'` a deletion is written as an item, not applied.
 - `kinesis_sink`: a record over the 1 MiB per-record limit poisons the whole `PutRecords` batch under `dlq=fail`; use `dlq=drop` to route oversized records to the bad-record path instead.
-- `firehose_sink`: no partition key and no ordering guarantee; the destination must split concatenated records using the appended delimiter.
+- `firehose_sink`: at-least-once into Firehose. A record can reach the destination twice after a lost reply, a failed entry the service had in fact processed, or a replay; there is no ordering and no producer deduplication, so deduplicate at the destination if it matters.
+- `firehose_sink`: a checkpoint covers acceptance by Firehose only. Buffering, delivery to the destination, its retries and the 24-hour retention of undelivered data are the service's, and the sink does not observe them.
+- `firehose_sink`: the destination must split concatenated records at the appended delimiter, so the delimiter must not occur inside a record.
+- `firehose_sink`: a record over 1,000 KiB with its delimiter fails the job each time the replay reaches it; there is no dead-letter option.
 - `kinesis_source`: per-key order across a split or merge holds only at parallelism 1; above it, order holds within each shard.
 - `kinesis_source`: a restore at another parallelism needs every previous subtask's source rows at every new subtask: `file://` provides them, `rocksdb://` and `forst://` only for 1 to N and N to 1, and the source refuses the rest.
 - `kinesis_source`: an earlier release's checkpoint restores at parallelism 1 only.
@@ -381,7 +445,7 @@ Each connector's evidence comes at three levels, and they are kept apart: determ
 
 ### The Kinesis source
 
-**Deterministic, against a model of the service.** `impls/aws/tests/test_kinesis_source.cpp` runs the production `KinesisSource` against `impls/aws/tests/kinesis_model.hpp`, a model of `ListShards`, `GetShardIterator` and `GetRecords` with parent and child links, arrival times, retention (trimmed records, shards leaving the listing), expiring iterators, paginated and reordered listings, and a hook that fails any call. It covers ownership; discovery by an empty subtask, by a busy one, and across pages in changing order; split and merge lineage with slow parents and parents on another subtask or absent; a restore at each parent and child transition; latest-mode starts and restores; iterator expiry before and after the first record; retention loss of a saved position; missing and recreated shards; earlier checkpoints; rescaling through the runtime's own `file://` and `rocksdb://` restores; throttling, transient and permanent failures; cancellation in a wait and in a call; and bounded state across 25 reshards. `test_factory_registration.cpp` and `test_kinesis_firehose_sink.cpp` cover the Kinesis and Firehose sinks and factory registration in-process.
+**Deterministic, against a model of the service.** `impls/aws/tests/test_kinesis_source.cpp` runs the production `KinesisSource` against `impls/aws/tests/kinesis_model.hpp`, a model of `ListShards`, `GetShardIterator` and `GetRecords` with parent and child links, arrival times, retention (trimmed records, shards leaving the listing), expiring iterators, paginated and reordered listings, and a hook that fails any call. It covers ownership; discovery by an empty subtask, by a busy one, and across pages in changing order; split and merge lineage with slow parents and parents on another subtask or absent; a restore at each parent and child transition; latest-mode starts and restores; iterator expiry before and after the first record; retention loss of a saved position; missing and recreated shards; earlier checkpoints; rescaling through the runtime's own `file://` and `rocksdb://` restores; throttling, transient and permanent failures; cancellation in a wait and in a call; and bounded state across 25 reshards. `test_factory_registration.cpp` and `test_kinesis_firehose_sink.cpp` cover factory registration and the Kinesis sink in-process.
 
 **Against the emulator.** LocalStack (`localstack/localstack:3`, which reported version 3.8.1 here) supports `SplitShard`, `MergeShards`, `UpdateShardCount`, paginated `ListShards`, and the `TRIM_HORIZON`, `AT_TIMESTAMP` and `AT_SEQUENCE_NUMBER` iterators. `impls/aws/tests/test_kinesis_live.cpp` (`KinesisLive`, eight cases) runs a sink to source round trip, a checkpoint resume, a split and a merge while one subtask reads (every key in order), a uniform reshard under two subtasks with one-shard listing pages (every shard owned once, every shard in order), a latest-mode restore before the first record, a missing stream, a recreated stream and a cancel. `tests/integration/test_kinesis_recovery.cpp` (`KinesisRecovery`, three cells) runs a coordinator and two workers reading the emulator's stream into the file two-phase-commit sink: at parallelism 1 with a split, a worker killed with records in flight and a merge after the restore; at parallelism 2 with a uniform reshard and a kill; and in latest mode killed before the first record. Each cell checks the sink's committed files against the records it wrote: every record once, nothing else, and the order the source promises.
 
@@ -402,19 +466,35 @@ scripts/kinesis-live.sh build
 
 **Not verified against AWS.** Nothing here ran against AWS. The emulator does not throttle, never returns `UnprocessedItems`, and has no partitions, permissions or local secondary index accounting, so partial writes, throttling, inconsistent responses and lost replies are covered by the model only. The same emulator ran the sink as it was before this change: it stored two records whose keys differed only around a NUL as one item, under a key neither had; collapsed two integer keys past the 64-bit range into one item holding the second record's value; failed a batch, its valid records included, after coalescing the string "1" with the number 1; and stored 12345678901234567890.123456789 as 12345678901234567168.
 
-The gate is `scripts/dynamodb-live.sh`: it starts LocalStack with DynamoDB and Kinesis on a free loopback port, waits for DynamoDB Local to answer, runs every DynamoDB suite and the recovery cells, and fails on a missing binary, an emulator that never answers, a failed case, any skip, or a suite that ran fewer cases than it should. It keeps each run's report and output, the cells' coordinator and worker logs, and `provenance.txt` (the commit, the build's configuration, the emulator's version and image) under `<build-dir>/dynamodb-live-reports`. It passed locally on commit 0ad045c2 against LocalStack 3.8.1 on 2026-11-06: 60 of 60, the three recovery cells converging on all 48 items with one restart each. The `aws` CI workflow runs it after the Kinesis gate; it has not run yet.
+The gate is `scripts/dynamodb-live.sh`: it starts LocalStack with DynamoDB and Kinesis on a free loopback port, waits for DynamoDB Local to answer, runs every DynamoDB suite and the recovery cells, and fails on a missing binary, an emulator that never answers, a failed case, any skip, or a suite that ran fewer cases than it should. It keeps each run's report and output, the cells' coordinator and worker logs, and `provenance.txt` (the commit, the build's configuration, the emulator's version and image) under `<build-dir>/dynamodb-live-reports`. It passed locally on commit 0ad045c2 against LocalStack 3.8.1 on 2026-11-06: 60 of 60, the three recovery cells converging on all 48 items with one restart each. It passed in CI on commit fb32551e, 60 of 60 (run 42285865904 of the `aws` workflow), the in-flight abort case included on the toolchain image's SDK.
 
 ```bash
 cmake --build build --target clink_aws_tests clink_integration_tests clink_node --parallel 10
 scripts/dynamodb-live.sh build
 ```
 
-To run the live cases by hand against LocalStack from `docker/integration-services.yml` (its service enables Kinesis and S3; the DynamoDB cases need `SERVICES=dynamodb,kinesis`, as the gate sets):
+### The Firehose sink
+
+**Deterministic, against a model of the service.** `impls/aws/tests/test_firehose_sink.cpp` checks the request accounting against the JSON the SDK itself writes, from empty records to records of 1,000 KiB and binary bytes, and the response judge on complete and partial responses and on every kind that does not account for its request: missing, short and oversized entry arrays, entries with both or neither result, and `FailedPutCount` values that contradict the entries. It runs the production `FirehoseSink` against `impls/aws/tests/firehose_model.hpp`, a model of `PutRecordBatch` that keeps every record it accepts, duplicates included, and refuses what the service refuses for a request's shape. Each call can be scripted: records accepted or failed, an error before or after acceptance, a hand-written response, or a call that hangs until aborted. The cases cover options and the factory's ranges; a record at the limit sent and one byte more refused; empty and binary payloads and the delimiter; requests that never outgrow their limits; partial acceptance resending only the failed records; retry bounds in attempts and in time; throttled and transient requests; the regressions of a response taken as success while missing entries and of an entry read past the request; permanent errors; a reply lost after acceptance; cancellation in a wait and in a call; a barrier that waits for acceptance; repeated barriers after a failure; the end of input and close; reopening after a failure; and linger.
+
+**Against the emulator.** LocalStack 3.8.1 serves `PutRecordBatch` with one `RecordId` per record, and delivers a DirectPut stream to its own S3 at once, one object per request with the records' bytes concatenated, once STS is enabled (the stream assumes its role to write). It does not enforce the per-record limit: it accepted a record of 1,024,001 bytes. `impls/aws/tests/test_firehose_live.cpp` (`FirehoseLive`, five cases) writes through the production sink and its SDK client and reads the bucket back with the SDK's S3 client, splitting each object at the delimiter and comparing every record byte for byte, duplicates allowed. Its cases: text, every byte value, an empty record, two records at 1,000 KiB and 1,200 small ones through the registered factory; binary records split by a two-byte delimiter; a record over the limit refused before it is sent; a missing stream; and an SDK call in flight ended by abort. `tests/integration/test_firehose_recovery.cpp` (`FirehoseRecovery`, three cells) runs a coordinator and two workers reading a Kinesis stream into the sink while the test writes 1,200 unique records. The cells kill worker 0 parked after `PutRecordBatch` accepted a batch no checkpoint covered, at parallelism 1 and 2, and parked before a send. Each checks that the bucket holds every record at least once and nothing else; the two parked after an acceptance also require that batch to arrive again.
+
+**Not verified against AWS.** Nothing here ran against AWS. The emulator never fails an entry, never throttles and never loses a reply, so partial acceptance, throttling, ambiguous responses and lost replies are covered by the model only. It delivers at once, without Firehose's buffering, delivery retries or 24-hour retention, so nothing here shows delivery timing or a destination outage. Whether AWS counts base64 against the 4 MiB request limit was not tested; the sink's accounting is safe under either reading.
+
+The gate is `scripts/firehose-live.sh`: it starts LocalStack with Firehose, S3, STS, IAM and Kinesis on a free loopback port, waits for its Firehose API, runs every Firehose suite and the recovery cells, and fails on a missing binary, an emulator that never answers, a failed case, any skip, or a suite that ran fewer cases than it should. It keeps each run's report and output, the cells' coordinator and worker logs, and `provenance.txt` (the commit, the build's configuration, the emulator's version and image) under `<build-dir>/firehose-live-reports`. The `aws` CI workflow runs it after the DynamoDB gate; it has not run yet.
 
 ```bash
-docker compose -f docker/integration-services.yml run -d -e SERVICES=dynamodb,kinesis -p 4566:4566 localstack
+cmake --build build --target clink_aws_tests clink_integration_tests clink_node --parallel 10
+scripts/firehose-live.sh build
+```
+
+To run the live cases by hand against LocalStack from `docker/integration-services.yml` (its service enables Kinesis and S3; the DynamoDB and Firehose cases need more, as their gates set):
+
+```bash
+docker compose -f docker/integration-services.yml run -d -e SERVICES=dynamodb,firehose,s3,sts,iam,kinesis -p 4566:4566 localstack
 export CLINK_KINESIS_TEST_ENDPOINT=http://localhost:4566
 export CLINK_DYNAMODB_TEST_ENDPOINT=http://localhost:4566
+export CLINK_FIREHOSE_TEST_ENDPOINT=http://localhost:4566
 export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
 ctest --test-dir build -L aws
 ```

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+**The Firehose sink counts a send only when the response accounts for every
+record, and never builds a request past its limits.** A response with
+`FailedPutCount` 0 counted as success whatever its entries said, so records
+missing from a short response were taken as accepted; and failed entries were
+used to index the request without checking the response's length. A response
+now counts only with one entry per record, each a `RecordId` or an `ErrorCode`,
+and a `FailedPutCount` equal to the failed entries; only the records whose
+entries failed are resent, and any other response fails the sink rather than
+guess. The request's size was checked only after a record was added, so a
+request could pass 4 MiB, and no record's size was checked. A record over
+1,000 KiB with its delimiter is now refused when it arrives, and the buffer is
+sent before a record that would take the request past 500 records or 4 MiB,
+counted as the SDK sends it. Records stay opaque bytes. Covered by
+`FirehoseLimits`, `FirehoseResponse`, `FirehoseSinkRecords`,
+`FirehoseSinkResponses` and `FirehoseLive` against LocalStack, reading the
+delivery stream's S3 destination back record by record.
+
+**The Firehose sink bounds its retries, and never acknowledges a barrier over
+records it dropped.** Every failure was retried with a sleep a cancellation
+could not end, permanent ones included, under the SDK's own retries. Failures
+are now classed as throttling, transient or permanent: the first two are retried
+with a backoff bounded by `max_retries` retries in a row that accept nothing and
+by `retry_timeout_ms` (new) in total, a cancellation ends a wait or aborts the
+call in flight, and a permanent error fails at once with what to check. A failed
+sink drops its buffer and refuses every later record, flush and barrier until
+`open()`. The connector page now states what a checkpoint covers (acceptance by
+Firehose, not delivery to the destination) and when a record can arrive twice.
+`batch_records` outside 1 to 500 and `max_retries` outside 0 to 20 fail the
+build instead of being clamped; `connect_timeout_ms` and `request_timeout_ms`
+are new. Covered by `FirehoseSinkWrites`, `FirehoseSinkFailures`,
+`FirehoseSinkCancel`, `FirehoseSinkLifecycle` and the `FirehoseRecovery` cluster
+cells; gate `scripts/firehose-live.sh`, run by the `aws` workflow.
+
 **The DynamoDB sink keys buffered records by the item they write, keeps every
 number's digits, and refuses a record DynamoDB would refuse or the SDK would
 change.** Buffered records were keyed by the key strings joined with a NUL, so
