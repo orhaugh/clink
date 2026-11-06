@@ -410,7 +410,7 @@ TEST(KinesisSourceDiscovery, ShardRemovalNeitherDuplicatesNorSilentlyDrops) {
     r.source->snapshot_offset(backend, kOp, CheckpointId{1});
     std::size_t rows = 0;
     backend.scan_operator_state(kOp, [&](StateBackend::KeyView k, StateBackend::ValueView) {
-        rows += std::string_view{k}.find(shard_name(0)) != std::string_view::npos ? 1 : 0;
+        rows += std::string_view{k}.find(shard_name(0)) != std::string_view::npos ? 1U : 0U;
     });
     EXPECT_EQ(rows, 0U) << "a forgotten shard kept its checkpoint row";
 

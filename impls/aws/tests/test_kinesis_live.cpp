@@ -204,7 +204,8 @@ bool await_active(Aws::Kinesis::KinesisClient& c, const std::string& stream) {
     return false;
 }
 
-using u128 = unsigned __int128;
+// 128-bit hash keys; __extension__ keeps -Wpedantic quiet about __int128.
+__extension__ typedef unsigned __int128 u128;
 u128 parse_u128(const std::string& s) {
     u128 v = 0;
     for (const char ch : s) {
