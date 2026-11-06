@@ -511,6 +511,17 @@ if(CLINK_INTEGRATION_TESTS)
                     integration/test_dynamodb_recovery.cpp)
                 target_link_libraries(clink_integration_tests PRIVATE aws-cpp-sdk-dynamodb)
             endif()
+            # The Firehose sink's cells read such a stream into a LocalStack
+            # delivery stream and read its S3 destination back
+            # (scripts/firehose-live.sh).
+            find_package(aws-cpp-sdk-firehose CONFIG QUIET)
+            find_package(aws-cpp-sdk-s3 CONFIG QUIET)
+            if(TARGET aws-cpp-sdk-firehose AND TARGET aws-cpp-sdk-s3)
+                target_sources(clink_integration_tests PRIVATE
+                    integration/test_firehose_recovery.cpp)
+                target_link_libraries(clink_integration_tests PRIVATE
+                    aws-cpp-sdk-firehose aws-cpp-sdk-s3)
+            endif()
         endif()
     endif()
     target_link_libraries(clink_integration_tests PRIVATE
