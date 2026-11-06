@@ -65,9 +65,15 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {"poll_interval_ms"},
+        .timeout_options = {"poll_interval_ms", "discovery_interval_ms", "retry_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"resharding while a job is running is not rebalanced until restart",
+        .limitations = {"source: records of one hash key keep their order across a split or "
+                        "merge only at parallelism 1; above it, order holds within a shard",
+                        "source: restoring at another parallelism needs every previous "
+                        "subtask's source rows at every new subtask (file:// hands them over; "
+                        "the source refuses a restore that lacks them)",
+                        "source: a shard the source tracks but has not read yet is not checked "
+                        "for records lost to retention before its first record",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -191,14 +197,17 @@ void install(clink::plugin::PluginRegistry& reg) {
             return std::make_shared<FirehoseSink>(std::move(o));
         });
 
-    // kinesis_source: read a Kinesis Data Stream (ListShards + GetRecords). Each
-    // subtask owns a modulo-slice of the shards; per-shard SequenceNumber is
-    // checkpointed (at-least-once). Params:
+    // kinesis_source: read a Kinesis Data Stream (ListShards + GetRecords). Shard
+    // s belongs to subtask kinesis_shard_owner(s, parallelism); each owned shard's
+    // last emitted record is checkpointed (at-least-once). Params:
     //   stream (required)         - stream name or ARN
     //   initial_position ("trim_horizon" [default] | "latest")
     //   region, endpoint_override
-    //   max_records_per_poll (default 1000; GetRecords Limit)
-    //   poll_interval_ms (default 250) - idle backoff
+    //   max_records_per_poll (default 1000; GetRecords Limit, 1..10000)
+    //   poll_interval_ms (default 250) - a caught-up shard's wait between reads
+    //   discovery_interval_ms (default 10000) - ListShards cadence
+    //   retry_timeout_ms (default 300000) - how long one call may keep failing
+    //     with throttling or transient errors before the task fails
     reg.register_source<std::string>(
         "kinesis_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             KinesisSourceOptions o;
@@ -211,6 +220,10 @@ void install(clink::plugin::PluginRegistry& reg) {
                 static_cast<int>(ctx.param_int64_or("max_records_per_poll", 1000));
             o.poll_interval =
                 std::chrono::milliseconds{ctx.param_int64_or("poll_interval_ms", 250)};
+            o.discovery_interval =
+                std::chrono::milliseconds{ctx.param_int64_or("discovery_interval_ms", 10000)};
+            o.retry_timeout =
+                std::chrono::milliseconds{ctx.param_int64_or("retry_timeout_ms", 300000)};
             o.name = "kinesis_source";
             return std::make_shared<KinesisSource>(std::move(o));
         });

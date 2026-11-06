@@ -31,6 +31,8 @@ if(NOT (TARGET aws-cpp-sdk-core AND TARGET aws-cpp-sdk-kinesis AND
 endif()
 
 add_library(clink_aws STATIC
+    src/kinesis_sdk_service.cpp
+    src/kinesis_source.cpp
     src/register_factories.cpp
 )
 add_library(clink::aws ALIAS clink_aws)

@@ -25,6 +25,13 @@ target_link_libraries(clink_aws_tests PRIVATE
     aws-cpp-sdk-kinesis aws-cpp-sdk-firehose aws-cpp-sdk-dynamodb aws-cpp-sdk-core
 )
 target_compile_definitions(clink_aws_tests PRIVATE CLINK_HAS_AWS)
+# The Kinesis source's rescale cases restore through rocksdb:// too, to show the
+# source refusing a restore that lacks rows it needs. impls/rocksdb is configured
+# after this directory, so the test is made at generate time, not with if(TARGET).
+target_link_libraries(clink_aws_tests PRIVATE
+    $<$<TARGET_EXISTS:clink_rocksdb>:clink_rocksdb>)
+target_compile_definitions(clink_aws_tests PRIVATE
+    $<$<TARGET_EXISTS:clink_rocksdb>:CLINK_AWS_TESTS_HAVE_ROCKSDB>)
 clink_set_warnings(clink_aws_tests)
 gtest_discover_tests(clink_aws_tests
     DISCOVERY_MODE PRE_TEST
