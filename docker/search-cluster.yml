@@ -1,0 +1,69 @@
+# Three-node Elasticsearch and OpenSearch clusters for the bulk sink gate's
+# cluster phase (scripts/search-live.sh). The gate starts one product's three
+# nodes at a time, with the image of the version under test
+# (SEARCH_ES_IMAGE / SEARCH_OS_IMAGE) and node 1 published on the loopback port
+# it picks (SEARCH_CLUSTER_PORT); the sink writes to node 1, and the case stops
+# another node while it writes. Security is off, as in the gate's main phase.
+#
+# Multi-node discovery turns on the servers' bootstrap checks, which need the
+# Docker host's vm.max_map_count at 262144 or more. The disk-based allocation
+# threshold is off: on a shared Docker disk past 85% full the cluster would
+# otherwise leave every replica unassigned, which is not what the cases test.
+
+x-es-node: &es-node
+  image: ${SEARCH_ES_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:8.13.4}
+  environment: &es-env
+    cluster.name: clink-search
+    discovery.seed_hosts: es01,es02,es03
+    cluster.initial_master_nodes: es01,es02,es03
+    xpack.security.enabled: "false"
+    cluster.routing.allocation.disk.threshold_enabled: "false"
+    ES_JAVA_OPTS: -Xms384m -Xmx384m
+
+x-os-node: &os-node
+  image: ${SEARCH_OS_IMAGE:-opensearchproject/opensearch:2.17.1}
+  environment: &os-env
+    cluster.name: clink-search
+    discovery.seed_hosts: os01,os02,os03
+    cluster.initial_cluster_manager_nodes: os01,os02,os03
+    DISABLE_SECURITY_PLUGIN: "true"
+    DISABLE_INSTALL_DEMO_CONFIG: "true"
+    cluster.routing.allocation.disk.threshold_enabled: "false"
+    OPENSEARCH_JAVA_OPTS: -Xms384m -Xmx384m
+
+services:
+  es01:
+    <<: *es-node
+    environment:
+      <<: *es-env
+      node.name: es01
+    ports:
+      - "127.0.0.1:${SEARCH_CLUSTER_PORT:-9210}:9200"
+  es02:
+    <<: *es-node
+    environment:
+      <<: *es-env
+      node.name: es02
+  es03:
+    <<: *es-node
+    environment:
+      <<: *es-env
+      node.name: es03
+
+  os01:
+    <<: *os-node
+    environment:
+      <<: *os-env
+      node.name: os01
+    ports:
+      - "127.0.0.1:${SEARCH_CLUSTER_PORT:-9211}:9200"
+  os02:
+    <<: *os-node
+    environment:
+      <<: *os-env
+      node.name: os02
+  os03:
+    <<: *os-node
+    environment:
+      <<: *os-env
+      node.name: os03

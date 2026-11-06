@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**The search sink gates cover Elasticsearch 9.2.0 and OpenSearch 3.3.0, and
+three more server set-ups each.** `scripts/search-live.sh` takes `elasticsearch9`
+and `opensearch3` beside the two it ran, and each run adds three phases to the
+main one. A throttled phase runs a server with a write pool of one thread and a
+queue of one, whose own 429s, counted from its replies, are retried until every
+record is stored. A secured phase runs the server with its own security on:
+verified HTTPS, a user with only the rights it needs, an API key, a wrong
+password and a user who may only read. That phase fails the gate if the run's
+generated password appears anywhere it keeps. A cluster phase runs three nodes
+and kills one while the sink writes (`docker/search-cluster.yml`). The recovery
+cells add the kill after a confirmed flush as a SQL job at parallelism 2. The
+unconfirmed-replies cell now waits for twelve refused requests instead of
+sleeping eight seconds, so the sleep baseline is back to five. The `search` CI
+workflow runs all four servers.
+
 **A cancelled task interrupts an HTTP bulk sink's request in flight.** Only the
 pause between retries ended on cancellation, so a task cancelled while a request
 was in flight held on until the request's 30-second read timeout: a cancelled
@@ -35,9 +50,9 @@ dead-lettered (`impls/http_connector/include/clink/http_connector/bulk_sink_buil
 `EsBulkResult.AResponseThatDoesNotConfirmEveryOperationIsNeverSuccess` covers 27
 such bodies, and the test stub no longer answers every batch with an empty
 `items`. `SearchRecovery.NoCheckpointCompletesWhileTheServerConfirmsNothing`
-answers a cluster job's requests that way for eight seconds against each server:
-no checkpoint completed, the job restarted, and every document ended at its
-latest record.
+answers a cluster job's requests that way against each server until twelve were
+refused: no checkpoint completed, the job restarted, and every document ended at
+its latest record.
 
 **A resent Elasticsearch or OpenSearch write no longer leaves a document at an
 older record.** When the earlier of two records with one `document_id` failed

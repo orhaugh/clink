@@ -28,6 +28,10 @@ permissions:
   contents: read
   packages: read
 
+env:
+  DOCKER_CLI_VERSION: 29.8.2
+  DOCKER_CLI_SHA256: 995d1ef289677f74fd58d8d2c35727b6a4ee389c69db8638a3e42d0487aa5b0f
+
 concurrency:
   group: search-${{ github.ref }}
   cancel-in-progress: true
@@ -36,7 +40,7 @@ jobs:
   live:
     name: The Elasticsearch and OpenSearch sinks hold their contracts against each server
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       TOOLCHAIN: ghcr.io/${{ github.repository_owner }}/clink-build:main
     steps:
@@ -60,7 +64,7 @@ jobs:
       # ON, not AUTO: a missing HTTP module fails the configure rather than
       # leaving the gate without its binary. Debug without DWARF and stripped,
       # as the build job builds.
-      - name: Build the HTTP connector tests, the recovery cells and the node binary
+      - name: Build the HTTP connector tests, the recovery cells and the node and SQL binaries
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ccache"
@@ -77,7 +81,7 @@ jobs:
                 -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_HTTP=ON -DCMAKE_C_FLAGS_DEBUG=-g0 \
                 -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
               cmake --build build --target clink_http_connector_tests clink_integration_tests \
-                clink_node -j "$(( $(nproc) / 2 + 1 ))"
+                clink_node clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
               ccache -s | tail -3'
       - name: Save compiler cache
         if: always()
@@ -85,17 +89,40 @@ jobs:
         with:
           path: ${{ runner.temp }}/ccache
           key: ccache-search-${{ github.run_id }}
-      - name: Run the Elasticsearch gate, then the OpenSearch gate
+      - name: Fetch the pinned Docker CLI
+        # The toolchain image carries no Docker client; the cluster cases kill
+        # and start nodes through the runner's daemon with this one.
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/docker.tgz" \
+            "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz"
+          echo "${DOCKER_CLI_SHA256}  ${RUNNER_TEMP}/docker.tgz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/docker.tgz" -C "${RUNNER_TEMP}" docker/docker
+      - name: Let multi-node servers pass their bootstrap checks
+        run: |
+          if [ "$(sysctl -n vm.max_map_count)" -lt 262144 ]; then
+            sudo sysctl -w vm.max_map_count=262144
+          fi
+      - name: Run the gates, Elasticsearch 8 and 9, then OpenSearch 2 and 3
         run: |
           set -euo pipefail
           export PIN_RUNNER="docker run --rm --user root --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v ${RUNNER_TEMP}/docker/docker:/usr/local/bin/docker:ro \
             -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
             -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
             -e CLINK_ELASTICSEARCH_TEST_ENDPOINT -e CLINK_OPENSEARCH_TEST_ENDPOINT \
+            -e CLINK_ELASTICSEARCH_THROTTLED_ENDPOINT -e CLINK_OPENSEARCH_THROTTLED_ENDPOINT \
+            -e CLINK_ELASTICSEARCH_SECURED_ENDPOINT -e CLINK_ELASTICSEARCH_SECURED_CA \
+            -e CLINK_ELASTICSEARCH_SECURED_USER -e CLINK_ELASTICSEARCH_SECURED_PASSWORD \
+            -e CLINK_OPENSEARCH_SECURED_ENDPOINT -e CLINK_OPENSEARCH_SECURED_CA \
+            -e CLINK_OPENSEARCH_SECURED_USER -e CLINK_OPENSEARCH_SECURED_PASSWORD \
+            -e CLINK_ELASTICSEARCH_CLUSTER_ENDPOINT -e CLINK_ELASTICSEARCH_CLUSTER_NODES \
+            -e CLINK_OPENSEARCH_CLUSTER_ENDPOINT -e CLINK_OPENSEARCH_CLUSTER_NODES \
             -e CLINK_SEARCH_RECOVERY_LOG_DIR \
             ${TOOLCHAIN}"
           status=0
-          for product in elasticsearch opensearch; do
+          for product in elasticsearch elasticsearch9 opensearch opensearch3; do
             REPORT_DIR="${RUNNER_TEMP}/search-live-reports/${product}" \
               scripts/search-live.sh "${product}" build 2>&1 \
               | tee "${RUNNER_TEMP}/search-gate-${product}.log" || status=1

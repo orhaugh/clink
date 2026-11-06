@@ -16,7 +16,9 @@
 //     each is answered `status` with `body`.
 //
 // Faults apply in the order armed, one request each (n requests for garble and
-// refuse). Every request, its body and what the proxy did with it are counted.
+// refuse). Every request, its body and what the proxy did with it are counted,
+// and so is every reply the server sent back: with no fault armed the proxy only
+// records, so a case can count failures that came from the server itself.
 // Where a TCP-level fault is wanted (a reply lost after the server applied the
 // request) tests use TcpFaultProxy instead.
 //
@@ -102,6 +104,45 @@ public:
         const std::lock_guard<std::mutex> lock(mu_);
         return faults_.size();
     }
+    // The server's own replies to the requests forwarded so far, as it sent them.
+    [[nodiscard]] std::vector<std::string> upstream_replies() const {
+        const std::lock_guard<std::mutex> lock(mu_);
+        return replies_;
+    }
+    // Bulk items the server itself answered with a status outside 2xx.
+    [[nodiscard]] std::size_t upstream_failed_items() const {
+        std::size_t n = 0;
+        for (int status = 100; status < 600; ++status) {
+            if (status < 200 || status >= 300) {
+                n += upstream_items_with_status(status);
+            }
+        }
+        return n;
+    }
+    // Bulk items the server itself answered with `status`, over every reply.
+    [[nodiscard]] std::size_t upstream_items_with_status(int status) const {
+        std::size_t n = 0;
+        for (const auto& body : upstream_replies()) {
+            try {
+                const auto reply = clink::config::parse(body);
+                const auto& o = reply.as_object();
+                const auto items = o.find("items");
+                if (items == o.end() || !items->second.is_array()) {
+                    continue;
+                }
+                for (const auto& item : items->second.as_array()) {
+                    const auto& r = item.as_object().begin()->second.as_object();
+                    const auto st = r.find("status");
+                    if (st != r.end() && st->second.is_integral_number() &&
+                        st->second.as_int() == status) {
+                        ++n;
+                    }
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        return n;
+    }
 
 private:
     enum class Kind { Withhold, Garble, Refuse };
@@ -175,6 +216,10 @@ private:
             up.status = 200;
             up.body = R"({"took":0,"errors":false,"items":[]})";
         }
+        if (up.status != 0) {
+            const std::lock_guard<std::mutex> lock(mu_);
+            replies_.push_back(up.body);
+        }
         if (up.status == 0) {
             res.status = 502;
             res.set_content("the proxy could not reach the server: " + up.error, "text/plain");
@@ -226,6 +271,7 @@ private:
     mutable std::mutex mu_;
     std::deque<Fault> faults_;
     std::vector<std::string> bodies_;
+    std::vector<std::string> replies_;
     std::size_t applied_{0};
 };
 

@@ -35,12 +35,7 @@
 #    5s ON PURPOSE, an outage shorter than the driver's server selection
 #    timeout, before it is started again: the length of the outage is what
 #    the cell tests.
-#  * test_search_recovery's unconfirmed-replies cell answers every bulk request
-#    with a body that confirms nothing for 8s ON PURPOSE and then checks that
-#    no checkpoint completed meanwhile: the wait is for the absence of an
-#    event, over a span of several checkpoint intervals.
 2      tests/integration/test_clickhouse_native_recovery.cpp
 1      tests/integration/test_mongodb_recovery.cpp
 1      tests/integration/test_postgres_pipeline.cpp
-1      tests/integration/test_search_recovery.cpp
 1      tests/integration/test_soak.cpp

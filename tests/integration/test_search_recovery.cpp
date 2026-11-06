@@ -21,7 +21,10 @@
 //   4. the sink writes through TcpFaultProxy, which forwards one bulk request
 //      whole and withholds the server's reply; the worker running the sink is
 //      SIGKILLed while the reply is held, so the server has applied writes whose
-//      outcome the job never learned.
+//      outcome the job never learned;
+//   5. cell 2 as a SQL job (connector='http_poll' into connector='elasticsearch'
+//      or 'opensearch' with document_id), submitted by clink_submit_sql at
+//      parallelism 2.
 //
 // Pass criteria, read through the case's own client rather than anything clink
 // reports: the index holds exactly one document per id, equal to that id's last
@@ -31,7 +34,7 @@
 // the server itself. Each cell prints one "[search-recovery]" line.
 //
 // Needs the server scripts/search-live.sh starts and the clink_node binary of a
-// build with fault injection.
+// build with fault injection (and clink_submit_sql for cell 5).
 
 #include <algorithm>
 #include <atomic>
@@ -81,13 +84,21 @@ std::filesystem::path recovery_node_binary() {
 #endif
 }
 
+std::filesystem::path sql_binary() {
+#ifdef CLINK_SUBMIT_SQL_BINARY
+    return std::filesystem::path{CLINK_SUBMIT_SQL_BINARY};
+#else
+    return {};
+#endif
+}
+
 std::string env_or_empty(const char* name) {
     const char* v = std::getenv(name);
     return v == nullptr ? std::string{} : std::string{v};
 }
 
 struct Product {
-    const char* name;  // "elasticsearch" or "opensearch"
+    const char* name;  // "elasticsearch" or "opensearch", also its SQL connector
     const char* env;   // the variable naming its server
     const char* sink;  // the sink's factory name, which its fault points carry
 };
@@ -314,11 +325,11 @@ protected:
     // A coordinator and worker 0 only, armed with `fault`: the job submitted
     // next places every task on worker 0. Worker 1 joins after the deploy,
     // unarmed, as the spare a restart can use; so is worker 0's replacement.
-    std::unique_ptr<Cluster> make_cluster(const std::string& fault) {
+    std::unique_ptr<Cluster> make_cluster(const std::string& fault, int slots = 3) {
         ClusterSpec spec;
         spec.node_binary = recovery_node_binary();
         spec.workers = 2;
-        spec.slots_per_worker = 3;
+        spec.slots_per_worker = slots;
         spec.http = true;
         auto cluster = std::make_unique<Cluster>(spec);
         ProcOptions o;
@@ -353,6 +364,51 @@ protected:
                                  "application/json");
         ASSERT_NE(r.body.find("\"ok\":true"), std::string::npos)
             << "the job was not accepted: " << r.body;
+    }
+
+    // The C++ job's pipeline as SQL: the feed through connector='http_poll' into
+    // the product's sink with document_id.
+    std::string sql_job(const std::string& sink_url) const {
+        return "CREATE TABLE feed (id STRING, seq BIGINT, v BIGINT) WITH (connector='http_poll', "
+               "format='json', url='" +
+               feed_->url() +
+               "', path='/feed', records_field='items', cursor_param='since', "
+               "cursor_field='seq', poll_interval_ms='20');\n"
+               "CREATE TABLE docs (id STRING, seq BIGINT, v BIGINT) WITH (connector='" +
+               std::string{GetParam().name} + "', format='json', url='" + sink_url + "', index='" +
+               index_ +
+               "', document_id='id', batch_records='100', linger_ms='200', max_retries='3');\n"
+               "INSERT INTO docs SELECT id, seq, v FROM feed;\n";
+    }
+
+    // `sql` compiled and submitted by clink_submit_sql, as a deployment does.
+    void submit_sql(Cluster& cluster, const std::string& sql, int parallelism) {
+        clink::itest::Process submit;
+        ASSERT_TRUE(submit.spawn("submit-sql",
+                                 sql_binary(),
+                                 {sql_binary().string(),
+                                  "-e",
+                                  sql,
+                                  "--coordinator-host",
+                                  "127.0.0.1",
+                                  "--coordinator-port",
+                                  std::to_string(cluster.http_port()),
+                                  "--name",
+                                  "search-recovery-sql",
+                                  "--checkpoint-dir",
+                                  cluster.checkpoint_dir().string(),
+                                  "--checkpoint-interval-ms",
+                                  "1000",
+                                  "--alignment",
+                                  "aligned",
+                                  "--max-restarts-on-worker-loss",
+                                  "8",
+                                  "--parallelism",
+                                  std::to_string(parallelism)},
+                                 cluster.log_dir()));
+        const auto code = submit.await_exit(60s);
+        ASSERT_TRUE(code.has_value());
+        ASSERT_EQ(*code, 0) << submit.read_log();
     }
 
     static void cancel_job(const Cluster& cluster) {
@@ -547,6 +603,39 @@ TEST_P(SearchRecovery, AWorkerKilledAfterTheServerConfirmedAFlushConvergesOnRepl
     kill_at("after_write", "block@10");
 }
 
+TEST_P(SearchRecovery, ASqlJobKilledAfterAConfirmedFlushConvergesOnReplay) {
+    if (!std::filesystem::exists(sql_binary())) {
+        GTEST_SKIP() << "the clink_submit_sql binary is not built";
+    }
+    const std::string point = std::string{GetParam().sink} + ".after_write";
+    auto cluster = make_cluster(point + "=block@10", /*slots=*/8);
+    ScopedDiagnostics diagnostics(*cluster);
+    submit_sql(*cluster, sql_job(endpoint_), /*parallelism=*/2);
+    add_spare_worker(*cluster);
+    await_first_checkpoint(*cluster);
+    feed_->start();
+    ASSERT_TRUE(parked_at(*cluster, point)) << "worker 0 never reached " << point;
+    const auto served = feed_->served_max();
+    const auto in_flight = in_flight_ids();
+    stored_at_park_ = stored().size();
+    feed_->watch_rewind();
+    kill_and_replace(*cluster, 0);
+    ASSERT_TRUE(cluster->await_workers_registered(2));
+    await_converged(*cluster, 240s);
+    const auto replayed = served - std::min(served, feed_->lowest_since());
+    const auto spent = restarts(*cluster);
+    cancel_job(*cluster);
+    report("sql_after_write",
+           *cluster,
+           spent,
+           served,
+           in_flight,
+           " replayed=" + std::to_string(replayed) + " parallelism=2");
+    EXPECT_EQ(spent, 1U) << "one worker loss is one restart";
+    EXPECT_GT(replayed, 0) << "the restored job read nothing again";
+    EXPECT_GT(stored_at_park_, 0U);
+}
+
 TEST_P(SearchRecovery, NoCheckpointCompletesWhileTheServerConfirmsNothing) {
     BulkFaultProxy proxy(endpoint_);
     auto cluster = make_cluster("");
@@ -562,10 +651,13 @@ TEST_P(SearchRecovery, NoCheckpointCompletesWhileTheServerConfirmsNothing) {
         [&] { return latest_completed(*cluster) > idle && stored().size() >= 20; }, 60s))
         << "nothing was written and checkpointed before the fault";
     // From here every bulk request is answered 200 with a body that confirms
-    // nothing, and none reaches the server.
+    // nothing, and none reaches the server. The window lasts until 12 requests
+    // were refused: three flushes' worth at max_retries=3, each failing a
+    // barrier, across several checkpoint intervals and at least one restart.
     proxy.refuse(1000000, 200, R"({"took":0,"errors":false,"items":[]})");
     const auto before = latest_completed(*cluster);
-    std::this_thread::sleep_for(8s);
+    ASSERT_TRUE(clink::itest::await([&] { return proxy.faults_applied() >= 12; }, 120s))
+        << "the sink stopped sending while nothing was confirmed";
     const auto during = latest_completed(*cluster);
     const auto refused = proxy.faults_applied();
     const auto served = feed_->served_max();
@@ -585,7 +677,7 @@ TEST_P(SearchRecovery, NoCheckpointCompletesWhileTheServerConfirmsNothing) {
            spent,
            served,
            in_flight,
-           " checkpoint_before=" + std::to_string(before) + " checkpoint_after_8s=" +
+           " checkpoint_before=" + std::to_string(before) + " checkpoint_after_window=" +
                std::to_string(during) + " requests_refused=" + std::to_string(refused) +
                " unconfirmed_flushes_logged=" + std::to_string(unconfirmed));
     EXPECT_GE(spent, 1U) << "a flush that cannot confirm its batch fails the job, which restarts";
