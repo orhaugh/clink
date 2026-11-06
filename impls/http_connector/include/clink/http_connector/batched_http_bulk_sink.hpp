@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "clink/fault/fault_injection.hpp"
+#include "clink/http_connector/cancel_watch.hpp"
 #include "clink/http_connector/http_bulk_post.hpp"
 #include "clink/http_connector/http_request.hpp"
 #include "clink/metrics/connector_metrics.hpp"
@@ -61,8 +62,9 @@ enum class BulkFraming {
 // the resend cannot leave a document at an older record's value. Records with
 // no key keep the plain rule: only the failed ones are resent.
 //
-// The pause before a retry ends early when the task is cancelled, and the
-// flush then throws with its batch still pending. Fault points
+// A cancelled task stops the flush at once: a POST in flight is interrupted
+// (CancelWatch) and the pause before a retry ends early, and the flush then
+// throws with its batch still pending. Fault points
 // "<name>.before_write" (an attempt's body is built and not yet sent) and
 // "<name>.after_write" (the endpoint confirmed every record of the flush, which
 // has not yet returned) let recovery tests stop a task at either side of a write.
@@ -145,7 +147,11 @@ private:
 
 public:
     void open() override {
+        watch_.reset();  // it watches the client being replaced
         client_ = std::make_unique<HttpRequest>(opts_.http);
+        if (this->runtime() != nullptr) {
+            watch_ = std::make_unique<CancelWatch>(*client_);
+        }
         fragments_.clear();
         keys_.clear();
         pending_bytes_ = 0;
@@ -197,7 +203,17 @@ public:
                 wait_before_retry_(attempt, last, why);
             }
             (void)CLINK_FAULT_POINT(before_write_point_);
+            const bool watched = watch_ != nullptr && this->runtime() != nullptr;
+            if (watched) {
+                watch_->arm(this->runtime()->cancel_signal());
+            }
             last = client_->post(opts_.path, build_body_(active), opts_.content_type);
+            if (watched && watch_->disarm() && last.status == 0) {
+                throw HttpDeliveryError(opts_.name + ": cancelled while a POST to " +
+                                            opts_.http.base_url + opts_.path +
+                                            " was in flight; the batch stays pending",
+                                        last);
+            }
             BulkResult r = opts_.response_handler
                                ? opts_.response_handler(last, active.size())
                                : whole_batch_result(last, active.size(), opts_.response_ok);
@@ -451,6 +467,9 @@ private:
     std::string before_write_point_;  // fault point: an attempt about to be sent
     std::string after_write_point_;   // fault point: the flush confirmed, not returned
     std::unique_ptr<HttpRequest> client_;
+    // Interrupts a POST in flight when the task is cancelled. Declared after
+    // client_, so it is joined before the client goes.
+    std::unique_ptr<CancelWatch> watch_;
     std::vector<std::string> fragments_;  // per-record rendered bodies (for subset resend)
     std::vector<std::string> keys_;       // per-record keys when keyed_, else empty
     std::size_t pending_bytes_{0};        // sum of fragment sizes (flush trigger + bytes metric)

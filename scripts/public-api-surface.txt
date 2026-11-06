@@ -232,6 +232,7 @@ impls/forst/include/clink/state/forst_state_backend.hpp
 impls/http_connector/include/clink/http_connector/base64.hpp
 impls/http_connector/include/clink/http_connector/batched_http_bulk_sink.hpp
 impls/http_connector/include/clink/http_connector/bulk_sink_builders.hpp
+impls/http_connector/include/clink/http_connector/cancel_watch.hpp
 impls/http_connector/include/clink/http_connector/http_bulk_post.hpp
 impls/http_connector/include/clink/http_connector/http_model_provider.hpp
 impls/http_connector/include/clink/http_connector/http_poll_source.hpp

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**A cancelled task interrupts an HTTP bulk sink's request in flight.** Only the
+pause between retries ended on cancellation, so a task cancelled while a request
+was in flight held on until the request's 30-second read timeout: a cancelled
+job, or one restarting after another task failed, waited on a server that might
+never answer. A watch now interrupts the request as soon as the task is
+cancelled (`impls/http_connector/include/clink/http_connector/cancel_watch.hpp`),
+and the flush fails with its batch pending.
+`ElasticsearchSink.CancellationInterruptsAPostInFlight` covers the Elasticsearch
+sink and the plain bulk sink the other HTTP sinks build on, and
+`SearchSinkLive.CancellationInterruptsARequestInFlight` returns within
+milliseconds from a request the server never answers.
+
+**The Elasticsearch and OpenSearch sinks take `tls_ca_file`.** An `https://` URL
+could be verified only against the system's trust store, so a cluster with its
+own CA, which both servers create when their security is on, could be reached
+only with `verify_tls='false'`, which checks nothing. `tls_ca_file` names the PEM
+file of the CAs that may sign the server's certificate. The connector page now
+sets out how credentials go in `headers`, and that a wrong password, a user who
+may not write and a certificate that does not verify are resent and then fail
+the job, never dead-lettered.
+
 **An Elasticsearch or OpenSearch batch counts as written only when the bulk
 response confirms every operation.** `_bulk` answers 200 with each operation's
 outcome in `items`, and the sink took a 200 whose body was not a JSON object, or

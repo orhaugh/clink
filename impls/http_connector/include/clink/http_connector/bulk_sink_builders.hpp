@@ -411,6 +411,9 @@ struct EsBulkOptions {
     std::string headers;      // "K: V; ..." header spec
     std::string path{"/_bulk"};
     bool verify_tls{true};
+    // https: PEM file of the CAs that may sign the server's certificate, in
+    // place of the system's trust store (a cluster's own CA). Empty: the system's.
+    std::string tls_ca_file;
     std::size_t batch_records{500};
     std::size_t batch_bytes{4 * 1024 * 1024};
     int max_retries{4};
@@ -437,6 +440,7 @@ inline std::shared_ptr<Sink<std::string>> make_es_bulk_sink(EsBulkOptions o) {
     opts.http.base_url = o.url;
     opts.http.headers = parse_headers(o.headers);
     opts.http.verify_tls = o.verify_tls;
+    opts.http.ca_cert_path = o.tls_ca_file;
     opts.path = o.path;
     opts.content_type = "application/x-ndjson";
     opts.framing = BulkFraming::Ndjson;

@@ -123,7 +123,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .transactional = false,
         // Bulk index with _id from document_id: replays overwrite.
         .idempotency_key_option = "document_id",
-        .auth_methods = {"none", "basic", "bearer-token"},
+        .auth_methods = {"none", "basic", "bearer-token", "api-key"},
         .tls = true,
         .backpressure = true,
         .retries = true,
@@ -139,6 +139,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "document_id takes a non-empty string of at most 512 bytes, an integer, a "
                         "number exact to six decimal places or a boolean; any other value is "
                         "refused",
+                        "the sink writes to one URL: in front of a cluster, a load balancer or a "
+                        "node that stays up; while it is down, flushes fail and the job replays",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -158,7 +160,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .transactional = false,
         // Bulk index with _id from document_id: replays overwrite.
         .idempotency_key_option = "document_id",
-        .auth_methods = {"none", "basic", "bearer-token"},
+        .auth_methods = {"none", "basic", "bearer-token", "api-key"},
         .tls = true,
         .backpressure = true,
         .retries = true,
@@ -174,6 +176,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "document_id takes a non-empty string of at most 512 bytes, an integer, a "
                         "number exact to six decimal places or a boolean; any other value is "
                         "refused",
+                        "the sink writes to one URL: in front of a cluster, a load balancer or a "
+                        "node that stays up; while it is down, flushes fail and the job replays",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -363,6 +367,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   batch_records (default 500), batch_bytes (default 4194304)
     //   max_retries (default 4; clamped to [0, 20])
     //   verify_tls ("true" [default] | "false")
+    //   tls_ca_file           - PEM CAs for an https server's certificate (default:
+    //                           the system's trust store)
     auto es_factory = [](const std::string& name) {
         return [name](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
             EsBulkOptions o;
@@ -372,6 +378,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.headers = ctx.param_or("headers", "");
             o.path = ctx.param_or("path", "/_bulk");
             o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
+            o.tls_ca_file = ctx.param_or("tls_ca_file", "");
             o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
             o.batch_bytes =
                 static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));

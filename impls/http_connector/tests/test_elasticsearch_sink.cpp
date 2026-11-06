@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <httplib.h>
 #include <map>
@@ -63,6 +64,7 @@ public:
         std::optional<int> http_status;  // with body: the reply, verbatim
         std::string body;
         bool apply{false};  // with http_status: apply the operations first
+        int delay_ms{0};    // hold the reply this long first (cut short at teardown)
     };
 
     BulkModel() {
@@ -76,6 +78,11 @@ public:
         }
     }
     ~BulkModel() {
+        {
+            std::lock_guard<std::mutex> lk(delay_mu_);
+            stopping_ = true;
+        }
+        delay_cv_.notify_all();
         svr_.stop();
         if (thread_.joinable()) {
             thread_.join();
@@ -149,14 +156,22 @@ private:
     }
 
     void handle(const httplib::Request& req, httplib::Response& res) {
-        std::lock_guard<std::mutex> lk(mu_);
-        bodies_.push_back(req.body);
-        content_types_.push_back(req.get_header_value("Content-Type"));
-        const int call = static_cast<int>(bodies_.size());
         Call c;
-        if (auto it = script_.find(call); it != script_.end()) {
-            c = it->second;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            bodies_.push_back(req.body);
+            content_types_.push_back(req.get_header_value("Content-Type"));
+            const int call = static_cast<int>(bodies_.size());
+            if (auto it = script_.find(call); it != script_.end()) {
+                c = it->second;
+            }
         }
+        if (c.delay_ms > 0) {
+            std::unique_lock<std::mutex> lk(delay_mu_);
+            delay_cv_.wait_for(
+                lk, std::chrono::milliseconds{c.delay_ms}, [this] { return stopping_; });
+        }
+        std::lock_guard<std::mutex> lk(mu_);
         if (c.http_status) {
             if (c.apply) {
                 for (const auto& op : parse_ops(req.body)) {
@@ -220,6 +235,9 @@ private:
     int port_{0};
     std::thread thread_;
     std::mutex mu_;
+    std::mutex delay_mu_;
+    std::condition_variable delay_cv_;
+    bool stopping_{false};
     std::map<int, Call> script_;
     int fail_all_{0};
     std::map<std::string, std::string> docs_;
@@ -241,6 +259,13 @@ BulkModel::Call replying(int status, std::string body, bool apply) {
     c.http_status = status;
     c.body = std::move(body);
     c.apply = apply;
+    return c;
+}
+
+// Call N holds its reply for `ms` first, then answers as unscripted.
+BulkModel::Call hanging(int ms) {
+    BulkModel::Call c;
+    c.delay_ms = ms;
     return c;
 }
 
@@ -1014,6 +1039,43 @@ TEST(ElasticsearchSink, CancellationCutsTheRetryPauseShort) {
     const auto [took2, error2] = p.cancel_during_flush(std::chrono::milliseconds{900});
     EXPECT_LT(took2, std::chrono::milliseconds{1000});
     EXPECT_TRUE(contains(error2, "cancelled while retrying")) << error2;
+}
+
+// A POST in flight when the task is cancelled is interrupted at once rather than
+// held to the request's read timeout (30 s by default): the flush fails with its
+// batch pending, and once the task runs again the batch is written. The same for
+// the plain bulk sink the other HTTP sinks build on.
+TEST(ElasticsearchSink, CancellationInterruptsAPostInFlight) {
+    BulkModel srv;
+    srv.script(1, hanging(20000));
+    auto o = options_for(srv);
+    o.document_id = "id";
+    Cancellable c(make_es_bulk_sink(o));
+    c.sink->open();
+    c.sink->on_data(batch_of({R"({"id":"a","v":1})"}));
+    const auto [took, error] = c.cancel_during_flush(std::chrono::milliseconds{300});
+    EXPECT_LT(took, std::chrono::milliseconds{500});
+    EXPECT_TRUE(contains(error, "cancelled while a POST")) << error;
+    c.cancel->store(false);
+    c.sink->flush();
+    EXPECT_EQ(srv.docs().at("a"), R"({"id":"a","v":1})");
+
+    BulkModel plain;
+    plain.script(1, hanging(20000));
+    plain.script(2, replying(200, "{}", false));
+    BatchedHttpBulkSink<std::string>::Options po;
+    po.http.base_url = plain.url();
+    po.path = "/_plain";
+    Cancellable p(std::make_shared<BatchedHttpBulkSink<std::string>>(
+        po, [](std::string& out, const std::string& rec) { out += rec; }));
+    p.sink->open();
+    p.sink->on_data(batch_of({R"({"a":1})"}));
+    const auto [took2, error2] = p.cancel_during_flush(std::chrono::milliseconds{300});
+    EXPECT_LT(took2, std::chrono::milliseconds{500});
+    EXPECT_TRUE(contains(error2, "cancelled while a POST")) << error2;
+    p.cancel->store(false);
+    EXPECT_NO_THROW(p.sink->flush());
+    EXPECT_EQ(plain.calls(), 2);
 }
 
 TEST(ElasticsearchSink, RequiresUrlAndIndex) {

@@ -81,6 +81,7 @@ Identical `_bulk` API; records are framed as NDJSON action+doc pairs.
 | `index` | Yes | (none) | Target index for the `_index` action metadata. |
 | `document_id` | No | (empty) | Record field whose value names the document `_id`, so a record replaces its id's document rather than adding one. Every record then needs a value the [id rules](#document-ids) accept: a record without one is refused (dead-lettered under `dlq='drop'`, otherwise the job fails) rather than indexed under a generated `_id` that a replay would duplicate. |
 | `path` | No | `/_bulk` | Bulk endpoint path. |
+| `tls_ca_file` | No | (empty) | For an `https://` URL: PEM file of the CAs that may sign the server's certificate, in place of the system's trust store (a cluster's own CA). |
 
 The two factories are the same sink; the gates run it against Elasticsearch 8.13.4 and OpenSearch 2.17.1 (see [Testing](#testing)).
 
@@ -128,7 +129,13 @@ The whole batch is then resent, and once `max_retries` run out the job fails and
 
 A 400 for the whole request used to dead-letter the whole batch under `dlq='drop'`, and the two index-level 400s dead-lettered every record written while the index was closed or misnamed. An HTTP 200 whose body was not an object, or that said `"errors":false` without listing every operation, used to count as written.
 
-The pause before each retry ends early when the task is cancelled; the flush then fails with its batch still pending. This holds for every sink built on the shared bulk base.
+When the task is cancelled the flush stops at once. A request in flight is interrupted rather than left to its 30-second read timeout, and the pause before a retry ends early. The flush then fails with its batch still pending. This holds for every sink built on the shared bulk base.
+
+#### Security
+
+Credentials go in `headers`: `Authorization: Basic <base64 of user:password>`, or `Authorization: ApiKey <encoded>` for an Elasticsearch API key. An `https://` URL is verified against the system's trust store, or against `tls_ca_file` for a cluster's own CA; `verify_tls='false'` skips verification and checks nothing about the server. The writing user needs to create and write the target index. Elasticsearch calls these privileges `create_index`, `auto_configure` and `write`; OpenSearch calls them `crud` and `create_index`, with `cluster_composite_ops` for the bulk request.
+
+A wrong password (HTTP 401 for the whole request), a user who may not write the index (403), and a certificate that does not verify are resent and then fail the job; none is dead-lettered. The sink's error names the status and the server's reason, never the credentials.
 
 #### Ordering
 
@@ -138,6 +145,7 @@ The scope ends there:
 - **Across subtasks.** Records of one id are ordered only when they reach the same sink subtask in order: in SQL, when the source already partitions them by that id. The sink does not repartition its input.
 - **Other writers.** Writes from outside the job to the same index are not ordered against the sink's; the later write wins.
 - **During a replay.** After a failure the job replays from its last checkpoint, rewriting each id from there. A document can therefore show an older record's value until the replay reaches its latest, then converges.
+- **One URL.** The sink writes to the one URL it is given, with no list of nodes. In front of a cluster, point it at a load balancer or at a node that stays up. While that node is down, flushes fail and the job replays until it returns. A node it does not write to can fail without loss, once the index has replicas on the others.
 - **A request the sink gave up on** (a timeout or a dropped connection) may still be applied by the server after the sink has resent it. Every request that writes an id carries that id's latest record of the flush, so the outcome only differs when the abandoned request's later write for an id fails while its earlier one succeeds.
 
 None of this is exactly-once; the delivery analyser reports these sinks as at-least-once and refuses `exactly_once`.
@@ -353,7 +361,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
 - All connectors carry records as `std::string` only; there is no int64 or typed-Arrow channel. On the SQL path rows are serialised to JSON strings.
 - No two-phase commit on any sink; exactly-once delivery is not offered. The SQL planner rejects `exactly_once` and `upsert` modes on these sinks.
-- `elasticsearch_sink` / `opensearch_sink`: records of one `document_id` are ordered only within one sink subtask, and not against other writers; a replay can show a document at an older record's value until it reaches the latest; `document_id` values outside [the id rules](#document-ids) are refused. Only the `index` action is written: no update, delete or external versioning.
+- `elasticsearch_sink` / `opensearch_sink`: records of one `document_id` are ordered only within one sink subtask, and not against other writers; a replay can show a document at an older record's value until it reaches the latest; `document_id` values outside [the id rules](#document-ids) are refused. Only the `index` action is written: no update, delete or external versioning. The sink takes one URL and does not discover other nodes.
 - HTTPS works only if cpp-httplib was built with OpenSSL; otherwise an `https://` URL is rejected at construction.
 - `prometheus_sink` targets a Pushgateway, which is a latest-value store for low-cardinality service metrics, not a high-throughput event TSDB. Records whose `value_field` is missing or non-numeric are dropped (no sample). Remote-write is not implemented.
 - `http_poll_source` requires the API to return records ascending by `cursor_field`; it has no client-side ordering or de-duplication beyond the cursor.
