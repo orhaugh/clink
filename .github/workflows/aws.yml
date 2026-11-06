@@ -1,22 +1,34 @@
-name: kinesis
+name: aws
 
-# The Kinesis source's gate (scripts/kinesis-live.sh): every Kinesis test, the
-# source's deterministic cases against a model of the service (ownership,
-# discovery, split and merge lineage, restores at each parent and child
-# transition, latest-mode starts, iterator expiry, throttling, transient and
-# permanent failures, retention loss, rescale through the runtime's file:// and
-# rocksdb:// restores, cancellation, bounded state) and the live ones against
-# LocalStack (docker/integration-services.yml's localstack service): a split and
-# a merge while the source reads, a uniform reshard under two subtasks, latest
-# mode restored before its first record, a missing and a recreated stream; and
-# the recovery cells, a coordinator and two workers reading the emulator's stream
-# into the file 2PC sink with a worker killed while records are in flight and
-# the stream resharded under the job, each verified against the cell's own
-# record of what it wrote. A live test skips when its endpoint or binary is
-# missing and gtest counts that as a pass, so the gate fails on any skip and on
-# any required suite that did not run. Nothing here runs against AWS.
+# The AWS connectors' gates, one build for both, each against LocalStack
+# (docker/integration-services.yml's localstack service) and a model of the
+# service. Nothing here runs against AWS.
 #
-# The script runs on the runner, where it starts and removes the emulator with
+# scripts/kinesis-live.sh, the Kinesis source: its deterministic cases against a
+# model of the service (ownership, discovery, split and merge lineage, restores
+# at each parent and child transition, latest-mode starts, iterator expiry,
+# throttling, transient and permanent failures, retention loss, rescale through
+# the runtime's file:// and rocksdb:// restores, cancellation, bounded state),
+# the live ones (a split and a merge while the source reads, a uniform reshard
+# under two subtasks, latest mode restored before its first record, a missing
+# and a recreated stream), and the recovery cells, a coordinator and two workers
+# reading the emulator's stream into the file 2PC sink with a worker killed while
+# records are in flight and the stream resharded under the job.
+#
+# scripts/dynamodb-live.sh, the DynamoDB sink: item identity, the record checks
+# and DynamoDB's size rules, and the sink's write path against a model of
+# DescribeTable and BatchWriteItem (partial writes, retry bounds, inconsistent
+# responses, permanent errors, a lost reply, cancellation, the failed state and a
+# restart); the live cases, read back from the emulator item by item; and the
+# recovery cells, a worker parked at the sink's own fault points with writes no
+# checkpoint covers and killed, each table checked against the last record
+# written for every item.
+#
+# A live test skips when its endpoint or binary is missing and gtest counts that
+# as a pass, so each gate fails on any skip and on any required suite that did
+# not run. The DynamoDB gate runs even when the Kinesis gate fails.
+#
+# The scripts run on the runner, where they start and remove the emulator with
 # Docker; the test binaries run inside the toolchain image through PIN_RUNNER,
 # on the runner's network.
 
@@ -31,12 +43,12 @@ permissions:
   packages: read
 
 concurrency:
-  group: kinesis-${{ github.ref }}
+  group: aws-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   live:
-    name: The Kinesis source holds its contract against the emulator and the model
+    name: The Kinesis source and the DynamoDB sink hold their contracts against the emulator and the models
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -57,12 +69,14 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-kinesis-${{ github.run_id }}
-          restore-keys: ccache-kinesis-
+          key: ccache-aws-${{ github.run_id }}
+          restore-keys: |
+            ccache-aws-
+            ccache-kinesis-
       # CLINK_WITH_AWS=ON, not AUTO: an SDK missing from the image fails the
       # configure rather than leaving the gate without its binaries. Debug
       # without DWARF and stripped, as the build job builds.
-      - name: Build the Kinesis tests, the recovery cells and the node binary
+      - name: Build the AWS tests, the recovery cells and the node binary
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ccache"
@@ -86,8 +100,8 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/ccache
-          key: ccache-kinesis-${{ github.run_id }}
-      - name: Run the gate
+          key: ccache-aws-${{ github.run_id }}
+      - name: Run the Kinesis gate
         run: |
           set -euo pipefail
           export REPORT_DIR="${RUNNER_TEMP}/kinesis-live-reports"
@@ -99,13 +113,26 @@ jobs:
             -e AWS_EC2_METADATA_DISABLED \
             ${TOOLCHAIN}"
           scripts/kinesis-live.sh build 2>&1 | tee "${RUNNER_TEMP}/kinesis-gate.log"
-      - name: Keep the reports and the cells' evidence
+      - name: Run the DynamoDB gate
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          export REPORT_DIR="${RUNNER_TEMP}/dynamodb-live-reports"
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_DYNAMODB_TEST_ENDPOINT -e CLINK_DYNAMODB_RECOVERY_LOG_DIR \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION -e AWS_REGION \
+            -e AWS_EC2_METADATA_DISABLED \
+            ${TOOLCHAIN}"
+          scripts/dynamodb-live.sh build 2>&1 | tee "${RUNNER_TEMP}/dynamodb-gate.log"
+      - name: Keep the Kinesis reports and the cells' evidence
         # The reports carry every case's result; the gate log and each run's log
-        # carry the recovery cells' "[kinesis-recovery]" lines and the fault
-        # framework's witness lines; recovery-logs/ holds every cell's
-        # coordinator and worker logs; provenance.txt names the commit, the
-        # build's configuration and the emulator. On failure the report
-        # directory also holds the emulator's own log.
+        # carry the recovery cells' verdict lines and the fault framework's
+        # witness lines; recovery-logs/ holds every cell's coordinator and worker
+        # logs; provenance.txt names the commit, the build's configuration and the
+        # emulator. On failure the report directory also holds the emulator's own
+        # log.
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -115,13 +142,23 @@ jobs:
             ${{ runner.temp }}/kinesis-gate.log
           if-no-files-found: warn
           retention-days: 90
+      - name: Keep the DynamoDB reports and the cells' evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynamodb-gate
+          path: |
+            ${{ runner.temp }}/dynamodb-live-reports/**
+            ${{ runner.temp }}/dynamodb-gate.log
+          if-no-files-found: warn
+          retention-days: 90
       - name: Upload the harness logs on failure
         # The harness keeps its scratch tree, with every Coordinator and
         # Worker log, when a recovery cell fails.
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: kinesis-harness-logs
+          name: aws-harness-logs
           path: /tmp/clink_it_*/logs/**
           if-no-files-found: ignore
           retention-days: 14
