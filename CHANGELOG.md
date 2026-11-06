@@ -14,8 +14,8 @@ generated password appears anywhere it keeps. A cluster phase runs three nodes
 and kills one while the sink writes (`docker/search-cluster.yml`). The recovery
 cells add the kill after a confirmed flush as a SQL job at parallelism 2. The
 unconfirmed-replies cell now waits for twelve refused requests instead of
-sleeping eight seconds, so the sleep baseline is back to five. The `search` CI
-workflow runs all four servers.
+sleeping eight seconds, so the sleep baseline is back to five. All four gates
+passed locally, 55 of 55 each. The `search` CI workflow runs all four servers.
 
 **A cancelled task interrupts an HTTP bulk sink's request in flight.** Only the
 pause between retries ended on cancellation, so a task cancelled while a request
