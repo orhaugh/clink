@@ -151,6 +151,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+free_port() {
+    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+}
+
+# run_published <container> <service> [docker compose run options...]: the
+# service's container with port 9200 on a free loopback port, which it prints.
+# Docker's port allocator can still hold a port the host shows free, and then
+# refuses to bind it, so a refused start is tried again on another port.
+run_published() {
+    local name="$1" service="$2" port attempt
+    shift 2
+    for attempt in 1 2 3; do
+        port="$(free_port)"
+        docker rm -fv "${name}" >/dev/null 2>&1 || true
+        if "${COMPOSE[@]}" run -d --name "${name}" -p "127.0.0.1:${port}:9200" "$@" "${service}" \
+            >/dev/null; then
+            echo "${port}"
+            return 0
+        fi
+        echo "search-live: ${name} did not start on port ${port} (attempt ${attempt})" >&2
+    done
+    return 1
+}
+
 # start_server <container> [docker compose run options...]: one container of the
 # product's service on a free loopback port. Prints its endpoint once it answers;
 # fails the gate if it never does. Run in a command substitution, so the caller
@@ -158,9 +182,7 @@ trap cleanup EXIT
 start_server() {
     local name="$1" port endpoint
     shift
-    port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-    docker rm -fv "${name}" >/dev/null 2>&1 || true
-    "${COMPOSE[@]}" run -d --name "${name}" -p "127.0.0.1:${port}:9200" "$@" "${PRODUCT}" >/dev/null
+    port="$(run_published "${name}" "${PRODUCT}" "$@")" || return 1
     endpoint="http://127.0.0.1:${port}"
     for _ in $(seq 1 180); do
         if curl -fsS "${endpoint}/_cluster/health?wait_for_status=yellow&timeout=1s" >/dev/null 2>&1; then
@@ -272,10 +294,8 @@ if [ "${SEARCH_LIVE_SECURED}" = "1" ]; then
             ;;
     esac
     export "${password_var}=${SECURED_PASSWORD}"
-    port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-    docker rm -fv "${secured}" >/dev/null 2>&1 || true
-    "${COMPOSE[@]}" run -d --name "${secured}" -p "127.0.0.1:${port}:9200" -e "${password_var}" \
-        "${PRODUCT}-secured" >/dev/null
+    port="$(run_published "${secured}" "${PRODUCT}-secured" -e "${password_var}")" ||
+        { unset "${password_var}"; status=1; exit 1; }
     unset "${password_var}"
     endpoint="https://127.0.0.1:${port}"
     ca="${REPORT_DIR}/secured-ca.pem"
@@ -330,9 +350,22 @@ if [ "${SEARCH_LIVE_CLUSTER}" = "1" ]; then
             nodes=(os01 os02 os03)
             ;;
     esac
-    SEARCH_CLUSTER_PORT="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-    export SEARCH_CLUSTER_PORT
-    "${CLUSTER_COMPOSE[@]}" up -d "${nodes[@]}" >/dev/null
+    # As run_published: a port Docker refuses is tried again on another.
+    up=0
+    for attempt in 1 2 3; do
+        SEARCH_CLUSTER_PORT="$(free_port)"
+        export SEARCH_CLUSTER_PORT
+        if "${CLUSTER_COMPOSE[@]}" up -d "${nodes[@]}" >/dev/null; then
+            up=1
+            break
+        fi
+        echo "search-live: the cluster did not start on port ${SEARCH_CLUSTER_PORT} (attempt ${attempt})" >&2
+        "${CLUSTER_COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+    done
+    if [ "${up}" != 1 ]; then
+        status=1
+        exit 1
+    fi
     endpoint="http://127.0.0.1:${SEARCH_CLUSTER_PORT}"
     ready=0
     for _ in $(seq 1 300); do
