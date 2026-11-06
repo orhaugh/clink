@@ -77,8 +77,9 @@ start the pinned server: Elasticsearch 8.13.4, or OpenSearch 2.17.1, which is
 new in `docker/integration-services.yml`. Each runs the offline suites, the
 product's live suite and four recovery cells against it. It fails on a skipped
 case, a short suite, a missing binary or a server that is not the product named,
-and keeps provenance, every case's verdict line and the cells' logs. The new
-`search` CI workflow runs both gates; it has not yet run.
+and keeps provenance, every case's verdict line and the cells' logs. Both
+passed locally on `9152fdc8`, 43 of 43 each. The new `search` CI workflow runs
+both gates; it has not yet run.
 
 **A MongoDB source's checkpoint covers only the change events it handed to the
 job.** A pass that stopped at its cap of 1,024 events advanced the driver's
