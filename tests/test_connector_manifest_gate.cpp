@@ -291,9 +291,9 @@ bool planner_binds(const std::string& connector, bool as_source) {
 // surface that no `connector='...'` reached, so `clink --capabilities` and
 // the connector pages disagreed about what SQL could do. Variant records
 // (kafka_2pc, postgres_upsert, clickhouse_native) are reached through their
-// base name plus a WITH option, and two identities also cover a longer SQL
+// base name plus a WITH option, and some identities also cover a longer SQL
 // vocabulary name their impl registers factories for (s3 -> s3_parquet,
-// http -> http_poll).
+// http -> http_poll, mongo and mongo_cdc -> mongodb).
 TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
     clink::plugin::PluginRegistry reg;
     clink::plugin::install_defaults(reg);
@@ -303,6 +303,8 @@ TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
     static const std::map<std::string, std::vector<std::string>> kAliases = {
         {"s3", {"s3_parquet"}},
         {"http", {"http_poll"}},
+        {"mongo", {"mongodb"}},
+        {"mongo_cdc", {"mongodb"}},
     };
     std::vector<std::string> failures;
     for (const auto& cap : clink::connectors::CapabilityRegistry::instance().all()) {

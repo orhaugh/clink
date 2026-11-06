@@ -52,6 +52,14 @@ struct MongoSinkOptions {
     // wtimeout for the majority write concern, unless the URI sets one: a batch
     // that cannot reach a majority fails within this bound.
     std::chrono::milliseconds write_timeout{30000};
+    // The SQL table's columns ("name:TYPE;name:TYPE"), set by the SQL planner.
+    // When set, each record is a row as row_to_json_string writes it: the sink
+    // writes the declared columns with the BSON types src/sql_row.hpp maps them
+    // to, and reads the row's __row_kind as its change kind. Under upsert a
+    // delete removes the key's document and an update_before is skipped (its
+    // update_after replaces the document); the insert sink refuses any kind but
+    // insert.
+    std::string sql_column_types;
     std::string name{"mongo_sink"};
 };
 

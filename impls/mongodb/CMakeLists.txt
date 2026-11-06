@@ -66,6 +66,7 @@ add_library(clink_mongodb STATIC
     src/register_factories.cpp
     src/mongo_cdc_source.cpp
     src/mongo_sink.cpp
+    src/sql_row.cpp
 )
 add_library(clink::mongodb ALIAS clink_mongodb)
 

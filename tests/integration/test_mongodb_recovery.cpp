@@ -17,9 +17,12 @@
 //      into a mirror, with a worker parked after a write killed;
 //   6. a worker parked at the source's first emission, before any checkpoint
 //      of the job completed, is SIGKILLed: the job restarts from no
-//      checkpoint, and the source resumes where the run's stream started.
+//      checkpoint, and the source resumes where the run's stream started;
+//   7. cell 5's mirror as a SQL job (connector='mongodb' tables, mode='upsert'),
+//      submitted by clink_submit_sql, with a worker parked after a write
+//      killed.
 //
-// Cells 1 to 4 and 6 copy inserts with the insert sink. Cells 1 to 3 and 5 let
+// Cells 1 to 4 and 6 copy inserts with the insert sink. Cells 1 to 3, 5 and 7 let
 // a checkpoint complete before the writer starts, so the kill restores from
 // one. Each kill lands while records are in flight: when the worker parks, the
 // source collection holds documents the destination does not. The pass
@@ -27,14 +30,15 @@
 // own client rather than anything clink reports: the destination holds exactly
 // one document per inserted source document, equal to it plus the change
 // metadata (cells 1-4), or the mirror holds every surviving source document as
-// the source holds it and a delete's tombstone for each deleted one (cell 5);
+// the source holds it and a delete's tombstone for each deleted one (cells 5
+// and 7, which also check that the mirror had not converged at the kill);
 // and the restarts and the faults each cell names, witnessed in the logs while
 // the job ran.
 //
 // Needs the replica set scripts/mongodb-live.sh starts (CLINK_MONGODB_TEST_URI,
 // and CLINK_MONGODB_TEST_CONTAINER for the outage cell), and the clink_node
-// binary of a build with fault injection. Each cell prints one
-// "[mongodb-recovery]" line.
+// binary of a build with fault injection (and clink_submit_sql for cell 7).
+// Each cell prints one "[mongodb-recovery]" line.
 
 #include <algorithm>
 #include <atomic>
@@ -235,17 +239,23 @@ protected:
         spec.slots_per_worker = 3;
         spec.http = true;
         auto cluster = std::make_unique<Cluster>(spec);
-        ProcOptions armed;
-        armed.fault = fault;
-        if (!cluster->start_coordinator() || !cluster->start_worker(0, armed) ||
+        if (!cluster->start_coordinator() || !cluster->start_worker(0, worker_options(fault)) ||
             !cluster->await_workers_registered(1)) {
             ADD_FAILURE() << "the cluster did not start";
         }
         return cluster;
     }
 
+    // Every worker can read the URI the SQL cell's tables name by reference.
+    ProcOptions worker_options(std::string fault = {}) const {
+        ProcOptions o;
+        o.fault = std::move(fault);
+        o.env = {{"CLINK_MONGODB_RECOVERY_URI", uri_}};
+        return o;
+    }
+
     void add_spare_worker(Cluster& cluster) {
-        ASSERT_TRUE(cluster.start_worker(1, ProcOptions{}));
+        ASSERT_TRUE(cluster.start_worker(1, worker_options()));
         ASSERT_TRUE(cluster.await_workers_registered(2));
         started_workers_ = 2;
     }
@@ -266,6 +276,90 @@ protected:
                                  "application/json");
         ASSERT_NE(r.body.find("\"ok\":true"), std::string::npos)
             << "the job was not accepted: " << r.body;
+    }
+
+    // `sql` compiled and submitted by clink_submit_sql, as a deployment does.
+    void submit_sql(Cluster& cluster, const std::string& sql) {
+        clink::itest::Process submit;
+        ASSERT_TRUE(submit.spawn("submit-sql",
+                                 sql_binary(),
+                                 {sql_binary().string(),
+                                  "-e",
+                                  sql,
+                                  "--coordinator-host",
+                                  "127.0.0.1",
+                                  "--coordinator-port",
+                                  std::to_string(cluster.http_port()),
+                                  "--name",
+                                  "mongodb-recovery-sql",
+                                  "--checkpoint-dir",
+                                  cluster.checkpoint_dir().string(),
+                                  "--checkpoint-interval-ms",
+                                  "1000",
+                                  "--alignment",
+                                  "aligned",
+                                  "--max-restarts-on-worker-loss",
+                                  "8",
+                                  "--parallelism",
+                                  "2"},
+                                 cluster.log_dir()));
+        const auto code = submit.await_exit(60s);
+        ASSERT_TRUE(code.has_value());
+        ASSERT_EQ(*code, 0) << submit.read_log();
+    }
+
+    static std::filesystem::path sql_binary() {
+#ifdef CLINK_SUBMIT_SQL_BINARY
+        return std::filesystem::path{CLINK_SUBMIT_SQL_BINARY};
+#else
+        return {};
+#endif
+    }
+
+    // Inserts, updates and deletes for the mirror cells: expected_ documents
+    // with v 0, then v 1 and v 2 for each, then every fifth deleted.
+    void mirror_workload() const {
+        auto own = verifier_client(uri_);
+        auto c = own["test"][src_];
+        for (std::int64_t i = 1; i <= expected_; ++i) {
+            c.insert_one(make_document(kvp("_id", i), kvp("v", 0)));
+        }
+        for (int round = 1; round <= 2; ++round) {
+            for (std::int64_t i = 1; i <= expected_; ++i) {
+                c.update_one(make_document(kvp("_id", i)),
+                             make_document(kvp("$set", make_document(kvp("v", round)))));
+            }
+        }
+        for (std::int64_t i = 5; i <= expected_; i += 5) {
+            c.delete_one(make_document(kvp("_id", i)));
+        }
+    }
+
+    // The mirror holds every surviving source document as the source holds it,
+    // and a delete's tombstone for each deleted one.
+    void expect_mirrored() {
+        auto mirror = (*client_)["test"][dst_];
+        ASSERT_TRUE(clink::itest::await(
+            [&] {
+                return mirror.count_documents(make_document(kvp("v", 2))) ==
+                           expected_ - expected_ / 5 &&
+                       mirror.count_documents(make_document(kvp("__op", "delete"))) ==
+                           expected_ / 5;
+            },
+            240s))
+            << "the mirror did not converge: " << mirror.count_documents(make_document(kvp("v", 2)))
+            << " documents at v=2, " << mirror.count_documents(make_document(kvp("__op", "delete")))
+            << " tombstones";
+        EXPECT_EQ(mirror.count_documents(make_document()), expected_);
+        std::size_t wrong = 0;
+        for (auto&& s : (*client_)["test"][src_].find(make_document())) {
+            const auto id = as_int(s["_id"]);
+            auto m = mirror.find_one(make_document(kvp("_id", id)));
+            if ((!m || as_int(m->view()["v"]) != as_int(s["v"])) && ++wrong <= 5) {
+                ADD_FAILURE() << "document " << id << " is not mirrored as the source holds it";
+            }
+        }
+        EXPECT_EQ(wrong, 0U);
     }
 
     static void cancel_job(const Cluster& cluster) {
@@ -345,7 +439,7 @@ protected:
         cluster.worker(idx).kill_hard();
         ASSERT_TRUE(cluster.worker(idx).await_exit(10s).has_value());
         archived_logs_.push_back(cluster.worker(idx).read_log());
-        ASSERT_TRUE(cluster.restart_worker(idx, ProcOptions{}));
+        ASSERT_TRUE(cluster.restart_worker(idx, worker_options()));
     }
 
     // Whether worker 0, the armed one, has parked at `point`.
@@ -399,22 +493,32 @@ protected:
         }
     }
 
+    // `extra` adds the mirror cells' measure of what was in flight.
     void report(const char* cell,
                 std::size_t restarts_spent,
                 Cluster& cluster,
                 std::int64_t inserted_at_fault,
-                std::int64_t landed_at_fault) {
+                std::int64_t landed_at_fault,
+                const std::string& extra = {}) {
         keep_logs(cell, cluster);
         std::printf(
             "[mongodb-recovery] cell=%s produced=%lld restarts=%zu inserted_at_fault=%lld "
-            "landed_at_fault=%lld replayed_batches_recognised=%zu\n",
+            "landed_at_fault=%lld replayed_batches_recognised=%zu%s\n",
             cell,
             static_cast<long long>(expected_),
             restarts_spent,
             static_cast<long long>(inserted_at_fault),
             static_cast<long long>(landed_at_fault),
-            count_in_workers(cluster, "were already stored exactly as they arrive"));
+            count_in_workers(cluster, "were already stored exactly as they arrive"),
+            extra.c_str());
         std::fflush(stdout);
+    }
+
+    // The mirror's documents at their final value when the worker was killed,
+    // against the number that end there.
+    std::string converged_at_fault(std::int64_t settled) const {
+        return " converged_at_fault=" + std::to_string(settled) + "/" +
+               std::to_string(expected_ - expected_ / 5);
     }
 
     void kill_at(const std::string& point, const char* cell, const std::string& rule);
@@ -542,57 +646,73 @@ TEST_F(MongoRecovery, AMirrorByKeyConvergesOnTheSourceAfterAWorkerIsKilled) {
     add_spare_worker(*cluster);
     await_first_checkpoint(*cluster);
     expected_ = 600;
-    auto c = (*client_)["test"][src_];
-    std::thread workload([&] {
-        auto own = verifier_client(uri_);
-        auto c = own["test"][src_];
-        for (std::int64_t i = 1; i <= expected_; ++i) {
-            c.insert_one(make_document(kvp("_id", i), kvp("v", 0)));
-        }
-        for (int round = 1; round <= 2; ++round) {
-            for (std::int64_t i = 1; i <= expected_; ++i) {
-                c.update_one(make_document(kvp("_id", i)),
-                             make_document(kvp("$set", make_document(kvp("v", round)))));
-            }
-        }
-        for (std::int64_t i = 5; i <= expected_; i += 5) {
-            c.delete_one(make_document(kvp("_id", i)));
-        }
-    });
+    std::thread workload([this] { mirror_workload(); });
     const bool parked = parked_at(*cluster, "mongodb.sink_after_write");
     if (!parked) {
         workload.join();
         FAIL() << "worker 0 never parked after a write";
     }
+    // In flight: the mirror had not caught up with the source when the worker
+    // was killed.
+    const auto inserted = count(src_);
+    const auto landed = count(dst_);
+    const auto settled = (*client_)["test"][dst_].count_documents(make_document(kvp("v", 2)));
     kill_and_replace(*cluster, 0);
     workload.join();
     ASSERT_TRUE(cluster->await_workers_registered(2));
-    // Converged: every surviving document at v=2, every deleted one a tombstone.
-    auto mirror = (*client_)["test"][dst_];
-    ASSERT_TRUE(clink::itest::await(
-        [&] {
-            return mirror.count_documents(make_document(kvp("v", 2))) ==
-                       expected_ - expected_ / 5 &&
-                   mirror.count_documents(make_document(kvp("__op", "delete"))) == expected_ / 5;
-        },
-        240s))
-        << "the mirror did not converge: " << mirror.count_documents(make_document(kvp("v", 2)))
-        << " documents at v=2, " << mirror.count_documents(make_document(kvp("__op", "delete")))
-        << " tombstones";
+    EXPECT_LT(settled, expected_ - expected_ / 5) << "the mirror had converged before the kill";
+    expect_mirrored();
     const auto spent = restarts(*cluster);
     cancel_job(*cluster);
-    report("mirror_after_write", spent, *cluster, 0, 0);
+    report("mirror_after_write", spent, *cluster, inserted, landed, converged_at_fault(settled));
     EXPECT_EQ(spent, 1U);
-    EXPECT_EQ(mirror.count_documents(make_document()), expected_);
-    std::size_t wrong = 0;
-    for (auto&& s : c.find(make_document())) {
-        const auto id = as_int(s["_id"]);
-        auto m = mirror.find_one(make_document(kvp("_id", id)));
-        if ((!m || as_int(m->view()["v"]) != as_int(s["v"])) && ++wrong <= 5) {
-            ADD_FAILURE() << "document " << id << " is not mirrored as the source holds it";
-        }
+}
+
+// The same mirror as a SQL job, compiled and submitted by clink_submit_sql at
+// parallelism 2 to the coordinator: the change stream read as typed rows, the
+// mirror written by mode='upsert' keyed by its PRIMARY KEY, the URI named by an
+// env:// reference that each worker resolves. A worker parked after a write is
+// killed while the changes flow.
+TEST_F(MongoRecovery, ASqlMirrorConvergesOnTheSourceAfterAWorkerIsKilled) {
+    if (!std::filesystem::exists(sql_binary())) {
+        GTEST_SKIP() << "the clink_submit_sql binary is not built";
     }
-    EXPECT_EQ(wrong, 0U);
+    auto cluster = make_cluster("mongodb.sink_after_write=block@3");
+    ScopedDiagnostics diagnostics(*cluster);
+    const std::string uri = "uri='env://CLINK_MONGODB_RECOVERY_URI', database='test', ";
+    submit_sql(*cluster,
+               "CREATE TABLE changes (__id BIGINT, __op VARCHAR, v BIGINT) WITH "
+               "(connector='mongodb', " +
+                   uri + "collection='" + src_ +
+                   "', max_await_ms='200'); "
+                   "CREATE TABLE mirror (_id BIGINT PRIMARY KEY, __op VARCHAR, v BIGINT) WITH "
+                   "(connector='mongodb', " +
+                   uri + "collection='" + dst_ +
+                   "', mode='upsert', batch_records='200', linger_ms='200'); "
+                   "INSERT INTO mirror SELECT __id AS _id, __op, v FROM changes;");
+    await_stream_open(*cluster);
+    add_spare_worker(*cluster);
+    await_first_checkpoint(*cluster);
+    expected_ = 600;
+    std::thread workload([this] { mirror_workload(); });
+    const bool parked = parked_at(*cluster, "mongodb.sink_after_write");
+    if (!parked) {
+        workload.join();
+        FAIL() << "worker 0 never parked after a write";
+    }
+    const auto inserted = count(src_);
+    const auto landed = count(dst_);
+    const auto settled = (*client_)["test"][dst_].count_documents(make_document(kvp("v", 2)));
+    kill_and_replace(*cluster, 0);
+    workload.join();
+    ASSERT_TRUE(cluster->await_workers_registered(2));
+    EXPECT_LT(settled, expected_ - expected_ / 5) << "the mirror had converged before the kill";
+    expect_mirrored();
+    const auto spent = restarts(*cluster);
+    cancel_job(*cluster);
+    report(
+        "sql_mirror_after_write", spent, *cluster, inserted, landed, converged_at_fault(settled));
+    EXPECT_EQ(spent, 1U);
 }
 
 // The worker parks at the source's first emission, before any checkpoint of the

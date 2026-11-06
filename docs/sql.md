@@ -211,13 +211,14 @@ windows.
 ### Connector catalogue
 
 `connector` names the kind. Sources you can read from include `file`, `kafka`,
-`rabbitmq`, `websocket`, `nats`, `pulsar`, `postgres`, `mysql`, `clickhouse`,
-`parquet`, `s3_parquet` (and `gcs_parquet` / `azure_parquet` / `webhdfs_parquet`),
-`kinesis`, `http_poll`, `pubsub`, `redis`, `iceberg`, `nexmark`, `lookup` and
-`queryable_state`. Sinks you can write to include `file`, `kafka`, `rabbitmq`,
-`nats`, `pulsar`, `pubsub`, `parquet`, `s3` / `s3_parquet` (and `gcs_parquet` /
-`azure_parquet` / `webhdfs_parquet`), `iceberg`, `delta`, `postgres`, `mysql`,
-`clickhouse`, `cassandra`, `redis`, `http`, `elasticsearch`, `opensearch`,
+`rabbitmq`, `websocket`, `nats`, `pulsar`, `postgres`, `mysql`, `mongodb`,
+`clickhouse`, `parquet`, `s3_parquet` (and `gcs_parquet` / `azure_parquet` /
+`webhdfs_parquet`), `kinesis`, `http_poll`, `pubsub`, `redis`, `iceberg`,
+`nexmark`, `lookup` and `queryable_state`. Sinks you can write to include
+`file`, `kafka`, `rabbitmq`, `nats`, `pulsar`, `pubsub`, `parquet`, `s3` /
+`s3_parquet` (and `gcs_parquet` / `azure_parquet` / `webhdfs_parquet`),
+`iceberg`, `delta`, `postgres`, `mysql`, `mongodb`, `clickhouse`, `cassandra`,
+`redis`, `http`, `elasticsearch`, `opensearch`,
 `splunk_hec` (alias `splunk`), `influxdb`, `prometheus`, `firehose`, `dynamodb`,
 `changelog`, and the debugging sinks `print`, `collect` and `blackhole`. The
 [connector catalogue](connectors/README.md) has the full list with each

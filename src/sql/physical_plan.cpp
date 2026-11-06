@@ -23,6 +23,7 @@
 #include "clink/sql/parser.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
 #include "clink/sql/state_ttl.hpp"
+#include "clink/sql/table_option_check.hpp"
 #include "clink/sql/type.hpp"
 
 namespace clink::sql {
@@ -95,9 +96,10 @@ bool is_object_store_parquet(const std::string& connector) {
 
 Channel channel_for_table(const TableDef& table) {
     // The Neo4j sink passes each row to its statement as typed parameters named
-    // after the declared columns, whatever their number: always the Row channel.
+    // after the declared columns, whatever their number, and a MongoDB table's
+    // columns are typed document fields: always the Row channel.
     if (const auto c = table.properties.find("connector");
-        c != table.properties.end() && c->second == "neo4j") {
+        c != table.properties.end() && (c->second == "neo4j" || c->second == "mongodb")) {
         return Channel::Row;
     }
     auto fmt = table.properties.find("format");
@@ -309,6 +311,72 @@ bool is_postgres_cdc_table(const TableDef& table) {
     const auto m = table.properties.find("mode");
     return c != table.properties.end() && c->second == "postgres" && m != table.properties.end() &&
            m->second == "cdc";
+}
+
+// A MongoDB table (connector='mongodb'): as a source, a change stream read by one
+// subtask; as a sink, the insert or upsert-by-key sink.
+bool is_mongodb_table(const TableDef& table) {
+    const auto c = table.properties.find("connector");
+    return c != table.properties.end() && c->second == "mongodb";
+}
+
+// A connector='mongodb' table's options, for the way it is used: an option the
+// connector does not read in that direction is refused rather than ignored, and
+// the refusal lists the ones it reads.
+void check_mongodb_options(const TableDef& table, bool as_source) {
+    static const std::vector<std::string> kCommon = {"uri", "database", "collection"};
+    static const std::vector<std::string> kSource = {"full_document", "max_await_ms"};
+    static const std::vector<std::string> kSink = {
+        "batch_records", "max_bytes", "linger_ms", "write_timeout_ms"};
+    const auto& own = as_source ? kSource : kSink;
+    const auto& other = as_source ? kSink : kSource;
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        const auto listed = [&key](const std::vector<std::string>& v) {
+            return std::find(v.begin(), v.end(), key) != v.end();
+        };
+        if (listed(kCommon) || listed(own)) {
+            continue;
+        }
+        if (key == "key_field" || key == "on_duplicate") {
+            unsupported("table '" + table.name + "': connector='mongodb' takes no '" + key +
+                        "' in SQL: the sink inserts, or under mode='upsert' replaces and "
+                        "deletes by the table's single-column PRIMARY KEY");
+        }
+        if (key == "format" && value == "json") {
+            continue;
+        }
+        if (listed(interpreted) && key != "format") {
+            continue;
+        }
+        std::string accepted;
+        for (const auto* list : {&kCommon, &own}) {
+            for (const auto& o : *list) {
+                accepted += (accepted.empty() ? "" : ", ") + o;
+            }
+        }
+        unsupported("table '" + table.name + "': connector='mongodb' " +
+                    (as_source ? "source" : "sink") + " does not read option '" + key + "'" +
+                    (listed(other)
+                         ? std::string{" (it is a "} + (as_source ? "sink" : "source") + " option)"
+                         : std::string{}) +
+                    "; it reads " + accepted);
+    }
+    if (const auto u = table.properties.find("uri");
+        u == table.properties.end() || u->second.empty()) {
+        unsupported("table '" + table.name +
+                    "': connector='mongodb' needs 'uri', the connection string (credentials and "
+                    "TLS go in it; 'env://VAR' reads it from the worker's environment)");
+    }
+    if (!as_source) {
+        for (const char* required : {"database", "collection"}) {
+            if (const auto it = table.properties.find(required);
+                it == table.properties.end() || it->second.empty()) {
+                unsupported("table '" + table.name + "': a connector='mongodb' sink needs '" +
+                            required + "'");
+            }
+        }
+    }
 }
 
 // A CDC table declared keep_rows='true': the plan keeps the latest row of every
@@ -696,11 +764,26 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{"postgres_source", kChannelString, "json_string_to_row"};
     }
+    if (connector == "mongodb") {
+        // MongoDB change stream: each insert, update, replace and delete is one
+        // appended row of the declared columns, converted strictly from the
+        // event's BSON (sql_row.hpp in the connector). There is no changelog
+        // form: an update carries no before-image to retract. At-least-once
+        // (resume-token checkpoint).
+        check_mongodb_options(table, /*as_source=*/true);
+        if (table.mode() != "append") {
+            unsupported("table '" + table.name +
+                        "': a connector='mongodb' source appends one row per change event, with "
+                        "its kind in __op; mode='" +
+                        table.mode() + "' does not apply to it");
+        }
+        return RowConnectorBinding{"mongo_cdc_source", kChannelString, "json_string_to_row"};
+    }
     unsupported(
         "format='json' source requires connector='file', 'queryable_state', 'kafka', "
         "'rabbitmq', 'websocket', 'nats', 'pulsar', 'parquet', 's3_parquet', 'gcs_parquet', "
         "'azure_parquet', 'webhdfs_parquet', 'iceberg', 'nexmark', 'kinesis', 'http_poll', "
-        "'pubsub', 'redis', 'mysql', 'clickhouse' or 'postgres' (got '" +
+        "'pubsub', 'redis', 'mysql', 'clickhouse', 'postgres' or 'mongodb' (got '" +
         connector + "')");
 }
 
@@ -864,6 +947,47 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
                                        {{"key_columns", keys}}};
         }
         return RowConnectorBinding{"cassandra_sink_string", kChannelString, "row_to_json_string"};
+    }
+    if (connector == "mongodb") {
+        // MongoDB sinks: each row -> JSON object string (non-finite doubles in
+        // the tagged form) -> the declared columns as typed BSON. Append inserts
+        // (at-least-once); mode='upsert' replaces by the single-column PRIMARY
+        // KEY and deletes on a delete row (effectively once on the key, under
+        // the conditions on the connector page). Refused here as well as at
+        // bind time, because a materialised view's backing table is not bound.
+        check_mongodb_options(table, /*as_source=*/false);
+        if (exactly_once) {
+            unsupported(
+                "connector='mongodb' sink is at-least-once, or with mode='upsert' effectively "
+                "once on its key; exactly-once delivery is not supported");
+        }
+        if (const auto cl = table.properties.find("changelog");
+            cl != table.properties.end() && cl->second == "true") {
+            unsupported(
+                "connector='mongodb' sink does not support changelog='true': declare a PRIMARY "
+                "KEY and mode='upsert' to apply deletes by key");
+        }
+        if (const auto wm = table.properties.find("write_mode");
+            wm != table.properties.end() && wm->second == "overwrite") {
+            unsupported(
+                "connector='mongodb' sink cannot back a full-refresh materialised view: each "
+                "refresh would write the whole result again");
+        }
+        std::map<std::string, std::string> params{
+            {"sql_column_types", render_sql_column_types(table)}};
+        if (upsert) {
+            if (table.primary_key.size() != 1) {
+                unsupported(
+                    "connector='mongodb' mode='upsert' keys each document by one field: "
+                    "declare a single-column PRIMARY KEY (table '" +
+                    table.name + "' declares " + std::to_string(table.primary_key.size()) + ")");
+            }
+            params["key_field"] = table.primary_key.front();
+            return RowConnectorBinding{
+                "mongo_upsert_sink", kChannelString, "row_to_json_string", std::move(params)};
+        }
+        return RowConnectorBinding{
+            "mongo_sink", kChannelString, "row_to_json_string", std::move(params)};
     }
     if (connector == "neo4j") {
         // The Neo4j sink takes Rows and sends each batch as typed parameters of
@@ -1264,8 +1388,8 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     unsupported(
         "format='json' sink requires connector='file', 'kafka', 'clickhouse', 'postgres', "
         "'parquet', 'http', 'pubsub', 'elasticsearch', 'opensearch', 'splunk_hec', 'prometheus', "
-        "'kinesis', 'redis', 'mysql', 'firehose', 'dynamodb', 'blackhole', 'print', 'collect' or "
-        "'changelog' (got '" +
+        "'kinesis', 'redis', 'mysql', 'firehose', 'dynamodb', 'mongodb', 'blackhole', 'print', "
+        "'collect' or 'changelog' (got '" +
         connector + "')");
 }
 
@@ -1317,6 +1441,11 @@ std::optional<std::string> sink_json_non_finite(const TableDef& table,
                     "': json_non_finite applies to a sink that writes JSON, and connector='" +
                     (c == table.properties.end() ? std::string{} : c->second) +
                     "' does not (its sink is '" + writer_op + "'). Remove the option.");
+    }
+    if (is_mongodb_table(table)) {
+        unsupported("table '" + table.name +
+                    "': json_non_finite does not apply to connector='mongodb', which writes a NaN "
+                    "or an infinity as the BSON double itself. Remove the option.");
     }
     if (registry_format_is_binary(table)) {
         unsupported("table '" + table.name + "': json_non_finite does not apply to format='" +
@@ -1473,6 +1602,17 @@ std::string compile_node(const LogicalPlan& node,
             // BIGINT and INTEGER columns (with_declared_numeric_columns). Other
             // Row connectors ignore it.
             op.params["schema_columns"] = serialize_row_schema(row_columns_of(table));
+        }
+        if (ch == Channel::Row && is_mongodb_table(table)) {
+            // A change stream has one reader; the other subtasks would only
+            // idle. Its events keep their order through every operator behind
+            // it that is not keyed (propagate_forced_singletons), and so per key
+            // through a keyed one.
+            op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+            op.parallelism = 1;
+            // The declared SQL types, which each event's values are converted to
+            // (refusing what a type cannot hold exactly).
+            op.params["declared_types"] = render_sql_column_types(table);
         }
         if (ch == Channel::Row && is_postgres_cdc_table(table)) {
             // One replication slot has one reader: a second subtask would
@@ -2766,9 +2906,10 @@ std::string compile_node(const LogicalPlan& node,
                 if (non_finite) {
                     bridge.params[std::string{clink::config::kJsonNonFiniteOption}] = *non_finite;
                 }
-                if (registry_format_is_binary(table)) {
+                if (registry_format_is_binary(table) || is_mongodb_table(table)) {
                     // The JSON only reaches clink's own Avro / Protobuf encoder,
-                    // which reads the tagged form back as the IEEE value.
+                    // or the MongoDB sink's BSON writer, which read the tagged
+                    // form back as the IEEE value.
                     bridge.params["non_finite_form"] = "tagged";
                 }
                 before_sink = bridge.id;

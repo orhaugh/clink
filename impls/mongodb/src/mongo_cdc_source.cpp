@@ -20,6 +20,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <bsoncxx/json.hpp>
 #include <mongocxx/change_stream.hpp>
@@ -37,6 +38,7 @@
 
 #include "change_pass.hpp"
 #include "fault_points.hpp"
+#include "sql_row.hpp"
 
 namespace clink::mongodb {
 
@@ -69,7 +71,10 @@ const char* full_document_param(FullDocument mode) {
 // stream.
 class StreamCursor {
 public:
-    explicit StreamCursor(mongocxx::change_stream stream) : stream_(std::move(stream)) {}
+    // `mode` is the Extended JSON each event is read as: canonical for the typed
+    // SQL row, which tells every BSON type apart, relaxed for the JSON envelope.
+    StreamCursor(mongocxx::change_stream stream, bsoncxx::ExtendedJsonMode mode)
+        : stream_(std::move(stream)), mode_(mode) {}
     StreamCursor(const StreamCursor&) = delete;
     StreamCursor& operator=(const StreamCursor&) = delete;
 
@@ -82,7 +87,7 @@ public:
         if (*it_ == stream_.end()) {
             return std::nullopt;
         }
-        return bsoncxx::to_json(**it_, bsoncxx::ExtendedJsonMode::k_relaxed);
+        return bsoncxx::to_json(**it_, mode_);
     }
 
     std::optional<std::string> resume_token() {
@@ -94,6 +99,7 @@ public:
 
 private:
     mongocxx::change_stream stream_;
+    bsoncxx::ExtendedJsonMode mode_;
     std::optional<mongocxx::change_stream::iterator> it_;
 };
 
@@ -101,9 +107,23 @@ class MongoCdcSource final : public Source<std::string> {
 public:
     explicit MongoCdcSource(MongoCdcOptions opts)
         : opts_(std::move(opts)), dormant_(opts_.subtask_idx != 0) {
-        mapper_ = [mode = opts_.full_document](const clink::config::JsonValue& event) {
-            return change_event_to_json(event, mode);
-        };
+        if (opts_.declared_types.empty()) {
+            mapper_ = [mode = opts_.full_document](const clink::config::JsonValue& event) {
+                return change_event_to_json(event, mode);
+            };
+        } else {
+            std::vector<sql::Column> columns;
+            try {
+                columns = sql::parse_declared_types(opts_.declared_types);
+            } catch (const sql::ConversionError& e) {
+                throw std::runtime_error(opts_.name + ": " + e.what());
+            }
+            mapper_ = [mode = opts_.full_document,
+                       columns = std::move(columns)](const clink::config::JsonValue& event) {
+                return sql::change_event_to_sql_row(event, mode, columns);
+            };
+            json_mode_ = bsoncxx::ExtendedJsonMode::k_canonical;
+        }
         if (!opts_.collection.empty() && opts_.database.empty()) {
             throw std::runtime_error(opts_.name + ": 'collection' requires 'database'");
         }
@@ -155,11 +175,12 @@ public:
         try {
             if (!opts_.collection.empty()) {
                 cursor_ = std::make_unique<StreamCursor>(
-                    client[opts_.database][opts_.collection].watch(copts));
+                    client[opts_.database][opts_.collection].watch(copts), json_mode_);
             } else if (!opts_.database.empty()) {
-                cursor_ = std::make_unique<StreamCursor>(client[opts_.database].watch(copts));
+                cursor_ =
+                    std::make_unique<StreamCursor>(client[opts_.database].watch(copts), json_mode_);
             } else {
-                cursor_ = std::make_unique<StreamCursor>(client.watch(copts));
+                cursor_ = std::make_unique<StreamCursor>(client.watch(copts), json_mode_);
             }
             // Where the stream starts: every checkpoint from here on holds a token,
             // so a restore never has to start at the current time.
@@ -336,6 +357,7 @@ private:
     MongoCdcOptions opts_;
     bool dormant_{false};
     detail::EventMapper mapper_;
+    bsoncxx::ExtendedJsonMode json_mode_{bsoncxx::ExtendedJsonMode::k_relaxed};
     std::optional<Connection> connection_;
     std::unique_ptr<StreamCursor> cursor_;
     std::string resume_token_;    // what the next checkpoint records

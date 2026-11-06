@@ -34,6 +34,16 @@ std::int64_t positive(const BuildContext& ctx,
     return v;
 }
 
+// An env:// reference resolves to empty when its variable is unset; refused
+// by name, never by value.
+void require_uri(const BuildContext& ctx, const char* factory, const std::string& uri) {
+    if (ctx.params.count("uri") != 0 && uri.empty()) {
+        throw std::runtime_error(std::string(factory) +
+                                 ": 'uri' is empty (an env:// reference to a variable that is "
+                                 "unset or empty on this worker?)");
+    }
+}
+
 MongoSinkOptions sink_options(const BuildContext& ctx, const char* factory) {
     MongoSinkOptions o;
     o.uri = ctx.param_or("uri", "mongodb://localhost:27017");
@@ -48,6 +58,8 @@ MongoSinkOptions sink_options(const BuildContext& ctx, const char* factory) {
     }
     o.max_age = std::chrono::milliseconds{linger};
     o.write_timeout = std::chrono::milliseconds{positive(ctx, factory, "write_timeout_ms", 30000)};
+    o.sql_column_types = ctx.param_or("sql_column_types", "");
+    require_uri(ctx, factory, o.uri);
     o.name = factory;
     return o;
 }
@@ -97,7 +109,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         .backpressure = true,
         .retries = false,
         .timeout_options = {"max_await_ms"},
-        .available_in_sql = false,  // no connector='mongodb' binding in the SQL planner
+        // connector='mongodb' in SQL: one appended row per change event.
+        .available_in_sql = true,
         .limitations = {"changes only: no snapshot of what the collection holds when the "
                         "source first opens",
                         "a single reader: only subtask 0 watches",
@@ -106,7 +119,9 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "drop, rename, dropDatabase and invalidate events stop the source",
                         "full_document='updateLookup' reads an update's document after the "
                         "event, so it can carry later changes, or none once deleted",
-                        "a document field named __op, __ns, __id or __image stops the source"},
+                        "a document field named __op, __ns, __id or __image stops the source",
+                        "in SQL, a value its declared column cannot hold exactly stops the source; "
+                        "no changelog form, as an update carries no before-image"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "mongo",
@@ -131,7 +146,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         .backpressure = true,
         .retries = false,
         .timeout_options = {"write_timeout_ms"},
-        .available_in_sql = false,
+        // connector='mongodb' in SQL without mode='upsert'.
+        .available_in_sql = true,
         .limitations = {"a replayed record without an _id is inserted again",
                         "a URI asking for a write concern below w=majority is refused",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
@@ -161,7 +177,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         .backpressure = true,
         .retries = false,
         .timeout_options = {"write_timeout_ms"},
-        .available_in_sql = false,
+        // connector='mongodb' mode='upsert' in SQL, keyed by the PRIMARY KEY.
+        .available_in_sql = true,
         .limitations = {"a record without key_field, or with a key that is not a string, an "
                         "integer or an ObjectId, fails the flush",
                         "a key_field other than _id needs a unique index on it alone",
@@ -181,6 +198,9 @@ void install(clink::plugin::PluginRegistry& reg) {
     //       key_field, as mongo_upsert_sink writes)
     //   key_field (default "_id"), batch_records (1000), max_bytes (16 MiB),
     //   linger_ms (0), write_timeout_ms (30000)
+    //   sql_column_types - the SQL table's columns, set by the planner: each
+    //       record is then a SQL row (MongoSinkOptions::sql_column_types)
+    //   uri may be an env:// reference, read from the worker's environment
     reg.register_sink<std::string>(
         "mongo_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
             auto o = sink_options(ctx, "mongo_sink");
@@ -218,6 +238,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   full_document ('updateLookup' (default; 'lookup' too), 'whenAvailable',
     //       'required', or 'off' ('false' too))
     //   max_await_ms (default 1000) - change-stream maxAwaitTime / cancel latency
+    //   declared_types - the SQL table's columns, set by the planner: each event
+    //       is then the typed row sql_row.hpp describes
     reg.register_source<std::string>(
         "mongo_cdc_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             MongoCdcOptions o;
@@ -227,6 +249,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.full_document = full_document_of(ctx.param_or("full_document", "updateLookup"));
             o.max_await =
                 std::chrono::milliseconds{positive(ctx, "mongo_cdc_source", "max_await_ms", 1000)};
+            o.declared_types = ctx.param_or("declared_types", "");
+            require_uri(ctx, "mongo_cdc_source", o.uri);
             o.subtask_idx = ctx.subtask_idx;
             o.parallelism = ctx.parallelism;
             o.name = "mongo_cdc_source";

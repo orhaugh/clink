@@ -13,11 +13,14 @@
 #   - clink_mongodb_tests: the offline suites, the connector's round trips
 #     (MongoLive), the source's recovery contract (MongoSourceRecoveryLive) and
 #     the sink's failure cases (MongoSinkLive);
+#   - clink_mongodb_sql_tests: the SQL plans and refusals (MongoSqlPlan) and
+#     embedded SQL pipelines through the replica set (MongoSqlLive);
 #   - clink_integration_tests' MongoRecovery cells when that binary is built
 #     (MONGODB_LIVE_RECOVERY=0 leaves them out): a coordinator and two workers
-#     running a change-stream job into MongoDB, with a worker killed at the
-#     connector's fault points and the server stopped under a running job, each
-#     cell verified by reading MongoDB directly.
+#     running a change-stream job into MongoDB, one of them a SQL job submitted
+#     by clink_submit_sql, with a worker killed at the connector's fault points
+#     and the server stopped under a running job, each cell verified by reading
+#     MongoDB directly.
 # The container goes, with its volumes, when the gate ends.
 #
 # A live case skips when its server is not named and googletest counts that as
@@ -56,9 +59,11 @@ find_bin() {
     find "${BUILD_DIR}" -name "$1" -type f -perm -u+x 2>/dev/null | head -1
 }
 UNIT_BIN="$(find_bin clink_mongodb_tests)"
+SQL_BIN="$(find_bin clink_mongodb_sql_tests)"
 IT_BIN="$(find_bin clink_integration_tests)"
-if [ -z "${UNIT_BIN}" ]; then
-    echo "mongodb-live: clink_mongodb_tests must be built under ${BUILD_DIR}" >&2
+if [ -z "${UNIT_BIN}" ] || [ -z "${SQL_BIN}" ]; then
+    echo "mongodb-live: clink_mongodb_tests and clink_mongodb_sql_tests must be built under" \
+        "${BUILD_DIR}" >&2
     exit 1
 fi
 if [ "${MONGODB_LIVE_RECOVERY}" = "1" ] && [ -z "${IT_BIN}" ]; then
@@ -152,7 +157,8 @@ run() {  # <report name> <binary> [gtest args...]
 }
 
 run mongodb "${UNIT_BIN}"
-reports=("${REPORT_DIR}/mongodb.json")
+run sql "${SQL_BIN}"
+reports=("${REPORT_DIR}/mongodb.json" "${REPORT_DIR}/sql.json")
 expect=(
     --expect 'MongoFactoryRegistration.*=3'
     --expect 'MongoCapabilityRecords.*=1'
@@ -160,14 +166,18 @@ expect=(
     --expect 'MongoChangePass.*=4'
     --expect 'MongoSourceRestore.*=1'
     --expect 'MongoSinkRules.*=6'
+    --expect 'MongoSqlRow.*=14'
+    --expect 'MongoSqlSink.*=6'
     --expect 'MongoLive.*=6'
     --expect 'MongoSourceRecoveryLive.*=10'
     --expect 'MongoSinkLive.*=9'
+    --expect 'MongoSqlPlan.*=6'
+    --expect 'MongoSqlLive.*=3'
 )
 if [ "${MONGODB_LIVE_RECOVERY}" = "1" ]; then
     run recovery "${IT_BIN}" --gtest_filter='MongoRecovery.*'
     reports+=("${REPORT_DIR}/recovery.json")
-    expect+=(--expect 'MongoRecovery.*=6')
+    expect+=(--expect 'MongoRecovery.*=7')
 fi
 
 python3 "${ROOT}/scripts/check-gtest-reports.py" "${expect[@]}" "${reports[@]}" || status=1

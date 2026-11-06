@@ -22,6 +22,7 @@
 #include <mongocxx/collection.hpp>
 #include <mongocxx/exception/bulk_write_exception.hpp>
 #include <mongocxx/exception/operation_exception.hpp>
+#include <mongocxx/model/delete_one.hpp>
 #include <mongocxx/model/insert_one.hpp>
 #include <mongocxx/model/replace_one.hpp>
 #include <mongocxx/options/bulk_write.hpp>
@@ -33,6 +34,7 @@
 
 #include "fault_points.hpp"
 #include "sink_rules.hpp"
+#include "sql_row.hpp"
 
 namespace clink::mongodb {
 
@@ -96,6 +98,16 @@ public:
         }
         if (opts_.write_timeout.count() <= 0) {
             throw std::runtime_error(opts_.name + ": the write timeout must be positive");
+        }
+        if (!opts_.sql_column_types.empty()) {
+            try {
+                columns_ = sql::parse_sink_columns(opts_.sql_column_types);
+            } catch (const sql::ConversionError& e) {
+                throw std::runtime_error(opts_.name + ": " + e.what());
+            }
+            if (opts_.upsert) {
+                require_sql_key_column_();
+            }
         }
     }
 
@@ -170,34 +182,62 @@ public:
             // the batch is written: a record that cannot be matched by its key
             // fails the flush, rather than being inserted beside the document it
             // should have replaced.
+            std::size_t operations = 0;
             for (std::size_t i = 0; i < pending_.size(); ++i) {
+                const auto which = "record " + std::to_string(i + 1) + " of " + std::to_string(n);
+                // A SQL row: its declared columns as typed Extended JSON, and its kind.
+                std::string kind = "insert";
+                std::string sql_document;
+                if (!columns_.empty()) {
+                    try {
+                        auto d = sql::sql_row_to_document(pending_[i], columns_);
+                        kind = std::move(d.kind);
+                        sql_document = std::move(d.json);
+                    } catch (const std::exception& e) {
+                        throw std::runtime_error(which + ": " + e.what() +
+                                                 "; nothing of the batch was written");
+                    }
+                    if (const auto why = kind_problem_(kind)) {
+                        throw std::runtime_error(which + ": " + *why +
+                                                 "; nothing of the batch was written");
+                    }
+                    if (kind == "update_before") {
+                        continue;  // its update_after replaces the document by key
+                    }
+                }
                 try {
-                    docs.push_back(bsoncxx::from_json(pending_[i]));
+                    docs.push_back(
+                        bsoncxx::from_json(columns_.empty() ? pending_[i] : sql_document));
                 } catch (const std::exception& e) {
-                    throw std::runtime_error("record " + std::to_string(i + 1) + " of " +
-                                             std::to_string(n) + " is not a JSON object (" +
-                                             e.what() + "); nothing of the batch was written");
+                    throw std::runtime_error(which + " is not a JSON object (" + e.what() +
+                                             "); nothing of the batch was written");
                 }
                 const auto view = docs.back().view();
                 if (opts_.upsert) {
                     if (const auto why = rules::key_problem(view, opts_.key_field)) {
-                        throw std::runtime_error("record " + std::to_string(i + 1) + " of " +
-                                                 std::to_string(n) + " cannot replace by key: " +
-                                                 *why + "; nothing of the batch was written");
+                        throw std::runtime_error(which + " cannot replace by key: " + *why +
+                                                 "; nothing of the batch was written");
                     }
                     using bsoncxx::builder::basic::kvp;
                     using bsoncxx::builder::basic::make_document;
                     filters.push_back(
                         make_document(kvp(opts_.key_field, view[opts_.key_field].get_value())));
-                    bulk.append(
-                        mongocxx::model::replace_one{filters.back().view(), view}.upsert(true));
+                    if (kind == "delete") {
+                        bulk.append(mongocxx::model::delete_one{filters.back().view()});
+                    } else {
+                        bulk.append(
+                            mongocxx::model::replace_one{filters.back().view(), view}.upsert(true));
+                    }
                 } else {
                     bulk.append(mongocxx::model::insert_one{view});
                 }
+                ++operations;
             }
             (void)CLINK_FAULT_POINT(points::kSinkBeforeWrite);
             try {
-                bulk.execute();
+                if (operations > 0) {
+                    bulk.execute();
+                }
             } catch (const mongocxx::bulk_write_exception& e) {
                 // A restore replays the records after the last checkpoint, and an
                 // insert of one carrying its own _id meets the document this sink
@@ -359,7 +399,44 @@ private:
                std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
     }
 
+    // Why a SQL row of change kind `kind` cannot be written, or nullopt.
+    std::optional<std::string> kind_problem_(const std::string& kind) const {
+        if (kind == "insert") {
+            return std::nullopt;
+        }
+        if (kind != "delete" && kind != "update_before" && kind != "update_after") {
+            return "the row's change kind '" + kind + "' is not one the sink knows";
+        }
+        if (!opts_.upsert) {
+            return "a " + kind +
+                   " row changes a document by its key, and this sink only inserts: declare the "
+                   "table's PRIMARY KEY and mode='upsert'";
+        }
+        return std::nullopt;
+    }
+
+    // Under upsert, a SQL table's key is one declared column of a type that
+    // names one document.
+    void require_sql_key_column_() const {
+        for (const auto& col : columns_) {
+            if (col.name != opts_.key_field) {
+                continue;
+            }
+            if (col.kind != sql::Kind::Varchar && col.kind != sql::Kind::BigInt &&
+                col.kind != sql::Kind::Integer && col.kind != sql::Kind::SmallInt) {
+                throw std::runtime_error(opts_.name + ": key column " + col.name + " is " +
+                                         col.sql_type +
+                                         "; a document key must be VARCHAR, BIGINT, INTEGER or "
+                                         "SMALLINT (a string or an integer in MongoDB)");
+            }
+            return;
+        }
+        throw std::runtime_error(opts_.name + ": key_field '" + opts_.key_field +
+                                 "' is not one of the table's columns");
+    }
+
     MongoSinkOptions opts_;
+    std::vector<sql::Column> columns_;  // the SQL table's, when it is one
     std::optional<Connection> connection_;
     std::optional<mongocxx::collection> coll_;
     mongocxx::write_concern write_concern_;

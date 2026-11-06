@@ -7,11 +7,12 @@ name: mongodb
 # (checkpoints at the per-pass cap, after an idle pass and before the first
 # pass, tokens the server cannot resume from, drop and rename, update images);
 # the sink's failure cases (keys, the unique index, write concerns, write concern
-# errors, dropped connections, a batch stopped part way); and the recovery cells,
-# a coordinator and two workers running a change-stream job into MongoDB with a
-# worker killed at the connector's fault points, before and after a checkpoint,
-# and the server restarted under the job, each verified by reading MongoDB
-# directly. A live test skips when its server or binary is missing and gtest
+# errors, dropped connections, a batch stopped part way); the SQL plans,
+# refusals and embedded SQL pipelines (connector='mongodb'); and the recovery
+# cells, a coordinator and two workers running a change-stream job into MongoDB,
+# one of them a SQL job, with a worker killed at the connector's fault points,
+# before and after a checkpoint, and the server restarted under the job, each
+# verified by reading MongoDB directly. A live test skips when its server or binary is missing and gtest
 # counts that as a pass, so the gate fails on any skip and on any required suite
 # that did not run.
 #
@@ -82,8 +83,8 @@ jobs:
               cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
                 -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_MONGODB=ON -DCMAKE_C_FLAGS_DEBUG=-g0 \
                 -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
-              cmake --build build --target clink_mongodb_tests clink_integration_tests \
-                clink_node clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
+              cmake --build build --target clink_mongodb_tests clink_mongodb_sql_tests \
+                clink_integration_tests clink_node clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
               ccache -s | tail -3'
       - name: Save compiler cache
         if: always()

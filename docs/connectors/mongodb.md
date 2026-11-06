@@ -1,6 +1,6 @@
 # MongoDB
 
-> Reads a collection's change stream (`mongo_cdc_source`) and writes documents into a collection (`mongo_sink`, inserts; `mongo_upsert_sink`, replacements by key), all on the string channel. The source captures changes only, from when it first opens; it takes no snapshot.
+> Reads a collection's change stream (`mongo_cdc_source`) and writes documents into a collection (`mongo_sink`, inserts; `mongo_upsert_sink`, replacements by key), all on the string channel, and from SQL as `connector='mongodb'`, with every declared column converted strictly between BSON and its SQL type. The source captures changes only, from when it first opens; it takes no snapshot.
 
 ## Overview
 
@@ -139,6 +139,76 @@ And under these, which it cannot check:
 
 The record says `EffectivelyOnceIdempotent` on `key_field`, never exactly once.
 
+## SQL
+
+A table declared `connector='mongodb'` reads a change stream as a source and writes a collection as a sink. Every column is a top-level document field, typed: the declaration decides each value's SQL type, and a value it cannot hold exactly is refused, never rounded or carried as text. [`examples/mongodb-orders-sql`](https://github.com/orhaugh/clink/tree/main/examples/mongodb-orders-sql) runs the pipeline below end to end and checks its output against MongoDB.
+
+```sql
+CREATE TABLE order_changes (
+    __op      VARCHAR,
+    __id      VARCHAR,
+    customer  VARCHAR,
+    amount    DECIMAL(10, 2),
+    placed_at TIMESTAMP(3)
+) WITH (connector = 'mongodb', uri = 'env://MONGODB_URI',
+        database = 'shop', collection = 'orders');
+
+CREATE TABLE customer_totals (
+    _id    VARCHAR PRIMARY KEY,
+    orders BIGINT,
+    total  DECIMAL(38, 2)
+) WITH (connector = 'mongodb', uri = 'env://MONGODB_URI',
+        database = 'shop', collection = 'customer_totals', mode = 'upsert');
+
+INSERT INTO customer_totals
+SELECT customer AS _id, COUNT(*) AS orders, SUM(amount) AS total
+FROM order_changes WHERE __op = 'insert' GROUP BY customer;
+```
+
+### As a source
+
+One row per change event, appended: an insert, update, replace or delete each becomes a row of the declared columns, filled from the event's document fields as the [change rows](#change-rows) describe them, with the event's kind in `__op`. The table is append-only, not a changelog. A change stream carries no before-image of an update, so there is no earlier row to retract; a query that needs the current state of each document reads the events with that in mind, as the example's totals do by summing the insert events, which no later change alters. `mode` other than `append` is refused.
+
+The metadata are declared like any column, under reserved names: `__op`, `__ns` and `__image` as `VARCHAR`, and `__id`, the document's `_id`, as any type below that holds it. Another declared name starting with `__` is refused, and a document field named like the metadata stops the source, as it does outside SQL. A field the document does not have is NULL. `_id`, which cannot change, is filled from the event's key where the image lacks it (a `partial` update).
+
+Each value is read from canonical Extended JSON, which keeps every BSON type apart, and converted for its column (`impls/mongodb/src/sql_row.hpp`):
+
+| Declared type | BSON types it takes | Refused |
+| --- | --- | --- |
+| `BIGINT` | int32, int64 | double, decimal |
+| `INTEGER`, `SMALLINT` | int32, int64 within the type's range | a value outside it |
+| `DOUBLE` | double; int32; int64 within 2^53 | NaN and the infinities; an int64 past 2^53 |
+| `REAL` | a double a float holds exactly; int32 within 2^24 | a double it would round |
+| `DECIMAL(p, s)` | decimal128, int32, int64, kept as written | more than `p - s` integer or `s` fraction digits; NaN and the infinities; a double |
+| `BOOLEAN` | bool | |
+| `TIMESTAMP(p)`, `TIMESTAMP(p) WITH TIME ZONE` | date, as its UTC milliseconds | |
+| `DATE` | a date at UTC midnight | a date with a time of day |
+| `VARCHAR` | string; ObjectId (its 24 hex digits); int32 and int64 (their digits); an embedded document or array (its canonical Extended JSON text) | double, decimal, date, bool |
+
+Binary data, BSON timestamps, regular expressions, code and the other BSON types are refused for every column, and so is a SQL type outside this table (`TINYINT`, `TIME`, `BYTEA`, arrays, maps and rows). A refused value stops the job with an error naming the namespace, the document's `_id`, the field, its BSON type and the column, and saying what to declare instead:
+
+```text
+mongo_cdc_source: change on shop.orders to document ObjectId(6aed4a20f2cc9658710ee2f9): field 'qty' is a double, which column qty (BIGINT) cannot hold; declare it DOUBLE
+```
+
+A restart meets the same event again; the way past it is a declaration that holds the value.
+
+The source is one reader. The planner places it on a single subtask and keeps every operator behind it that is not keyed there too, so its events stay in order, and per key through a keyed operator such as a `GROUP BY`. The options it reads are `uri` (required), `database`, `collection`, `full_document` and `max_await_ms`, with the meanings [above](#mongo_cdc_source); any other is refused, naming the ones it reads.
+
+### As a sink
+
+Without `mode='upsert'`, `mongo_sink` inserts each row; with it, `mongo_upsert_sink` replaces the document whose key equals the row's, keyed by the table's PRIMARY KEY, which must be one column. A delete row removes the key's document and an `update_before` row is skipped, its `update_after` replacing the document, so a query that retracts, such as a top-N, keeps the collection equal to its answer. The key column must be `VARCHAR`, `BIGINT`, `INTEGER` or `SMALLINT`; a key other than `_id` needs a unique index on that field alone, as [above](#sinks). An append-only sink refuses a query that retracts, as for every connector.
+
+Each column is written as the BSON type its SQL type maps to: `BIGINT` as int64, `INTEGER` and `SMALLINT` as int32, `DOUBLE` and `REAL` as double (NaN and the infinities as themselves), `DECIMAL` as decimal128 with the row's digits, `BOOLEAN` as bool, `TIMESTAMP` as a date, `DATE` as a date at UTC midnight and `VARCHAR` as a string; NULL is written as null. The declared columns are the document's fields, in declared order; a name starting with `__` is an ordinary field here. A value its type cannot hold fails the flush.
+
+The options it reads are `uri` (required), `database` and `collection` (both required), `batch_records`, `max_bytes`, `linger_ms` and `write_timeout_ms`. It refuses `key_field` and `on_duplicate` (the PRIMARY KEY and `mode` decide), `delivery_guarantee='exactly_once'`, `changelog='true'`, `json_non_finite` and a full-refresh materialised view.
+
+The guarantees are the sinks' own, [above](#sinks). Inserts are at least once; a row with an `_id` column is recognised when a replay writes it again, and one without is inserted again. Replacements converge on each key's latest row when a key's rows reach the sink in order, which holds behind a MongoDB source and through a keyed `GROUP BY`. The delivery analyser the Coordinator runs at submission reports a job into the upsert sink as `EFFECTIVELY_ONCE_REQUIRES_IDEMPOTENT_KEY`, with a warning that the key must identify a row, and one into the insert sink as `STATE_EXACTLY_ONCE_OUTPUT_AT_LEAST_ONCE`; neither as exactly once.
+
+### Credentials and TLS
+
+They go in the connection string, as outside SQL. Written `uri = 'env://MONGODB_URI'`, the string is read from each Worker's environment when the job is built there, so it is not part of the SQL, the submitted job or what the Coordinator serves; a variable that is unset or empty is refused when the job is built. A literal `uri` with a password in it is stored with the job like any other option. No error or log line of the connector repeats the URI.
+
 ## Limitations
 
 - Changes only: the source reads from when it first opens and takes no snapshot of what the collection already holds.
@@ -151,7 +221,7 @@ The record says `EffectivelyOnceIdempotent` on `key_field`, never exactly once.
 - The change stream needs a replica set or sharded cluster. A sharded collection's replacement needs its shard key in the filter, which `mongo_upsert_sink` does not add.
 - Credentials and TLS are expressed only through the connection URI.
 - Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
-- Not exposed through the SQL frontend.
+- In SQL: append-only change rows, with no changelog form; no type for binary data, BSON timestamps, regular expressions or the other BSON types, and nested documents and arrays only as `VARCHAR` text; an ObjectId read as `VARCHAR` is written back as its hex string, not an ObjectId; a single-column key for the upsert sink; no exactly-once.
 
 ## Testing
 
@@ -163,10 +233,15 @@ The record says `EffectivelyOnceIdempotent` on `key_field`, never exactly once.
 | `MongoLive` | `clink_mongodb_tests`, live | round trips: insert, update and delete events, a resume without gap, a burst across the per-pass cap, the sink's writes and replays |
 | `MongoSourceRecoveryLive` | `clink_mongodb_tests`, live | checkpoints at the cap, after an idle pass and before the first pass, each restored by a second source that must deliver exactly the events after it; an unresumable token; drop, rename and a metadata collision; `updateLookup` and post-images |
 | `MongoSinkLive` | `clink_mongodb_tests`, live | a replacement without its key, the unique index, write concerns below majority, a write concern error, a dropped connection, a batch stopped part way, per-key order, the byte bound, a password kept out of errors |
-| `MongoRecovery` | `clink_integration_tests`, live | a coordinator and two workers running the source into a sink while a writer changes the collection: a worker killed before a write, after a write and with change events in flight (each after a checkpoint completed), a worker killed before any checkpoint, the server restarted, and a mirror by key; each verified by reading MongoDB directly, and each kill landing while the source held documents the destination did not |
+| `MongoSqlRow`, `MongoSqlSink` | `clink_mongodb_tests`, no server | every BSON-to-SQL pair the source converts and every one it refuses, the metadata columns, the declared-types rules; the sink's SQL-to-BSON writes, exact decimals, non-finite doubles, row kinds and refusals |
+| `MongoSqlPlan` | `clink_mongodb_sql_tests`, no server | the source op (one reader, its declared types, every unkeyed operator behind it on one subtask), the insert and upsert sink ops, a retracting query needing the upsert sink, the analyser's verdict on each sink, and the plans and options refused |
+| `MongoSqlLive` | `clink_mongodb_sql_tests`, live | embedded SQL pipelines: inserts, an update and a delete read as typed rows and written back as typed BSON; a value its column cannot hold failing the job; an upsert sink replacing and deleting by key under a top-N, and a decimal sum written exactly |
+| `MongoRecovery` | `clink_integration_tests`, live | a coordinator and two workers running the source into a sink while a writer changes the collection: a worker killed before a write, after a write and with change events in flight (each after a checkpoint completed), a worker killed before any checkpoint, the server restarted, a mirror by key, and the same mirror as a SQL job submitted by `clink_submit_sql`; each verified by reading MongoDB directly, each kill landing while the source held documents or changes the destination did not |
 
 ```bash
 scripts/mongodb-live.sh build
 ```
 
 `ctest --test-dir build -L mongodb` runs the suites without a server; the live ones skip there.
+
+The gate passed on commit `9acee127`, before the SQL support, in a local run on 2026-11-06: 56 of 56 cases, the six recovery cells among them. An earlier run on the same commit failed two cells because the machine suspended mid-cell and the workers' leases expired; it was run again with sleep prevented. The `mongodb` CI workflow has not yet run the gate.

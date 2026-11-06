@@ -12,6 +12,7 @@ add_executable(clink_mongodb_tests
     test_mongo_live.cpp
     test_mongo_recovery_live.cpp
     test_mongo_sink_rules.cpp
+    test_mongo_sql_row.cpp
 )
 target_link_libraries(clink_mongodb_tests PRIVATE
     clink::core

@@ -82,6 +82,30 @@ reading MongoDB directly. It fails on a skip, a short suite or a missing binary,
 and keeps provenance and the cells' logs. The new `mongodb` workflow runs it.
 The integration services' `mongodb` runs with `enableTestCommands`.
 
+**MongoDB is available in SQL as `connector='mongodb'`.** As a source, a
+collection's change stream: one appended row per insert, update, replace or
+delete, with `__op`, `__ns`, `__id` and `__image` declared like any column, on
+one reader that keeps every unkeyed operator behind it on one subtask. Each
+value is read from canonical Extended JSON and converted strictly to its
+declared type: decimal128 into `DECIMAL` with its digits, dates into
+`TIMESTAMP` and midnight dates into `DATE`, integers into the integer types
+within their ranges, ObjectIds and nested values into `VARCHAR` text. A value a
+column cannot hold (a double in a `BIGINT`, a fraction past a `DECIMAL`'s
+scale, binary data anywhere) stops the job naming the document, the field and
+the column, rather than being rounded or passed through as text
+(`impls/mongodb/src/sql_row.hpp`). There is no changelog form: an update
+carries no before-image to retract. As a sink, inserts, or under
+`mode='upsert'` replacements by a one-column PRIMARY KEY with deletes applied by
+key, each column written as the BSON type its SQL type maps to. Options either
+side does not read are refused, as are `exactly_once`, `changelog='true'` and a
+composite key. `uri='env://VAR'` keeps the connection string out of the SQL and
+the submitted job. `MongoSqlRow`, `MongoSqlSink` and `MongoSqlPlan` hold the
+conversions and plans without a server; `MongoSqlLive` runs embedded pipelines
+against the replica set; `MongoRecovery.ASqlMirrorConvergesOnTheSourceAfterAWorkerIsKilled`
+submits a SQL mirror through `clink_submit_sql` and kills a worker after a
+write; and `examples/mongodb-orders-sql` runs a small pipeline end to end and
+checks its output with mongosh. The gate runs the new suites.
+
 **The MQTT source acknowledges a message only once a completed checkpoint
 covers it.** libmosquitto acknowledges a message when its callback returns and
 cannot hold that back, so a crash, an aborted checkpoint or a close lost what

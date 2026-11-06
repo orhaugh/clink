@@ -886,6 +886,26 @@ if(CLINK_BUILD_SQL)
         )
     endif()
 
+    # The MongoDB connector through the SQL frontend: the source and sink ops the
+    # planner builds, the plans and options it refuses, and embedded SQL
+    # pipelines against the replica set scripts/mongodb-live.sh starts, read back
+    # through the driver. The live cases skip without CLINK_MONGODB_TEST_URI.
+    if(TARGET clink::mongodb)
+        add_executable(clink_mongodb_sql_tests test_mongodb_sql.cpp)
+        target_link_libraries(clink_mongodb_sql_tests PRIVATE
+            clink::sql
+            clink::embed
+            clink::mongodb
+            clink_mongodb_driver
+            GTest::gtest_main
+        )
+        clink_set_warnings(clink_mongodb_sql_tests)
+        gtest_discover_tests(clink_mongodb_sql_tests
+            DISCOVERY_MODE PRE_TEST
+            PROPERTIES TIMEOUT 180 LABELS mongodb
+        )
+    endif()
+
     # Differential SQL oracle: the same query and data through clink's
     # EmbeddedEngine and through DuckDB, answers compared as multisets.
     # Needs a duckdb binary at runtime (CLINK_DUCKDB or PATH) and SKIPS

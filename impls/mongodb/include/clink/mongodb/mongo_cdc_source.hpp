@@ -51,6 +51,12 @@ struct MongoCdcOptions {
     std::string collection;  // empty = the whole `database` (requires database set)
     FullDocument full_document{FullDocument::UpdateLookup};
     std::chrono::milliseconds max_await{1000};  // change-stream maxAwaitTime; bounds cancel latency
+    // The SQL table's columns ("name:TYPE;name:TYPE"), set by the SQL planner.
+    // When set, each event is emitted as the typed row src/sql_row.hpp
+    // describes, read from canonical Extended JSON so every BSON type stays
+    // distinct, and a value its column cannot hold fails the job naming the
+    // document. Empty: the flat JSON envelope above.
+    std::string declared_types;
     std::uint32_t subtask_idx{0};
     std::uint32_t parallelism{1};
     std::string name{"mongo_cdc_source"};
