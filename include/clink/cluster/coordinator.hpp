@@ -1625,16 +1625,17 @@ private:
             // (fed task key, new upstream idx) pairs whose rebind port has
             // not yet arrived.
             std::set<std::pair<std::string, std::uint32_t>> rebind_ports_pending;
-            // Old subtasks whose SubtaskFinished landed while C was still
-            // completing. An exit at C is a drained ack, but the state machine
-            // only counts drains once C has completed (Preparing -> Draining),
-            // so they are held here and replayed the moment it does; dropping
-            // them lost the rendezvous, the cut never finished and the phase
-            // deadline aborted the cutover to the replan. The exit itself is
-            // already a fact: the subtask left pending_per_worker when it
-            // reported. Its slot is released by the rebind teardown with every
-            // other old subtask's, or by the abort if the cutover never gets
-            // there, which is what the worker id is for.
+            // Old subtasks of the hot operator that have ended at C. An exit
+            // at C is a drained ack. One that landed while C was still
+            // completing cannot be counted until C has completed (Preparing ->
+            // Draining), so it is replayed the moment it does; dropping it
+            // lost the rendezvous, the cut never finished and the phase
+            // deadline aborted the cutover to the replan. One that lands after
+            // is counted as it lands. Either way the exit is a fact: the
+            // subtask left pending_per_worker when it reported. Its slot is
+            // released by the rebind teardown with every other old subtask's,
+            // or by the abort if the cutover never gets there, which is what
+            // the worker id is for.
             struct EarlyDrain {
                 std::uint32_t subtask_idx_in_op{0};
                 std::string worker_id;
@@ -2068,6 +2069,11 @@ private:
     void hot_cutover_complete_locked_(JobState& job, std::vector<PendingDeploy>& out_frames);
     // Abort at any phase: clear the hot state and fall back to the replan
     // at the requested parallelism. Stages the CancelJob frames to post.
+    // An old subtask of the hot operator ended at C: hold its exit in
+    // early_drains and take it out of pending_per_worker.
+    void hold_hot_cut_exit_locked_(JobState& job,
+                                   std::uint32_t subtask_idx_in_op,
+                                   const SubtaskFinishedMsg& msg);
     void abort_hot_cutover_locked_(JobState& job,
                                    const std::string& reason,
                                    std::vector<PendingDeploy>& out_frames);

@@ -4639,6 +4639,33 @@ void Coordinator::hot_cutover_complete_locked_(JobState& job,
     cv_.notify_all();
 }
 
+void Coordinator::hold_hot_cut_exit_locked_(JobState& job,
+                                            std::uint32_t subtask_idx_in_op,
+                                            const SubtaskFinishedMsg& msg) {
+    auto& hot = *job.hot_cutover;
+    hot.early_drains.push_back({.subtask_idx_in_op = subtask_idx_in_op,
+                                .worker_id = msg.worker_id,
+                                .key = msg.role + ":" + std::to_string(msg.subtask_idx)});
+    if (auto pending_it = job.pending_per_worker.find(msg.worker_id);
+        pending_it != job.pending_per_worker.end()) {
+        std::erase_if(pending_it->second, [&](const auto& p) {
+            return p.first == msg.role && p.second == msg.subtask_idx;
+        });
+    }
+    std::string tally;
+    if (job.rescale_coordinator) {
+        if (auto st = job.rescale_coordinator->status(hot.op_id); st.has_value()) {
+            tally = ", " + std::to_string(st->old_subtasks_drained) + " of " +
+                    std::to_string(st->current_parallelism) + " counted";
+        }
+    }
+    log::info("coordinator.rescale",
+              "hot cutover old subtask ended at C job_id=" + std::to_string(job.id) +
+                  " op_id=" + hot.op_id + " subtask=" + std::to_string(subtask_idx_in_op) +
+                  " worker=" + msg.worker_id + " (" + std::to_string(hot.early_drains.size()) +
+                  " ended" + tally + ")");
+}
+
 void Coordinator::abort_hot_cutover_locked_(JobState& job,
                                             const std::string& reason,
                                             std::vector<PendingDeploy>& out_frames) {
@@ -9085,6 +9112,18 @@ void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& s
                 CLINK_FAULT_POINT(clink::fault::points::kRescaleAfterDrain);
                 job.rescale_coordinator->mark_old_drained(ack.op_id, ack.subtask_idx_in_op);
                 was_drain = true;
+                if (job.hot_cutover.has_value() && job.hot_cutover->op_id == ack.op_id) {
+                    // A hot cutover's old subtask that ended at C after C
+                    // completed. As for one that ended before (below), the exit
+                    // is a fact for the worker's bookkeeping: it leaves
+                    // pending_per_worker and is held until the rebind tears
+                    // every old subtask down. Left pending, a cutover aborted
+                    // with the cut part-drained (a worker lost before its own
+                    // old subtasks reported) staged a replan whose drain waited
+                    // for exits that had already happened, and the job failed
+                    // at the restart-drain deadline.
+                    hold_hot_cut_exit_locked_(job, ack.subtask_idx_in_op, msg);
+                }
                 if (auto post = job.rescale_coordinator->status(ack.op_id);
                     post.has_value() && post->state == RescaleState::CuttingOver) {
                     if (job.hot_cutover.has_value() && job.hot_cutover->op_id == ack.op_id) {
@@ -9110,15 +9149,7 @@ void Coordinator::handle_subtask_finished_(MessageReader& r, WorkerConnection& s
                 // replan staged before C completes drains only what still runs
                 // (the abort releases its slot; the rebind teardown does when
                 // the cut completes).
-                job.hot_cutover->early_drains.push_back({.subtask_idx_in_op = ack.subtask_idx_in_op,
-                                                         .worker_id = msg.worker_id,
-                                                         .key = key});
-                if (auto pending_it = job.pending_per_worker.find(msg.worker_id);
-                    pending_it != job.pending_per_worker.end()) {
-                    std::erase_if(pending_it->second, [&](const auto& p) {
-                        return p.first == msg.role && p.second == msg.subtask_idx;
-                    });
-                }
+                hold_hot_cut_exit_locked_(job, ack.subtask_idx_in_op, msg);
                 was_drain = true;
             }
         }

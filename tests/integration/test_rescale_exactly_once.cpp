@@ -1182,8 +1182,10 @@ TEST_F(HotRescaleTest, AWorkerLostMidCutoverFallsBackToTheReplanAndStaysExactlyO
     ::setenv("CLINK_RXO_PAR", "4", 1);  // target 2: the replanned job fits one worker
     Cluster c(spec());
     ScopedDiagnostics diag(c);
-    // Hold the cutting-over window wide open so the kill lands inside the
-    // cutover deterministically rather than racing its completion.
+    // Hold the cutting-over window wide open so the kill usually lands in it
+    // rather than racing the cutover's completion. Under load it can land
+    // earlier, while the cut is still draining; that has to replan too, and
+    // AWorkerLostWhileTheCutIsPartDrainedStillReplans pins it.
     ASSERT_TRUE(c.start_coordinator(
         clink::itest::ProcOptions{.fault = "rescale.hot_cutting_over=delay:4000@1"}));
     ASSERT_TRUE(c.start_worker(0));
@@ -1206,7 +1208,75 @@ TEST_F(HotRescaleTest, AWorkerLostMidCutoverFallsBackToTheReplanAndStaysExactlyO
         std::chrono::seconds(60)))
         << "the cutover never reached its checkpoint";
 
-    // Inside the cutover (the held window guarantees it): lose a worker.
+    // Inside the cutover: lose a worker.
+    c.worker(1).kill_and_reap();
+
+    ASSERT_TRUE(
+        clink::itest::await([&] { return c.coordinator().log_contains("hot cutover ABORTED"); },
+                            std::chrono::seconds(120)))
+        << "the worker loss never aborted the cutover";
+    ASSERT_TRUE(clink::itest::await([&] { return c.coordinator().log_contains("replanned"); },
+                                    std::chrono::seconds(120)))
+        << "the abort never fell back to the replan";
+
+    const auto exit_code = sub->await_exit(std::chrono::seconds(300));
+    ASSERT_TRUE(exit_code.has_value()) << "submitter never exited after the fallback";
+    EXPECT_EQ(*exit_code, 0) << "the job did not complete after the fallback replan";
+
+    const auto v = verify_exactly_once(out_dir_, kTotalRecords);
+    EXPECT_TRUE(v.duplicated.empty())
+        << "records committed MORE than once across the abort + replan. " << describe(v);
+    EXPECT_TRUE(v.unexpected.empty())
+        << "STATE-MISMATCH across the abort + replan. " << describe(v);
+    EXPECT_TRUE(v.missing.empty()) << "records LOST across the abort + replan. " << describe(v);
+}
+
+// A worker lost while the cut is part-drained: the cutover checkpoint C has
+// completed and worker 0's old subtasks have reported their exits after it, but
+// worker 1's never report, so the cut cannot finish, and worker 1 is killed. The
+// replan the abort stages used to count worker 0's old subtasks as still
+// running: their exits were counted as drains and never taken out of the
+// pending set, so its drain waited for exits that would not come again and
+// failed the job at the restart-drain deadline. Seen once under load in the
+// test above, whose kill can land before every old subtask has drained. Worker
+// 0's first two exit reports are held back five seconds, so they reach the
+// coordinator after C completes; worker 1 holds its own until it dies.
+TEST_F(HotRescaleTest, AWorkerLostWhileTheCutIsPartDrainedStillReplans) {
+    ::setenv("CLINK_RXO_PAR", "4", 1);  // target 2: the replanned job fits one worker
+    Cluster c(spec());
+    ScopedDiagnostics diag(c);
+    ASSERT_TRUE(c.start_coordinator());
+    ASSERT_TRUE(c.start_worker(
+        0,
+        clink::itest::ProcOptions{.fault = "worker.before_subtask_finished=delay:5000@1,"
+                                           "worker.before_subtask_finished=delay:5000@2"}));
+    ASSERT_TRUE(c.start_worker(
+        1, clink::itest::ProcOptions{.fault = "worker.before_subtask_finished=block:0"}));
+    ASSERT_TRUE(c.await_workers_registered(2));
+
+    auto sub = submit(c);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            return verify_exactly_once(out_dir_, kTotalRecords).total_lines >= kMinCommittedBefore;
+        },
+        std::chrono::seconds(90)));
+
+    std::string rescale_out;
+    const int rc = rescale_operator(c, "counter", 2, &rescale_out);
+    ASSERT_EQ(rc, 0) << rescale_out;
+    // Worker 0's exits, counted as drains after C completed, and the cut
+    // still short of all four.
+    ASSERT_TRUE(clink::itest::await(
+        [&] {
+            const auto& co = c.coordinator();
+            return co.log_contains("worker=worker-0 (1 ended, 1 of 4 counted)") &&
+                   co.log_contains("worker=worker-0 (2 ended, 2 of 4 counted)");
+        },
+        std::chrono::seconds(90)))
+        << "worker 0's old subtasks were not counted as drains after the cut checkpoint";
+    ASSERT_FALSE(c.coordinator().log_contains("hot cutover complete"));
+
     c.worker(1).kill_and_reap();
 
     ASSERT_TRUE(

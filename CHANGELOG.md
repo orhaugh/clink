@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**A hot cutover that loses a worker part-way through its drain falls back to the
+replan instead of failing the job.** A hot cutover counts each old subtask's exit
+at the cutover checkpoint as a drain. An exit counted after that checkpoint
+completed stayed in the coordinator's set of running subtasks. So when a worker
+was lost before its own old subtasks reported, the replan the abort staged
+waited for exits that had already happened, and the job failed at the
+restart-drain deadline. Seen once under load in
+`HotRescaleTest.AWorkerLostMidCutoverFallsBackToTheReplanAndStaysExactlyOnce`,
+whose kill can land before the cut has drained. Such an exit is now held like
+one that lands before the checkpoint completes: out of the running set, its slot
+released by the abort. The coordinator logs each old subtask's exit at the
+checkpoint with the drain tally.
+`HotRescaleTest.AWorkerLostWhileTheCutIsPartDrainedStillReplans` pins the
+schedule with fault points: worker 0's exit reports are held past the
+checkpoint's completion and worker 1's are never sent. Against the previous
+bookkeeping it fails at the restart-drain deadline, as the flake did.
+
 **The search sink gates cover Elasticsearch 9.2.0 and OpenSearch 3.3.0, and
 three more server set-ups each.** `scripts/search-live.sh` takes `elasticsearch9`
 and `opensearch3` beside the two it ran, and each run adds three phases to the
