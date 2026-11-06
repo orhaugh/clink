@@ -1,205 +1,195 @@
 #pragma once
 
-// Amazon Data Firehose sink (PutRecordBatch). SDK-dependent; compiled only with
-// the AWS SDK.
+// Amazon Data Firehose sink: string records written with PutRecordBatch.
 //
-// Each input record is a string (e.g. SQL row_to_json_string JSON) sent as one
-// Firehose record's Data, with a delimiter (newline by default) appended so the
-// destination can split records (Firehose concatenates record bytes and adds no
-// boundary itself). Firehose has NO partition key and NO ordering guarantee.
-// Delivery is AT-LEAST-ONCE: PutRecordBatch is partial-success, so on
-// FailedPutCount > 0 ONLY the failed entries (by response index) are resent.
+// Each record is opaque bytes, sent as one Firehose record's data with the
+// delimiter appended (a newline by default), so a destination that concatenates
+// records can split them again. The sink never parses a record.
+//
+// Limits, from the service documentation: a record holds at most 1,000 KiB
+// (1,024,000 bytes) before base64 encoding, its delimiter included, and a
+// request at most 500 records and 4 MiB. The documentation does not say whether
+// the 4 MiB counts the base64 encoding, so the sink counts a request as the SDK
+// sends it, base64 and JSON included, which keeps it within either reading. A
+// record over its limit is refused when it arrives, by its position and size; the
+// buffer is flushed before a record that would push the next request past its
+// count or byte limit is added, so no request is ever built over a limit.
+//
+// A response counts only when it accounts for every record: one entry per
+// record, each holding a RecordId or an ErrorCode, never both or neither, and a
+// FailedPutCount equal to the entries that failed. The records whose entries
+// failed, and only those, are sent again. Any other response is ambiguous and
+// fails the sink. Throttling and transient errors are retried with a backoff
+// bounded in attempts and in time, which a cancellation cuts short; permanent
+// errors fail at once. A barrier returns only once every record before it has
+// been accepted, and a sink that has failed refuses every later barrier.
+//
+// Accepted means accepted by Firehose: delivery to the destination is the
+// service's, after its own buffering and retries. Delivery into Firehose is
+// at-least-once: a record resent after a reply that never arrived, or replayed
+// after a restart, can reach the destination twice, and Firehose keeps no order
+// and no producer identity. See docs/connectors/aws.md ("The Firehose sink").
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <stdexcept>
 #include <string>
-#include <thread>
-#include <utility>
+#include <string_view>
 #include <vector>
 
-#include <aws/firehose/FirehoseClient.h>
-#include <aws/firehose/model/PutRecordBatchRequest.h>
-#include <aws/firehose/model/PutRecordBatchResponseEntry.h>
-#include <aws/firehose/model/Record.h>
-
 #include "clink/aws/aws_client.hpp"
-#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::aws {
 
-// Indices of the response entries that FAILED (non-empty ErrorCode). The
-// PutRecordBatch response is index-aligned with the request. Pure: unit-testable
-// without a live delivery stream.
-inline std::vector<std::size_t> firehose_failed_indices(
-    const Aws::Vector<Aws::Firehose::Model::PutRecordBatchResponseEntry>& results) {
+// ---- Firehose's limits ----------------------------------------------------------------
+
+inline constexpr std::size_t kFirehoseMaxRecordBytes = 1000 * 1024;  // before base64
+inline constexpr std::size_t kFirehoseMaxBatchRecords = 500;
+inline constexpr std::size_t kFirehoseMaxRequestBytes = 4 * 1024 * 1024;
+
+// What a record of `data_bytes` (delimiter included) adds to a PutRecordBatch
+// request as the AWS SDK sends it: its data base64-encoded, inside its indented
+// JSON object, and the separator before the next one.
+[[nodiscard]] std::size_t firehose_record_request_bytes(std::size_t data_bytes);
+// The request's JSON around its records, for a stream name of `name_bytes`.
+[[nodiscard]] std::size_t firehose_request_envelope_bytes(std::size_t name_bytes);
+// The smallest max_bytes that still lets the largest record go alone.
+[[nodiscard]] std::size_t firehose_min_request_bytes(std::size_t name_bytes);
+
+// ---- the calls the sink makes -------------------------------------------------------
+
+enum class FirehoseFault : std::uint8_t {
+    None,
+    Throttled,  // nothing was accepted: back off and send again
+    Transient,  // the request may or may not have been accepted: back off and send again
+    Permanent,  // configuration, access, a missing stream or a refused request: fail now
+    Cancelled,  // the task was cancelled while the call was in flight
+};
+
+struct FirehoseCallError {
+    FirehoseFault fault{FirehoseFault::None};
+    std::string code;     // the service's error code, e.g. ServiceUnavailableException
+    std::string message;  // the service's message
+    int http_status{0};   // 0 when no response arrived
+    [[nodiscard]] bool ok() const noexcept { return fault == FirehoseFault::None; }
+};
+
+// One entry of a response's RequestResponses, as the service sent it.
+struct FirehoseResponseEntry {
+    std::string record_id;
+    std::string error_code;
+    std::string error_message;
+};
+
+struct FirehoseBatchResult {
+    FirehoseCallError error;
+    // A response the SDK read without FailedPutCount reports 0 here.
+    std::int64_t failed_put_count{0};
+    std::vector<FirehoseResponseEntry> entries;
+};
+
+// The verdict on a response: when `valid`, the positions (in the request) of the
+// records whose entries failed; otherwise why the response cannot be trusted.
+struct FirehoseVerdict {
+    bool valid{false};
     std::vector<std::size_t> failed;
-    for (std::size_t i = 0; i < results.size(); ++i) {
-        if (!results[i].GetErrorCode().empty()) {
-            failed.push_back(i);
-        }
-    }
-    return failed;
-}
+    std::string why;
+};
+
+// Judges a response to a request of `sent` records: one entry per record, each
+// a RecordId or an ErrorCode and not both, and a FailedPutCount equal to the
+// failed entries. Never reads past the shorter of the two.
+[[nodiscard]] FirehoseVerdict judge_firehose_response(std::size_t sent,
+                                                      const FirehoseBatchResult& result);
+
+// The calls the sink makes. make_firehose_sdk_service is the production
+// implementation; tests substitute a model of the service.
+class FirehoseWriteService {
+public:
+    virtual ~FirehoseWriteService() = default;
+    // One PutRecordBatch of these records, in order, to `stream`.
+    virtual FirehoseBatchResult put_record_batch(
+        const std::string& stream, const std::vector<const std::string*>& records) = 0;
+    // From another thread: end the call in flight, and every later one, at once.
+    virtual void abort() noexcept {}
+};
+
+// The AWS SDK's Firehose client with its own retries off, so every failure
+// reaches the sink, which classifies, paces and bounds them.
+[[nodiscard]] std::shared_ptr<FirehoseWriteService> make_firehose_sdk_service(
+    const AwsClientOptions& client);
+
+// How the sink treats an error, from its code, HTTP status (0 when no response
+// arrived) and whether the SDK would have retried it.
+[[nodiscard]] FirehoseFault classify_firehose_error(std::string_view code,
+                                                    int http_status,
+                                                    bool sdk_retryable);
+
+// ---- the sink -----------------------------------------------------------------------
 
 struct FirehoseSinkOptions {
-    std::string delivery_stream;  // required
-    std::string delimiter{"\n"};  // appended to each record's Data (empty = none)
+    std::string delivery_stream;  // required: 1 to 64 of a-z, A-Z, 0-9, '_', '.', '-'
+    // Appended to each record's data, and counted in its size; empty appends nothing.
+    std::string delimiter{"\n"};
     AwsClientOptions client;
-    std::size_t batch_records{500};                        // PutRecordBatch hard max is 500
-    std::size_t max_bytes{3u * 1024 * 1024 + 512 * 1024};  // flush under the 4 MiB request cap
-    int max_retries{8};                                    // failed-subset resend attempts
+    std::size_t batch_records{500};  // records per PutRecordBatch, 1 to 500
+    // The most one request may carry as the SDK sends it, from
+    // firehose_min_request_bytes (the largest record alone) to 4 MiB.
+    std::size_t max_bytes{kFirehoseMaxRequestBytes};
+    // Retries in a row that accept nothing (a failed request, or failed entries
+    // that did not shrink) before a flush fails, 0 to kMaxRetries: 0 fails at the
+    // first such attempt.
+    int max_retries{8};
     std::chrono::milliseconds retry_base_backoff{100};
+    std::chrono::milliseconds max_backoff{10000};
+    // The longest one request's records may take with every retry and wait.
+    std::chrono::milliseconds retry_timeout{60000};
     std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old (0 = off)
     std::string name{"firehose_sink"};
+    // The calls the sink makes; empty means the AWS SDK.
+    std::shared_ptr<FirehoseWriteService> service;
 };
 
 class FirehoseSink : public Sink<std::string> {
 public:
-    static constexpr int kMaxRetries = 20;  // bound the backoff shift + attempt loop
+    static constexpr int kMaxRetries = 20;
 
-    explicit FirehoseSink(FirehoseSinkOptions opts) : opts_(std::move(opts)) {
-        if (opts_.delivery_stream.empty()) {
-            throw std::runtime_error(opts_.name + ": 'delivery_stream' is required");
-        }
-        if (opts_.batch_records == 0 || opts_.batch_records > 500) {
-            opts_.batch_records = 500;  // PutRecordBatch ceiling
-        }
-        if (opts_.max_retries < 0) {
-            opts_.max_retries = 0;
-        } else if (opts_.max_retries > kMaxRetries) {
-            opts_.max_retries = kMaxRetries;  // else 1u<<(attempt-1) overflows
-        }
-    }
+    // Checks the options; touches no service.
+    explicit FirehoseSink(FirehoseSinkOptions opts);
+    ~FirehoseSink() override;
+    FirehoseSink(const FirehoseSink&) = delete;
+    FirehoseSink& operator=(const FirehoseSink&) = delete;
+    FirehoseSink(FirehoseSink&&) = delete;
+    FirehoseSink& operator=(FirehoseSink&&) = delete;
 
-    void open() override {
-        ensure_aws_initialized();
-        client_ = std::make_unique<Aws::Firehose::FirehoseClient>(make_client_config(opts_.client));
-        pending_.clear();
-    }
-
-    void on_data(const Batch<std::string>& batch) override {
-        for (const auto& rec : batch) {
-            if (pending_.empty()) {
-                first_buffered_at_ = std::chrono::steady_clock::now();  // linger age clock
-            }
-            pending_.push_back(make_record_(rec.value()));
-            // Flush on count OR bytes so a batch of large records never exceeds
-            // the 4 MiB request cap (rejected on every retry -> a wedged job).
-            pending_bytes_ += rec.value().size() + opts_.delimiter.size() + 16;
-            if (pending_.size() >= opts_.batch_records || pending_bytes_ >= opts_.max_bytes ||
-                linger_elapsed_()) {
-                flush();
-            }
-        }
-    }
-
-    void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+    // Starts afresh: an empty buffer and no failure, also after an earlier one.
+    void open() override;
+    // Writes nothing: a clean end of input has flushed, and a failed or
+    // cancelled task must not send what it holds.
+    void close() override;
+    // Checks every record of the batch before buffering any: a batch with a
+    // record over the limit adds nothing, and the sink fails.
+    void on_data(const Batch<std::string>& batch) override;
+    void on_barrier(CheckpointBarrier b) override;
     // Its barrier hook writes out everything it received before the barrier,
     // which is its guarantee only while it owns its chain's checkpoint, so
     // Dag::add_sink refuses another sink beside it.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+    void flush() override;
+    std::string name() const override;
 
-    void flush() override {
-        if (pending_.empty()) {
-            return;
-        }
-        const std::size_t n = pending_.size();
-        const std::size_t bytes = pending_bytes_;
-        const auto t0 = std::chrono::steady_clock::now();
-        try {
-            put_with_retry_(std::move(pending_));
-        } catch (...) {
-            clink::metrics::connector::error_inc("firehose", "sink");
-            pending_.clear();
-            pending_bytes_ = 0;
-            throw;
-        }
-        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-        clink::metrics::connector::records_out_inc("firehose", n);
-        clink::metrics::connector::bytes_out_inc("firehose", bytes);
-        clink::metrics::connector::commit_latency_observe("firehose",
-                                                          static_cast<std::uint64_t>(dt));
-        pending_.clear();
-        pending_bytes_ = 0;
-    }
-
-    std::string name() const override { return opts_.name; }
+    // Records buffered and not yet accepted.
+    [[nodiscard]] std::size_t pending_records() const;
+    // True once a refused record or a failed send has stopped this instance; it
+    // then refuses every call that would send or acknowledge a barrier, until
+    // open() starts it afresh.
+    [[nodiscard]] bool failed() const;
 
 private:
-    Aws::Firehose::Model::Record make_record_(const std::string& rec) {
-        // Append the delimiter to the RAW bytes (the SDK base64-encodes on the
-        // wire; never pre-encode or concatenate base64).
-        std::string data = rec;
-        data += opts_.delimiter;
-        Aws::Firehose::Model::Record r;
-        r.SetData(Aws::Utils::ByteBuffer(reinterpret_cast<const unsigned char*>(data.data()),
-                                         data.size()));
-        return r;
-    }
-
-    // PutRecordBatch + failed-subset resend. On partial failure resend ONLY the
-    // entries whose response index carries an ErrorCode; the rest are delivered,
-    // so resending them would duplicate. Throw on exhaustion.
-    void put_with_retry_(std::vector<Aws::Firehose::Model::Record> records) {
-        for (int attempt = 0; attempt <= opts_.max_retries; ++attempt) {
-            if (attempt > 0) {
-                sleep_backoff_(attempt);
-            }
-            Aws::Firehose::Model::PutRecordBatchRequest req;
-            req.SetDeliveryStreamName(opts_.delivery_stream);
-            req.SetRecords(Aws::Vector<Aws::Firehose::Model::Record>(records));
-            auto outcome = client_->PutRecordBatch(req);
-            if (!outcome.IsSuccess()) {
-                if (attempt == opts_.max_retries) {
-                    throw std::runtime_error(opts_.name + ": PutRecordBatch failed: " +
-                                             std::string(outcome.GetError().GetMessage().c_str()));
-                }
-                continue;
-            }
-            if (outcome.GetResult().GetFailedPutCount() == 0) {
-                return;  // all records delivered
-            }
-            const auto failed = firehose_failed_indices(outcome.GetResult().GetRequestResponses());
-            if (!failed.empty()) {
-                std::vector<Aws::Firehose::Model::Record> retry;
-                retry.reserve(failed.size());
-                for (std::size_t idx : failed) {
-                    retry.push_back(records[idx]);
-                }
-                records = std::move(retry);
-            }
-            // else: FailedPutCount>0 but no per-entry ErrorCode (anomalous /
-            // short response). Retry the WHOLE batch (records unchanged) rather
-            // than silently dropping records.
-        }
-        throw std::runtime_error(opts_.name + ": PutRecordBatch left records undelivered after " +
-                                 std::to_string(opts_.max_retries + 1) + " attempts");
-    }
-
-    void sleep_backoff_(int attempt) {
-        auto backoff = opts_.retry_base_backoff * (1u << (attempt - 1));
-        constexpr std::chrono::milliseconds kMaxBackoff{30000};
-        if (backoff > kMaxBackoff) {
-            backoff = kMaxBackoff;
-        }
-        std::this_thread::sleep_for(backoff);
-    }
-
-    bool linger_elapsed_() const {
-        return opts_.max_age.count() > 0 && !pending_.empty() &&
-               std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
-    }
-
-    FirehoseSinkOptions opts_;
-    std::unique_ptr<Aws::Firehose::FirehoseClient> client_;
-    std::vector<Aws::Firehose::Model::Record> pending_;
-    std::size_t pending_bytes_{0};
-    std::chrono::steady_clock::time_point first_buffered_at_{};
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace clink::aws

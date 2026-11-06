@@ -95,9 +95,15 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {},
+        .timeout_options = {"connect_timeout_ms", "request_timeout_ms", "retry_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"no producer dedup: a replayed batch is re-appended to the delivery stream",
+        .limitations = {"at-least-once into Firehose: a record resent after a lost reply or "
+                        "replayed after a restart can reach the destination twice; no producer "
+                        "dedup and no ordering",
+                        "a checkpoint covers acceptance by Firehose, not delivery to the "
+                        "destination, which the service does after its own buffering and retries",
+                        "a record over 1,000 KiB with its delimiter fails the sink, and the job's "
+                        "restart replays it",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -211,21 +217,43 @@ void install(clink::plugin::PluginRegistry& reg) {
         });
 
     // firehose_sink: PutRecordBatch into an Amazon Data Firehose delivery
-    // stream. At-least-once; no partition key, no ordering. Params:
+    // stream. At-least-once into Firehose; no partition key, no ordering. Params:
     //   delivery_stream (required)
-    //   delimiter (default "\n")  - appended to each record's Data (empty = none)
+    //   delimiter (default "\n")  - appended to each record's data (empty = none)
     //   region, endpoint_override
-    //   batch_records (default 500; clamped to [1, 500])
-    //   max_retries (default 8)   - failed-subset resend attempts
+    //   connect_timeout_ms (default 3000), request_timeout_ms (default 10000)
+    //   batch_records (default 500; 1 to 500)
+    //   max_retries (default 8; 0 to 20) - retries in a row that accept nothing
+    //   retry_timeout_ms (default 60000) - the most one request's retries may take
+    //   linger_ms (default 0)     - flush a partial batch this old
     reg.register_sink<std::string>(
         "firehose_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            // Each number is range-checked here, before it is narrowed.
+            const auto ranged =
+                [&ctx](const char* key, std::int64_t fallback, std::int64_t lo, std::int64_t hi) {
+                    const auto v = ctx.param_int64_or(key, fallback);
+                    if (v < lo || v > hi) {
+                        throw std::runtime_error(std::string{"firehose_sink: '"} + key +
+                                                 "' must be " + std::to_string(lo) + " to " +
+                                                 std::to_string(hi) + "; it is " +
+                                                 std::to_string(v));
+                    }
+                    return v;
+                };
             FirehoseSinkOptions o;
             o.delivery_stream = ctx.param_or("delivery_stream");
             o.delimiter = ctx.param_or("delimiter", "\n");
             o.client = client_options_from(ctx);
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
-            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
-            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+            o.client.connect_timeout_ms = static_cast<int>(
+                ranged("connect_timeout_ms", o.client.connect_timeout_ms, 1, 600000));
+            o.client.request_timeout_ms = static_cast<int>(
+                ranged("request_timeout_ms", o.client.request_timeout_ms, 1, 600000));
+            o.batch_records = static_cast<std::size_t>(ranged("batch_records", 500, 1, 500));
+            o.max_retries =
+                static_cast<int>(ranged("max_retries", 8, 0, FirehoseSink::kMaxRetries));
+            o.retry_timeout =
+                std::chrono::milliseconds{ranged("retry_timeout_ms", 60000, 1, 3600000)};
+            o.max_age = std::chrono::milliseconds{ranged("linger_ms", 0, 0, 3600000)};
             o.name = "firehose_sink";
             return std::make_shared<FirehoseSink>(std::move(o));
         });

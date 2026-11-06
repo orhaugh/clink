@@ -13,6 +13,7 @@ add_executable(clink_aws_tests
     test_dynamodb_item.cpp
     test_dynamodb_sink.cpp
     test_dynamodb_live.cpp
+    test_firehose_sink.cpp
     test_kinesis_firehose_sink.cpp
     test_kinesis_source.cpp
     test_kinesis_live.cpp
@@ -34,6 +35,14 @@ target_link_libraries(clink_aws_tests PRIVATE
     $<$<TARGET_EXISTS:clink_rocksdb>:clink_rocksdb>)
 target_compile_definitions(clink_aws_tests PRIVATE
     $<$<TARGET_EXISTS:clink_rocksdb>:CLINK_AWS_TESTS_HAVE_ROCKSDB>)
+# The Firehose emulator cases read the delivery stream's S3 destination back
+# with the SDK's own S3 client; without that component they are not built, and
+# scripts/firehose-live.sh fails on the missing suite.
+find_package(aws-cpp-sdk-s3 CONFIG QUIET)
+if(TARGET aws-cpp-sdk-s3)
+    target_sources(clink_aws_tests PRIVATE test_firehose_live.cpp)
+    target_link_libraries(clink_aws_tests PRIVATE aws-cpp-sdk-s3)
+endif()
 clink_set_warnings(clink_aws_tests)
 gtest_discover_tests(clink_aws_tests
     DISCOVERY_MODE PRE_TEST
