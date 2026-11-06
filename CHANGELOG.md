@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+**The DynamoDB sink keys buffered records by the item they write, keeps every
+number's digits, and refuses a record DynamoDB would refuse or the SDK would
+change.** Buffered records were keyed by the key strings joined with a NUL, so
+two different composite keys could share one entry and one record vanished; a
+string key and a number key of the same text shared one too. Numbers passed
+through a double, so integers past the 64-bit range and decimals past 17 digits
+were rounded, and neighbouring keys collapsed into one item. Records are now
+keyed by the key attributes' types and values compared field by field, a number
+by its value as DynamoDB compares it, and numbers are written with every digit up
+to DynamoDB's 38. The table's key schema is read with `DescribeTable` at open and
+checked against `partition_key` and `sort_key`. Each record is checked against it
+and against DynamoDB's documented limits (key types and sizes, 38 digits and the
+range, 400 KB by the documented size rules, 31 levels of nesting below an
+attribute, names) before it is buffered, so it never replaces a buffered record
+and the service never sees a write it would refuse for its shape. A string
+holding U+0000 is refused: the AWS SDK for C++ cuts strings at it, and the sink
+stored them cut. Covered by `DynamoDbIdentity`, `DynamoDbNumber`,
+`DynamoDbRecord`, `DynamoDbItemSize`, `DynamoDbSinkIdentity`,
+`DynamoDbSinkValidation` and `DynamoDbLive` against LocalStack, where the
+previous sink was shown to collapse keys, round numbers and cut strings.
+
+**The DynamoDB sink resends only confirmed unprocessed writes, bounds its
+retries, and never acknowledges a barrier over writes it dropped.** A response
+listing `UnprocessedItems` that were not the request's own puts was taken at its
+word; it now fails the sink as ambiguous. Retries were the SDK's and the sink's,
+with a sleep a cancellation could not end; the sink now classifies every error
+as throttling, transient or permanent, resends throttled and transient requests
+and unprocessed items with a backoff bounded by `max_retries` retries in a row
+that write nothing and by `retry_timeout_ms` (new) in total, ends a wait or a
+call in flight on cancellation, and fails at once on a permanent error with what
+to check. Requests stay within 16 MiB as the SDK writes them. A sink that fails
+drops its buffer and refuses every later record, flush and barrier. Options are
+checked: `batch_records` outside 1 to 25 and `max_retries` outside 0 to 20 fail
+the build instead of being clamped, and `connect_timeout_ms` and
+`request_timeout_ms` are new. The sink needs `dynamodb:DescribeTable`. Covered by
+`DynamoDbSinkWrites`, `DynamoDbSinkResponses`, `DynamoDbSinkFailures`,
+`DynamoDbSinkCancel`, `DynamoDbSinkLifecycle` and the `DynamoDbRecovery` cluster
+cells; gate `scripts/dynamodb-live.sh`, run by the `aws` workflow.
+
 **The Kinesis source gives every shard exactly one owner, finds reshards as they
 happen, and reads a split's or merge's children after their parents.** Shards
 were assigned by their position in a sorted listing and kept across listings, so
@@ -34,7 +73,7 @@ source refuses one that lacks them. `max_records_per_poll` outside 1 to 10000 is
 rejected instead of coerced. Covered by `KinesisSourceRestore`,
 `KinesisSourceRescale`, `KinesisSourceFailures`, `KinesisSourceCancel` and the
 `KinesisRecovery` cluster cells; gate `scripts/kinesis-live.sh`, run by the new
-`kinesis` workflow.
+`aws` workflow.
 
 **A hot cutover that loses a worker part-way through its drain falls back to the
 replan instead of failing the job.** A hot cutover counts each old subtask's exit

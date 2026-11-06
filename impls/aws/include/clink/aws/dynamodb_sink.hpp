@@ -264,8 +264,9 @@ struct DynamoDbSinkOptions {
     std::string sort_key;       // the table's sort key attribute; required when it has one
     AwsClientOptions client;
     std::size_t batch_records{25};  // items per BatchWriteItem, 1 to 25
-    // Attempts in a row that write nothing (a failed request, or UnprocessedItems
-    // that did not shrink) before a flush fails, 0 to kMaxRetries.
+    // Retries in a row that write nothing (a failed request, or UnprocessedItems
+    // that did not shrink) before a flush fails, 0 to kMaxRetries: 0 fails at the
+    // first such attempt.
     int max_retries{8};
     std::chrono::milliseconds retry_base_backoff{100};
     std::chrono::milliseconds max_backoff{10000};

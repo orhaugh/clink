@@ -151,7 +151,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   region, endpoint_override - endpoint_override targets LocalStack/custom
     //   connect_timeout_ms (default 3000), request_timeout_ms (default 10000)
     //   batch_records (default 25; 1 to 25)
-    //   max_retries (default 8; 0 to 20) - attempts in a row that write nothing
+    //   max_retries (default 8; 0 to 20) - retries in a row that write nothing
     //   retry_timeout_ms (default 60000) - the most one batch's retries may take
     //   linger_ms (default 0)     - flush a partial batch this old
     reg.register_sink<std::string>(
