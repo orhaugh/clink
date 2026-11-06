@@ -492,6 +492,18 @@ if(CLINK_INTEGRATION_TESTS)
         target_sources(clink_integration_tests PRIVATE integration/test_search_recovery.cpp)
         target_link_libraries(clink_integration_tests PRIVATE $<BUILD_INTERFACE:httplib::httplib>)
     endif()
+    # The Kinesis source's recovery cells, against the LocalStack stream
+    # scripts/kinesis-live.sh starts; they skip without it. The test creates,
+    # writes and reshards the stream with the SDK's Kinesis client, found here
+    # the way impls/aws finds it (imported targets are scoped to a directory).
+    if(TARGET clink::aws AND TARGET clink::http_connector)
+        find_package(aws-cpp-sdk-kinesis CONFIG QUIET)
+        if(TARGET aws-cpp-sdk-kinesis)
+            target_sources(clink_integration_tests PRIVATE integration/test_kinesis_recovery.cpp)
+            target_link_libraries(clink_integration_tests PRIVATE
+                clink::aws aws-cpp-sdk-kinesis aws-cpp-sdk-core)
+        endif()
+    endif()
     target_link_libraries(clink_integration_tests PRIVATE
         clink::clink
         GTest::gtest_main

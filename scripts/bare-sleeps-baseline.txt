@@ -35,7 +35,14 @@
 #    5s ON PURPOSE, an outage shorter than the driver's server selection
 #    timeout, before it is started again: the length of the outage is what
 #    the cell tests.
+#  * test_kinesis_recovery's latest-mode cell waits 1.5s ON PURPOSE on each
+#    side of the source's start time: records written before the job must
+#    arrive earlier, and records written during the outage later, by the
+#    emulator's clock, which latest mode measures against the Worker's. The
+#    gap is the margin between two clocks; nothing the test can observe
+#    marks them apart.
 2      tests/integration/test_clickhouse_native_recovery.cpp
+2      tests/integration/test_kinesis_recovery.cpp
 1      tests/integration/test_mongodb_recovery.cpp
 1      tests/integration/test_postgres_pipeline.cpp
 1      tests/integration/test_soak.cpp
