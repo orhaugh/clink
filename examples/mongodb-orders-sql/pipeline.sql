@@ -49,8 +49,8 @@ CREATE TABLE order_log (
     collection = 'order_log'
 );
 
--- Orders placed: the insert events. A change stream carries no before-image of
--- an update, so the source is append-only; totals over the inserts are exact,
+-- Orders placed: the insert events. The source does not ask for an update's
+-- before-image, so it is append-only; totals over the inserts are exact,
 -- whatever later changes the orders.
 INSERT INTO customer_totals
 SELECT customer AS _id, COUNT(*) AS orders, SUM(amount) AS total

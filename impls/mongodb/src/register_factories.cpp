@@ -121,7 +121,8 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "event, so it can carry later changes, or none once deleted",
                         "a document field named __op, __ns, __id or __image stops the source",
                         "in SQL, a value its declared column cannot hold exactly stops the source; "
-                        "no changelog form, as an update carries no before-image"},
+                        "no changelog form, as the source does not ask for an update's "
+                        "before-image"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "mongo",

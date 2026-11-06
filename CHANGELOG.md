@@ -93,8 +93,9 @@ within their ranges, ObjectIds and nested values into `VARCHAR` text. A value a
 column cannot hold (a double in a `BIGINT`, a fraction past a `DECIMAL`'s
 scale, binary data anywhere) stops the job naming the document, the field and
 the column, rather than being rounded or passed through as text
-(`impls/mongodb/src/sql_row.hpp`). There is no changelog form: an update
-carries no before-image to retract. As a sink, inserts, or under
+(`impls/mongodb/src/sql_row.hpp`). There is no changelog form: the source does
+not ask for an update's before-image (`fullDocumentBeforeChange`), so there is
+none to retract. As a sink, inserts, or under
 `mode='upsert'` replacements by a one-column PRIMARY KEY with deletes applied by
 key, each column written as the BSON type its SQL type maps to. Options either
 side does not read are refused, as are `exactly_once`, `changelog='true'` and a

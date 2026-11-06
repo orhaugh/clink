@@ -768,8 +768,8 @@ RowConnectorBinding row_source_binding_for(const TableDef& table) {
         // MongoDB change stream: each insert, update, replace and delete is one
         // appended row of the declared columns, converted strictly from the
         // event's BSON (sql_row.hpp in the connector). There is no changelog
-        // form: an update carries no before-image to retract. At-least-once
-        // (resume-token checkpoint).
+        // form: the source does not ask for an update's before-image, so there
+        // is none to retract. At-least-once (resume-token checkpoint).
         check_mongodb_options(table, /*as_source=*/true);
         if (table.mode() != "append") {
             unsupported("table '" + table.name +

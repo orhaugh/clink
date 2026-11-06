@@ -39,8 +39,8 @@ added; until a release carries it, use a local build.
   cannot hold (a double in a `DECIMAL` column, a string in a `BIGINT` one) stops
   the job with an error naming the document, the field and the column.
 - **An append-only change stream.** Each change is one row, its kind in `__op`
-  and the document's `_id` in `__id`. An update carries no before-image, so
-  there is no retraction to apply: the totals sum the insert events, which no
+  and the document's `_id` in `__id`. The source does not ask for an update's
+  before-image, so there is no retraction to apply: the totals sum the insert events, which no
   later change alters.
 - **Typed BSON out.** The sinks write each column as the BSON type its SQL type
   maps to: `DECIMAL` as decimal128 with its digits, `TIMESTAMP` as a date,
