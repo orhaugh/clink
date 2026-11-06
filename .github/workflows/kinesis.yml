@@ -1,0 +1,127 @@
+name: kinesis
+
+# The Kinesis source's gate (scripts/kinesis-live.sh): every Kinesis test, the
+# source's deterministic cases against a model of the service (ownership,
+# discovery, split and merge lineage, restores at each parent and child
+# transition, latest-mode starts, iterator expiry, throttling, transient and
+# permanent failures, retention loss, rescale through the runtime's file:// and
+# rocksdb:// restores, cancellation, bounded state) and the live ones against
+# LocalStack (docker/integration-services.yml's localstack service): a split and
+# a merge while the source reads, a uniform reshard under two subtasks, latest
+# mode restored before its first record, a missing and a recreated stream; and
+# the recovery cells, a coordinator and two workers reading the emulator's stream
+# into the file 2PC sink with a worker killed while records are in flight and
+# the stream resharded under the job, each verified against the cell's own
+# record of what it wrote. A live test skips when its endpoint or binary is
+# missing and gtest counts that as a pass, so the gate fails on any skip and on
+# any required suite that did not run. Nothing here runs against AWS.
+#
+# The script runs on the runner, where it starts and removes the emulator with
+# Docker; the test binaries run inside the toolchain image through PIN_RUNNER,
+# on the runner's network.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: kinesis-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: The Kinesis source holds its contract against the emulator and the model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      TOOLCHAIN: ghcr.io/${{ github.repository_owner }}/clink-build:main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report what is under test
+        run: |
+          echo "commit under test: $(git rev-parse HEAD)"
+          docker pull -q "${TOOLCHAIN}"
+          df -h /
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-kinesis-${{ github.run_id }}
+          restore-keys: ccache-kinesis-
+      # CLINK_WITH_AWS=ON, not AUTO: an SDK missing from the image fails the
+      # configure rather than leaving the gate without its binaries. Debug
+      # without DWARF and stripped, as the build job builds.
+      - name: Build the Kinesis tests, the recovery cells and the node binary
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ccache"
+          docker run --rm --user root \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
+            -v "${RUNNER_TEMP}/ccache:/root/.ccache" \
+            -e CLINK_DEPS_PREFIX=/usr/local -e CCACHE_DIR=/root/.ccache -e CCACHE_MAXSIZE=1500M \
+            -e CMAKE_C_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "${TOOLCHAIN}" bash -c '
+              set -euo pipefail
+              git config --global --add safe.directory "*"
+              apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
+                -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_AWS=ON -DCMAKE_C_FLAGS_DEBUG=-g0 \
+                -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
+              cmake --build build --target clink_aws_tests clink_integration_tests clink_node \
+                -j "$(( $(nproc) / 2 + 1 ))"
+              ccache -s | tail -3'
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-kinesis-${{ github.run_id }}
+      - name: Run the gate
+        run: |
+          set -euo pipefail
+          export REPORT_DIR="${RUNNER_TEMP}/kinesis-live-reports"
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_KINESIS_TEST_ENDPOINT -e CLINK_KINESIS_RECOVERY_LOG_DIR \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION -e AWS_REGION \
+            -e AWS_EC2_METADATA_DISABLED \
+            ${TOOLCHAIN}"
+          scripts/kinesis-live.sh build 2>&1 | tee "${RUNNER_TEMP}/kinesis-gate.log"
+      - name: Keep the reports and the cells' evidence
+        # The reports carry every case's result; the gate log and each run's log
+        # carry the recovery cells' "[kinesis-recovery]" lines and the fault
+        # framework's witness lines; recovery-logs/ holds every cell's
+        # coordinator and worker logs; provenance.txt names the commit, the
+        # build's configuration and the emulator. On failure the report
+        # directory also holds the emulator's own log.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kinesis-gate
+          path: |
+            ${{ runner.temp }}/kinesis-live-reports/**
+            ${{ runner.temp }}/kinesis-gate.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Upload the harness logs on failure
+        # The harness keeps its scratch tree, with every Coordinator and
+        # Worker log, when a recovery cell fails.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kinesis-harness-logs
+          path: /tmp/clink_it_*/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
