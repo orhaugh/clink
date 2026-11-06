@@ -244,4 +244,4 @@ scripts/mongodb-live.sh build
 
 `ctest --test-dir build -L mongodb` runs the suites without a server; the live ones skip there.
 
-The gate passed on commit `9acee127`, before the SQL support, in a local run on 2026-11-06: 56 of 56 cases, the six recovery cells among them. An earlier run on the same commit failed two cells because the machine suspended mid-cell and the workers' leases expired; it was run again with sleep prevented. The `mongodb` CI workflow has not yet run the gate.
+The gate passed on commit `5e29b318` in a local run on 2026-11-06: 86 of 86 cases, 70 in `clink_mongodb_tests`, 9 in `clink_mongodb_sql_tests` and the seven recovery cells, against `mongo:7` (7.0.45); its reports are not published. Before the SQL support it passed on `9acee127`, 56 of 56; an earlier run on that commit failed two cells because the machine suspended mid-cell and the workers' leases expired, and passed when run again with sleep prevented. The `mongodb` CI workflow has not yet run the gate.
