@@ -496,12 +496,21 @@ if(CLINK_INTEGRATION_TESTS)
     # scripts/kinesis-live.sh starts; they skip without it. The test creates,
     # writes and reshards the stream with the SDK's Kinesis client, found here
     # the way impls/aws finds it (imported targets are scoped to a directory).
+    # The DynamoDB sink's cells read such a stream into a LocalStack table
+    # (scripts/dynamodb-live.sh), which the test reads with the SDK's DynamoDB
+    # client.
     if(TARGET clink::aws AND TARGET clink::http_connector)
         find_package(aws-cpp-sdk-kinesis CONFIG QUIET)
+        find_package(aws-cpp-sdk-dynamodb CONFIG QUIET)
         if(TARGET aws-cpp-sdk-kinesis)
             target_sources(clink_integration_tests PRIVATE integration/test_kinesis_recovery.cpp)
             target_link_libraries(clink_integration_tests PRIVATE
                 clink::aws aws-cpp-sdk-kinesis aws-cpp-sdk-core)
+            if(TARGET aws-cpp-sdk-dynamodb)
+                target_sources(clink_integration_tests PRIVATE
+                    integration/test_dynamodb_recovery.cpp)
+                target_link_libraries(clink_integration_tests PRIVATE aws-cpp-sdk-dynamodb)
+            endif()
         endif()
     endif()
     target_link_libraries(clink_integration_tests PRIVATE
