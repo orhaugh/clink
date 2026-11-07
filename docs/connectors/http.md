@@ -194,22 +194,113 @@ Pushes batched records as gauge samples to a Prometheus Pushgateway. This sink d
 
 ### `http_poll_source`
 
-GETs a JSON REST endpoint on an interval and emits the array elements, with a checkpointed cursor. Only subtask 0 polls, whatever the job's parallelism; the other subtasks read nothing. This source does not use `batch_records` / `batch_bytes` / `dlq` / `linger_ms`.
+GETs a JSON endpoint on an interval and emits the elements of the array each response carries, one record per element, as single-line JSON with every token as the endpoint wrote it. Only subtask 0 polls, whatever the job's parallelism; the other subtasks read nothing. This source does not use `batch_records` / `batch_bytes` / `dlq` / `linger_ms`.
+
+#### Modes
+
+| Mode | Set with | What each poll asks for | What a checkpoint holds | After a restore | A bounded run ends |
+| --- | --- | --- | --- | --- | --- |
+| Cursor | `cursor_param` and `cursor_field` | The records strictly after the cursor, sent as `?<cursor_param>=<cursor>` | The cursor | Polls again from the checkpointed cursor | At the first valid empty page |
+| Resource | Neither | The same request every time | No position | Reads the resource as it is then | After the first valid response |
+
+One of `cursor_param` and `cursor_field` without the other is refused, as are `initial_cursor` and `cursor_type` in resource mode and an empty value for any of these options.
+
+#### What cursor mode needs from the endpoint
+
+The source can replay only what the endpoint lets it ask for again. Cursor mode assumes the endpoint:
+- answers the records strictly after the cursor it is sent, ascending by `cursor_field`, with each value unique;
+- keeps those records long enough for any checkpointed cursor to be asked for again, that is, for as long as a restore can reach back;
+- may end a page anywhere, the next poll continuing after the page's last record.
+
+It checks every page against what it can of that, before it emits a record or moves the cursor:
+- every record is an object with exactly one `cursor_field`, holding a usable value;
+- with `cursor_type='integer'`, the values rise strictly and the first is past the cursor the request carried;
+- with `cursor_type='opaque'`, no value repeats within the page and none is the cursor the request carried, since no order is assumed between two tokens.
+
+A page that fails a check fails the poll: nothing of it is emitted, the cursor stays where it was, the subtask fails and the job restarts from its last checkpoint. That is also how an endpoint that ignores the cursor shows up, since it serves the request's own cursor, or records before it, again.
+
+A value shared by two records, as timestamps often are, is refused. The cursor moves past a value, so a page that ended inside a run of equal values would skip the rest of the run, and the source cannot tell whether a page ended there. Give the endpoint a unique field to page on, or an opaque cursor it makes unique, such as a timestamp and an id in one token.
+
+| `cursor_type` | Accepted values | Compared |
+| --- | --- | --- |
+| `opaque` (default) | A non-empty JSON string, or a number's text as written, at most 1,024 bytes | For equality only; sent back unchanged |
+| `integer` | A decimal integer: a JSON integer of up to 64 bits, or a string of one of up to 100 digits | By value, exactly at any size |
+
+Page tokens or next-page links, offsets, cursors made of several fields, and endpoints that include the record at the cursor are not supported.
+
+#### Responses
+
+| Response | What the source does |
+| --- | --- |
+| HTTP 200 with a JSON body | Reads the array at `records_field`, or the body itself when that is empty, and checks the page as above |
+| HTTP 200 with an empty array, or HTTP 204 | An empty page: nothing emitted, the cursor unchanged. A bounded cursor-mode run ends here |
+| HTTP 304 to a request that carried `If-None-Match` | Not modified: nothing emitted |
+| HTTP 304 to any other request | Fails the poll |
+| A missing, null or mistyped records field, a body that is not JSON or is cut short, a page over `max_response_records`, a body over `max_response_bytes` | Fails the poll: nothing emitted, the cursor unchanged |
+| A record clink's JSON reader cannot decode: an integer past 64 bits, or a number past a double's range | Fails the poll. Every record the source emits stays readable by the operators after it, SQL's included; an endpoint should send such values as strings |
+| Any other 2xx, any 3xx | Fails the poll. Redirects are not followed |
+| 408, 425, 429, 5xx other than 501 and 505, no response, a request past `request_timeout_ms` | Retried, as below |
+| Any other 4xx, such as 400, 401, 403 or 404 | Fails at once |
+
+Records are emitted as served: the whitespace between tokens goes, and every number and string is kept byte for byte, so an integer past what a double holds reaches the next operator exact.
+
+#### Conditional requests
+
+The source sends `If-None-Match` with the previous response's ETag only when the request repeats that response's exactly: every poll in resource mode, and in cursor mode the poll after an empty page. A cursor that moves changes the request, so no validator is ever sent for another position. The ETag is not checkpointed: after a restore or a reopen the first request carries none, so a validator cannot hide records a restore has to read again. A bounded run sends none. A server whose validator ignores the cursor, answering 304 while its records have moved on, stops the source receiving records until the validator changes; that is a fault in the server the source cannot see.
+
+#### Bounds, retries and cancellation
+
+- `max_response_bytes` bounds a response's body, counted as it is decompressed. A longer body ends the request and fails the poll.
+- `max_response_records` bounds the records of one response.
+- `request_timeout_ms` bounds one request as a whole, however slowly the server sends, and `connect_timeout_ms` the connection.
+- A failed attempt is retried after a backoff that starts at `retry_base_backoff_ms` and doubles up to `max_backoff_ms`, or after as long as `Retry-After` asks (seconds or an HTTP date) when that is longer. A poll makes at most `max_retries` retries, all within `retry_timeout_ms` of its first attempt; a wait that would end past that fails the poll at once rather than waiting.
+- The poll interval and every backoff are waited out a slice at a time between calls into the source, so checkpoint barriers pass while it waits. A cancel ends a wait, or a request in flight, at once.
+- Errors name the source, the request's path without its query string, and the status or the problem. They never carry a header, the query string or the URL; a URL with a user or password in it is refused without being repeated.
+
+#### Recovery
+
+In cursor mode the checkpoint holds the cursor, as operator state under the key the source has always used, so a checkpoint an earlier release wrote restores. A restore sends the source back to that cursor, and it reads again the records it had emitted since. Into the job that is at-least-once, and into a two-phase-commit sink it is exactly-once, while the endpoint keeps what it served. A restored cursor the configured `cursor_type` cannot read is refused, as is a cursor restored into a source in resource mode.
+
+In resource mode nothing is replayed. A restart polls the resource as it is then: records emitted after the last checkpoint and lost with a worker come back only if the resource still holds them, and a change between two polls is never seen. A job over a resource-mode source cannot declare a delivery guarantee above at-most-once.
+
+#### Options
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `path` | No | `/` | Request path (may carry a fixed query string). |
+| `path` | No | `/` | Request path from `/`, which may carry a fixed query string. |
 | `headers` | No | (empty) | Request headers (auth). |
-| `verify_tls` | No | `true` | HTTPS certificate verification. |
-| `cursor_param` | No | (empty) | Query-parameter name to send the cursor as. |
-| `cursor_field` | No | (empty) | Record field holding the next cursor; the API must return records ascending by it. |
+| `verify_tls` | No | `true` | HTTPS certificate verification: `true` or `false`. |
+| `cursor_param` | No | (empty) | Cursor mode: the query parameter the cursor is sent as. |
+| `cursor_field` | No | (empty) | Cursor mode: the record field each record's cursor is read from. |
+| `cursor_type` | No | `opaque` | Cursor mode: `opaque` or `integer`, as above. |
 | `records_field` | No | (empty) | Response field holding the array; if empty, the response itself is the array. |
-| `initial_cursor` | No | (empty) | Starting cursor on a fresh run. |
-| `poll_interval_ms` | No | `1000` | Interval between polls. |
-| `jitter_frac` | No | `0` | Fraction of jitter applied to the poll interval. |
-| `bounded` | No | `false` | `true` stops after a poll returns nothing (one-shot). |
-| `max_retries` | No | `4` | Transient-GET retries within one poll; clamped to `[0, 20]`. |
-| `retry_base_backoff_ms` | No | `200` | Base backoff between transient retries. |
+| `initial_cursor` | No | (empty) | Cursor mode: where a run without a checkpoint starts; empty sends no cursor. |
+| `bounded` | No | `false` | `true` ends the run as the modes table says. |
+| `poll_interval_ms` | No | `1000` | From the start of one poll to the start of the next, `0` to `3600000`. |
+| `jitter_frac` | No | `0` | Fraction of jitter on the poll interval, `0` to `1`. |
+| `max_retries` | No | `4` | Retries one poll may make after its first attempt, `0` to `20`. |
+| `retry_base_backoff_ms` | No | `200` | The first backoff, `1` to `60000`; it doubles per retry. |
+| `max_backoff_ms` | No | `10000` | The longest backoff, from `retry_base_backoff_ms` to `600000`. |
+| `retry_timeout_ms` | No | `60000` | The longest one poll may take from its first attempt to its last, `1` to `3600000`. |
+| `connect_timeout_ms` | No | `5000` | `1` to `600000`. |
+| `request_timeout_ms` | No | `30000` | One request as a whole, `1` to `600000`. |
+| `max_response_bytes` | No | `16777216` | The most a response's body may hold, decompressed, `64` to `1073741824`. |
+| `max_response_records` | No | `100000` | The most records one response may carry, `1` to `10000000`. |
+
+Every option is parsed strictly: a value outside its range, or one that is not a number where a number is wanted, fails the job's build rather than falling back to a default.
+
+#### Earlier releases
+
+What changed from the source before this one, which a job moving to this release may notice:
+- A response with a missing, null or mistyped records field, or malformed JSON, fails the poll. Before, it read as a page with no records, so it could end a bounded run early. HTTP 204 is an empty page, where it used to fail as malformed JSON, and a 304 to a request that carried no `If-None-Match` fails, where it used to read as no records.
+- In cursor mode a record without a usable cursor, a repeated or falling value, or the request's own cursor fails the poll. Before, such records were emitted and the cursor stayed at the last usable value.
+- Records are emitted as served. Before, each was written again through clink's JSON value, which rounded integers past 2^63 and decimals past a double's precision and rewrote string escapes, and an integer cursor past 2^63 went back to the endpoint rounded. So a replay across the upgrade can give a record different bytes, and an integer cursor an earlier release rounded is refused when restored under `cursor_type='integer'`.
+- A bounded run in resource mode reads once. It used to poll again and emit the same records each time, unless the server answered 304.
+- `bounded` and `verify_tls` take only `true` or `false`, and every number must be one, in range. `max_retries` outside `0` to `20` is refused rather than clamped, and a value that does not parse no longer falls back to the default.
+- `url` must be `scheme://host[:port]` without a user or password. A URL with a path or a user in it never reached the endpoint, since the client took the whole text for a host name, and the error then repeated it, password included.
+- The delivery analyser treats the source as replayable only in cursor mode. Before, its record claimed replay however it was set up, so a job over a resource-mode source could declare `at_least_once` or `exactly_once`; it is now refused.
+- Errors no longer carry the URL or the query string.
+- The source no longer builds on `PollingSource`, which is unchanged for its other users.
 
 ### `pubsub_sink` / `pubsub_source`
 
@@ -287,7 +378,7 @@ CREATE TABLE es_out (
 );
 ```
 
-Source example (HTTP poll):
+Source example (HTTP poll, cursor mode on a unique, rising integer id):
 
 ```sql
 CREATE TABLE feed (
@@ -301,9 +392,12 @@ CREATE TABLE feed (
     records_field    = 'items',
     cursor_param     = 'since',
     cursor_field     = 'id',
+    cursor_type      = 'integer',
     poll_interval_ms = '2000'
 );
 ```
+
+A sink over this table may declare `delivery_guarantee='exactly_once'` when it is a two-phase-commit sink, and holds it while the endpoint answers strictly after the cursor and keeps what it served. Without `cursor_param` and `cursor_field` the table is in resource mode, and the coordinator refuses any guarantee above `at_most_once` for a job over it.
 
 A `connector='http'` table must declare `format='json'` so the row is rendered to a JSON string before the string-channel `http_sink` receives it.
 
@@ -344,7 +438,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - `influxdb_sink` is effectively-once when `timestamp_field` is set, since an identical point is idempotent.
 - `splunk_hec_sink` and `prometheus_sink` are at-least-once with no dedup key; HEC ingestion is append, and the Pushgateway stores the latest value per series (last-write-wins within a push). Each push is a POST, which replaces every series of the metric in its group with the series the push carries, and a push carries the series of the records since the previous one. So a series no record has named since the previous push disappears from the gateway rather than keeping its last value; give every series a record in each checkpoint interval if they must all stay visible.
 - `pubsub_sink` is at-least-once with no producer dedup; a replay re-publishes.
-- `http_poll_source` is at-least-once: the cursor is checkpointed. Avoiding re-emission of the boundary record requires an exclusive cursor server-side. The `http` capability record declares the source replayable from that cursor, so the delivery analyser lets a job over it declare `at_least_once`, and `exactly_once` with a two-phase-commit sink, which holds when the endpoint honours an exclusive cursor and retains what it served; an endpoint that ignores the cursor delivers everything again after a restart.
+- `http_poll_source` in cursor mode replays from its checkpointed cursor: at-least-once into the job, and exactly-once into a two-phase-commit sink, while the endpoint answers the records strictly after the cursor, ascending and each value unique, and keeps what it served. Every page is checked against what the source can see of that before anything is emitted, and one that fails fails the poll (see [the source's section](#http_poll_source)). Its capability record, `http_poll`, declares replay only with `cursor_field` and `cursor_param`, so the delivery analyser reports a job over a source in resource mode as `AT_MOST_ONCE_SOURCE` and refuses `at_least_once` and above for it, naming the options that would make it replay. Before, the source shared the `http` record, which claimed replay however the source was set up.
 - `pubsub_source` is at-least-once. It pulls, leases what it holds, and acknowledges once the checkpoint that covers a message completes; the server delivers again whatever was not acknowledged, which is also the crash-recovery mechanism. The contract, in detail:
     - `snapshot_offset()` seals the messages pulled since the last barrier as that checkpoint's; `notify_checkpoint_complete()` makes every interval at or below the completed id ready, and the next `produce()` turn, or `close()`, posts `:acknowledge` for them. Every request stays on the source thread; the notification only moves ackIds between lists (`include/clink/connectors/checkpoint_ack_ledger.hpp`), and a repeated, late or out-of-order one moves nothing twice and nothing sealed above the id it names.
     - An aborted checkpoint's messages, and those of a checkpoint that never completes, are not acknowledged: the source stops renewing their leases and the server delivers them again. `close()` acknowledges what completed checkpoints cover and hands every other held message back (`ackDeadlineSeconds` 0), so a restart receives them at once rather than when their leases run out.
@@ -364,7 +458,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - `elasticsearch_sink` / `opensearch_sink`: records of one `document_id` are ordered only within one sink subtask, and not against other writers; a replay can show a document at an older record's value until it reaches the latest; `document_id` values outside [the id rules](#document-ids) are refused. Only the `index` action is written: no update, delete or external versioning. The sink takes one URL and does not discover other nodes.
 - HTTPS works only if cpp-httplib was built with OpenSSL; otherwise an `https://` URL is rejected at construction.
 - `prometheus_sink` targets a Pushgateway, which is a latest-value store for low-cardinality service metrics, not a high-throughput event TSDB. Records whose `value_field` is missing or non-numeric are dropped (no sample). Remote-write is not implemented.
-- `http_poll_source` requires the API to return records ascending by `cursor_field`; it has no client-side ordering or de-duplication beyond the cursor.
+- `http_poll_source` replays only in cursor mode, and only from an endpoint that answers strictly after the cursor, ascending by a unique `cursor_field`, and keeps what it served; it refuses a page that breaks what it can check of that, including a value shared by two records. Page tokens, offsets and cursors of several fields are not supported. One subtask polls. A bounded run ends only on an empty page (cursor mode) or after one response (resource mode). Records with an integer past 64 bits or a number past a double's range are refused, since clink's JSON reader cannot decode them.
 - `pubsub_source` holds at most `max_outstanding` unacknowledged messages per subtask, and a job that completes no checkpoint stops pulling there. A message held past `max_lease_s` is delivered again (a duplicate). Subscriptions with exactly-once delivery enabled are not handled specially.
 - Pub/Sub uses the synchronous REST `Pull` with `returnImmediately`; gRPC StreamingPull is not used. The build does not mint OAuth2 tokens itself; a static `auth_token` expires after its lifetime, but `auth_token_file` lets an external refresher rotate the token without a restart. Multiple subtasks pull the same subscription and Pub/Sub load-balances across them (no client-side sharding).
 - The bulk sinks buffer rendered records in memory until a flush trigger; `batch_records` / `batch_bytes` / `linger_ms` bound that buffer.
@@ -387,7 +481,7 @@ The live integration tests are skipped unless their endpoint environment variabl
 | InfluxDB (`test_influxdb_live.cpp`) | `CLINK_INFLUXDB_TEST_ENDPOINT`, plus optional `CLINK_INFLUXDB_TEST_ORG` / `_BUCKET` / `_TOKEN` (defaults `clink` / `clink` / `clink-token`) | `influxdb:2` |
 | Pub/Sub (`test_pubsub_live.cpp`) | `CLINK_PUBSUB_EMULATOR_HOST` (e.g. `localhost:8085`) | `gcr.io/google.com/cloudsdktool/cloud-sdk:emulators` |
 
-There is no live test for `splunk_hec_sink`, `prometheus_sink`, or `http_poll_source`; these are covered by in-process and mock tests (`http_poll_source` also feeds the search recovery cells, from a feed the test serves).
+There is no live test for `splunk_hec_sink` or `prometheus_sink`; these are covered by in-process and mock tests. `http_poll_source` has a gate of its own against local servers, below, and also feeds the search recovery cells, from a feed the test serves.
 
 `pubsub_source`'s acknowledgement contract is tested in process by `PubSubSourceAck` (`test_pubsub.cpp`), against a stub of the REST endpoints that leases each delivery under a new ackId, honours `modifyAckDeadline`, acknowledges only through a current ackId and can fail acknowledges: an aborted checkpoint, crashes after the barrier and after completion, failed and retried acknowledges, notifications out of order, leases held across a delayed checkpoint and given up past `max_lease`, the `max_outstanding` bound, close after a cancel, and both `on_decode_error` policies. `PubSubSourceAckLive` (`test_pubsub_live.cpp`) repeats the abort, the crash after completion and the delayed checkpoint against the emulator. `test_factory_registration.cpp` pins the capability record and the analyser's verdict. `scripts/ack-sources-live.sh [build-dir]` is the required gate: it runs `PubSubLive` and `PubSubSourceAckLive` against a one-off emulator container, with the other acknowledging sources' suites, and fails on a missing binary, an emulator that never answers, a failed or skipped case, or a short suite (see the [Redis page](redis.md#testing)). The `ack-sources` CI workflow runs it.
 
@@ -402,7 +496,7 @@ There is no live test for `splunk_hec_sink`, `prometheus_sink`, or `http_poll_so
 | secured | The same image with its own security on: HTTPS with a certificate from its own CA, every request authenticated, an administrator's password generated for the run and passed only through the environment | `<Product>/SearchSinkSecuredLive` |
 | cluster | Three nodes of the same image (`docker/search-cluster.yml`), the sink writing to node 1 | `<Product>/SearchSinkClusterLive` |
 
-A gate fails on a skipped case, a suite that ran fewer cases than it has, a missing binary, a server that never answers or is not the product named, and the secured phase's password appearing anywhere in what it keeps. It keeps each run's report and output, the recovery cells' coordinator and worker logs, the secured server's CA certificate, and a `provenance.txt` naming the commit, the build's configuration and each phase's server version, image and digest. The `search` CI workflow runs all four gates.
+A gate fails on a skipped case, a suite that ran fewer cases than it has, a missing binary, a server that never answers or is not the product named, and the secured phase's password appearing anywhere in what it keeps. It keeps each run's report and output, the recovery cells' coordinator and worker logs, the secured server's CA certificate, and a `provenance.txt` naming the commit, the build's configuration and each phase's server version, image and digest. The `http` CI workflow runs all four gates; it was named `search` until the polling source's gate joined it.
 
 | Suite | Binary | What it checks |
 | --- | --- | --- |
@@ -423,3 +517,24 @@ Where a case needs a fault the server will not produce on demand, it writes thro
 The search CI workflow passed the gates for Elasticsearch 8.13.4 and OpenSearch 2.17.1 on commit `bf6cae33` (run 42184675107), 43 of 43 each, before the throttled, secured and cluster phases and the newer servers were added.
 
 All four gates passed in local runs on 2026-11-06, 55 of 55 each. Elasticsearch 8.13.4 and OpenSearch 3.3.0 ran on commit `52bfc6f9`. Elasticsearch 9.2.0 and OpenSearch 2.17.1 ran on `a3ecff67`, which adds only the gate's retry of a port Docker refused; on `52bfc6f9`, Docker had refused one port in each of those two gates. In every case the fault landed with records in flight or not yet covered by a checkpoint, and the throttled servers' own 429s ran from 2,999 to 6,940 items. The cluster absorbed a non-sink node's kill without failing a write, so that case shows nothing is lost; the case that kills the sink's own node shows the flush failing and recovering. These reports are not published. The `search` CI workflow then ran all four gates on commit `9102113f` (run 42199665079): 55 of 55 for each server.
+
+### The polling source
+
+`scripts/http-poll-live.sh [build-dir]` is the polling source's gate. It needs no service: every case runs against HTTP servers the tests start themselves. It fails on a skipped case, a suite that ran fewer cases than it has, a missing binary or a failed case, and keeps each run's report and output, the recovery cells' coordinator and worker logs, and a `provenance.txt` naming the commit, the build's configuration and the feed the cells served. The `http` CI workflow runs it after the search gates, whenever the build succeeded.
+
+| Suite | Binary | What it checks |
+| --- | --- | --- |
+| `HttpPollPage` | `clink_http_connector_tests` | The page reader on its own: an array or a configured envelope; numbers and escapes kept as served; a missing, null, mistyped or repeated records field; 26 malformed or empty bodies; a record clink's JSON reader cannot decode; the record bound; every record's cursor (missing, null, mistyped, repeated, falling, at or before the request's cursor, a run of equal timestamps); integer cursors exact at any size |
+| `HttpPollConfig` | `clink_http_connector_tests` | Cursor and resource mode's option combinations; a URL with a password refused without being repeated; every range; the factory's strict parsing of each option |
+| `HttpPollSourceCursor` | `clink_http_connector_tests` | Against a scripted endpoint: paging a retained feed; a bounded run ending at the first valid empty page and never on a malformed one; 204; cursors sent exactly and percent-encoded; an endpoint that ignores the cursor; conditional requests only for the same request, against a server whose validator ignores the cursor; a restore into the same and into a fresh source, through the file state backend, dropping the validator and reading again what the checkpoint did not cover; a reopen; an earlier release's checkpoint, and a restored cursor the configuration cannot read |
+| `HttpPollSourceResource` | `clink_http_connector_tests` | Every response emitted and an unchanged one not; a bounded run reading once; a 304 to a request that did not ask |
+| `HttpPollSourceResponses` | `clink_http_connector_tests` | Other 2xx, redirects and permanent 4xx failing at once, without a retry |
+| `HttpPollSourceBounds` | `clink_http_connector_tests` | An oversized body; one that passes the bound only once decompressed; a body sent slowly and headers held back, each bounded by `request_timeout_ms` as a whole |
+| `HttpPollSourceRetries` | `clink_http_connector_tests` | Each retried status and a refused connection, retried then exhausted; `retry_timeout_ms`; `Retry-After` in seconds and as a date, and one past the budget failing at once |
+| `HttpPollSourceCancel` | `clink_http_connector_tests` | A cancel ending a poll interval, a backoff and a request in flight at once |
+| `HttpPollSourceErrors` | `clink_http_connector_tests` | No header, token or query string in any error, a body that echoes them included |
+| `HttpPollCapability` | `clink_http_connector_tests` | The `http_poll` record, and the coordinator's verdict: `exactly_once` accepted in cursor mode, and refused in resource mode or with only one cursor option, naming what is missing |
+| `HttpPollRecovery` | `clink_integration_tests` | A coordinator and two workers polling a retained feed (2,400 records released at 600 a second, at most 100 a page, each with an integer past int64) into a two-phase-commit file sink; worker 0 parked just after the source emitted a page and killed with it in flight, at parallelism 1 and 2 and as a SQL job submitted by `clink_submit_sql`. Each checks the committed files against the feed's dataset, every record once and, in the C++ cells, byte for byte; that the feed had served past what was committed at the kill; and that the restored source asked again from before the page it had emitted |
+| `HttpPollSql` | `clink_integration_tests` | `clink run` reading the feed bounded to its end and finishing, every row once; the coordinator refusing `at_least_once` over a table in resource mode |
+
+What these establish is how the source treats each response a local server gives it. They qualify no third-party API: whether cursor mode is safe against one depends on that API answering strictly after the cursor, on a unique field, and keeping what it served.

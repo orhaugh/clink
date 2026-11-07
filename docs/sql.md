@@ -77,6 +77,13 @@ sink gives; its guarantee report (`guarantee_reasons` on
 `GET /api/v1/jobs/:id`) gives the guarantee each sink is held to and the one
 its own sources let it give.
 
+What a source lets a sink give can depend on how the source table is set up.
+An `http_poll` table replays from its cursor only in cursor mode, with
+`cursor_param` and `cursor_field`; without them it keeps no position, so a
+sink reading it may declare no more than `at_most_once`, and a stronger
+declaration is refused at submission, naming the missing options. See
+[the polling source](connectors/http.md#http_poll_source).
+
 ### Rescaling a running job
 
 A job submitted to a cluster can have its keyed stages resized while it runs.

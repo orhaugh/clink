@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+**The HTTP polling source checks every page against its cursor contract before
+it emits a record or moves the cursor.** A response without its records array,
+with the array null or of another type, or with malformed JSON read as a page
+with no records, so it could end a bounded job early; records without a usable
+cursor were emitted while the cursor stayed at an earlier one; and the cursor
+was taken from the last record without any check that the endpoint had moved
+on. A poll now counts only on HTTP 200 with the array where `records_field`
+says, 204 (an empty page) or 304 to a request that asked; anything else fails
+the poll, emitting nothing and moving nothing. In cursor mode every record must
+carry one usable cursor; `cursor_type='integer'` (new) values must rise and the
+default `opaque` ones never repeat or come back as the request's own, so an
+endpoint that ignores the cursor, or a page that ends inside a run of equal
+timestamps, is caught rather than skipped past. A bounded run ends on an empty
+page, or in resource mode after one response, where it used to poll again for
+ever. Records are emitted as served, numbers and escapes byte for byte, where an
+integer cursor or field past 2^63 used to be rounded. A conditional request goes
+only with the request it describes and never survives a restore, so a cached
+ETag can no longer hide records a restore has to read again. Covered by
+`HttpPollPage`, `HttpPollSourceCursor`, `HttpPollSourceResource` and
+`HttpPollSourceResponses` against a scripted local endpoint.
+
+**The HTTP polling source bounds its responses, retries and waits, and replays
+only where it can.** Bodies were read whole, retries slept in a way a cancel
+could not end, and errors repeated the request's URL and query string.
+`max_response_bytes` (counted decompressed), `max_response_records`,
+`request_timeout_ms` for a request as a whole, `connect_timeout_ms`,
+`retry_timeout_ms` and `max_backoff_ms` are new; 408, 425, 429 and passing 5xx
+are retried within those bounds, honouring `Retry-After`, and other 4xx fail at
+once; a cancel ends a wait or a request in flight. Errors name the path without
+its query string and never a header. The source has its own capability record,
+`http_poll`, which declares replay only with `cursor_field` and `cursor_param`,
+and the delivery analyser honours such a requirement (new,
+`ConnectorCapabilities::replay_requires_options`): a job over a resource-mode
+source is reported at-most-once and an `at_least_once` or stronger request is
+refused, naming what is missing. Options are parsed strictly: `bounded` and
+`verify_tls` take `true` or `false`, `max_retries` outside 0 to 20 is refused
+rather than clamped, and a URL with a path or a user is refused without being
+repeated. Covered by `HttpPollConfig`, `HttpPollSourceBounds`,
+`HttpPollSourceRetries`, `HttpPollSourceCancel`, `HttpPollSourceErrors`,
+`HttpPollCapability` and the `HttpPollRecovery` cluster cells, which kill a
+worker with an emitted page in flight and find every record committed once;
+gate `scripts/http-poll-live.sh`, run by the `http` workflow (until now named
+`search`).
+
 **The Firehose sink counts a send only when the response accounts for every
 record, and never builds a request past its limits.** A response with
 `FailedPutCount` 0 counted as success whatever its entries said, so records
