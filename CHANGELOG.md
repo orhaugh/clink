@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+**The Cassandra and ScyllaDB sinks bound what they hold, order every write to a
+row, and fail rather than acknowledge a checkpoint over a write whose outcome is
+unknown.** The plain sink kept every write in flight until the next barrier and
+the upsert sink every distinct key, with no bound; a failed flush cleared what
+it held and left the sink able to acknowledge the next barrier; `close()`
+flushed even on a cancelled task; the upsert sink accepted a partial key, so a
+delete by the partition key alone removed the whole partition, wrote an unknown
+`__row_kind` as an insert, put delete keys into the CQL text (a `uuid` key could
+not be deleted), rounded numbers past a double's precision, and quoted records in
+its errors; and ordering rested on the driver's default timestamps. Both sinks
+now hold at most `max_in_flight` writes and `max_in_flight_bytes` (the upsert sink
+also `max_buffered_records` rows and `max_buffered_bytes`, writing out early),
+holding the input back when full; every write carries a timestamp from the sink's
+own increasing clock, so a row's later record wins whatever order writes arrive
+in; the upsert sink checks at open that `key_columns` is the table's whole primary
+key, checks every record before buffering it, and deletes with a prepared
+`fromJson(?)` per key column; and any failed, timed-out or cancelled write fails
+the sink, which then refuses every barrier until it opens again. `consistency`
+(default `local_one`; `any` and the serial levels refused) and
+`request_timeout_ms` are new, numbers are read whole, SQL refuses options the sink
+does not read (TLS options among them) and `changelog='true'`, and
+`records_total` now counts acknowledged writes beside the new
+`writes_submitted_total` and `writes_in_flight`. `close()` writes nothing, so a
+program driving a sink directly calls `flush()` first. Covered by
+`CassandraRules`, `CassandraSink*` against a model of the server,
+`SqlPhysical.CassandraOptionsAreCheckedWhenTheJobIsPlanned`, and the gate
+`scripts/cassandra-live.sh`, which passed against Apache Cassandra 4.1.12 and
+ScyllaDB 6.2.3 with its live cases (`CassandraLive`, `CassandraSqlLive`) and four
+recovery cells (`CassandraRecovery`).
+
 **A SQL source table no longer turns a record it cannot decode into a row of
 nulls.** The JSON bridge that decodes each record of a text-reading source
 (Kafka, RabbitMQ, NATS, Pulsar, Kinesis, `http_poll`, Pub/Sub, Redis, the

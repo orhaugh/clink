@@ -222,8 +222,12 @@ that the SELECT projects it.
   commit. An upload orphaned by a crash before the checkpoint became durable
   produces no visible object and is left for an S3 lifecycle rule to expire.
 - **Cassandra upsert**: CQL has no multi-row IN over a composite key, so deletes
-  are per-row `DELETE ... WHERE k=<literal>`; `__row_kind` is stripped before
-  `INSERT ... JSON` (Cassandra rejects an unknown column).
+  are per-row, a prepared `DELETE ... WHERE "k" = fromJson(?)` binding each key
+  value as the record wrote it; `__row_kind` is removed before `INSERT ... JSON`
+  (the server rejects an unknown column). Every write carries the sink's own
+  timestamp, so a row's later record wins whatever order writes arrive in, and
+  the key must be the table's whole primary key (see
+  [Cassandra](../connectors/cassandra.md#delivery-ordering-and-the-final-state)).
 - **Redis upsert**: a key-value view (`SET`/`DEL` by the PK-derived key), distinct
   from the append-only Streams sink.
 
