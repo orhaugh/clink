@@ -165,19 +165,106 @@ Posts events to a Splunk HTTP Event Collector with `Authorization: Splunk <token
 
 ### `influxdb_sink`
 
-Converts each JSON-object row to one InfluxDB v2 line-protocol point and POSTs NDJSON batches to `/api/v2/write` with `Authorization: Token <token>`.
+Converts each JSON-object row to exactly one InfluxDB v2 line-protocol point and POSTs newline-delimited batches to `/api/v2/write` with `Authorization: Token <token>`. The renderer, the point rules and the reading of responses are in `impls/http_connector/include/clink/http_connector/influxdb_sink.hpp`; buffering, retries and cancellation are the shared `BatchedHttpBulkSink`'s. It is tested against InfluxDB 2.7.12.
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `org` | Yes | (empty) | InfluxDB v2 organisation. |
-| `bucket` | Yes | (empty) | InfluxDB v2 bucket. |
-| `token` | Yes | (empty) | API token; sets the `Authorization` header. |
-| `measurement` | Yes | (empty) | Line-protocol measurement name. |
-| `tags` | No | (empty) | CSV of row fields to emit as tags; remaining scalar fields become fields. |
-| `timestamp_field` | No | (empty) | Row field holding the point timestamp; otherwise the server assigns it. |
-| `precision` | No | `ns` | Write precision: `ns`, `us`, `ms`, or `s`. |
+| `url` | Yes | | `scheme://host[:port]`. |
+| `org` | Yes | | InfluxDB v2 organisation. |
+| `bucket` | Yes | | InfluxDB v2 bucket. |
+| `token` | Yes | | API token; sets the `Authorization` header. `env://VAR` reads it from the worker's environment. |
+| `measurement` | Yes | | The measurement name of every point. |
+| `tags` | No | | Comma-separated row fields written as tags, in that order; every record must carry each one. |
+| `timestamp_field` | No | | Row field holding the point's timestamp; without it the server stamps each point. |
+| `precision` | No | `ns` | The timestamps' unit: `ns`, `us`, `ms` or `s`. |
+| `number_fields` | No | `float` | `float`: every JSON number a float field. `typed`: an integer an integer field, any other number a float field. |
+| `connect_timeout_ms` | No | `5000` | 1 to 600000. |
+| `request_timeout_ms` | No | `30000` | 1 to 600000: how long one write may wait for its reply. |
+| `batch_records` | No | `500` | 1 to 100000 points per request. |
+| `batch_bytes` | No | `4194304` | 1024 to 268435456; keep it under the server's `http-max-body-size` (25,000,000 by default). |
+| `max_retries` | No | `4` | 0 to 20 retries of a batch. |
+| `linger_ms` | No | `0` | Write out a partial batch this old. |
+| `dlq` | No | `fail` | `fail` or `drop`: what a refused record does (below). |
+| `verify_tls`, `headers` | No | `true`, none | As the other HTTP sinks. |
 
-The required fields above are validated by `make_influxdb_sink` and the factory; the factory reads them with empty defaults, so they are required in practice rather than by a `param_or` default.
+Every option is read strictly: a value outside its set or range, or a number with anything after its digits, fails the build instead of falling back to a default.
+
+#### Point identity and timestamps
+
+InfluxDB identifies a point by its measurement, its tag set and its timestamp. The sink refuses to build, naming the option, when `tags` names a field twice, holds an empty entry, names the timestamp field, or names `time`, `_field` or `_measurement`, which InfluxDB refuses as tag keys. Each record must then carry every configured tag, not null and not empty (InfluxDB refuses an empty tag value). A tag may be a string, a boolean, or a number: an integer is written with all its digits, so two tags past 2^53 never merge into one series.
+
+With `timestamp_field`, every record must carry a timestamp: a JSON integer, written without a fraction or exponent, counting `precision` units since the epoch, within InfluxDB's range of plus or minus 9223372036854775806 nanoseconds (plus or minus 9223372036 at `precision='s'`). The value is written with its own digits, never through a double, so neighbouring nanoseconds above 2^53 stay two points. A missing, null, fractional, exponent, string or out-of-range timestamp is refused; the sink never lets the server stamp a record that should carry its own time. Strings are not read as timestamps; a SQL `TIMESTAMP` column needs converting to an epoch integer first. A point at InfluxDB's last nanosecond is written, though a Flux `range()` cannot read it back, its stop being exclusive.
+
+Without `timestamp_field`, the server stamps each point when it writes it.
+
+#### Records and fields
+
+| JSON value | Written as |
+| --- | --- |
+| string | a string field, quoted, with `"` and `\` escaped; line breaks and tabs kept inside the quotes |
+| `true`, `false` | a boolean field |
+| integer, `number_fields='float'` | a float field, as earlier releases wrote it; refused past 2^53, which a float cannot hold exactly |
+| integer, `number_fields='typed'` | an integer field (`i` suffix), with all its digits |
+| other number | a float field, in its shortest exact form |
+| `null` | left out: InfluxDB has no null |
+| object or array | refused: line protocol has no nested field |
+
+Every field other than the tags and the timestamp field is written, in name order. A record must be one JSON object with at least one field to write; one that is not valid JSON, not an object, or has nothing but tags, the timestamp and nulls is refused. An integer of 2^64 or more is refused by the JSON reader, and one between 2^63 and 2^64 is refused as no field type holds it.
+
+`number_fields` decides a field's type, and InfluxDB fixes a field's type in each shard once it is written: switching an existing measurement from `float` to `typed`, or writing a number into a field another writer made a string, produces the type conflicts described below. A field one record leaves out and another carries is simply missing from the first point.
+
+#### Escaping, and what is refused
+
+Measurement names have commas and spaces escaped, and tag keys, tag values and field keys commas, equals signs and spaces; a backslash elsewhere is literal, as line protocol reads it. Unicode is written as UTF-8. What line protocol cannot carry is refused rather than written in a form that would split, merge or vanish:
+
+- a line feed or carriage return in a measurement, tag key, tag value or field key: a line break ends the point, so the rest would become a second point;
+- NUL in any name or string: InfluxDB drops it, changing the value;
+- a name or tag value ending in a backslash, which would escape the separator after it;
+- a measurement starting with `#`, which makes the line a comment that InfluxDB answers with 204 and stores nothing of;
+- a field named `time`.
+
+A refused record never reaches the server. Under `dlq='drop'` it goes to the dead-letter queue with the rule it broke and the rest of the batch is written; under `dlq='fail'` the sink fails, and because it keeps no copy of that record it then refuses every later record and barrier until it opens again. Refusals name the rule and the field, never a value.
+
+#### When a batch counts as written
+
+| Response | Meaning | Handling |
+| --- | --- | --- |
+| 204 | every point written | the batch is done |
+| another 2xx | not a confirmation (InfluxDB answers an accepted write with 204) | sent again, then the sink fails |
+| 400 | InfluxDB refused the whole request and wrote none of it: one line it could not parse fails all | the batch's records dead-lettered under `drop`; the sink fails under `fail` |
+| 422 | a partial write: InfluxDB wrote some points and dropped others, saying how many (`dropped=N`) but not which, as for a field-type conflict | under `fail` the sink fails, keeping the batch; under `drop` the request's records go to the dead-letter queue as one report that says N of them were refused and the rest written, and the batch is done |
+| 401, 403 | the token refused | sent again, then the sink fails; never dead-lettered |
+| 404 | no such organisation or bucket | as 401 |
+| 413 | the request larger than the server takes | as 401; lower `batch_bytes` |
+| 429, 5xx, no reply | throttling, a server error, or a reply lost after the request may have been applied | sent again after a backoff, then the sink fails |
+
+Local checks mean a 400 should not happen; a 422 is the one outcome the response cannot attribute. A server message is repeated with the line it quotes removed, since that line carries the record's values; the token never appears in a message.
+
+#### Checkpoints and failure
+
+A barrier returns only once every point received before it is confirmed with a 204 (or, under `drop`, dead-lettered), so a checkpoint never covers a point whose write is outstanding, refused or unconfirmed. When the sink fails for a write outcome it keeps the batch: a later barrier sends it again and returns only if it is confirmed. A cancelled task stops at once, the request in flight interrupted and the batch kept. The job's restart replays every record after the last completed checkpoint.
+
+#### Delivery, replay and ordering
+
+- **Writes are at-least-once.** A replay, a retry after a lost reply, and a batch resent after a failure all write points again.
+- **With `timestamp_field`, a rewritten point lands on its own series and time.** InfluxDB merges a point into an existing point with the same measurement, tag set and timestamp: the field set becomes the union of the two, and a field both carry takes the newer value. So a replay of the same record leaves the point as it was, a record carrying fewer fields leaves the others at their earlier values rather than removing them, and two different records with the same identity become one point. Measured on 2.7.12: a reply withheld after the server applied a batch, then the batch resent, left one point.
+- **Without `timestamp_field`, every write is a new point.** The server stamps each write, so a resend or a replay adds points beside the first: the same lost reply left two.
+- **Ordering:** the points of one identity end at their last write only when one sink subtask writes them, in order, and nothing else writes that series; two subtasks or another writer can leave an older value. Between a restart and the point the replay reaches, a point can show older field values than before the failure.
+
+None of this is exactly-once delivery, and InfluxDB makes no conditional write. The SQL frontend refuses `exactly_once`, `mode='upsert'` and `changelog='true'` (line protocol has no delete, and the `__row_kind` marker would be written as a field).
+
+#### Earlier releases
+
+Records the previous sink wrote correctly are written the same way, with the same point identities and float fields. What changes:
+
+- **A configured timestamp is required.** A record whose `timestamp_field` was missing or not a number used to be written with the server's time, a different point on every replay; one with a fraction had it cut off. Both are now refused.
+- **Tags are required.** A record missing a configured tag, or with it null, used to be written to another series; it is now refused, as is an empty tag value, which the server refused.
+- **Unsafe text is refused.** A line break in a name or tag value used to split the record across two lines, and the server refused the whole request (under `dlq='drop'`, every record of the batch was dead-lettered); a NUL was dropped by the server; a `#` measurement was silently discarded. All are refused now.
+- **Bad records are refused before they are sent.** Malformed JSON, a non-object and a record without fields used to be sent as broken lines, so the server refused the whole batch, and under `dlq='drop'` every good record of it was dead-lettered. They are now refused alone.
+- **Nested values are refused** instead of being left out of the point without a word.
+- **Integers past 2^53 are refused under `number_fields='float'`** instead of being rounded; `number_fields='typed'` is new and writes them exactly.
+- **Partial writes are reported as such.** A 422 used to dead-letter every record of the request under `drop`, though the server had written most of them.
+- **Only 204 confirms a write**, the options are read strictly, and `connect_timeout_ms` and `request_timeout_ms` are new.
 
 ### `prometheus_sink`
 
@@ -433,9 +520,9 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 
 ## Delivery semantics
 
-- Sinks (`http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, `prometheus_sink`, `pubsub_sink`) are at-least-once. The shared `BatchedHttpBulkSink` flushes on every checkpoint barrier (before the sink acks), on the size and linger thresholds, and at end-of-stream. On permanent failure with retries exhausted it throws rather than dropping, so the job replays from the last checkpoint. There is no two-phase commit, so a replay re-delivers buffered records.
+- Sinks (`http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, `prometheus_sink`, `pubsub_sink`) are at-least-once. The shared `BatchedHttpBulkSink` flushes on every checkpoint barrier (before the sink acks), on the size and linger thresholds, and at end-of-stream. On permanent failure with retries exhausted it throws rather than dropping, keeping the batch, so the job replays from the last checkpoint. A record a sink refuses before sending is dead-lettered under `dlq='drop'`; under `dlq='fail'` the sink throws and, keeping no copy of it, refuses every later record and barrier until it opens again. A response that refuses some records without naming them (an InfluxDB partial write) fails the sink under `fail` and is dead-lettered as one report under `drop`. There is no two-phase commit, so a replay re-delivers buffered records.
 - `elasticsearch_sink` / `opensearch_sink` are at-least-once. Without `document_id` a resend or a replay indexes the record again; a reply lost after the server applied the request is enough to duplicate a batch. With `document_id` each record replaces its id's document, so a replay converges on each id's latest record, ordered within a sink subtask as [Ordering](#ordering) describes. A batch counts as written only when the bulk response confirms every operation, and failures are classified as [the table above](#when-a-batch-counts-as-written) sets out.
-- `influxdb_sink` is effectively-once when `timestamp_field` is set, since an identical point is idempotent.
+- `influxdb_sink` is at-least-once. With `timestamp_field` a rewritten point lands on its own series and time, where InfluxDB merges it into the point already there; without it every write is a new point, so a replay duplicates. [Its section](#influxdb_sink) has the contract.
 - `splunk_hec_sink` and `prometheus_sink` are at-least-once with no dedup key; HEC ingestion is append, and the Pushgateway stores the latest value per series (last-write-wins within a push). Each push is a POST, which replaces every series of the metric in its group with the series the push carries, and a push carries the series of the records since the previous one. So a series no record has named since the previous push disappears from the gateway rather than keeping its last value; give every series a record in each checkpoint interval if they must all stay visible.
 - `pubsub_sink` is at-least-once with no producer dedup; a replay re-publishes.
 - `http_poll_source` in cursor mode replays from its checkpointed cursor: at-least-once into the job, and exactly-once into a two-phase-commit sink, while the endpoint answers the records strictly after the cursor, ascending and each value unique, and keeps what it served. Every page is checked against what the source can see of that before anything is emitted, and one that fails fails the poll (see [the source's section](#http_poll_source)). Its capability record, `http_poll`, declares replay only with `cursor_field` and `cursor_param`, so the delivery analyser reports a job over a source in resource mode as `AT_MOST_ONCE_SOURCE` and refuses `at_least_once` and above for it, naming the options that would make it replay. Before, the source shared the `http` record, which claimed replay however the source was set up.
@@ -478,12 +565,22 @@ The live integration tests are skipped unless their endpoint environment variabl
 | --- | --- | --- |
 | Elasticsearch (`Elasticsearch/SearchSinkLive`, `test_elasticsearch_sink_live.cpp`) | `CLINK_ELASTICSEARCH_TEST_ENDPOINT` | `docker.elastic.co/elasticsearch/elasticsearch:8.13.4` |
 | OpenSearch (`OpenSearch/SearchSinkLive`, same file) | `CLINK_OPENSEARCH_TEST_ENDPOINT` | `opensearchproject/opensearch:2.17.1`, security plugin off |
-| InfluxDB (`test_influxdb_live.cpp`) | `CLINK_INFLUXDB_TEST_ENDPOINT`, plus optional `CLINK_INFLUXDB_TEST_ORG` / `_BUCKET` / `_TOKEN` (defaults `clink` / `clink` / `clink-token`) | `influxdb:2` |
+| InfluxDB (`InfluxDbLive`, `test_influxdb_live.cpp`) | `CLINK_INFLUXDB_TEST_ENDPOINT`, plus `CLINK_INFLUXDB_TEST_ORG` / `_BUCKET` / `_TOKEN` (defaults `clink` / `clink` / `clink-token`) and `_VERSION` | `influxdb:2.7.12`, pinned by digest in `scripts/influxdb-live.sh` |
 | Pub/Sub (`test_pubsub_live.cpp`) | `CLINK_PUBSUB_EMULATOR_HOST` (e.g. `localhost:8085`) | `gcr.io/google.com/cloudsdktool/cloud-sdk:emulators` |
 
 There is no live test for `splunk_hec_sink` or `prometheus_sink`; these are covered by in-process and mock tests. `http_poll_source` has a gate of its own against local servers, below, and also feeds the search recovery cells, from a feed the test serves.
 
 `pubsub_source`'s acknowledgement contract is tested in process by `PubSubSourceAck` (`test_pubsub.cpp`), against a stub of the REST endpoints that leases each delivery under a new ackId, honours `modifyAckDeadline`, acknowledges only through a current ackId and can fail acknowledges: an aborted checkpoint, crashes after the barrier and after completion, failed and retried acknowledges, notifications out of order, leases held across a delayed checkpoint and given up past `max_lease`, the `max_outstanding` bound, close after a cancel, and both `on_decode_error` policies. `PubSubSourceAckLive` (`test_pubsub_live.cpp`) repeats the abort, the crash after completion and the delayed checkpoint against the emulator. `test_factory_registration.cpp` pins the capability record and the analyser's verdict. `scripts/ack-sources-live.sh [build-dir]` is the required gate: it runs `PubSubLive` and `PubSubSourceAckLive` against a one-off emulator container, with the other acknowledging sources' suites, and fails on a missing binary, an emulator that never answers, a failed or skipped case, or a short suite (see the [Redis page](redis.md#testing)). The `ack-sources` CI workflow runs it.
+
+### InfluxDB
+
+Without a server: `InfluxRender` (point identity, every escape and refusal, timestamp boundaries per precision, neighbours above 2^53, float and typed numbers, refusals that name no value, the option checks), `InfluxWriteResult` (each response class) and `InfluxSink`, the sink against a stub `/api/v2/write`: the request's path, precision and token, an unexpected 2xx, refused records under each policy, a 400, a partial write under each policy (the batch kept under `fail`, one report under `drop`), a refused token never dead-lettered, a reply lost after the server received the batch, retries spent and cancelled, the factory's strict options. `SqlPhysical.InfluxDbOptionsAreCheckedWhenTheJobIsPlanned` covers the planner.
+
+`InfluxDbLive` writes to a live server and reads every point back with Flux, comparing tags, times, field values and field types: the version, exact timestamps to the ends of the range, every escape, refused records beside good ones under each policy, float and typed numbers and a type conflict's partial write, merged identities, a reply withheld by a proxy after the server applied the batch (one point with a timestamp, two without), and a refused token and a missing bucket. Flux's CSV writes a line break inside a value as CRLF and drops a lone carriage return, so the reader undoes the first and checks the second through a Flux replace.
+
+`InfluxDbRecovery` (`tests/integration/test_influxdb_recovery.cpp`) runs a coordinator and two workers polling a feed into the sink and kills a worker parked at `influxdb_sink.after_write`, after writes the server confirmed and no checkpoint covered: timestamped, where every record must end as exactly one point with its value; in server-time mode, where every record must be present and the replay's duplicates present too; and as a SQL job at parallelism 2.
+
+`scripts/influxdb-live.sh [build-dir]` is the gate: it starts InfluxDB 2.7.12, pinned by digest, on a free loopback port with a throwaway token, runs the suites above, and fails on a missing binary, a server that never becomes ready, a failed or skipped case or a short suite, keeping each run's report, the cells' cluster logs and a provenance file (never the token) in `build/influxdb-live-reports/`. The `http` CI workflow runs it.
 
 ### Elasticsearch and OpenSearch
 

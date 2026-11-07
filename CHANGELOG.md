@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+**The InfluxDB sink writes exactly one point per accepted record, requires the
+timestamp it is told to use, and reports partial writes as such.** A record whose
+`timestamp_field` was missing or not a number was written with the server's
+time, a new point on every replay, and a fractional timestamp was cut off; a
+missing tag sent the point to another series; a line break in a name or tag
+value split the line, a NUL vanished at the server and a `#` measurement became a
+comment the server dropped; malformed records were sent as broken lines, so the
+server refused the whole batch and `dlq='drop'` dead-lettered its good records;
+nested values were left out without a word; integers past 2^53 were rounded; a
+422 partial write dead-lettered every record of the request though the server
+had written most of them; and any 2xx counted as written. Now every record is
+checked and escaped before it is sent: timestamps must be exact integers within
+InfluxDB's range at the write precision, configured tags present and non-empty,
+names free of what line protocol cannot carry, and nested values are refused; a
+refused record is dead-lettered under `drop`, and under `fail` it stops the sink,
+which then refuses every barrier until it opens again (a change to the shared
+HTTP bulk sink, so a refused Elasticsearch or OpenSearch record does the same).
+Only 204 confirms a batch, a 400 means nothing was written, and a 422 fails the
+sink under `fail` or becomes one dead letter that says the server named no point
+under `drop`. `number_fields='typed'` writes integers as integer fields;
+`connect_timeout_ms` and `request_timeout_ms` are new; options are read strictly,
+and SQL refuses options the sink does not read and `changelog='true'`. Covered by
+`InfluxRender`, `InfluxWriteResult`, `InfluxSink` against a stub server,
+`SqlPhysical.InfluxDbOptionsAreCheckedWhenTheJobIsPlanned`, and the gate
+`scripts/influxdb-live.sh` against InfluxDB 2.7.12 with `InfluxDbLive` and three
+recovery cells (`InfluxDbRecovery`).
+
 **The Cassandra and ScyllaDB sinks bound what they hold, order every write to a
 row, and fail rather than acknowledge a checkpoint over a write whose outcome is
 unknown.** The plain sink kept every write in flight until the next barrier and
