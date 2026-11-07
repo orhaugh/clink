@@ -265,6 +265,33 @@ TEST(SqlUnsupportedSemantics, InsertFormatIsAClosedDomain) {
     EXPECT_NE(near_miss.find("insert_format"), std::string::npos) << near_miss;
 }
 
+// on_decode_error decides what a source table's decoding does with a record it
+// cannot read; a value other than the two it names, or a misspelling of the
+// option, is refused at CREATE TABLE rather than leaving the default in force.
+TEST(SqlUnsupportedSemantics, OnDecodeErrorIsAClosedDomain) {
+    for (const char* v : {"fail", "drop"}) {
+        EXPECT_EQ(register_ddl(std::string("CREATE TABLE t (k BIGINT) WITH (connector='kafka', "
+                                           "format='json', topic='t', on_decode_error='") +
+                               v + "');"),
+                  "")
+            << "on_decode_error='" << v << "' was refused";
+    }
+    for (const char* bad : {"skip", "Drop", "", "dlq"}) {
+        const auto err =
+            register_ddl(std::string("CREATE TABLE t (k BIGINT) WITH (connector='kafka', "
+                                     "format='json', topic='t', on_decode_error='") +
+                         bad + "');");
+        ASSERT_FALSE(err.empty()) << "on_decode_error='" << bad << "' was accepted";
+        EXPECT_NE(err.find("'fail', 'drop'"), std::string::npos) << err;
+        EXPECT_NE(err.find("dead-letter queue"), std::string::npos) << err;
+    }
+    const auto near_miss = register_ddl(
+        "CREATE TABLE t (k BIGINT) WITH (connector='kafka', format='json', topic='t', "
+        "on_decode_eror='drop');");
+    ASSERT_FALSE(near_miss.empty()) << "a misspelt on_decode_error was accepted";
+    EXPECT_NE(near_miss.find("on_decode_error"), std::string::npos) << near_miss;
+}
+
 // json_non_finite picks how a JSON sink writes NaN and the infinities; any
 // value but the two it names is refused at CREATE TABLE, listing them.
 TEST(SqlUnsupportedSemantics, JsonNonFiniteIsAClosedDomain) {

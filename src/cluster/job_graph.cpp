@@ -647,6 +647,23 @@ std::string job_graph_fingerprint(const JobGraphSpec& spec) {
         if (feeds_the_bind.contains(op.id)) {
             op.params.erase("columnar_output");
         }
+        // What a source table's decoding does with a record it cannot read
+        // changes neither the state a job keeps nor how its keys route, and a job
+        // stopped by such a record is resumed with the option changed. The JSON
+        // bridges' table, source and on_decode_error were never written by a
+        // released planner, so erasing them changes no recorded fingerprint. A
+        // table's option also reaches its source op. The Pub/Sub and PostgreSQL
+        // CDC sources read it, and released planners hashed it there, so it stays
+        // hashed on them and a job recorded with it still resumes. Any other
+        // source ignored it; erasing it there changes only the fingerprint of a
+        // job that set it to no effect.
+        if (op.type == "json_string_to_row" || op.type == "json_string_to_row_columnar") {
+            op.params.erase("table");
+            op.params.erase("source");
+            op.params.erase("on_decode_error");
+        } else if (op.type != "pubsub_source" && op.type != "postgres_cdc_source") {
+            op.params.erase("on_decode_error");
+        }
         // The second Row layout spells a TIMESTAMP column ts_ms and a
         // TIMESTAMPTZ column tstz_ms where every released planner wrote str:
         // in the columnar JSON decode's schema_columns and in a window's or

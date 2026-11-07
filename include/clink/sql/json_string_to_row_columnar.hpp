@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,6 +45,96 @@ namespace clink::sql {
 // it on materialisation. The assigner reads it columnar via
 // with_columnar_partitions; this operator's materialize restores it onto the
 // row records, so a row consumer (or the assigner's row fallback) is unchanged.
+
+// What the JSON bridges do with a record their row decode refuses: a payload
+// that is not a JSON object clink's JSON reader can decode (malformed JSON,
+// another JSON value, a number the reader holds no value for). An empty payload,
+// such as a Kafka tombstone or an empty message, carries no row and is skipped
+// under either policy. Set by the source table's on_decode_error option.
+enum class JsonDecodeErrorPolicy : std::uint8_t {
+    // The record is skipped, counted in dropped_events_total and reported, with
+    // its payload, to the job's dead-letter queue: the default, and what the
+    // bridge always said it did.
+    Drop,
+    // The subtask fails, naming the table, the partition and why.
+    Fail,
+};
+
+// Reads an on_decode_error value, "fail" or "drop"; throws std::invalid_argument
+// naming `who` for any other.
+[[nodiscard]] JsonDecodeErrorPolicy json_decode_error_policy(std::string_view value,
+                                                             std::string_view who);
+
+// The part of a JSON bridge that handles a record its decode refused. The two
+// bridges share it, so the columnar decoder's row fallback and the plain row
+// bridge treat every refused record alike.
+class JsonRowRefusals {
+public:
+    JsonRowRefusals() = default;
+    // `table` names the SQL table and `source` the operator that read the record,
+    // for the error, the dead-letter report and the metric; either may be empty.
+    JsonRowRefusals(JsonDecodeErrorPolicy policy, std::string table, std::string source)
+        : policy_(policy), table_(std::move(table)), source_(std::move(source)) {}
+
+    // For a record the decode refused: returns when the record is to be skipped
+    // (an empty payload, or any record under Drop, which is counted and reported
+    // to `rt`'s dead-letter queue when there is one); throws std::runtime_error
+    // under Fail.
+    void refused(const Record<std::string>& rec, RuntimeContext* rt) const;
+
+    [[nodiscard]] JsonDecodeErrorPolicy policy() const noexcept { return policy_; }
+
+private:
+    JsonDecodeErrorPolicy policy_{JsonDecodeErrorPolicy::Drop};
+    std::string table_;
+    std::string source_;
+};
+
+// json_string_to_row: the bridge from a string-channel source to the Row channel.
+// Each record is decoded with `fmt`; a record it refuses goes to `refusals`,
+// which skips it or fails the subtask, and never becomes a row. Event time and
+// the source partition ride through, as for any value-mapping bridge.
+class JsonStringToRowOperator final : public Operator<std::string, Row> {
+public:
+    JsonStringToRowOperator(clink::TextFormat<Row> fmt,
+                            JsonRowRefusals refusals,
+                            std::string name = "json_string_to_row")
+        : fmt_(std::move(fmt)), refusals_(std::move(refusals)), name_(std::move(name)) {}
+
+    void process(const StreamElement<std::string>& element, Emitter<Row>& out) override {
+        if (element.is_data()) {
+            const Batch<std::string>& in = element.as_data();
+            Batch<Row> rows;
+            rows.reserve(in.size());
+            for (const auto& rec : in) {
+                auto decoded = fmt_.decode(rec.value());
+                if (!decoded.has_value()) {
+                    refusals_.refused(rec, this->runtime());
+                    continue;
+                }
+                Record<Row> out_rec = rec.event_time().has_value()
+                                          ? Record<Row>(std::move(*decoded), *rec.event_time())
+                                          : Record<Row>(std::move(*decoded));
+                if (auto p = rec.source_partition(); p.has_value()) {
+                    out_rec.set_source_partition(*p);
+                }
+                rows.push(std::move(out_rec));
+            }
+            out.emit_data(std::move(rows));
+        } else if (element.is_watermark()) {
+            this->on_watermark(element.as_watermark(), out);
+        } else {
+            this->on_barrier(element.as_barrier(), out);
+        }
+    }
+
+    std::string name() const override { return name_; }
+
+private:
+    clink::TextFormat<Row> fmt_;
+    JsonRowRefusals refusals_;
+    std::string name_;
+};
 
 // Columnar variant of json_string_to_row (Wave 2).
 //
@@ -146,14 +237,19 @@ public:
             }
 
             // Row fallback - identical to json_string_to_row, preserving each
-            // record's event_time and source_partition.
+            // record's event_time and source_partition. A record the decode
+            // refuses goes to the same refusals as there, and never becomes a row.
             Batch<Row> rows;
             rows.reserve(in.size());
             for (const auto& rec : in) {
-                Row row = fmt_.decode(rec.value()).value_or(Row{});
+                auto decoded = fmt_.decode(rec.value());
+                if (!decoded.has_value()) {
+                    refusals_.refused(rec, this->runtime());
+                    continue;
+                }
                 Record<Row> out_rec = rec.event_time().has_value()
-                                          ? Record<Row>(std::move(row), *rec.event_time())
-                                          : Record<Row>(std::move(row));
+                                          ? Record<Row>(std::move(*decoded), *rec.event_time())
+                                          : Record<Row>(std::move(*decoded));
                 if (auto p = rec.source_partition(); p.has_value()) {
                     out_rec.set_source_partition(*p);
                 }
@@ -168,6 +264,9 @@ public:
     }
 
     std::string name() const override { return name_; }
+
+    // What the row fallback does with a record its decode refuses; Drop until set.
+    void set_refusals(JsonRowRefusals refusals) { refusals_ = std::move(refusals); }
 
     // Out of line: od_ points at an incomplete type here.
     ~JsonStringToRowColumnarOperator() override;
@@ -618,6 +717,7 @@ private:
     }
 
     clink::TextFormat<Row> fmt_;
+    JsonRowRefusals refusals_;
     // Declared DECIMAL columns and their scales; empty for a schema without one,
     // which is what keeps the per-line token scan off every other schema's path.
     std::map<std::string, int> decimal_scales_;

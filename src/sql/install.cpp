@@ -13519,15 +13519,27 @@ void install(clink::plugin::PluginRegistry& reg) {
             return op;
         });
 
+    // What a JSON bridge does with a record its decode refuses, from the params
+    // the planner forwards: on_decode_error (the source table's option, 'drop'
+    // when absent), the table's name and the source operator's, for the error
+    // and the dead-letter report.
+    const auto refusals_of = [](const BuildContext& ctx, const char* who) {
+        return JsonRowRefusals{
+            json_decode_error_policy(ctx.param_or("on_decode_error", "drop"), who),
+            ctx.param_or("table", ""),
+            ctx.param_or("source", "")};
+    };
+
     // json_string_to_row: bridge from the string channel (raw NDJSON
     // payload) to the Row channel. Used by the SQL planner when a
     // Row-typed table is backed by a string-typed connector (e.g.
-    // kafka_source_string). Lines that don't parse as JSON objects
-    // are dropped silently (matches file_json_source's tolerant
-    // decoder behaviour).
+    // kafka_source_string). A record that is not a JSON object the decode can
+    // read is skipped and reported to the dead-letter queue, or under
+    // on_decode_error='fail' fails the subtask; an empty payload carries no row
+    // and is skipped. Such a record used to become a row of nulls.
     reg.register_operator<std::string, Row>(
         "json_string_to_row",
-        [](const BuildContext& ctx) -> std::shared_ptr<Operator<std::string, Row>> {
+        [refusals_of](const BuildContext& ctx) -> std::shared_ptr<Operator<std::string, Row>> {
             // Schema-aware when the planner passes the table's typed columns:
             // declared DECIMAL columns are ingested exactly and quantised to their
             // scale, declared FLOAT columns are rounded to float precision. Without
@@ -13537,14 +13549,9 @@ void install(clink::plugin::PluginRegistry& reg) {
             // The columnar decoder is written against THIS decode, so the two
             // carriers must derive their coercion from the same place; hence both
             // read the same schema_columns param.
-            auto fmt = std::make_shared<clink::TextFormat<Row>>(
-                row_json_text_format_for_columns(parse_row_schema(ctx.param_or("schema_columns"))));
-            return std::make_shared<MapOperator<std::string, Row>>(
-                [fmt](const std::string& line) -> Row {
-                    auto decoded = fmt->decode(line);
-                    return decoded.value_or(Row{});
-                },
-                "json_string_to_row");
+            return std::make_shared<JsonStringToRowOperator>(
+                row_json_text_format_for_columns(parse_row_schema(ctx.param_or("schema_columns"))),
+                refusals_of(ctx, "json_string_to_row"));
         });
 
     // json_string_to_row_columnar: Wave 2 increment 1. Same decode as
@@ -13557,14 +13564,16 @@ void install(clink::plugin::PluginRegistry& reg) {
     // columnar_decode WITH-option.
     reg.register_operator<std::string, Row>(
         "json_string_to_row_columnar",
-        [](const BuildContext& ctx) -> std::shared_ptr<Operator<std::string, Row>> {
+        [refusals_of](const BuildContext& ctx) -> std::shared_ptr<Operator<std::string, Row>> {
             // schema_columns stays the FULL declared schema - the faithfulness gate needs
             // it - while projected_columns (optional) narrows only what gets built. See
             // the operator's constructor comment for why narrowing the schema instead
             // would disable the columnar path rather than speed it up.
-            return std::make_shared<JsonStringToRowColumnarOperator>(
+            auto op = std::make_shared<JsonStringToRowColumnarOperator>(
                 parse_row_schema(ctx.param_or("schema_columns"), admitted_row_layout(ctx)),
                 projection_from_csv(ctx.param_or("projected_columns", "")));
+            op->set_refusals(refusals_of(ctx, "json_string_to_row_columnar"));
+            return op;
         });
 
     // row_to_json_string: bridge from the Row channel back to the

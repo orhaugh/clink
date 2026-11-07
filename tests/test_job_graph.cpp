@@ -599,6 +599,66 @@ TEST(JobGraphFingerprint, IgnoresColumnarOutputOnlyInFrontOfTheSinkBind) {
 // onto Deploy frames, never into a submitted spec, and no released planner
 // wrote it. It is erased from every op as a guard: admission depends on which
 // workers host a run, and the same job must resume whichever they are.
+// What a source table's decoding does with a record it cannot read changes neither the
+// state a job keeps nor how its keys route, and a job stopped by such a record is
+// resumed with on_decode_error changed. So the JSON bridge's table, source and
+// on_decode_error, which no released planner wrote, stay out of the fingerprint, and so
+// does on_decode_error on a source that ignores it. On the Pub/Sub and PostgreSQL CDC
+// sources, which read it and on which released planners hashed it, it stays hashed, so
+// a job recorded with it still resumes.
+TEST(JobGraphFingerprint, IgnoresTheDecodeErrorPolicyWhereItKeepsNoState) {
+    auto spec_of = [](const std::string& source_type,
+                      const std::string& bridge_type,
+                      const std::map<std::string, std::string>& source_params,
+                      const std::map<std::string, std::string>& bridge_params) {
+        JobGraphSpec spec;
+        OperatorSpec src;
+        src.type = source_type;
+        src.id = "src_0";
+        src.params = source_params;
+        OperatorSpec bridge;
+        bridge.type = bridge_type;
+        bridge.id = "bridge_1";
+        bridge.inputs = {"src_0"};
+        bridge.params = bridge_params;
+        bridge.params["schema_columns"] = "k:i64";
+        OperatorSpec sink;
+        sink.type = "file_json_sink";
+        sink.id = "snk_2";
+        sink.inputs = {"bridge_1"};
+        spec.ops = {src, bridge, sink};
+        return spec;
+    };
+    for (const char* bridge : {"json_string_to_row", "json_string_to_row_columnar"}) {
+        SCOPED_TRACE(bridge);
+        const auto before = spec_of("kafka_source_string", bridge, {{"topic", "t"}}, {});
+        // What this release's planner writes on the bridge, and the option on the
+        // source it ignores, leave the fingerprint as the last release recorded it.
+        const auto now = spec_of(
+            "kafka_source_string",
+            bridge,
+            {{"topic", "t"}, {"on_decode_error", "fail"}},
+            {{"table", "ev"}, {"source", "kafka_source_string"}, {"on_decode_error", "fail"}});
+        EXPECT_EQ(job_graph_fingerprint(before), job_graph_fingerprint(now));
+        auto dropping = now;
+        dropping.ops[0].params["on_decode_error"] = "drop";
+        dropping.ops[1].params["on_decode_error"] = "drop";
+        EXPECT_EQ(job_graph_fingerprint(now), job_graph_fingerprint(dropping));
+        // Anything else on the bridge still counts.
+        auto projected = now;
+        projected.ops[1].params["projected_columns"] = "k";
+        EXPECT_NE(job_graph_fingerprint(now), job_graph_fingerprint(projected));
+    }
+    for (const char* reader : {"pubsub_source", "postgres_cdc_source"}) {
+        SCOPED_TRACE(reader);
+        const auto fail = spec_of(reader, "json_string_to_row", {{"on_decode_error", "fail"}}, {});
+        const auto drop = spec_of(reader, "json_string_to_row", {{"on_decode_error", "drop"}}, {});
+        const auto unset = spec_of(reader, "json_string_to_row", {}, {});
+        EXPECT_NE(job_graph_fingerprint(fail), job_graph_fingerprint(drop));
+        EXPECT_NE(job_graph_fingerprint(fail), job_graph_fingerprint(unset));
+    }
+}
+
 TEST(JobGraphFingerprint, IgnoresTheAdmittedRowLayoutOnEveryOp) {
     const auto base = fingerprint_fixture();
     auto stamped = fingerprint_fixture();

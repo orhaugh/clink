@@ -13,6 +13,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,10 +23,17 @@
 #include <arrow/type.h>
 #include <gtest/gtest.h>
 
+#include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/operator_registry.hpp"
 #include "clink/core/record.hpp"
 #include "clink/core/stream_element.hpp"
+#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/map_operator.hpp"
+#include "clink/plugin/plugin.hpp"
 #include "clink/runtime/bounded_channel.hpp"
+#include "clink/runtime/dead_letter.hpp"
+#include "clink/runtime/runtime_context.hpp"
+#include "clink/sql/install.hpp"
 #include "clink/sql/json_string_to_row_columnar.hpp"
 #include "clink/sql/row.hpp"
 #include "clink/sql/row_columnar_batcher.hpp"
@@ -71,12 +79,15 @@ StreamElement<Row> run_one(Op& op, Batch<std::string> in) {
     return std::move(*e);
 }
 
-// The row-path oracle: identical to the json_string_to_row factory.
-MapOperator<std::string, Row> make_row_oracle() {
-    auto fmt = std::make_shared<clink::TextFormat<Row>>(clink::sql::row_json_text_format());
-    return MapOperator<std::string, Row>(
-        [fmt](const std::string& line) -> Row { return fmt->decode(line).value_or(Row{}); },
-        "json_string_to_row");
+// Both decoders skip a line they refuse, so they hand on the same records: the
+// columnar decoder's row fallback and json_string_to_row share these refusals.
+clink::sql::JsonRowRefusals dropping() {
+    return clink::sql::JsonRowRefusals{clink::sql::JsonDecodeErrorPolicy::Drop, "", ""};
+}
+
+// The row-path oracle: identical to the json_string_to_row factory, under drop.
+clink::sql::JsonStringToRowOperator make_row_oracle() {
+    return clink::sql::JsonStringToRowOperator(clink::sql::row_json_text_format(), dropping());
 }
 
 // The row-path oracle for a TYPED schema: what json_string_to_row now does when
@@ -84,12 +95,9 @@ MapOperator<std::string, Row> make_row_oracle() {
 // quantised, declared FLOAT rounded to float precision). This is the reference the
 // columnar decoder must match for a schema carrying either type - the plain oracle
 // above is only the reference for schemas that declare neither.
-MapOperator<std::string, Row> make_typed_row_oracle(const std::vector<RowColumn>& schema) {
-    auto fmt = std::make_shared<clink::TextFormat<Row>>(
-        clink::sql::row_json_text_format_for_columns(schema));
-    return MapOperator<std::string, Row>(
-        [fmt](const std::string& line) -> Row { return fmt->decode(line).value_or(Row{}); },
-        "json_string_to_row");
+clink::sql::JsonStringToRowOperator make_typed_row_oracle(const std::vector<RowColumn>& schema) {
+    return clink::sql::JsonStringToRowOperator(clink::sql::row_json_text_format_for_columns(schema),
+                                               dropping());
 }
 
 // Canonical NDJSON for each row. The same formatter on both sides yields equal
@@ -137,6 +145,7 @@ void expect_fallback_and_equivalent(const std::vector<std::string>& lines) {
     ASSERT_TRUE(row_el.is_data());
 
     JsonStringToRowColumnarOperator col_op(demo_schema());
+    col_op.set_refusals(dropping());
     auto col_el = run_one(col_op, lines_batch(lines));
     ASSERT_TRUE(col_el.is_data());
 
@@ -183,9 +192,9 @@ TEST(JsonColumnarDecode, ConformingJsonFiresColumnarAndIsByteEquivalent) {
               mat_before + 1);
 }
 
-// A line that is not a JSON object decodes to an empty Row on both sides; the
-// columnar op must fall back (an empty Row would reconstruct as an all-null
-// row) and stay byte-equivalent.
+// A line that is not a JSON object is refused on both sides (skipped here, under
+// drop); the columnar op must fall back rather than carry it, and stay
+// byte-equivalent.
 TEST(JsonColumnarDecode, NonJsonLineFallsBackToRowFormByteEquivalent) {
     expect_fallback_and_equivalent({
         R"({"a":1,"b":1.5,"c":"x","d":true})",
@@ -856,6 +865,7 @@ TEST(JsonColumnarDecode, EscapedAndUnicodeStringsMatchTheRowDecode) {
     auto oracle = make_typed_row_oracle(schema);
     auto row_el = run_one(oracle, lines_batch(lines));
     JsonStringToRowColumnarOperator col_op(schema);
+    col_op.set_refusals(dropping());
     auto col_el = run_one(col_op, lines_batch(lines));
 
     ASSERT_TRUE(col_el.is_data());
@@ -1079,6 +1089,7 @@ void expect_kinded_parity(const std::shared_ptr<arrow::DataType>& type,
         auto oracle = make_typed_row_oracle(schema);
         auto row_el = run_one(oracle, lines_batch(lines));
         JsonStringToRowColumnarOperator col_op(schema);
+        col_op.set_refusals(dropping());
         const auto dom_before = clink::detail::json_columnar_dom_arm_counter().load();
         auto col_el = run_one(col_op, lines_batch(lines));
         const auto dom_runs = clink::detail::json_columnar_dom_arm_counter().load() - dom_before;
@@ -1161,6 +1172,7 @@ TEST(JsonColumnarDecode, ReorderedSameTypedFieldsLandInTheRightColumns) {
     ASSERT_TRUE(row_el.is_data());
 
     JsonStringToRowColumnarOperator col_op(schema);
+    col_op.set_refusals(dropping());
     auto col_el = run_one(col_op, lines_batch(lines));
     ASSERT_TRUE(col_el.is_data());
 
@@ -1208,9 +1220,10 @@ TEST(JsonColumnarDecode, FieldOrderIndependence) {
 // ---- lines the row decode refuses ----------------------------------------------------
 //
 // The row decode parses each line with a validating DOM parse, and a line that parse
-// refuses decodes to an empty row, on json_string_to_row and on this operator's own row
-// fallback alike. The columnar arms must hand on that same empty row, so a line the DOM
-// parse refuses must never ride columnar: whichever column holds the offending value,
+// refuses goes to the bridge's refusals, on json_string_to_row and on this operator's own
+// row fallback alike (skipped here, under drop). The columnar arms must hand on the same
+// records, so a line the DOM parse refuses must never ride columnar: whichever column
+// holds the offending value,
 // and whether or not the query reads that column. The on-demand arm reads only the
 // columns it builds, so a value in a declared column outside the keep-list is the case
 // these tests exist for: the arm still has to reach the DOM parse's verdict on it.
@@ -1282,13 +1295,10 @@ std::vector<std::pair<std::string, std::vector<std::string>>> keep_lists(const s
 // The typed row decode under the same keep-list: this operator's own row fallback, and
 // what json_string_to_row hands on once the query has dropped the columns it does not
 // read.
-MapOperator<std::string, Row> make_projected_row_oracle(const std::vector<RowColumn>& schema,
-                                                        const std::vector<std::string>& keep) {
-    auto fmt = std::make_shared<clink::TextFormat<Row>>(
-        clink::sql::row_json_text_format_for_columns_projected(schema, keep));
-    return MapOperator<std::string, Row>(
-        [fmt](const std::string& line) -> Row { return fmt->decode(line).value_or(Row{}); },
-        "json_string_to_row");
+clink::sql::JsonStringToRowOperator make_projected_row_oracle(
+    const std::vector<RowColumn>& schema, const std::vector<std::string>& keep) {
+    return clink::sql::JsonStringToRowOperator(
+        clink::sql::row_json_text_format_for_columns_projected(schema, keep), dropping());
 }
 
 // Raw bytes made readable in a failure message, and a long value shortened.
@@ -1334,6 +1344,7 @@ Decoded decode_against_rows(const std::vector<std::string>& lines,
     auto oracle = make_projected_row_oracle(schema, keep);
     const auto want = kinded_cells(run_one(oracle, lines_batch(lines)).as_data());
     JsonStringToRowColumnarOperator col_op(schema, keep);
+    col_op.set_refusals(dropping());
     Decoded out;
     const auto dom_before = clink::detail::json_columnar_dom_arm_counter().load();
     try {
@@ -1350,8 +1361,7 @@ Decoded decode_against_rows(const std::vector<std::string>& lines,
     return out;
 }
 
-// Values the DOM parse refuses wherever they stand, so a line holding one decodes to an
-// empty row.
+// Values the DOM parse refuses wherever they stand, so a line holding one is refused.
 std::vector<std::string> parse_refused_values() {
     std::vector<std::string> v = {
         // Integers outside 64 bits.
@@ -1443,8 +1453,9 @@ std::vector<std::string> parse_refused_values() {
 }  // namespace
 
 // A value the DOM parse refuses, in each declared column and in an undeclared key, read
-// by the query or not. The columnar decode must hand on what the row decode does, an
-// empty row between two whole ones, and must not carry that batch columnar.
+// by the query or not. The columnar decode must hand on what the row decode does, the
+// two whole lines either side of the refused one, and must not carry that batch
+// columnar.
 TEST(JsonColumnarDecode, ALineTheRowDecodeRefusesNeverRidesColumnar) {
     const auto row_decode = clink::sql::row_json_text_format_for_columns(refusal_schema());
     std::vector<std::string> diverged;
@@ -1606,4 +1617,259 @@ TEST(JsonColumnarDecode, WellFormedValuesOutsideTheProjectionStayOnTheOnDemandAr
         list += "  " + d + "\n";
     }
     EXPECT_TRUE(diverged.empty()) << diverged.size() << " cases:\n" << list;
+}
+
+// ---- what the JSON bridges do with a record they refuse ------------------------------
+//
+// A record the row decode refuses used to become a row of nulls on both bridges. Under
+// on_decode_error='drop', the default, it is skipped, counted and reported to the
+// dead-letter queue; under 'fail' it fails the subtask, naming the table, the
+// partition and why. An empty payload carries no row and is skipped under either.
+namespace {
+
+using clink::sql::JsonDecodeErrorPolicy;
+using clink::sql::JsonRowRefusals;
+using clink::sql::JsonStringToRowOperator;
+
+class BridgeDlq final : public clink::DeadLetterQueue {
+public:
+    void report(const clink::BadRecord& rec) override {
+        const std::lock_guard<std::mutex> lk(mu_);
+        records.push_back(rec);
+    }
+    std::vector<clink::BadRecord> records;
+
+private:
+    std::mutex mu_;
+};
+
+// The lines as records of `partition`, the n-th at event time 1000 * (n + 1).
+Batch<std::string> partition_batch(const std::vector<std::string>& lines, std::int32_t partition) {
+    Batch<std::string> b;
+    for (std::size_t n = 0; n < lines.size(); ++n) {
+        Record<std::string> r(lines[n],
+                              clink::EventTime{static_cast<std::int64_t>(1000 * (n + 1))});
+        r.set_source_partition(partition);
+        b.push(std::move(r));
+    }
+    return b;
+}
+
+// What process() threw for this batch, or empty; whether it emitted anything.
+template <typename Op>
+std::pair<std::string, bool> refused_by(Op& op, Batch<std::string> in) {
+    BoundedChannel<StreamElement<Row>> ch(8);
+    Emitter<Row> em(&ch);
+    std::string error;
+    try {
+        op.process(StreamElement<std::string>::data(std::move(in)), em);
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    return {error, ch.try_pop().has_value()};
+}
+
+std::vector<std::int64_t> column_a(const Batch<Row>& b) {
+    std::vector<std::int64_t> out;
+    for (const auto& rec : b) {
+        out.push_back(rec.value().values.find("a")->second.as_int());
+    }
+    return out;
+}
+
+std::uint64_t dropped_events(const std::string& source) {
+    return clink::MetricsRegistry::global()
+        .counter(clink::metrics::connector_metric_name("dropped_events_total", source, "source"))
+        .value();
+}
+
+}  // namespace
+
+TEST(JsonRowBridge, UnderFailARefusedRecordFailsTheSubtask) {
+    JsonStringToRowOperator op(
+        clink::sql::row_json_text_format(),
+        JsonRowRefusals{JsonDecodeErrorPolicy::Fail, "feed", "kafka_source_string"});
+    const auto [error, emitted] =
+        refused_by(op, partition_batch({R"({"a":1})", "not json", R"({"a":2})"}, 3));
+    EXPECT_NE(
+        error.find("json_string_to_row: a record of table 'feed' partition 3 (8 bytes) is not "
+                   "a JSON object the row decoder can read: "),
+        std::string::npos)
+        << error;
+    EXPECT_NE(error.find("on_decode_error='fail' stops here; set on_decode_error='drop'"),
+              std::string::npos)
+        << error;
+    EXPECT_EQ(error.find("not json"), std::string::npos) << "the payload reached the error";
+    EXPECT_FALSE(emitted) << "the batch was handed on with a record missing";
+}
+
+TEST(JsonRowBridge, ByDefaultARefusedRecordIsSkippedCountedAndReported) {
+    BridgeDlq dlq;
+    clink::RuntimeContext ctx{clink::OperatorId{1}, "bridge", nullptr, nullptr};
+    ctx.set_dead_letter_queue(&dlq);
+    JsonStringToRowOperator op(
+        clink::sql::row_json_text_format(),
+        JsonRowRefusals{JsonDecodeErrorPolicy::Drop, "feed", "test_bridge_source"});
+    op.attach_runtime(&ctx);
+    // Drop is what a bridge built without a policy does.
+    EXPECT_EQ(JsonRowRefusals{}.policy(), JsonDecodeErrorPolicy::Drop);
+    const auto before = dropped_events("test_bridge_source");
+    auto el = run_one(op, partition_batch({R"({"a":1})", "[1,2]", R"({"a":2})"}, 5));
+    EXPECT_EQ(column_a(el.as_data()), (std::vector<std::int64_t>{1, 2}));
+    ASSERT_EQ(dlq.records.size(), 1U);
+    EXPECT_EQ(dlq.records[0].payload, "[1,2]");
+    EXPECT_EQ(dlq.records[0].error,
+              "not a JSON object the row decoder can read: it is an array, not an object");
+    EXPECT_EQ(dlq.records[0].connector, "test_bridge_source");
+    EXPECT_EQ(dlq.records[0].direction, "source");
+    EXPECT_EQ(dlq.records[0].location, "table 'feed' partition 5");
+    EXPECT_EQ(dropped_events("test_bridge_source"), before + 1);
+    op.attach_runtime(nullptr);
+}
+
+TEST(JsonRowBridge, AnEmptyPayloadCarriesNoRowUnderEitherPolicy) {
+    for (const auto policy : {JsonDecodeErrorPolicy::Fail, JsonDecodeErrorPolicy::Drop}) {
+        BridgeDlq dlq;
+        clink::RuntimeContext ctx{clink::OperatorId{1}, "bridge", nullptr, nullptr};
+        ctx.set_dead_letter_queue(&dlq);
+        JsonStringToRowOperator op(clink::sql::row_json_text_format(),
+                                   JsonRowRefusals{policy, "feed", "kafka_source_string"});
+        op.attach_runtime(&ctx);
+        auto el = run_one(op, lines_batch({R"({"a":1})", "", R"({"a":2})"}));
+        EXPECT_EQ(column_a(el.as_data()), (std::vector<std::int64_t>{1, 2}));
+        EXPECT_TRUE(dlq.records.empty()) << "a tombstone is not a bad record";
+        op.attach_runtime(nullptr);
+    }
+}
+
+TEST(JsonRowBridge, EveryRefusalSaysWhy) {
+    JsonStringToRowOperator op(clink::sql::row_json_text_format(),
+                               JsonRowRefusals{JsonDecodeErrorPolicy::Fail, "feed", "s"});
+    for (const auto& [payload, why] : std::vector<std::pair<std::string, std::string>>{
+             {"7", "it is a number, not an object"},
+             {R"("text")", "it is a string, not an object"},
+             {"null", "it is null, not an object"},
+             {"true", "it is a boolean, not an object"},
+             {"[1]", "it is an array, not an object"},
+         }) {
+        const auto error = refused_by(op, lines_batch({payload})).first;
+        EXPECT_NE(error.find(why), std::string::npos) << payload << " -> " << error;
+    }
+    // Documents clink's JSON reader cannot read give the reader's own reason.
+    for (const std::string payload :
+         {R"({"a":1)", R"({"a":1} trailing)", R"({"a":18446744073709551616})", "{'a':1}"}) {
+        const auto error = refused_by(op, lines_batch({payload})).first;
+        const std::string head = "is not a JSON object the row decoder can read: ";
+        const auto at = error.find(head);
+        ASSERT_NE(at, std::string::npos) << payload << " -> " << error;
+        EXPECT_GT(error.find(". on_decode_error='fail'"), at + head.size())
+            << "no reason given for " << payload << ": " << error;
+    }
+}
+
+TEST(JsonRowBridge, KeptRecordsKeepTheirEventTimeAndPartition) {
+    JsonStringToRowOperator op(clink::sql::row_json_text_format(),
+                               JsonRowRefusals{JsonDecodeErrorPolicy::Drop, "", ""});
+    auto el = run_one(op, partition_batch({R"({"a":1})", "oops", R"({"a":3})"}, 7));
+    const auto& out = el.as_data();
+    ASSERT_EQ(out.size(), 2U);
+    std::vector<std::int64_t> times;
+    for (const auto& rec : out) {
+        ASSERT_TRUE(rec.event_time().has_value());
+        times.push_back(rec.event_time()->millis());
+        EXPECT_EQ(rec.source_partition(), std::optional<std::int32_t>{7});
+    }
+    EXPECT_EQ(times, (std::vector<std::int64_t>{1000, 3000}));
+}
+
+TEST(JsonRowBridge, TheColumnarDecodersFallbackRefusesAlike) {
+    const std::vector<std::string> mixed = {
+        R"({"a":1,"b":1.5,"c":"x","d":true})", "{broken", R"({"a":2,"b":2.5,"c":"y","d":false})"};
+    JsonStringToRowColumnarOperator failing(demo_schema());
+    failing.set_refusals(
+        JsonRowRefusals{JsonDecodeErrorPolicy::Fail, "feed", "kafka_source_string"});
+    const auto [error, emitted] = refused_by(failing, partition_batch(mixed, 2));
+    EXPECT_NE(
+        error.find("json_string_to_row: a record of table 'feed' partition 2 (7 bytes) is not "
+                   "a JSON object the row decoder can read"),
+        std::string::npos)
+        << error;
+    EXPECT_FALSE(emitted);
+    // A columnar decoder never set takes the default, Drop, as the row bridge does.
+    JsonStringToRowColumnarOperator unset(demo_schema());
+    EXPECT_EQ(run_one(unset, lines_batch(mixed)).as_data().size(), 2U);
+
+    JsonStringToRowColumnarOperator dropping_op(demo_schema());
+    dropping_op.set_refusals(dropping());
+    auto oracle = make_row_oracle();
+    const auto col = run_one(dropping_op, lines_batch(mixed));
+    EXPECT_FALSE(col.as_data().is_columnar());
+    EXPECT_EQ(encoded_rows(col.as_data()),
+              encoded_rows(run_one(oracle, lines_batch(mixed)).as_data()));
+    EXPECT_EQ(col.as_data().size(), 2U);
+    // A batch with nothing to refuse still rides columnar.
+    const auto clean = run_one(dropping_op, lines_batch({mixed[0], mixed[2]}));
+    EXPECT_TRUE(clean.as_data().is_columnar());
+}
+
+TEST(JsonRowBridge, ThePolicyReadsFailOrDropOnly) {
+    EXPECT_EQ(clink::sql::json_decode_error_policy("fail", "t"), JsonDecodeErrorPolicy::Fail);
+    EXPECT_EQ(clink::sql::json_decode_error_policy("drop", "t"), JsonDecodeErrorPolicy::Drop);
+    for (const char* bad : {"skip", "", "FAIL", "dlq"}) {
+        try {
+            (void)clink::sql::json_decode_error_policy(bad, "json_string_to_row");
+            ADD_FAILURE() << "'" << bad << "' was accepted";
+        } catch (const std::invalid_argument& e) {
+            EXPECT_NE(
+                std::string{e.what()}.find("json_string_to_row: on_decode_error must be 'fail' "
+                                           "or 'drop'; it is '" +
+                                           std::string{bad} + "'"),
+                std::string::npos)
+                << e.what();
+        }
+    }
+}
+
+TEST(JsonRowBridge, BothFactoriesTakeTheTablesPolicy) {
+    clink::cluster::ensure_built_ins_registered();
+    clink::plugin::PluginRegistry reg;
+    clink::sql::install(reg);
+    for (const char* type : {"json_string_to_row", "json_string_to_row_columnar"}) {
+        SCOPED_TRACE(type);
+        const auto* factory = clink::cluster::OperatorRegistry::default_instance().find_operator(
+            type, "string", "row");
+        ASSERT_NE(factory, nullptr);
+        clink::cluster::OperatorBuildContext ctx;
+        ctx.params = {{"schema_columns",
+                       clink::sql::serialize_row_schema(demo_schema(), clink::sql::RowLayout::V1)},
+                      {"table", "feed"},
+                      {"source", "kafka_source_string"}};
+        const std::vector<std::string> mixed = {
+            R"({"a":1,"b":1.5,"c":"x","d":true})", "7", R"({"a":2,"b":2.5,"c":"y","d":false})"};
+        // Without the option the bridge drops, as it always said it did.
+        auto by_default =
+            std::static_pointer_cast<clink::Operator<std::string, Row>>(factory->build(ctx));
+        EXPECT_EQ(column_a(run_one(*by_default, lines_batch(mixed)).as_data()),
+                  (std::vector<std::int64_t>{1, 2}));
+        auto c = ctx;
+        c.params["on_decode_error"] = "fail";
+        auto failing =
+            std::static_pointer_cast<clink::Operator<std::string, Row>>(factory->build(c));
+        EXPECT_NE(refused_by(*failing, lines_batch(mixed)).first.find("table 'feed'"),
+                  std::string::npos);
+        c.params["on_decode_error"] = "drop";
+        auto dropping_op =
+            std::static_pointer_cast<clink::Operator<std::string, Row>>(factory->build(c));
+        EXPECT_EQ(column_a(run_one(*dropping_op, lines_batch(mixed)).as_data()),
+                  (std::vector<std::int64_t>{1, 2}));
+        c.params["on_decode_error"] = "skip";
+        try {
+            (void)factory->build(c);
+            ADD_FAILURE() << "on_decode_error='skip' was accepted";
+        } catch (const std::exception& e) {
+            EXPECT_NE(std::string{e.what()}.find("on_decode_error must be 'fail' or 'drop'"),
+                      std::string::npos)
+                << e.what();
+        }
+    }
 }

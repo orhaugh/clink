@@ -48,6 +48,12 @@ const std::vector<ClosedDomain>& closed_domains() {
          {"null", "string"},
          "It decides how a sink that writes JSON writes NaN and the infinities: 'null' as "
          "null, 'string' as \"NaN\", \"Infinity\" and \"-Infinity\"."},
+        // What a source table's decoding does with a record it cannot read; the
+        // JSON bridges read it, as do the Pub/Sub and PostgreSQL CDC sources.
+        {"on_decode_error",
+         {"fail", "drop"},
+         "It decides what happens to a record the table's decoding cannot read: 'fail' stops "
+         "the job, 'drop' skips the record and reports it to the dead-letter queue."},
     };
     return domains;
 }
@@ -79,6 +85,7 @@ const std::vector<std::string>& interpreted_table_options() {
         "json_non_finite",
         "keep_rows",
         "shared_reader",
+        "on_decode_error",
     };
     return opts;
 }

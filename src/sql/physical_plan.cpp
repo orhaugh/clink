@@ -1716,6 +1716,17 @@ std::string compile_node(const LogicalPlan& node,
                         pit != op_params_projection.end() && !pit->second.empty()) {
                         bridge.params["projected_columns"] = pit->second;
                     }
+                    // What the bridge does with a record it cannot decode: the
+                    // table's on_decode_error, 'drop' when it sets none, with the
+                    // table and source named for the error and the dead-letter
+                    // report. The fingerprint a resume checks leaves all three out
+                    // (job_graph_fingerprint).
+                    if (const auto dit = table.properties.find("on_decode_error");
+                        dit != table.properties.end()) {
+                        bridge.params["on_decode_error"] = dit->second;
+                    }
+                    bridge.params["table"] = table.name;
+                    bridge.params["source"] = binding.source_or_sink_op;
                 }
                 after_src = bridge.id;
                 spec.ops.push_back(std::move(bridge));

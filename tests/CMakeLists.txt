@@ -490,10 +490,12 @@ if(CLINK_INTEGRATION_TESTS)
     # own points and through the fault proxies. They skip without it.
     # The HTTP polling source's recovery cells and SQL paths, against a feed the
     # test serves itself; they need no service, only the node, SQL and CLI binaries.
+    # The SQL JSON bridge's decode-error cases read such a feed through `clink run`.
     if(TARGET clink::http_connector)
         target_sources(clink_integration_tests PRIVATE
             integration/test_search_recovery.cpp
-            integration/test_http_poll_recovery.cpp)
+            integration/test_http_poll_recovery.cpp
+            integration/test_sql_json_decode.cpp)
         target_link_libraries(clink_integration_tests PRIVATE $<BUILD_INTERFACE:httplib::httplib>)
     endif()
     # The Kinesis source's recovery cells, against the LocalStack stream

@@ -13292,8 +13292,10 @@ LinePerBatchRun run_kafka_case_line_per_batch(const std::string& table_cols,
 
 }  // namespace
 
-// A line the row bridge's parse refuses decodes there to an empty row, which the query
-// then filters out or counts nowhere. The columnar decode must lose the same records
+// A line the row bridge's parse refuses is dropped there, as on_decode_error's default
+// 'drop' does, and reported to the dead-letter queue; it once became an empty row, which
+// these queries happened to filter out or count nowhere. The columnar decode must lose
+// the same records
 // when the offending value sits in a column the query never reads: a declared column the
 // optimizer's projection pushdown leaves out of the decode, or a key the table does not
 // declare. The values: an integer past 64 bits, a numeral with a leading zero, a bad

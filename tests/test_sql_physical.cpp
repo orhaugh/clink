@@ -616,6 +616,46 @@ TEST(SqlPhysical, HttpPollConnectorSourceLowers) {
     EXPECT_NE(find_op(spec, "json_string_to_row"), nullptr);  // string -> Row bridge
 }
 
+// The JSON bridge after a string-channel source takes the table's on_decode_error,
+// its name and the source operator's, so a record it cannot decode fails or is
+// dropped as the table says, and is named. Without the option the bridge takes no
+// param and drops by default; the columnar Kafka bridge is handed the same.
+TEST(SqlPhysical, TheJsonBridgeTakesTheTablesDecodeErrorPolicy) {
+    const auto bridge_of = [](const std::string& ddl, const char* bridge_type) {
+        Catalog cat;
+        auto s = parse(ddl +
+                       "CREATE TABLE out_f (a BIGINT) WITH (connector='file', format='json', "
+                       "path='/tmp/o.ndjson');");
+        cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+        cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+        auto plan = bind_insert(cat, "INSERT INTO out_f SELECT a FROM src_t");
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        const auto* bridge = find_op(spec, bridge_type);
+        EXPECT_NE(bridge, nullptr) << bridge_type;
+        return bridge == nullptr ? std::map<std::string, std::string>{} : bridge->params;
+    };
+    const auto dropping = bridge_of(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='http_poll', format='json', "
+        "url='http://api:8080', on_decode_error='drop');",
+        "json_string_to_row");
+    EXPECT_EQ(dropping.at("on_decode_error"), "drop");
+    EXPECT_EQ(dropping.at("table"), "src_t");
+    EXPECT_EQ(dropping.at("source"), "http_poll_source");
+    const auto unset = bridge_of(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='http_poll', format='json', "
+        "url='http://api:8080');",
+        "json_string_to_row");
+    EXPECT_EQ(unset.count("on_decode_error"), 0U);
+    EXPECT_EQ(unset.at("table"), "src_t");
+    const auto columnar = bridge_of(
+        "CREATE TABLE src_t (a BIGINT) WITH (connector='kafka', format='json', topic='t', "
+        "on_decode_error='drop');",
+        "json_string_to_row_columnar");
+    EXPECT_EQ(columnar.at("on_decode_error"), "drop");
+    EXPECT_EQ(columnar.at("source"), "kafka_source_string");
+}
+
 // connector='kinesis' source lowers to the kinesis_source (string channel)
 // bridged to Row via json_string_to_row.
 TEST(SqlPhysical, KinesisConnectorSourceLowers) {

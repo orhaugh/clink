@@ -1,5 +1,6 @@
 // Out-of-line half of JsonStringToRowColumnarOperator: the simdjson on-demand
-// decoder.
+// decoder; and of JsonRowRefusals, what both JSON bridges do with a record their
+// row decode refuses.
 //
 // It lives here rather than in the header because simdjson is a PRIVATE
 // implementation detail of the engine. Including <simdjson.h> from a public
@@ -22,12 +23,97 @@
 #include <optional>
 #include <set>
 #include <simdjson.h>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
 #include "clink/config/decimal.hpp"
+#include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/dead_letter.hpp"
+#include "clink/runtime/runtime_context.hpp"
 
 namespace clink::sql {
+
+namespace {
+
+const char* json_kind(const clink::config::JsonValue& v) {
+    if (v.is_array()) {
+        return "an array";
+    }
+    if (v.is_string()) {
+        return "a string";
+    }
+    if (v.is_number()) {
+        return "a number";
+    }
+    if (v.is_bool()) {
+        return "a boolean";
+    }
+    if (v.is_null()) {
+        return "null";
+    }
+    return "an object";
+}
+
+// Why the row decode refused `payload`, in words: the JSON reader's own message
+// for a document it cannot read, or what the document is when it is no object.
+std::string why_not_a_row(std::string_view payload) {
+    try {
+        const auto v = clink::config::parse(payload);
+        if (!v.is_object()) {
+            return std::string{"it is "} + json_kind(v) + ", not an object";
+        }
+        return "the row decoder could not read it";
+    } catch (const clink::config::ParseError& e) {
+        return e.what();
+    }
+}
+
+}  // namespace
+
+JsonDecodeErrorPolicy json_decode_error_policy(std::string_view value, std::string_view who) {
+    if (value == "fail") {
+        return JsonDecodeErrorPolicy::Fail;
+    }
+    if (value == "drop") {
+        return JsonDecodeErrorPolicy::Drop;
+    }
+    throw std::invalid_argument(std::string{who} +
+                                ": on_decode_error must be 'fail' or 'drop'; it is '" +
+                                std::string{value} + "'");
+}
+
+void JsonRowRefusals::refused(const Record<std::string>& rec, RuntimeContext* rt) const {
+    const std::string& payload = rec.value();
+    if (payload.empty()) {
+        return;  // a tombstone or an empty message: there is no row to make
+    }
+    // Where the record came from: the table, and the partition when the source
+    // reads partitions.
+    std::string location = table_.empty() ? std::string{} : "table '" + table_ + "'";
+    if (const auto partition = rec.source_partition(); partition.has_value()) {
+        location +=
+            (location.empty() ? "" : " ") + std::string{"partition "} + std::to_string(*partition);
+    }
+    const std::string why = why_not_a_row(payload);
+    if (policy_ == JsonDecodeErrorPolicy::Fail) {
+        throw std::runtime_error(
+            "json_string_to_row: a record" + (location.empty() ? "" : " of " + location) + " (" +
+            std::to_string(payload.size()) +
+            " bytes) is not a JSON object the row decoder can read: " + why +
+            ". on_decode_error='fail' stops here; set on_decode_error='drop' on the table to "
+            "skip such records, each reported to the dead-letter queue");
+    }
+    clink::metrics::connector::dropped_events_inc(source_.empty() ? std::string{"json"} : source_);
+    if (rt != nullptr) {
+        rt->report_bad_record(clink::BadRecord{
+            .payload = payload,
+            .error = "not a JSON object the row decoder can read: " + why,
+            .connector = source_.empty() ? std::string{"json_string_to_row"} : source_,
+            .direction = "source",
+            .location = location});
+    }
+}
 
 // Parser + padded scratch buffer, reused across records so the fast path
 // allocates nothing per line. On-demand requires SIMDJSON_PADDING readable bytes
