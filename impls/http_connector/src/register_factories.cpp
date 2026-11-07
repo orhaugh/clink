@@ -213,7 +213,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "influxdb",
-        .version = "1",
+        .version = "2",
         .is_source = false,
         .is_sink = true,
         .build_dependencies = {"cpp-httplib"},
@@ -225,17 +225,25 @@ void install(clink::plugin::PluginRegistry& reg) {
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
-        // An identical (series, timestamp) point overwrites on replay.
+        // A replayed point with its timestamp lands on the same series and time.
         .idempotency_key_option = "timestamp_field",
         .auth_methods = {"token"},
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {},
+        .timeout_options = {"connect_timeout_ms", "request_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"effectively-once only when timestamp_field is set",
-                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
-                        "another sink beside it"},
+        .limitations =
+            {"at-least-once: a replay rewrites the points after the last checkpoint",
+             "without timestamp_field the server stamps each write, so a replay adds points",
+             "with timestamp_field a replayed point merges into the point of its series and "
+             "time: fields it carries win, fields it lacks keep their earlier values",
+             "points of one series written by two sink subtasks or another writer can end at "
+             "an older value",
+             "a partial write (HTTP 422) does not say which points were dropped: dlq=fail fails "
+             "the sink, dlq=drop dead-letters the request as one report",
+             "the sink must be the only sink on its chain: Dag::add_sink refuses another sink "
+             "beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "prometheus",
@@ -456,23 +464,62 @@ void install(clink::plugin::PluginRegistry& reg) {
             return make_splunk_hec_sink(std::move(o));
         });
 
-    // influxdb_sink: convert each JSON-object row to one InfluxDB v2 line-protocol point
-    // and POST newline-delimited batches to /api/v2/write with `Authorization: Token <token>`.
-    // At-least-once; effectively-once when timestamp_field is set (an identical point is
-    // idempotent). Every JSON number becomes a float field. Params:
+    // influxdb_sink: convert each JSON-object row to exactly one InfluxDB v2
+    // line-protocol point and POST newline-delimited batches to /api/v2/write with
+    // `Authorization: Token <token>`. At-least-once; with timestamp_field every
+    // record carries its point's time, so a replay lands on the same points
+    // (make_influxdb_sink has the contract). Every option is parsed strictly.
+    // Params:
     //   url (required)        - scheme://host[:port], e.g. http://influxdb:8086
     //   org, bucket (required)- InfluxDB v2 organisation + bucket
     //   token (required)      - API token (sets the Authorization header)
     //   measurement (required)- line-protocol measurement name
-    //   tags                  - CSV of row fields to emit as tags (else all are fields)
+    //   tags                  - CSV of row fields written as tags (each required per record)
     //   timestamp_field       - row field holding the point timestamp (else server-assigned)
-    //   precision (default "ns") - ns|us|ms|s (write precision)
+    //   precision (default "ns") - ns|us|ms|s: the timestamps' unit
+    //   number_fields (default "float") - "float" | "typed" (integers as integer fields)
     //   headers               - extra "K: V; ..." (rarely needed)
-    //   batch_records (default 500), batch_bytes (default 4194304)
-    //   max_retries (default 4; clamped to [0, 20])
+    //   connect_timeout_ms (default 5000), request_timeout_ms (default 30000)
+    //   batch_records (default 500; 1 to 100000), batch_bytes (default 4194304)
+    //   max_retries (default 4; 0 to 20), linger_ms (default 0)
     //   dlq ("fail" [default] | "drop"), verify_tls ("true" [default] | "false")
     reg.register_sink<std::string>(
         "influxdb_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            const auto given = [&ctx](const char* key) { return ctx.params.contains(key); };
+            const auto refuse = [](const std::string& why) {
+                throw std::runtime_error("influxdb_sink: " + why);
+            };
+            // Read whole: "12abc" or "abc" is refused rather than read as 12 or
+            // as the default.
+            const auto integer = [&](const char* key, std::int64_t fallback) {
+                if (!given(key)) {
+                    return fallback;
+                }
+                const std::string v = ctx.param_or(key);
+                std::int64_t out = 0;
+                const auto* end = v.data() + v.size();
+                const auto [ptr, ec] = std::from_chars(v.data(), end, out);
+                if (v.empty() || ec != std::errc{} || ptr != end) {
+                    refuse(std::string{"'"} + key + "' must be an integer; it is '" + v + "'");
+                }
+                return out;
+            };
+            const auto one_of = [&](const char* key,
+                                    const std::string& fallback,
+                                    const std::vector<std::string>& allowed) {
+                const std::string v = ctx.param_or(key, fallback);
+                for (const auto& a : allowed) {
+                    if (v == a) {
+                        return v;
+                    }
+                }
+                std::string list;
+                for (const auto& a : allowed) {
+                    list += (list.empty() ? "'" : ", '") + a + "'";
+                }
+                refuse(std::string{"'"} + key + "' must be one of " + list + "; it is '" + v + "'");
+                return fallback;
+            };
             InfluxDbOptions o;
             o.url = ctx.param_or("url");
             o.org = ctx.param_or("org", "");
@@ -481,16 +528,25 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.measurement = ctx.param_or("measurement", "");
             o.tag_keys = ctx.param_or("tags", "");
             o.timestamp_field = ctx.param_or("timestamp_field", "");
-            o.precision = ctx.param_or("precision", "ns");
+            o.precision = one_of("precision", "ns", {"ns", "us", "ms", "s"});
+            o.number_fields = one_of("number_fields", "float", {"float", "typed"});
             o.headers = ctx.param_or("headers", "");
-            o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
-            o.batch_bytes =
-                static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
-            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
-            o.dlq_policy = parse_dlq(ctx);
-            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+            o.verify_tls = one_of("verify_tls", "true", {"true", "false"}) == "true";
+            o.connect_timeout_ms = static_cast<int>(integer("connect_timeout_ms", 5000));
+            o.request_timeout_ms = static_cast<int>(integer("request_timeout_ms", 30000));
+            o.batch_records = static_cast<std::size_t>(integer("batch_records", 500));
+            o.batch_bytes = static_cast<std::size_t>(integer("batch_bytes", 4 * 1024 * 1024));
+            o.max_retries = static_cast<int>(integer("max_retries", 4));
+            o.dlq_policy = one_of("dlq", "fail", {"fail", "drop"}) == "drop" ? DlqPolicy::Drop
+                                                                             : DlqPolicy::Fail;
+            o.max_age = std::chrono::milliseconds{integer("linger_ms", 0)};
             o.name = "influxdb_sink";
+            // Negative counts are refused before they are narrowed.
+            for (const char* key : {"batch_records", "batch_bytes"}) {
+                if (integer(key, 1) < 1) {
+                    refuse(std::string{"'"} + key + "' must be at least 1");
+                }
+            }
             return make_influxdb_sink(std::move(o));
         });
 

@@ -62,6 +62,14 @@ enum class BulkFraming {
 // the resend cannot leave a document at an older record's value. Records with
 // no key keep the plain rule: only the failed ones are resent.
 //
+// A record the renderer refuses (UnrenderableRecord) is dead-lettered under
+// dlq=drop; under dlq=fail the sink throws and, holding no copy of the record,
+// refuses every later record, flush and barrier until open() starts afresh, so
+// no checkpoint covers it as written. A response that refuses some records
+// without saying which (BulkResult::refused_unattributed, an InfluxDB partial
+// write) fails the sink under dlq=fail, keeping the batch, and is dead-lettered
+// as one report for the request under dlq=drop.
+//
 // A cancelled task stops the flush at once: a POST in flight is interrupted
 // (CancelWatch) and the pause before a retry ends early, and the flush then
 // throws with its batch still pending. Fault points
@@ -155,9 +163,11 @@ public:
         fragments_.clear();
         keys_.clear();
         pending_bytes_ = 0;
+        refused_unkept_.clear();
     }
 
     void on_data(const Batch<In>& batch) override {
+        check_usable_();
         for (const auto& rec : batch) {
             append_(rec.value());
             if (fragments_.size() >= opts_.max_records || pending_bytes_ >= opts_.max_bytes ||
@@ -168,6 +178,7 @@ public:
     }
 
     void on_barrier(CheckpointBarrier /*b*/) override {
+        check_usable_();
         if (opts_.flush_on_barrier) {
             flush();
         }
@@ -181,6 +192,7 @@ public:
     }
 
     void flush() override {
+        check_usable_();
         if (fragments_.empty()) {
             return;
         }
@@ -221,6 +233,15 @@ public:
             if (r.ok) {
                 (void)CLINK_FAULT_POINT(after_write_point_);
                 finish_success_(n, dropped, dropped_bytes, t0);
+                return;
+            }
+            if (r.refused_unattributed > 0) {
+                settle_unattributed_(active, r.refused_unattributed, last, why);
+                (void)CLINK_FAULT_POINT(after_write_point_);
+                finish_success_(n,
+                                dropped + std::min(r.refused_unattributed, active.size()),
+                                dropped_bytes,
+                                t0);
                 return;
             }
             // Permanent (poison) records: DLQ under Drop, throw under Fail. The
@@ -366,6 +387,9 @@ private:
         } catch (const UnrenderableRecord& e) {
             clink::metrics::connector::error_inc(opts_.name, "sink");
             if (opts_.dlq_policy != DlqPolicy::Drop) {
+                // The record is in no batch and in no dead letter: a later
+                // barrier that succeeded would cover it as written.
+                refused_unkept_ = e.what();
                 throw;
             }
             if (auto* rt = this->runtime(); rt != nullptr) {
@@ -388,6 +412,53 @@ private:
         if (keyed_) {
             keys_.push_back(std::move(key));
         }
+    }
+
+    // Refuses to write or acknowledge anything once a refused record was thrown
+    // away under dlq=fail, until open() starts afresh.
+    void check_usable_() const {
+        if (!refused_unkept_.empty()) {
+            throw std::runtime_error(opts_.name +
+                                     ": the sink refused a record earlier and keeps no copy of "
+                                     "it, so it refuses to write or acknowledge a barrier until "
+                                     "it is opened again (" +
+                                     refused_unkept_ + ")");
+        }
+    }
+
+    // The endpoint applied part of the request and refused `refused` of its
+    // records without saying which. Under dlq=drop the request's records go to
+    // the dead-letter queue as one report that says so; otherwise the sink
+    // throws, keeping the batch, so no barrier passes over the refusal.
+    void settle_unattributed_(const std::vector<std::size_t>& active,
+                              std::size_t refused,
+                              const HttpResponse& last,
+                              const std::string& why) {
+        const std::string what = std::to_string(refused) + " of the " +
+                                 std::to_string(active.size()) + " record(s) sent to " +
+                                 opts_.http.base_url + opts_.path +
+                                 " were refused and the rest applied; the response does not say "
+                                 "which (" +
+                                 delivery_detail_(last, why) + ")";
+        if (opts_.dlq_policy != DlqPolicy::Drop) {
+            clink::metrics::connector::error_inc(opts_.name, "sink");
+            throw HttpDeliveryError(opts_.name + ": " + what, last);
+        }
+        if (auto* rt = this->runtime(); rt != nullptr) {
+            std::string payload;
+            for (std::size_t idx : active) {
+                payload += fragments_[idx];
+                payload.push_back('\n');
+            }
+            rt->report_bad_record(clink::BadRecord{.payload = std::move(payload),
+                                                   .error = what,
+                                                   .connector = opts_.name,
+                                                   .direction = "sink",
+                                                   .location = opts_.http.base_url + opts_.path});
+        }
+        clink::metrics::connector::dropped_records_inc(opts_.name,
+                                                       std::min(refused, active.size()));
+        clink::metrics::connector::permanent_failures_inc(opts_.name);
     }
 
     bool linger_elapsed_() const {
@@ -473,6 +544,8 @@ private:
     std::vector<std::string> fragments_;  // per-record rendered bodies (for subset resend)
     std::vector<std::string> keys_;       // per-record keys when keyed_, else empty
     std::size_t pending_bytes_{0};        // sum of fragment sizes (flush trigger + bytes metric)
+    // Why a refused record was thrown away under dlq=fail; empty while usable.
+    std::string refused_unkept_;
     std::chrono::steady_clock::time_point
         first_buffered_at_{};  // age of the oldest buffered record
 };

@@ -450,6 +450,48 @@ void check_cassandra_options(const TableDef& table, bool upsert) {
     }
 }
 
+// A connector='influxdb' sink table's options: an option the sink does not read
+// is refused rather than ignored, and the refusal lists the ones it reads.
+void check_influxdb_options(const TableDef& table) {
+    static const std::vector<std::string> kOptions = {"url",
+                                                      "org",
+                                                      "bucket",
+                                                      "token",
+                                                      "measurement",
+                                                      "tags",
+                                                      "timestamp_field",
+                                                      "precision",
+                                                      "number_fields",
+                                                      "headers",
+                                                      "verify_tls",
+                                                      "connect_timeout_ms",
+                                                      "request_timeout_ms",
+                                                      "batch_records",
+                                                      "batch_bytes",
+                                                      "max_retries",
+                                                      "dlq",
+                                                      "linger_ms"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        if (std::find(kOptions.begin(), kOptions.end(), key) != kOptions.end()) {
+            continue;
+        }
+        if (key == "format" && value == "json") {
+            continue;
+        }
+        if (std::find(interpreted.begin(), interpreted.end(), key) != interpreted.end() &&
+            key != "format") {
+            continue;
+        }
+        std::string accepted;
+        for (const auto& o : kOptions) {
+            accepted += (accepted.empty() ? "" : ", ") + o;
+        }
+        unsupported("table '" + table.name + "': connector='influxdb' does not read option '" +
+                    key + "'; it reads " + accepted);
+    }
+}
+
 // A CDC table declared keep_rows='true': the plan keeps the latest row of every
 // key behind its source.
 bool keeps_rows(const TableDef& table) {
@@ -1246,17 +1288,25 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         return RowConnectorBinding{"prometheus_sink", kChannelString, "row_to_json_string"};
     }
     if (connector == "influxdb") {
-        // InfluxDB v2 line-protocol write (/api/v2/write). At-least-once;
-        // effectively-once when a timestamp_field is set (an identical point is
-        // idempotent). Each row -> JSON object string -> one line-protocol point
-        // (every number a float field; `tags` names the tag columns).
+        // InfluxDB v2 line-protocol write (/api/v2/write). At-least-once; with
+        // timestamp_field a replayed point lands on the same series and time.
+        // Each row -> JSON object string -> exactly one line-protocol point
+        // (`tags` names the tag columns, number_fields chooses the number types).
+        // Line protocol has no delete, so a changelog is refused.
+        check_influxdb_options(table);
         if (exactly_once) {
             unsupported(
-                "connector='influxdb' sink is at-least-once (set timestamp_field for idempotent "
-                "writes); exactly-once delivery is not supported");
+                "connector='influxdb' sink is at-least-once (with timestamp_field a replay lands "
+                "on the same points); exactly-once delivery is not supported");
         }
         if (upsert) {
             unsupported("connector='influxdb' sink does not support mode='upsert'");
+        }
+        if (const auto cl = table.properties.find("changelog");
+            cl != table.properties.end() && cl->second == "true") {
+            unsupported(
+                "connector='influxdb' sink does not support changelog='true': line protocol has "
+                "no delete, and the __row_kind marker would be written as a field");
         }
         return RowConnectorBinding{"influxdb_sink", kChannelString, "row_to_json_string"};
     }

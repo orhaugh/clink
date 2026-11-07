@@ -61,6 +61,12 @@ struct BulkResult {
     // sink's error and its dead-letter reports. Empty when there is nothing to
     // add to the HTTP status.
     std::string detail;
+    // Records the endpoint refused without saying which, while it applied the
+    // rest of the request (an InfluxDB partial write). Neither list above can
+    // hold them, since no record can be named; under dlq=drop the sink reports
+    // the request's records as one dead letter that says so, and otherwise it
+    // fails. 0 when the response says nothing of the kind.
+    std::size_t refused_unattributed{0};
 };
 
 // Inspects a bulk response and returns the per-record verdict. `record_count` is

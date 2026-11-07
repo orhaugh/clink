@@ -3114,6 +3114,69 @@ TEST(SqlPhysical, CassandraOptionsAreCheckedWhenTheJobIsPlanned) {
     EXPECT_NE(eo.find("exactly"), std::string::npos) << eo;
 }
 
+namespace {
+
+// Plans INSERT INTO pts SELECT k, v FROM src_t into a connector='influxdb' table
+// with the given options; returns the planner's refusal, or "" with the sink
+// op's params in *params.
+std::string influxdb_plan(const std::map<std::string, std::string>& options,
+                          std::map<std::string, std::string>* params = nullptr) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    TableDef dst;
+    dst.name = "pts";
+    dst.columns.push_back(ColumnSpec{"k", arrow::int64()});
+    dst.columns.push_back(ColumnSpec{"v", arrow::int64()});
+    dst.properties = {{"connector", "influxdb"},
+                      {"url", "http://influx:8086"},
+                      {"org", "o"},
+                      {"bucket", "b"},
+                      {"token", "env://TOKEN"},
+                      {"measurement", "m"}};
+    for (const auto& [k, v] : options) {
+        dst.properties[k] = v;
+    }
+    cat.register_table(std::move(dst));
+    try {
+        auto plan = bind_insert(cat, "INSERT INTO pts SELECT k, v FROM src_t");
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        if (const auto* op = find_op(spec, "influxdb_sink"); op != nullptr && params != nullptr) {
+            *params = op->params;
+        }
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+TEST(SqlPhysical, InfluxDbOptionsAreCheckedWhenTheJobIsPlanned) {
+    std::map<std::string, std::string> params;
+    EXPECT_EQ(influxdb_plan({{"tags", "k"},
+                             {"timestamp_field", "v"},
+                             {"precision", "s"},
+                             {"number_fields", "typed"},
+                             {"request_timeout_ms", "5000"},
+                             {"dlq", "drop"}},
+                            &params),
+              "");
+    EXPECT_EQ(params.at("timestamp_field"), "v");
+    EXPECT_EQ(params.at("number_fields"), "typed");
+    EXPECT_EQ(params.at("token"), "env://TOKEN");
+    const auto typo = influxdb_plan({{"timestamp_feild", "v"}});
+    EXPECT_NE(typo.find("does not read option 'timestamp_feild'"), std::string::npos) << typo;
+    EXPECT_NE(typo.find("timestamp_field"), std::string::npos) << typo;
+    EXPECT_NE(influxdb_plan({{"changelog", "true"}}).find("does not support changelog='true'"),
+              std::string::npos);
+    EXPECT_NE(influxdb_plan({{"mode", "upsert"}, {"primary_key", "k"}}).find("mode='upsert'"),
+              std::string::npos);
+}
+
 TEST(SqlPhysical, CommitGroupThreadsThroughToSinkParams) {
     // commit_group property on the table flows through the
     // physical planner into OperatorSpec.params, where sink factories
