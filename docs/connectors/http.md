@@ -582,6 +582,8 @@ Without a server: `InfluxRender` (point identity, every escape and refusal, time
 
 `scripts/influxdb-live.sh [build-dir]` is the gate: it starts InfluxDB 2.7.12, pinned by digest, on a free loopback port with a throwaway token, runs the suites above, and fails on a missing binary, a server that never becomes ready, a failed or skipped case or a short suite, keeping each run's report, the cells' cluster logs and a provenance file (never the token) in `build/influxdb-live-reports/`. The `http` CI workflow runs it.
 
+The gate passed locally on commit 50bdbaa6, 37 of 37, on 2026-11-07 (reports not published). In the timestamped cell 3,000 records left exactly 3,000 points after the kill and replay; in server-time mode 294 of the 318 replayed records were written twice, leaving 3,294 points; the SQL cell left 3,000. The previous sink's defects (a missing or fractional timestamp, a missing tag, line breaks in names, malformed records sent as broken lines, nested values dropped, a 422 dead-lettering written points) were found by reading its code and are each covered by a case above; they were not run against the server with the old code.
+
 ### Elasticsearch and OpenSearch
 
 `scripts/search-live.sh <server> [build-dir]` is the sinks' gate, for one server at a time. The servers are `elasticsearch` (8.13.4), `elasticsearch9` (9.2.0), `opensearch` (2.17.1) and `opensearch3` (3.3.0), run one after the other. Each gate runs four phases, each on its own server, started on a free loopback port and removed when the phase ends:
