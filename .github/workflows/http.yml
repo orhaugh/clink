@@ -1,5 +1,7 @@
-name: search
+name: http
 
+# The HTTP connectors' gates, from one build.
+#
 # The Elasticsearch and OpenSearch bulk sink's gate (scripts/search-live.sh), run
 # once per product, one after the other, each against its pinned server from
 # docker/integration-services.yml (elasticsearch 8.13.4, opensearch 2.17.1): the
@@ -10,13 +12,26 @@ name: search
 # and the recovery cells, a coordinator and two workers polling a feed into the
 # sink with a worker killed at the sink's fault points, replies that confirm
 # nothing, and a reply lost after the server applied a flush, each verified by
-# reading the index. A live test skips when its server or binary is missing and
-# gtest counts that as a pass, so each gate fails on any skip and on any required
-# suite that did not run in full.
+# reading the index.
 #
-# The script runs on the runner, where it starts and removes the server with
-# Docker; the test binaries run inside the toolchain image through PIN_RUNNER,
-# on the runner's network.
+# The HTTP polling source's gate (scripts/http-poll-live.sh), against local
+# servers the tests run themselves: the page reader, the options, the source
+# against a scripted endpoint (paging, bounded completion, 204 and 304,
+# conditional requests across cursor moves and restores, exact and encoded
+# cursors, response bounds, retries, throttling, cancellation, errors that name
+# no credential), the delivery analyser's verdicts, and the recovery cells, a
+# worker killed with a page in flight at parallelism 1 and 2 and as a SQL job,
+# each checked against the feed's dataset, with `clink run` reading the feed to
+# its end. It runs whenever the build succeeded, whatever the search gates did.
+#
+# A live test skips when its server or binary is missing and gtest counts that
+# as a pass, so each gate fails on any skip and on any required suite that did
+# not run in full. This workflow was named search until the polling source's
+# gate joined it.
+#
+# The scripts run on the runner, where the search gate starts and removes the
+# server with Docker; the test binaries run inside the toolchain image through
+# PIN_RUNNER, on the runner's network.
 
 on:
   push:
@@ -33,12 +48,12 @@ env:
   DOCKER_CLI_SHA256: 995d1ef289677f74fd58d8d2c35727b6a4ee389c69db8638a3e42d0487aa5b0f
 
 concurrency:
-  group: search-${{ github.ref }}
+  group: http-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   live:
-    name: The Elasticsearch and OpenSearch sinks hold their contracts against each server
+    name: The search sinks and the polling source hold their contracts
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -65,6 +80,7 @@ jobs:
       # leaving the gate without its binary. Debug without DWARF and stripped,
       # as the build job builds.
       - name: Build the HTTP connector tests, the recovery cells and the node and SQL binaries
+        id: build
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ccache"
@@ -128,6 +144,32 @@ jobs:
               | tee "${RUNNER_TEMP}/search-gate-${product}.log" || status=1
           done
           exit "${status}"
+      - name: Run the polling source's gate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_HTTP_POLL_RECOVERY_LOG_DIR \
+            ${TOOLCHAIN}"
+          REPORT_DIR="${RUNNER_TEMP}/http-poll-live-reports" \
+            scripts/http-poll-live.sh build 2>&1 | tee "${RUNNER_TEMP}/http-poll-gate.log"
+      - name: Keep the polling source's reports and the cells' evidence
+        # The reports carry every case's result; the gate log and each run's log
+        # carry the "[http-poll-recovery]" and "[http-poll-sql]" verdict lines and
+        # the fault framework's witness lines; recovery-logs/ holds every cell's
+        # coordinator and worker logs; provenance.txt names the commit, the
+        # build's configuration and the feed the cells served.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-poll-gate
+          path: |
+            ${{ runner.temp }}/http-poll-live-reports/**
+            ${{ runner.temp }}/http-poll-gate.log
+          if-no-files-found: warn
+          retention-days: 90
       - name: Keep the reports and the cells' evidence
         # The reports carry every case's result; each gate log and each run's
         # log carry the "[search-live]" and "[search-recovery]" verdict lines
