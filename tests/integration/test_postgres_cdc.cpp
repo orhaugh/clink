@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include "clink/connectors/cdc_event.hpp"
+#include "clink/connectors/cdc_json.hpp"
 #include "clink/connectors/postgres_cdc_source.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/runtime/dag.hpp"
@@ -56,6 +57,19 @@ private:
     std::vector<CdcEvent> events_;
 };
 
+// The events in order ("begin, insert public.widgets, commit, ..."), so a short
+// count shows which transaction is missing.
+std::string describe(const std::vector<CdcEvent>& events) {
+    std::string out;
+    for (const auto& e : events) {
+        out += (out.empty() ? "" : ", ") + pgcdc::cdc_op_name(e.op);
+        if (!e.table.empty()) {
+            out += " " + e.table;
+        }
+    }
+    return out.empty() ? "none" : out;
+}
+
 }  // namespace
 
 TEST(PostgresCdcIntegration, StreamsInsertUpdateDeleteThroughPipeline) {
@@ -90,21 +104,26 @@ TEST(PostgresCdcIntegration, StreamsInsertUpdateDeleteThroughPipeline) {
     LocalExecutor exec(std::move(dag));
     exec.start();
 
-    // Wait for START_REPLICATION to actually land, not for a duration
-    // that usually covers it: the walsender for our slot appears in
-    // pg_stat_replication once streaming begins, which is exactly what
-    // the WAL traffic below depends on.
+    // Wait until a walsender is streaming our slot, not merely connected.
+    // The source creates the slot over a replication connection of its own,
+    // and pg_stat_replication lists that walsender, in state startup, before
+    // the slot is consistent: a change committed then lies before the slot's
+    // start and is never streamed. A walsender holding the slot in catchup or
+    // streaming has run START_REPLICATION, so every commit from here on is
+    // streamed.
     {
         const auto deadline = std::chrono::steady_clock::now() + 10s;
         bool streaming = false;
         while (std::chrono::steady_clock::now() < deadline) {
-            if (pg.scalar("SELECT count(*) FROM pg_stat_replication") != "0") {
+            if (pg.scalar("SELECT count(*) FROM pg_replication_slots s JOIN pg_stat_replication r "
+                          "ON r.pid = s.active_pid WHERE s.slot_name = 'clink_cdc_test' AND "
+                          "r.state IN ('catchup', 'streaming')") != "0") {
                 streaming = true;
                 break;
             }
             std::this_thread::sleep_for(50ms);
         }
-        ASSERT_TRUE(streaming) << "walsender never appeared in pg_stat_replication";
+        ASSERT_TRUE(streaming) << "no walsender started streaming slot clink_cdc_test";
     }
 
     // Drive INSERT/UPDATE/DELETE from a parallel connection. Each
@@ -126,7 +145,8 @@ TEST(PostgresCdcIntegration, StreamsInsertUpdateDeleteThroughPipeline) {
     exec.await_termination();
 
     auto events = sink->snapshot();
-    ASSERT_GE(events.size(), 9u) << "expected at least 9 CDC events (3 transactions × 3 rows)";
+    ASSERT_GE(events.size(), 9u) << "expected at least 9 CDC events (3 transactions × 3 rows), got "
+                                 << describe(events);
 
     // Verify the canonical (BEGIN, INSERT, COMMIT, BEGIN, UPDATE, COMMIT,
     // BEGIN, DELETE, COMMIT) sequence appears in order. We tolerate extra
