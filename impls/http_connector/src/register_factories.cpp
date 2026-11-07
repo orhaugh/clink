@@ -1,5 +1,6 @@
 // HTTP connector factory registration.
 
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include "clink/connectors/capability.hpp"
@@ -74,24 +76,17 @@ void install(clink::plugin::PluginRegistry& reg) {
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "http",
         .version = "1",
-        .is_source = true,
+        .is_source = false,
         .is_sink = true,
         .build_dependencies = {"cpp-httplib"},
         .runtime_dependencies = {"http endpoint"},
         .formats = {"text", "json", "bytes"},
-        .boundedness = clink::connectors::Boundedness::Either,
-        // The poll source checkpoints its cursor as operator state and
-        // re-polls from it after a restart (PollingSource), so it replays
-        // from a recorded position: at-least-once, and exact when the
-        // endpoint honours an exclusive cursor, which is the endpoint's
-        // property, not the source's, hence the limitation below. The SINK
-        // side posts with retries and flushes at every barrier
-        // (at-least-once). This record said the source kept no cursor and
-        // sat outside checkpointing, which was never what the code did,
-        // and it barred a job over the source from declaring any
-        // guarantee at all.
-        .replayable = true,
-        .offset_model = clink::connectors::OffsetModel::OpaqueToken,
+        .boundedness = clink::connectors::Boundedness::Unbounded,
+        // The sink posts with retries and flushes at every barrier
+        // (at-least-once). The polling source has a record of its own,
+        // http_poll, since what it can replay depends on how it is set up.
+        .replayable = false,
+        .offset_model = clink::connectors::OffsetModel::None,
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
@@ -99,13 +94,48 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {"poll_interval_ms"},
+        .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"the poll source replays exactly only if the endpoint honours an "
-                        "exclusive cursor and retains what it served; an endpoint that "
-                        "ignores the cursor delivers everything again after a restart",
-                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
+        .limitations = {"the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
+    });
+    clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
+        .name = "http_poll",
+        .version = "2",
+        .is_source = true,
+        .is_sink = false,
+        .build_dependencies = {"cpp-httplib"},
+        .runtime_dependencies = {"http endpoint"},
+        .formats = {"json"},
+        .boundedness = clink::connectors::Boundedness::Either,
+        // In cursor mode the checkpoint carries the cursor and a restore polls
+        // again from it, so the source replays from a recorded position while
+        // the endpoint answers strictly after a cursor and keeps what it
+        // served: the endpoint's property, not the source's, hence the
+        // limitations. In resource mode it keeps no position at all, so it
+        // replays only with the cursor options. The record before this one
+        // declared the source replayable however it was set up.
+        .replayable = true,
+        .offset_model = clink::connectors::OffsetModel::OpaqueToken,
+        .checkpoint_integrated = true,
+        .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
+        .transactional = false,
+        .auth_methods = {"none", "headers"},
+        .tls = true,
+        .backpressure = true,
+        .retries = true,
+        .timeout_options = {"connect_timeout_ms", "request_timeout_ms", "retry_timeout_ms"},
+        .available_in_sql = true,
+        .limitations = {"replays only in cursor mode, and only while the endpoint answers the "
+                        "records strictly after the cursor, ascending, each cursor value unique, "
+                        "and keeps what it served; a page that breaks what the source can check "
+                        "of that fails the poll",
+                        "resource mode replays nothing: a restart reads the resource as it is "
+                        "then",
+                        "one subtask polls, whatever the parallelism",
+                        "pagination by page token, offset or a cursor made of several fields is "
+                        "not supported"},
+        .replay_requires_options = {"cursor_field", "cursor_param"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "elasticsearch",
@@ -497,38 +527,117 @@ void install(clink::plugin::PluginRegistry& reg) {
             return make_prometheus_pushgateway_sink(std::move(o));
         });
 
-    // http_poll_source: GET a JSON REST endpoint on an interval, emit the array
-    // elements, cursor on a record field. At-least-once (the cursor is
-    // checkpointed). Params:
+    // http_poll_source: GET a JSON endpoint on an interval and emit the array
+    // elements. Cursor mode (cursor_param + cursor_field) checkpoints the
+    // cursor and replays from it; resource mode (neither) keeps no position.
+    // Every option is parsed strictly: a value the source cannot read fails
+    // the build rather than falling back to a default. Params:
     //   url (required)        - scheme://host[:port]
     //   path (default "/")    - request path (may carry a fixed query string)
     //   headers               - "K: V; ..." (auth)
-    //   cursor_param          - query-param name to send the cursor as
-    //   cursor_field          - record field holding the next cursor (API must
-    //                           return records ascending by it)
+    //   verify_tls            - "true" (default) | "false"
+    //   cursor_param          - query parameter the cursor is sent as
+    //   cursor_field          - record field each record's cursor is read from
+    //   cursor_type           - "opaque" (default) | "integer"
     //   records_field         - response field holding the array (else the
     //                           response itself is the array)
-    //   initial_cursor        - starting cursor on a fresh run
-    //   poll_interval_ms (default 1000)
-    //   max_retries (default 4; clamped to [0, 20]) - transient-GET retries
-    //   verify_tls ("true" [default] | "false")
+    //   initial_cursor        - cursor mode: where a fresh run starts
+    //   bounded               - "false" (default) | "true"
+    //   poll_interval_ms (default 1000; 0 to 3600000)
+    //   jitter_frac (default 0; 0 to 1)
+    //   max_retries (default 4; 0 to 20) - retries one poll may make
+    //   retry_base_backoff_ms (default 200), max_backoff_ms (default 10000)
+    //   retry_timeout_ms (default 60000) - the longest one poll may take
+    //   connect_timeout_ms (default 5000), request_timeout_ms (default 30000)
+    //   max_response_bytes (default 16777216), max_response_records (default 100000)
     reg.register_source<std::string>(
         "http_poll_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            const auto given = [&ctx](const char* key) { return ctx.params.contains(key); };
+            const auto refuse = [](const std::string& why) {
+                throw std::runtime_error("http_poll_source: " + why);
+            };
+            const auto integer = [&](const char* key, std::int64_t fallback) {
+                if (!given(key)) {
+                    return fallback;
+                }
+                const std::string v = ctx.param_or(key);
+                std::int64_t out = 0;
+                const auto* end = v.data() + v.size();
+                const auto [ptr, ec] = std::from_chars(v.data(), end, out);
+                if (v.empty() || ec != std::errc{} || ptr != end) {
+                    refuse(std::string{"'"} + key + "' must be an integer; it is '" + v + "'");
+                }
+                return out;
+            };
+            const auto boolean = [&](const char* key, bool fallback) {
+                if (!given(key)) {
+                    return fallback;
+                }
+                const std::string v = ctx.param_or(key);
+                if (v != "true" && v != "false") {
+                    refuse(std::string{"'"} + key + "' must be 'true' or 'false'; it is '" + v +
+                           "'");
+                }
+                return v == "true";
+            };
+            const auto text = [&](const char* key) {
+                const std::string v = ctx.param_or(key, "");
+                if (given(key) && v.empty()) {
+                    refuse(std::string{"'"} + key + "' is empty; leave it out instead");
+                }
+                return v;
+            };
             HttpPollOptions o;
             o.url = ctx.param_or("url");
             o.path = ctx.param_or("path", "/");
             o.headers = ctx.param_or("headers", "");
-            o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
-            o.cursor_param = ctx.param_or("cursor_param", "");
-            o.cursor_field = ctx.param_or("cursor_field", "");
-            o.records_field = ctx.param_or("records_field", "");
-            o.initial_cursor = ctx.param_or("initial_cursor", "");
-            o.interval = std::chrono::milliseconds{ctx.param_int64_or("poll_interval_ms", 1000)};
-            o.jitter_frac = std::stod(ctx.param_or("jitter_frac", "0"));
-            o.bounded = ctx.param_or("bounded", "") == "true";  // one-shot poll
-            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
-            o.retry_base_backoff =
-                std::chrono::milliseconds{ctx.param_int64_or("retry_base_backoff_ms", 200)};
+            o.verify_tls = boolean("verify_tls", true);
+            o.cursor_param = text("cursor_param");
+            o.cursor_field = text("cursor_field");
+            o.records_field = text("records_field");
+            o.initial_cursor = text("initial_cursor");
+            if (given("cursor_type")) {
+                if (o.cursor_field.empty()) {
+                    refuse("'cursor_type' needs cursor mode ('cursor_param' and 'cursor_field')");
+                }
+                const std::string t = ctx.param_or("cursor_type");
+                if (t == "integer") {
+                    o.cursor_type = HttpPollCursorType::Integer;
+                } else if (t != "opaque") {
+                    refuse("'cursor_type' must be 'opaque' or 'integer'; it is '" + t + "'");
+                }
+            }
+            o.bounded = boolean("bounded", false);
+            o.interval = std::chrono::milliseconds{integer("poll_interval_ms", 1000)};
+            if (given("jitter_frac")) {
+                const std::string v = ctx.param_or("jitter_frac");
+                char* end = nullptr;
+                const double j = std::strtod(v.c_str(), &end);
+                if (v.empty() || end != v.c_str() + v.size() || !(j >= 0.0 && j <= 1.0)) {
+                    refuse("'jitter_frac' must be a number from 0 to 1; it is '" + v + "'");
+                }
+                o.jitter_frac = j;
+            }
+            // Range-checked as an int64 before it is narrowed; the source
+            // checks every range again.
+            const auto max_retries = integer("max_retries", 4);
+            if (max_retries < 0 || max_retries > HttpPollSource::kMaxRetries) {
+                refuse("'max_retries' must be 0 to " + std::to_string(HttpPollSource::kMaxRetries) +
+                       "; it is " + std::to_string(max_retries));
+            }
+            o.max_retries = static_cast<int>(max_retries);
+            o.retry_base_backoff = std::chrono::milliseconds{integer("retry_base_backoff_ms", 200)};
+            o.max_backoff = std::chrono::milliseconds{integer("max_backoff_ms", 10000)};
+            o.retry_timeout = std::chrono::milliseconds{integer("retry_timeout_ms", 60000)};
+            o.connect_timeout = std::chrono::milliseconds{integer("connect_timeout_ms", 5000)};
+            o.request_timeout = std::chrono::milliseconds{integer("request_timeout_ms", 30000)};
+            const auto max_bytes = integer("max_response_bytes", 16LL * 1024 * 1024);
+            const auto max_records = integer("max_response_records", 100000);
+            if (max_bytes < 0 || max_records < 0) {
+                refuse("'max_response_bytes' and 'max_response_records' must be positive");
+            }
+            o.max_response_bytes = static_cast<std::size_t>(max_bytes);
+            o.max_response_records = static_cast<std::size_t>(max_records);
             o.name = "http_poll_source";
             return clink::read_on_first_subtask<std::string>(ctx.subtask_idx,
                                                              make_http_poll_source(std::move(o)));
