@@ -17,6 +17,8 @@
 #include "clink/cassandra/cassandra_upsert_sink.hpp"
 #include "clink/test/upsert_contract.hpp"
 
+#include "cassandra_live.hpp"
+
 namespace {
 
 using clink::cassandra::CassandraUpsertSink;
@@ -24,16 +26,16 @@ using clink::test::UpsertContractFixture;
 using clink::test::UpsertState;
 
 bool cass_configured() {
-    return std::getenv("CLINK_CASSANDRA_TEST_CONTACT_POINTS") != nullptr;
+    return clink::cassandra::live::configured();
 }
 std::string cass_contact_points() {
-    const char* v = std::getenv("CLINK_CASSANDRA_TEST_CONTACT_POINTS");
-    return v == nullptr ? std::string{} : std::string{v};
+    return clink::cassandra::live::contact_points();
 }
 
 CassSession* connect_raw(CassCluster** out_cluster) {
     CassCluster* cluster = cass_cluster_new();
     cass_cluster_set_contact_points(cluster, cass_contact_points().c_str());
+    cass_cluster_set_port(cluster, clink::cassandra::live::port());
     CassSession* session = cass_session_new();
     CassFuture* cf = cass_session_connect(session, cluster);
     cass_future_wait(cf);
@@ -153,7 +155,7 @@ struct CassandraUpsertContract {
         fx.expected_updated = {{"1", "a2"}, {"2", "b2"}, {"3", "c2"}};
         fx.fresh = [table] {
             CassandraUpsertSink::Options o;
-            o.conn.contact_points = cass_contact_points();
+            o.conn = clink::cassandra::live::conn();
             o.keyspace = kContractKeyspace;
             o.table = table;
             o.key_columns = {"id"};

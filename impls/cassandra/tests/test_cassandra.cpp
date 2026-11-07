@@ -2,6 +2,7 @@
 // dead endpoint (no cluster needed). The insert + read-back lives in the env-gated
 // test_cassandra_live.cpp.
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -32,7 +33,11 @@ TEST(CassandraSink, RequiresKeyspaceAndTable) {
 
 TEST(CassandraSink, OpenAgainstDeadEndpointFailsCleanly) {
     CassandraSink sink(dead_sink_opts());
+    const auto t0 = std::chrono::steady_clock::now();
     EXPECT_THROW(sink.open(), std::runtime_error);
-    EXPECT_NO_THROW(sink.flush());  // flush with nothing pending is a no-op
+    // Bounded by the connect timeout (2 s here), with room for a slow runner.
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(20));
+    // A sink that never opened refuses a flush rather than reporting it written.
+    EXPECT_THROW(sink.flush(), std::runtime_error);
     EXPECT_NO_THROW(sink.close());
 }

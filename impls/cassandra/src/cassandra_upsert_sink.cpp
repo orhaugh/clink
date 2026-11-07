@@ -1,179 +1,179 @@
 #include "clink/cassandra/cassandra_upsert_sink.hpp"
 
-#include <cassandra.h>
-#include <chrono>
-#include <cstddef>
+#include <algorithm>
 #include <cstdint>
-#include <cstdio>
-#include <map>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "clink/config/json.hpp"
-#include "clink/metrics/connector_metrics.hpp"
+#include "clink/cassandra/cassandra_rules.hpp"
+#include "clink/runtime/logging.hpp"
+
+#include "sink_core.hpp"
 
 namespace clink::cassandra {
 
 namespace {
-constexpr const char* kLabel = "cassandra";
 
-std::string future_error_message(CassFuture* f) {
-    const char* msg = nullptr;
-    std::size_t len = 0;
-    cass_future_error_message(f, &msg, &len);
-    return std::string(msg, len);
+detail::SinkCoreOptions core_options(CassandraUpsertSink::Options& o) {
+    const auto refuse = [&o](const std::string& why) {
+        throw std::runtime_error(o.name + ": " + why);
+    };
+    if (o.max_buffered_records < 1 || o.max_buffered_records > detail::kMaxBufferedRecordsLimit) {
+        refuse("'max_buffered_records' must be 1 to " +
+               std::to_string(detail::kMaxBufferedRecordsLimit) + "; it is " +
+               std::to_string(o.max_buffered_records));
+    }
+    if (o.max_buffered_bytes < detail::kMinBytesBound ||
+        o.max_buffered_bytes > detail::kMaxBytesBound) {
+        refuse("'max_buffered_bytes' must be " + std::to_string(detail::kMinBytesBound) + " to " +
+               std::to_string(detail::kMaxBytesBound) + "; it is " +
+               std::to_string(o.max_buffered_bytes));
+    }
+    return detail::checked_options(o.name,
+                                   o.conn,
+                                   o.keyspace,
+                                   o.table,
+                                   o.key_columns,
+                                   /*keyed=*/true,
+                                   o.max_in_flight,
+                                   o.max_in_flight_bytes,
+                                   std::move(o.service));
 }
 
-void check_future(CassFuture* f, const std::string& ctx) {
-    cass_future_wait(f);
-    const CassError e = cass_future_error_code(f);
-    if (e != CASS_OK) {
-        const std::string m = future_error_message(f);
-        throw std::runtime_error(ctx + ": " + cass_error_desc(e) + (m.empty() ? "" : " - " + m));
-    }
-}
-
-void check_err(CassError e, const std::string& ctx) {
-    if (e != CASS_OK) {
-        throw std::runtime_error(ctx + ": " + cass_error_desc(e));
-    }
-}
-
-// Format a JSON scalar as a CQL literal for a WHERE clause. Cassandra coerces the
-// literal to the column's declared type, so a bare number works for int/bigint
-// and a quoted string for text. A primary-key cell is never null.
-std::string cql_literal(const clink::config::JsonValue& v, const std::string& ctx) {
-    if (v.is_bool()) {
-        return v.as_bool() ? "true" : "false";
-    }
-    if (v.is_integral_number()) {
-        // Exact: a double would round a key past 2^53, and the DELETE would
-        // name a different row.
-        return std::to_string(v.as_int());
-    }
-    if (v.is_number()) {
-        const double n = v.as_number();
-        if (n >= -9223372036854775808.0 && n < 9223372036854775808.0 &&
-            n == static_cast<double>(static_cast<std::int64_t>(n))) {
-            return std::to_string(static_cast<std::int64_t>(n));
-        }
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%.17g", n);
-        return std::string{buf};
-    }
-    if (v.is_string()) {
-        std::string out = "'";
-        for (char c : v.as_string()) {
-            if (c == '\'') {
-                out += "''";  // CQL escapes a single quote by doubling it
-            } else {
-                out += c;
-            }
-        }
-        out += "'";
-        return out;
-    }
-    throw std::runtime_error(ctx + ": primary-key value is not a scalar");
-}
 }  // namespace
 
 struct CassandraUpsertSink::Impl {
-    Options opts;
-    CassCluster* cluster{nullptr};
-    CassSession* session{nullptr};
-    const CassPrepared* insert_prepared{nullptr};
-    std::string table_fqn;  // "<keyspace>.<table>"
+    Impl(detail::SinkCoreOptions o, std::size_t max_records, std::size_t max_bytes)
+        : core(std::move(o)), max_buffered_records(max_records), max_buffered_bytes(max_bytes) {}
 
+    // The latest record for one row, waiting to be written.
     struct Entry {
         bool is_delete{false};
-        std::string json;
+        std::string insert_json;
+        std::vector<std::string> key_json;
+        std::uint64_t seq{0};  // the position of the record that set it
+        std::size_t bytes{0};
     };
-    std::map<std::string, Entry> netted_;  // primary-key tuple -> latest op
 
-    explicit Impl(Options o) : opts(std::move(o)) {}
+    detail::SinkCore core;
+    std::size_t max_buffered_records;
+    std::size_t max_buffered_bytes;
+    std::unordered_map<std::string, Entry> buffer;  // identity -> latest record
+    std::size_t buffer_bytes{0};
+    std::uint64_t seq{0};
+
+    void clear_buffer() {
+        buffer.clear();
+        buffer_bytes = 0;
+        core.note_buffered(0);
+    }
+
+    // Hands every buffered row to the server, in the order of the records that
+    // set them. Waits only for room in the window, not for acknowledgements.
+    void write_out(RuntimeContext* rt) {
+        if (buffer.empty()) {
+            return;
+        }
+        core.reach("before_write");
+        std::vector<Entry> rows;
+        rows.reserve(buffer.size());
+        for (auto& [identity, entry] : buffer) {
+            (void)identity;
+            rows.push_back(std::move(entry));
+        }
+        clear_buffer();
+        std::sort(
+            rows.begin(), rows.end(), [](const Entry& a, const Entry& b) { return a.seq < b.seq; });
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            core.note_buffered(rows.size() - i - 1);
+            auto& r = rows[i];
+            CassandraWrite w;
+            w.kind = r.is_delete ? CassandraWrite::Kind::Delete : CassandraWrite::Kind::Insert;
+            w.json = std::move(r.insert_json);
+            w.key_json = std::move(r.key_json);
+            core.submit(rt, std::move(w), r.bytes);
+        }
+        core.note_buffered(0);
+    }
+
+    void add(RuntimeContext* rt, CassandraUpsertRecord rec) {
+        std::size_t bytes = rec.identity.size();
+        if (rec.is_delete) {
+            for (const auto& k : rec.key_json) {
+                bytes += k.size();
+            }
+        } else {
+            bytes += rec.insert_json.size();
+        }
+        auto it = buffer.find(rec.identity);
+        const std::size_t count = buffer.size() + (it == buffer.end() ? 1 : 0);
+        const std::size_t total =
+            buffer_bytes - (it == buffer.end() ? 0 : it->second.bytes) + bytes;
+        if (!buffer.empty() && (count > max_buffered_records || total > max_buffered_bytes)) {
+            write_out(rt);
+            it = buffer.end();
+        }
+        Entry e;
+        e.is_delete = rec.is_delete;
+        e.insert_json = std::move(rec.insert_json);
+        e.key_json = std::move(rec.key_json);
+        e.seq = ++seq;
+        e.bytes = bytes;
+        if (it == buffer.end()) {
+            buffer.emplace(std::move(rec.identity), std::move(e));
+        } else {
+            buffer_bytes -= it->second.bytes;
+            it->second = std::move(e);
+        }
+        buffer_bytes += bytes;
+        core.note_buffered(buffer.size());
+        if (buffer_bytes > max_buffered_bytes) {
+            // A record larger than the bound, buffered alone: written at once.
+            write_out(rt);
+        }
+    }
 };
 
-CassandraUpsertSink::CassandraUpsertSink(Options opts)
-    : impl_(std::make_unique<Impl>(std::move(opts))) {
-    if (impl_->opts.keyspace.empty() || impl_->opts.table.empty()) {
-        throw std::runtime_error(impl_->opts.name + ": 'keyspace' and 'table' are required");
-    }
-    if (impl_->opts.key_columns.empty()) {
-        throw std::runtime_error(impl_->opts.name +
-                                 ": 'key_columns' (the primary key) is required");
-    }
-    impl_->table_fqn = impl_->opts.keyspace + "." + impl_->opts.table;
+CassandraUpsertSink::CassandraUpsertSink(Options opts) {
+    const std::size_t max_records = opts.max_buffered_records;
+    const std::size_t max_bytes = opts.max_buffered_bytes;
+    auto core = core_options(opts);
+    impl_ = std::make_unique<Impl>(std::move(core), max_records, max_bytes);
 }
 
-CassandraUpsertSink::~CassandraUpsertSink() {
-    if (impl_->insert_prepared != nullptr) {
-        cass_prepared_free(impl_->insert_prepared);
-    }
-    if (impl_->session != nullptr) {
-        cass_session_free(impl_->session);
-    }
-    if (impl_->cluster != nullptr) {
-        cass_cluster_free(impl_->cluster);
-    }
-}
+CassandraUpsertSink::~CassandraUpsertSink() = default;
 
 void CassandraUpsertSink::open() {
-    const auto& c = impl_->opts.conn;
-    impl_->cluster = cass_cluster_new();
-    check_err(cass_cluster_set_contact_points(impl_->cluster, c.contact_points.c_str()),
-              impl_->opts.name + ": contact_points");
-    check_err(cass_cluster_set_port(impl_->cluster, c.port), impl_->opts.name + ": port");
-    cass_cluster_set_connect_timeout(impl_->cluster, static_cast<unsigned>(c.connect_timeout_ms));
-    if (!c.username.empty()) {
-        cass_cluster_set_credentials(impl_->cluster, c.username.c_str(), c.password.c_str());
-    }
-    impl_->session = cass_session_new();
-    CassFuture* cf = cass_session_connect(impl_->session, impl_->cluster);
-    check_future(cf, impl_->opts.name + ": connect");
-    cass_future_free(cf);
-
-    const std::string query = "INSERT INTO " + impl_->table_fqn + " JSON ?";
-    CassFuture* pf = cass_session_prepare(impl_->session, query.c_str());
-    check_future(pf, impl_->opts.name + ": prepare");
-    impl_->insert_prepared = cass_future_get_prepared(pf);
-    cass_future_free(pf);
+    impl_->clear_buffer();
+    impl_->seq = 0;
+    impl_->core.open(runtime());
 }
 
 void CassandraUpsertSink::on_data(const Batch<std::string>& batch) {
-    if (impl_->insert_prepared == nullptr) {
-        throw std::runtime_error(impl_->opts.name + ": on_data before open()");
-    }
+    auto& core = impl_->core;
+    core.check_usable();
+    std::vector<CassandraUpsertRecord> prepared;
+    prepared.reserve(batch.size());
+    std::size_t i = 0;
     for (const auto& rec : batch) {
-        const std::string& json = rec.value();
-        auto j = clink::config::parse(json);
-        if (!j.is_object()) {
-            throw std::runtime_error(impl_->opts.name + ": sink row is not a JSON object: " + json);
+        ++i;
+        try {
+            prepared.push_back(prepare_cassandra_upsert_record(rec.value(), core.key()));
+        } catch (const CassandraRecordError& e) {
+            const std::size_t buffered = impl_->buffer.size();
+            impl_->clear_buffer();
+            core.fail("record " + std::to_string(i) + " of a batch of " +
+                          std::to_string(batch.size()) + " is refused: " + e.what() +
+                          ". Nothing of that batch was buffered or written",
+                      buffered);
         }
-        auto& obj = j.as_object();
-
-        bool is_delete = false;
-        if (auto it = obj.find("__row_kind"); it != obj.end() && it->second.is_string()) {
-            const std::string& k = it->second.as_string();
-            is_delete = (k == "delete" || k == "update_before");
-        }
-
-        std::string key;
-        for (const auto& kc : impl_->opts.key_columns) {
-            auto it = obj.find(kc);
-            if (it == obj.end() || it->second.is_null()) {
-                throw std::runtime_error(
-                    impl_->opts.name + ": changelog row missing primary key '" + kc + "': " + json);
-            }
-            it->second.serialize_into(key);
-            key.push_back('\x1f');
-        }
-        // Strip the synthetic marker: `INSERT INTO t JSON ?` rejects a JSON object
-        // with a field that is not a table column (__row_kind is not one). The
-        // primary-key columns remain for the DELETE path.
-        obj.erase("__row_kind");
-        impl_->netted_[std::move(key)] = Impl::Entry{is_delete, j.serialize(0)};
+    }
+    auto* rt = runtime();
+    for (auto& p : prepared) {
+        impl_->add(rt, std::move(p));
     }
 }
 
@@ -182,99 +182,43 @@ void CassandraUpsertSink::on_barrier(CheckpointBarrier /*b*/) {
 }
 
 void CassandraUpsertSink::flush() {
-    if (impl_->netted_.empty()) {
+    auto& core = impl_->core;
+    core.check_usable();
+    auto* rt = runtime();
+    impl_->write_out(rt);
+    if (core.in_flight() == 0) {
         return;
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    const std::size_t n = impl_->netted_.size();
-    std::vector<CassFuture*> pending;
-    pending.reserve(n);
-    try {
-        for (auto& [key, entry] : impl_->netted_) {
-            (void)key;
-            if (entry.is_delete) {
-                // CQL has no multi-row IN over a composite key: one DELETE per key.
-                const auto j = clink::config::parse(entry.json);
-                const auto& obj = j.as_object();
-                std::string cql = "DELETE FROM " + impl_->table_fqn + " WHERE ";
-                for (std::size_t i = 0; i < impl_->opts.key_columns.size(); ++i) {
-                    const auto& kc = impl_->opts.key_columns[i];
-                    cql += kc + "=" + cql_literal(obj.at(kc), impl_->opts.name);
-                    if (i + 1 < impl_->opts.key_columns.size()) {
-                        cql += " AND ";
-                    }
-                }
-                CassStatement* st = cass_statement_new(cql.c_str(), 0);
-                pending.push_back(cass_session_execute(impl_->session, st));
-                cass_statement_free(st);
-            } else {
-                CassStatement* st = cass_prepared_bind(impl_->insert_prepared);
-                const CassError be =
-                    cass_statement_bind_string_n(st, 0, entry.json.data(), entry.json.size());
-                if (be != CASS_OK) {
-                    cass_statement_free(st);
-                    throw std::runtime_error(impl_->opts.name + ": bind: " + cass_error_desc(be));
-                }
-                pending.push_back(cass_session_execute(impl_->session, st));
-                cass_statement_free(st);
-            }
-        }
-    } catch (...) {
-        for (CassFuture* f : pending) {
-            cass_future_free(f);
-        }
-        impl_->netted_.clear();
-        clink::metrics::connector::error_inc(kLabel, "sink");
-        throw;
-    }
-
-    CassError first = CASS_OK;
-    std::string first_msg;
-    for (CassFuture* f : pending) {
-        cass_future_wait(f);
-        const CassError e = cass_future_error_code(f);
-        if (e != CASS_OK && first == CASS_OK) {
-            first = e;
-            first_msg = future_error_message(f);
-        }
-        cass_future_free(f);
-    }
-    impl_->netted_.clear();
-    if (first != CASS_OK) {
-        clink::metrics::connector::error_inc(kLabel, "sink");
-        throw std::runtime_error(impl_->opts.name + ": apply: " + cass_error_desc(first) +
-                                 (first_msg.empty() ? "" : " - " + first_msg));
-    }
-    clink::metrics::connector::records_out_inc(kLabel, n);
-    const auto dt =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
-            .count();
-    clink::metrics::connector::commit_latency_observe(kLabel, static_cast<std::uint64_t>(dt));
+    core.reach("in_flight");
+    core.drain(rt);
+    core.reach("after_write");
 }
 
 void CassandraUpsertSink::close() {
-    if (impl_->session != nullptr) {
-        flush();
+    if (!impl_->buffer.empty()) {
+        clink::log::warn("cassandra.sink",
+                         impl_->core.name() + ": closing with " +
+                             std::to_string(impl_->buffer.size()) +
+                             " buffered row(s) not written; no barrier covers them");
     }
-    if (impl_->insert_prepared != nullptr) {
-        cass_prepared_free(impl_->insert_prepared);
-        impl_->insert_prepared = nullptr;
-    }
-    if (impl_->session != nullptr) {
-        CassFuture* cf = cass_session_close(impl_->session);
-        cass_future_wait(cf);
-        cass_future_free(cf);
-        cass_session_free(impl_->session);
-        impl_->session = nullptr;
-    }
-    if (impl_->cluster != nullptr) {
-        cass_cluster_free(impl_->cluster);
-        impl_->cluster = nullptr;
-    }
+    impl_->clear_buffer();
+    impl_->core.close();
 }
 
 std::string CassandraUpsertSink::name() const {
-    return impl_->opts.name;
+    return impl_->core.name();
+}
+
+bool CassandraUpsertSink::failed() const {
+    return impl_->core.failed();
+}
+
+std::size_t CassandraUpsertSink::buffered_rows() const {
+    return impl_->buffer.size();
+}
+
+std::size_t CassandraUpsertSink::in_flight() const {
+    return impl_->core.in_flight();
 }
 
 }  // namespace clink::cassandra

@@ -221,6 +221,8 @@ impls/aws/include/clink/aws/dynamodb_sink.hpp
 impls/aws/include/clink/aws/firehose_sink.hpp
 impls/aws/include/clink/aws/kinesis_sink.hpp
 impls/aws/include/clink/aws/kinesis_source.hpp
+impls/cassandra/include/clink/cassandra/cassandra_rules.hpp
+impls/cassandra/include/clink/cassandra/cassandra_service.hpp
 impls/cassandra/include/clink/cassandra/cassandra_sink.hpp
 impls/cassandra/include/clink/cassandra/cassandra_upsert_sink.hpp
 impls/cassandra/include/clink/cassandra/connection_params.hpp

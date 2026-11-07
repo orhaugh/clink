@@ -193,6 +193,8 @@ std::string string_source_factory_for(const TableDef& table) {
     unsupported("unsupported source connector '" + connector + "' for table " + table.name);
 }
 
+void check_cassandra_options(const TableDef& table, bool upsert);
+
 std::string string_sink_factory_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
     if (connector == "file" || connector == "filesystem") {
@@ -211,6 +213,7 @@ std::string string_sink_factory_for(const TableDef& table) {
         return "pulsar_sink_string";
     }
     if (connector == "cassandra") {
+        check_cassandra_options(table, /*upsert=*/false);
         return "cassandra_sink_string";
     }
     if (connector == "clickhouse") {
@@ -375,6 +378,74 @@ void check_mongodb_options(const TableDef& table, bool as_source) {
                 unsupported("table '" + table.name + "': a connector='mongodb' sink needs '" +
                             required + "'");
             }
+        }
+    }
+}
+
+// A connector='cassandra' sink table's options: an option the sink does not read
+// is refused rather than ignored, and the refusal lists the ones it reads. The
+// upsert sink (mode='upsert') also reads the buffer bounds; its key comes from
+// the table's PRIMARY KEY, never from key_columns.
+void check_cassandra_options(const TableDef& table, bool upsert) {
+    static const std::vector<std::string> kCommon = {"contact_points",
+                                                     "port",
+                                                     "username",
+                                                     "password",
+                                                     "connect_timeout_ms",
+                                                     "request_timeout_ms",
+                                                     "consistency",
+                                                     "keyspace",
+                                                     "table",
+                                                     "max_in_flight",
+                                                     "max_in_flight_bytes"};
+    static const std::vector<std::string> kUpsert = {"max_buffered_records", "max_buffered_bytes"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        const auto listed = [&key](const std::vector<std::string>& v) {
+            return std::find(v.begin(), v.end(), key) != v.end();
+        };
+        if (listed(kCommon) || (upsert && listed(kUpsert))) {
+            continue;
+        }
+        if (listed(kUpsert)) {
+            unsupported("table '" + table.name + "': '" + key +
+                        "' bounds the connector='cassandra' upsert sink's buffer, which only "
+                        "mode='upsert' uses");
+        }
+        if (key == "key_columns") {
+            unsupported("table '" + table.name +
+                        "': connector='cassandra' takes no 'key_columns' in SQL: mode='upsert' "
+                        "keys rows by the table's PRIMARY KEY, which must be the Cassandra "
+                        "table's whole primary key");
+        }
+        if (key.starts_with("ssl") || key.starts_with("tls") ||
+            key.find("cert") != std::string::npos || key.find("truststore") != std::string::npos ||
+            key.find("keystore") != std::string::npos) {
+            unsupported("table '" + table.name +
+                        "': connector='cassandra' does not support TLS ('" + key +
+                        "'): it connects in plain text, so reach the cluster over a "
+                        "trusted network");
+        }
+        if (key == "format" && value == "json") {
+            continue;
+        }
+        if (listed(interpreted) && key != "format") {
+            continue;
+        }
+        std::string accepted;
+        for (const auto* list : {&kCommon, &kUpsert}) {
+            for (const auto& o : *list) {
+                accepted += (accepted.empty() ? "" : ", ") + o;
+            }
+        }
+        unsupported("table '" + table.name + "': connector='cassandra' does not read option '" +
+                    key + "'; it reads " + accepted + " (the last two with mode='upsert' only)");
+    }
+    for (const char* required : {"keyspace", "table"}) {
+        if (const auto it = table.properties.find(required);
+            it == table.properties.end() || it->second.empty()) {
+            unsupported("table '" + table.name + "': a connector='cassandra' sink needs '" +
+                        required + "'");
         }
     }
 }
@@ -925,18 +996,27 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     if (connector == "cassandra") {
         // Cassandra / ScyllaDB sink. Each row -> JSON object string -> INSERT ... JSON ?. At-least-
         // once; a CQL INSERT is an upsert keyed by the primary key, so replay is idempotent for a
-        // stable PK. The simple JSON-insert path has no delete/tombstone handling, so mode='upsert'
-        // (changelog) is rejected; exactly-once is not supported.
+        // stable PK. The plain sink writes inserts only: a retracting query needs mode='upsert',
+        // and changelog='true' (rows written verbatim with their __row_kind) is refused, since
+        // the marker is no column of the table. Exactly-once is not supported.
+        check_cassandra_options(table, upsert);
         if (exactly_once) {
             unsupported(
                 "connector='cassandra' sink is at-least-once (idempotent for a stable primary "
                 "key); exactly-once delivery is not supported");
         }
+        if (const auto cl = table.properties.find("changelog");
+            cl != table.properties.end() && cl->second == "true") {
+            unsupported(
+                "connector='cassandra' sink does not support changelog='true': declare the "
+                "table's PRIMARY KEY and mode='upsert' to apply deletes by key");
+        }
         if (upsert) {
             // Changelog-aware upsert: maintain the table by PRIMARY KEY (INSERT
             // JSON - a CQL upsert - for insert/update_after, DELETE by key for
             // delete/update_before). Effectively-once on the sink table for a
-            // stable PK. The binder has already checked a PRIMARY KEY.
+            // stable PK. The binder has already checked a PRIMARY KEY; the sink
+            // checks at open that it is the Cassandra table's whole key.
             std::string keys;
             for (std::size_t i = 0; i < table.primary_key.size(); ++i) {
                 keys += (i ? "," : "") + table.primary_key[i];

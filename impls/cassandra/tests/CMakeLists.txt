@@ -6,6 +6,8 @@ add_executable(clink_cassandra_tests
     register.cpp
     test_factory_registration.cpp
     test_cassandra.cpp
+    test_cassandra_rules.cpp
+    test_cassandra_sink_model.cpp
     test_cassandra_live.cpp
     test_cassandra_upsert_sink.cpp
     test_cassandra_upsert_contract.cpp
@@ -16,6 +18,8 @@ target_link_libraries(clink_cassandra_tests PRIVATE
     ${CLINK_CASSANDRA_LIBS_EXPORT}
     GTest::gtest_main
 )
+# The repository root, for the TCP fault proxy the live tests put between sink and server.
+target_include_directories(clink_cassandra_tests PRIVATE ${PROJECT_SOURCE_DIR})
 target_compile_definitions(clink_cassandra_tests PRIVATE CLINK_HAS_CASSANDRA)
 clink_set_warnings(clink_cassandra_tests)
 gtest_discover_tests(clink_cassandra_tests

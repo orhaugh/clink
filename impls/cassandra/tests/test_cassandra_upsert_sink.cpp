@@ -19,6 +19,8 @@
 #include "clink/core/record.hpp"
 #include "clink/operators/operator_base.hpp"
 
+#include "cassandra_live.hpp"
+
 using clink::Batch;
 using clink::CheckpointBarrier;
 using clink::CheckpointId;
@@ -38,15 +40,16 @@ TEST(CassandraUpsertSink, RejectsEmptyKeyColumns) {
 // --- live integration ---------------------------------------------------
 
 bool cass_configured() {
-    return std::getenv("CLINK_CASSANDRA_TEST_CONTACT_POINTS") != nullptr;
+    return clink::cassandra::live::configured();
 }
 std::string cass_contact_points() {
-    return std::getenv("CLINK_CASSANDRA_TEST_CONTACT_POINTS");
+    return clink::cassandra::live::contact_points();
 }
 
 CassSession* connect_raw(CassCluster** out_cluster) {
     CassCluster* cluster = cass_cluster_new();
     cass_cluster_set_contact_points(cluster, cass_contact_points().c_str());
+    cass_cluster_set_port(cluster, clink::cassandra::live::port());
     cass_cluster_set_connect_timeout(cluster, 10000);
     CassSession* session = cass_session_new();
     CassFuture* cf = cass_session_connect(session, cluster);
@@ -118,7 +121,7 @@ std::string text_of(CassSession* s, const std::string& cql) {
 
 CassandraUpsertSink::Options opts_for(const std::string& ks, const std::string& table) {
     CassandraUpsertSink::Options o;
-    o.conn.contact_points = cass_contact_points();
+    o.conn = clink::cassandra::live::conn();
     o.keyspace = ks;
     o.table = table;
     o.key_columns = {"id"};

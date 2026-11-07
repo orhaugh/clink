@@ -32,9 +32,12 @@ if(NOT _cass_found)
 endif()
 
 add_library(clink_cassandra STATIC
+    src/cassandra_rules.cpp
     src/cassandra_sink.cpp
     src/cassandra_upsert_sink.cpp
+    src/driver_service.cpp
     src/register_factories.cpp
+    src/sink_core.cpp
 )
 add_library(clink::cassandra ALIAS clink_cassandra)
 

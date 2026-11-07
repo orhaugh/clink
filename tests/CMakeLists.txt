@@ -952,6 +952,28 @@ if(CLINK_BUILD_SQL)
         )
     endif()
 
+    # The Cassandra and ScyllaDB sinks through the SQL frontend: append and
+    # retracting queries on an embedded engine against the server
+    # scripts/cassandra-live.sh starts, read back through the driver. The live
+    # cases skip without CLINK_CASSANDRA_TEST_CONTACT_POINTS.
+    if(TARGET clink::cassandra)
+        add_executable(clink_cassandra_sql_tests test_cassandra_sql.cpp)
+        target_link_libraries(clink_cassandra_sql_tests PRIVATE
+            clink::sql
+            clink::embed
+            clink::cassandra
+            ${CLINK_CASSANDRA_LIBS_EXPORT}
+            GTest::gtest_main
+        )
+        target_include_directories(clink_cassandra_sql_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/impls/cassandra/tests)
+        clink_set_warnings(clink_cassandra_sql_tests)
+        gtest_discover_tests(clink_cassandra_sql_tests
+            DISCOVERY_MODE PRE_TEST
+            PROPERTIES TIMEOUT 300 LABELS cassandra
+        )
+    endif()
+
     # Differential SQL oracle: the same query and data through clink's
     # EmbeddedEngine and through DuckDB, answers compared as multisets.
     # Needs a duckdb binary at runtime (CLINK_DUCKDB or PATH) and SKIPS

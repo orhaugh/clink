@@ -3023,7 +3023,8 @@ TEST(SqlPhysical, CassandraUpsertSinkSelected) {
         "CREATE TABLE src_t (k BIGINT, v BIGINT) "
         "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
         "CREATE TABLE cup (k BIGINT, v BIGINT) "
-        "WITH (connector='cassandra', keyspace='ks', mode='upsert', primary_key='k')");
+        "WITH (connector='cassandra', keyspace='ks', table='cup', mode='upsert', "
+        "primary_key='k')");
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
     auto plan = bind_insert(cat, "INSERT INTO cup SELECT k, v FROM src_t");
@@ -3033,6 +3034,84 @@ TEST(SqlPhysical, CassandraUpsertSinkSelected) {
     ASSERT_NE(sink, nullptr);
     EXPECT_EQ(sink->params.at("key_columns"), "k");
     EXPECT_EQ(find_op(spec, "cassandra_sink_string"), nullptr);
+}
+
+namespace {
+
+// Plans INSERT INTO cs SELECT k, v FROM src_t into a connector='cassandra'
+// table with the given options; returns the planner's refusal, or "" with the
+// sink op's params in *params.
+std::string cassandra_plan(const std::map<std::string, std::string>& options,
+                           std::map<std::string, std::string>* params = nullptr) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    TableDef dst;
+    dst.name = "cs";
+    dst.columns.push_back(ColumnSpec{"k", arrow::int64()});
+    dst.columns.push_back(ColumnSpec{"v", arrow::int64()});
+    dst.properties = {{"connector", "cassandra"}, {"keyspace", "ks"}, {"table", "t"}};
+    for (const auto& [k, v] : options) {
+        if (v.empty()) {
+            dst.properties.erase(k);
+        } else {
+            dst.properties[k] = v;
+        }
+    }
+    if (dst.properties.count("mode") != 0 && dst.properties.at("mode") == "upsert") {
+        dst.primary_key = {"k"};
+    }
+    cat.register_table(std::move(dst));
+    try {
+        auto plan = bind_insert(cat, "INSERT INTO cs SELECT k, v FROM src_t");
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        for (const char* name : {"cassandra_sink_string", "cassandra_upsert_sink_string"}) {
+            if (const auto* op = find_op(spec, name); op != nullptr && params != nullptr) {
+                *params = op->params;
+            }
+        }
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+TEST(SqlPhysical, CassandraOptionsAreCheckedWhenTheJobIsPlanned) {
+    std::map<std::string, std::string> params;
+    EXPECT_EQ(cassandra_plan({{"mode", "upsert"},
+                              {"consistency", "local_quorum"},
+                              {"request_timeout_ms", "3000"},
+                              {"max_in_flight", "64"},
+                              {"max_in_flight_bytes", "1048576"},
+                              {"max_buffered_records", "500"},
+                              {"max_buffered_bytes", "1048576"}},
+                             &params),
+              "");
+    EXPECT_EQ(params.at("key_columns"), "k");
+    EXPECT_EQ(params.at("consistency"), "local_quorum");
+    EXPECT_EQ(params.at("max_in_flight"), "64");
+
+    const auto typo = cassandra_plan({{"max_inflight", "64"}});
+    EXPECT_NE(typo.find("does not read option 'max_inflight'"), std::string::npos) << typo;
+    EXPECT_NE(typo.find("max_in_flight"), std::string::npos) << typo;
+    EXPECT_NE(cassandra_plan({{"max_buffered_records", "5"}}).find("only mode='upsert' uses"),
+              std::string::npos);
+    EXPECT_NE(cassandra_plan({{"mode", "upsert"}, {"key_columns", "k"}})
+                  .find("takes no 'key_columns' in SQL"),
+              std::string::npos);
+    EXPECT_NE(cassandra_plan({{"ssl", "true"}}).find("does not support TLS"), std::string::npos);
+    EXPECT_NE(cassandra_plan({{"ssl_certfile", "/x.pem"}}).find("does not support TLS"),
+              std::string::npos);
+    EXPECT_NE(cassandra_plan({{"table", ""}}).find("needs 'table'"), std::string::npos);
+    EXPECT_NE(cassandra_plan({{"changelog", "true"}}).find("does not support changelog='true'"),
+              std::string::npos);
+    const auto eo = cassandra_plan({{"delivery_guarantee", "exactly_once"}});
+    EXPECT_NE(eo.find("exactly"), std::string::npos) << eo;
 }
 
 TEST(SqlPhysical, CommitGroupThreadsThroughToSinkParams) {
