@@ -538,3 +538,5 @@ All four gates passed in local runs on 2026-11-06, 55 of 55 each. Elasticsearch 
 | `HttpPollSql` | `clink_integration_tests` | `clink run` reading the feed bounded to its end and finishing, every row once; the coordinator refusing `at_least_once` over a table in resource mode |
 
 What these establish is how the source treats each response a local server gives it. They qualify no third-party API: whether cursor mode is safe against one depends on that API answering strictly after the cursor, on a unique field, and keeping what it served.
+
+The gate passed locally on commit `5c849d4d`, 44 of 44, on 2026-11-07. In each recovery cell the feed had served past what was committed when the worker died (to 1,039, 1,281 and 1,184 records against 831, 1,145 and 773 committed), the restored source asked again from the last completed checkpoint's cursor, and every one of the 2,400 records was committed once after one restart. On the same code the Elasticsearch 8.13.4 recovery cells of the search gate, which poll their feed through the source, passed 5 of 5. These reports are not published. The `http` CI workflow has not run the gate yet.
