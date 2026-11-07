@@ -169,6 +169,10 @@ std::vector<std::string> ConnectorCapabilities::self_check() const {
         problems.emplace_back(name +
                               ": lists options required for exactly-once but does not claim it");
     }
+    if (!replay_requires_options.empty() && !(is_source && replayable)) {
+        problems.emplace_back(name +
+                              ": lists options its replay requires but is no replayable source");
+    }
     return problems;
 }
 

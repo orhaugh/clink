@@ -178,6 +178,13 @@ struct ConnectorCapabilities {
     // exactly-once levels. Checked at validation time.
     std::vector<std::string> required_options_for_exactly_once;
 
+    // For a replayable source that replays only in one configuration: the
+    // options it must be given for that, each naming alternatives as "a|b".
+    // Without them the delivery analyser treats it as a source that cannot
+    // replay. The HTTP polling source replays from its cursor, so only when it
+    // is told where the cursor goes and where it comes from.
+    std::vector<std::string> replay_requires_options;
+
     // Internal consistency of the record itself. A declaration that claims
     // two-phase commit but not `transactional`, or exactly-once from a
     // non-replayable source, is a bug in the DECLARATION and is caught by

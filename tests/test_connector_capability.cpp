@@ -350,6 +350,63 @@ TEST_F(ConnectorCapabilityTest, NonReplayableSourceIsAtMostOnceRegardlessOfSink)
     EXPECT_EQ(r.level, EndToEndGuarantee::AtMostOnceSource) << r.render_text();
 }
 
+TEST_F(ConnectorCapabilityTest, ASourceThatReplaysOnlyWhenConfiguredNeedsItsOptions) {
+    // A replayable source whose position exists in one configuration only
+    // (the HTTP polling source's cursor mode) names the options that select
+    // it. Without them it replays nothing, so no stronger guarantee than
+    // at-most-once holds, and a request for one is refused with what is missing.
+    CapabilityRegistry::instance().declare(ConnectorCapabilities{
+        .name = "test_cursor_poller",
+        .version = "1",
+        .is_source = true,
+        .replayable = true,
+        .offset_model = OffsetModel::OpaqueToken,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+        .replay_requires_options = {"cursor_field", "cursor_param|cursor_header"},
+    });
+    struct Undeclare {
+        ~Undeclare() { CapabilityRegistry::instance().undeclare("test_cursor_poller"); }
+    } cleanup;
+    EXPECT_TRUE(CapabilityRegistry::instance().find("test_cursor_poller")->self_check().empty());
+
+    PipelineFacts f;
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    f.requested = DeliveryGuarantee::ExactlyOnceTwoPhaseCommit;
+    f.connectors = {src("test_cursor_poller", {"cursor_field", "cursor_header"}),
+                    snk("file_2pc", {"dir"})};
+    const auto replaying = analyse_pipeline(f);
+    EXPECT_EQ(replaying.level, EndToEndGuarantee::EndToEndExactlyOnce) << replaying.render_text();
+    EXPECT_TRUE(replaying.acceptable());
+
+    f.requested = DeliveryGuarantee::AtLeastOnce;
+    f.connectors = {src("test_cursor_poller", {"cursor_field"}), snk("file_2pc", {"dir"})};
+    const auto r = analyse_pipeline(f);
+    EXPECT_EQ(r.level, EndToEndGuarantee::AtMostOnceSource) << r.render_text();
+    EXPECT_EQ(r.limiting_factor, "source 'test_cursor_poller_source'");
+    ASSERT_EQ(r.rejections.size(), 1U) << r.render_text();
+    EXPECT_NE(r.rejections[0].find("only with option 'cursor_param' or 'cursor_header', which "
+                                   "was not supplied"),
+              std::string::npos)
+        << r.rejections[0];
+}
+
+TEST_F(ConnectorCapabilityTest, SelfCheckRejectsReplayOptionsWithoutReplay) {
+    const ConnectorCapabilities c{
+        .name = "x",
+        .version = "1",
+        .is_source = true,
+        .replayable = false,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtMostOnce,
+        .replay_requires_options = {"cursor_field"},
+    };
+    const auto problems = c.self_check();
+    ASSERT_EQ(problems.size(), 1U);
+    EXPECT_NE(problems[0].find("lists options its replay requires"), std::string::npos);
+}
+
 TEST_F(ConnectorCapabilityTest, AnAcknowledgingSourceIsAtLeastOnceNotAtMostOnce) {
     // The broker-redelivery model loses nothing: what a crash leaves
     // unacknowledged comes back. What it cannot rule out is a checkpoint

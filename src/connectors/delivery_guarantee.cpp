@@ -52,6 +52,25 @@ bool requirement_satisfied(const PipelineConnector& c, const std::string& requir
     return false;
 }
 
+// Alternatives rendered readably: "'dir' or 'path'" beats echoing the raw
+// "dir|path" back at whoever has to fix it.
+std::string named_alternatives(const std::string& required) {
+    std::string named;
+    std::size_t p = 0;
+    while (p <= required.size()) {
+        const auto bar = required.find('|', p);
+        const auto alt = required.substr(p, bar == std::string::npos ? std::string::npos : bar - p);
+        if (!alt.empty()) {
+            named += (named.empty() ? "'" : " or '") + alt + "'";
+        }
+        if (bar == std::string::npos) {
+            break;
+        }
+        p = bar + 1;
+    }
+    return named;
+}
+
 }  // namespace
 
 GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
@@ -99,6 +118,7 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
     std::size_t source_count = 0;
     bool all_sources_replayable = true;
     std::string weakest_source;
+    std::string weakest_source_why;  // why it cannot replay, when its record says
     std::string redelivered_source;
     for (const auto& c : facts.connectors) {
         if (!c.is_source) {
@@ -108,13 +128,34 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
         if (c.declaration_missing) {
             all_sources_replayable = false;
             weakest_source = c.op_type;
+            weakest_source_why.clear();
             reasons.emplace_back("source '" + c.op_type +
                                  "' has no capability declaration, so its replayability cannot "
                                  "be established and is assumed absent");
             continue;
         }
         const auto* caps = CapabilityRegistry::instance().find(c.connector_name);
-        if (caps != nullptr && caps->checkpoint_integrated && caps->replayable) {
+        // A source that replays only in one configuration names the options
+        // that select it; without them it replays nothing.
+        std::string missing;
+        if (caps != nullptr) {
+            for (const auto& required : caps->replay_requires_options) {
+                if (!requirement_satisfied(c, required)) {
+                    missing = named_alternatives(required);
+                    break;
+                }
+            }
+        }
+        if (caps != nullptr && caps->checkpoint_integrated && caps->replayable &&
+            !missing.empty()) {
+            all_sources_replayable = false;
+            weakest_source = c.op_type;
+            weakest_source_why = "it replays from its checkpointed position only with option " +
+                                 missing + ", which was not supplied";
+            reasons.emplace_back(
+                "source '" + c.op_type +
+                "' cannot be replayed from a checkpointed position: " + weakest_source_why);
+        } else if (caps != nullptr && caps->checkpoint_integrated && caps->replayable) {
             reasons.emplace_back("source '" + c.op_type + "' replays from " +
                                  std::string(to_string(caps->offset_model)));
         } else if (caps != nullptr && caps->checkpoint_integrated &&
@@ -130,6 +171,7 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
         } else {
             all_sources_replayable = false;
             weakest_source = c.op_type;
+            weakest_source_why.clear();
             reasons.emplace_back("source '" + c.op_type +
                                  "' cannot be replayed from a checkpointed position");
         }
@@ -145,9 +187,10 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
             strength(*facts.requested) > strength(DeliveryGuarantee::AtMostOnce)) {
             r.rejections.emplace_back(
                 std::string("requested ") + std::string(to_string(*facts.requested)) +
-                " but source '" + weakest_source +
-                "' cannot replay from a checkpointed position; records in flight at the "
-                "moment of failure are lost, so no stronger guarantee is achievable");
+                " but source '" + weakest_source + "' cannot replay from a checkpointed position" +
+                (weakest_source_why.empty() ? std::string{} : " (" + weakest_source_why + ")") +
+                "; records in flight at the moment of failure are lost, so no stronger guarantee "
+                "is achievable");
         }
         return r;
     }
@@ -193,22 +236,7 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
         // transactional sink.
         for (const auto& required : caps->required_options_for_exactly_once) {
             if (!requirement_satisfied(c, required)) {
-                // Render alternatives readably: "'dir' or 'path'" beats
-                // echoing the raw "dir|path" back at whoever has to fix it.
-                std::string named;
-                std::size_t p = 0;
-                while (p <= required.size()) {
-                    const auto bar = required.find('|', p);
-                    const auto alt =
-                        required.substr(p, bar == std::string::npos ? std::string::npos : bar - p);
-                    if (!alt.empty()) {
-                        named += (named.empty() ? "'" : " or '") + alt + "'";
-                    }
-                    if (bar == std::string::npos) {
-                        break;
-                    }
-                    p = bar + 1;
-                }
+                const std::string named = named_alternatives(required);
                 reasons.emplace_back("sink '" + c.op_type + "' declares " +
                                      std::string(to_string(caps->delivery)) + " but option " +
                                      named + " was not supplied, so it degrades to at-least-once");
