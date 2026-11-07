@@ -1,7 +1,7 @@
-// HttpRequest::post_bounded and interrupt(): the reply is read up to a bound
-// and no further, a failed exchange says whether the whole request had been
-// written, and another thread can end an exchange that is waiting on the
-// server. Against in-process servers: an httplib server for replies, and a raw
+// HttpRequest::post_bounded, get_bounded and interrupt(): the reply is read up
+// to a bound and no further, a failed exchange says whether the whole request
+// had been written, and another thread can end an exchange that is waiting on
+// the server. Against in-process servers: an httplib server for replies, and a raw
 // listener for a peer that reads the request and then never answers.
 
 #include <atomic>
@@ -41,6 +41,17 @@ public:
         svr_.Post("/big", [](const httplib::Request&, httplib::Response& res) {
             res.status = 202;
             res.set_content(std::string(64 * 1024, 'x'), "application/json");
+        });
+        svr_.Get("/get", [](const httplib::Request& req, httplib::Response& res) {
+            res.set_header("ETag", "\"e1\"");
+            res.set_content("{\"q\":\"" + req.get_param_value("q") + "\"}", "application/json");
+        });
+        svr_.Get("/get-big", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(std::string(64 * 1024, 'y'), "application/json");
+        });
+        svr_.Get("/none", [](const httplib::Request&, httplib::Response& res) {
+            res.status = 204;
+            res.set_header("X-Mixed-Case", "yes");
         });
         port_ = svr_.bind_to_any_port("127.0.0.1");
         thread_ = std::thread([this] { svr_.listen_after_bind(); });
@@ -191,6 +202,36 @@ TEST(HttpRequestBounded, AReplyPastTheBoundStopsBeingRead) {
     const auto again = client.post_bounded("/echo", "{}", "application/json", BoundedRequest{});
     EXPECT_TRUE(again.complete);
     EXPECT_EQ(again.status, 202);
+}
+
+TEST(HttpRequestBounded, AGetIsReadUpToTheBoundAsAPostIs) {
+    ReplyServer srv;
+    auto client = client_for(srv.url());
+    BoundedRequest req;
+    req.headers["If-None-Match"] = "\"e0\"";
+    const auto r = client.get_bounded("/get?q=a%20b", req);
+    EXPECT_TRUE(r.complete) << r.error;
+    EXPECT_EQ(r.status, 200);
+    EXPECT_EQ(r.body, "{\"q\":\"a b\"}");
+    EXPECT_EQ(r.headers.at("etag"), "\"e1\"");
+
+    req.max_response_bytes = 1024;
+    const auto big = client.get_bounded("/get-big", req);
+    EXPECT_FALSE(big.complete);
+    EXPECT_EQ(big.failure, Failure::TooLarge);
+    EXPECT_LE(big.body.size(), 1024U);
+}
+
+// A reply that may not carry a body never reaches the response handler, so its
+// status and headers come from the completed response itself.
+TEST(HttpRequestBounded, ANoContentReplyKeepsItsStatusAndHeaders) {
+    ReplyServer srv;
+    auto client = client_for(srv.url());
+    const auto r = client.get_bounded("/none", BoundedRequest{});
+    EXPECT_TRUE(r.complete) << r.error;
+    EXPECT_EQ(r.status, 204);
+    EXPECT_EQ(r.headers.at("x-mixed-case"), "yes");
+    EXPECT_TRUE(r.body.empty());
 }
 
 TEST(HttpRequestBounded, ARefusedConnectionWroteNothing) {

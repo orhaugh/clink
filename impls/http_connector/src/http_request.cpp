@@ -113,6 +113,59 @@ struct HttpRequest::Impl {
         return {{"Authorization", "Bearer " + auth_token_provider()}};
     }
     bool has_auth_provider() const { return static_cast<bool>(auth_token_provider); }
+
+    // One bounded exchange: post_bounded and get_bounded build `req`, this sends
+    // it and reads the reply up to request.max_response_bytes.
+    BoundedResponse exchange_bounded(httplib::Request& req, const BoundedRequest& request) {
+        BoundedResponse out;
+        interrupted.store(false, std::memory_order_release);
+        for (const auto& [k, v] : request.headers) {
+            req.headers.emplace(k, v);
+        }
+        if (has_auth_provider()) {
+            req.headers.emplace("Authorization", "Bearer " + auth_token_provider());
+        }
+        // The status line and headers, before any of the body.
+        req.response_handler = [&out](const httplib::Response& res) {
+            out.status = res.status;
+            for (const auto& [k, v] : res.headers) {
+                out.headers.emplace(lower(k), v);
+            }
+            return true;
+        };
+        bool too_large = false;
+        req.content_receiver = [&out, &too_large, &request](
+                                   const char* data, std::size_t n, std::uint64_t, std::uint64_t) {
+            if (out.body.size() + n > request.max_response_bytes) {
+                too_large = true;
+                return false;
+            }
+            out.body.append(data, n);
+            return true;
+        };
+        httplib::Response res;
+        httplib::Error error = httplib::Error::Success;
+        const bool ok = client.send(req, res, error);
+        if (ok) {
+            // From the response itself: httplib calls the response handler only
+            // for a reply that may carry a body, never for a 204.
+            out.status = res.status;
+            out.headers.clear();
+            for (const auto& [k, v] : res.headers) {
+                out.headers.emplace(lower(k), v);
+            }
+            out.complete = true;
+            out.request_written = true;
+            return out;
+        }
+        out.failure = too_large ? BoundedResponse::Failure::TooLarge : failure_of(error);
+        out.request_written = written_before(out.failure);
+        out.interrupted = interrupted.load(std::memory_order_acquire);
+        out.error =
+            too_large ? "the reply passed " + std::to_string(request.max_response_bytes) + " bytes"
+                      : httplib::to_string(error);
+        return out;
+    }
 };
 
 HttpRequest::HttpRequest(Options opts) : impl_(std::make_unique<Impl>(opts)) {}
@@ -168,52 +221,19 @@ BoundedResponse HttpRequest::post_bounded(const std::string& path,
                                           const std::string& body,
                                           const std::string& content_type,
                                           const BoundedRequest& request) {
-    BoundedResponse out;
-    impl_->interrupted.store(false, std::memory_order_release);
     httplib::Request req;
     req.method = "POST";
     req.path = path;
-    for (const auto& [k, v] : request.headers) {
-        req.headers.emplace(k, v);
-    }
-    if (impl_->has_auth_provider()) {
-        req.headers.emplace("Authorization", "Bearer " + impl_->auth_token_provider());
-    }
     req.headers.emplace("Content-Type", content_type);
     req.body = body;
-    // The status line and headers, before any of the body.
-    req.response_handler = [&out](const httplib::Response& res) {
-        out.status = res.status;
-        for (const auto& [k, v] : res.headers) {
-            out.headers.emplace(lower(k), v);
-        }
-        return true;
-    };
-    bool too_large = false;
-    req.content_receiver = [&out, &too_large, &request](
-                               const char* data, std::size_t n, std::uint64_t, std::uint64_t) {
-        if (out.body.size() + n > request.max_response_bytes) {
-            too_large = true;
-            return false;
-        }
-        out.body.append(data, n);
-        return true;
-    };
-    httplib::Response res;
-    httplib::Error error = httplib::Error::Success;
-    const bool ok = impl_->client.send(req, res, error);
-    if (ok) {
-        out.complete = true;
-        out.request_written = true;
-        return out;
-    }
-    out.failure = too_large ? BoundedResponse::Failure::TooLarge : failure_of(error);
-    out.request_written = written_before(out.failure);
-    out.interrupted = impl_->interrupted.load(std::memory_order_acquire);
-    out.error = too_large
-                    ? "the reply passed " + std::to_string(request.max_response_bytes) + " bytes"
-                    : httplib::to_string(error);
-    return out;
+    return impl_->exchange_bounded(req, request);
+}
+
+BoundedResponse HttpRequest::get_bounded(const std::string& path, const BoundedRequest& request) {
+    httplib::Request req;
+    req.method = "GET";
+    req.path = path;
+    return impl_->exchange_bounded(req, request);
 }
 
 void HttpRequest::interrupt() noexcept {

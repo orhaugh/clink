@@ -27,7 +27,7 @@ struct HttpResponse {
     std::map<std::string, std::string> headers;
 };
 
-// One request of post_bounded().
+// One request of post_bounded() or get_bounded().
 struct BoundedRequest {
     // Sent on this request only, beside the client's default headers.
     std::map<std::string, std::string> headers;
@@ -36,7 +36,7 @@ struct BoundedRequest {
     std::size_t max_response_bytes{1U << 20};
 };
 
-// What post_bounded() saw. Unlike HttpResponse, an exchange that fails keeps
+// What post_bounded() or get_bounded() saw. Unlike HttpResponse, an exchange that fails keeps
 // what arrived before the failure (the status line, the headers, the body so
 // far), and says whether the whole request had been written: a request the
 // server never received in full cannot have been acted on, while one whose
@@ -127,6 +127,10 @@ public:
                                  const std::string& body,
                                  const std::string& content_type,
                                  const BoundedRequest& request);
+
+    // Blocking GET on the same terms. A compressed reply is counted as it is
+    // decompressed, so the bound holds for the body the caller receives.
+    BoundedResponse get_bounded(const std::string& path, const BoundedRequest& request);
 
     // Ends the exchange in flight on another thread, which returns at once
     // with BoundedResponse::interrupted (a connect or TLS handshake under way
