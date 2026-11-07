@@ -508,6 +508,15 @@ if(CLINK_INTEGRATION_TESTS)
         target_include_directories(clink_integration_tests PRIVATE
             ${CMAKE_SOURCE_DIR}/impls/cassandra/tests)
     endif()
+    # The InfluxDB sink's recovery cells: a coordinator and two workers polling a
+    # feed the test serves into influxdb_sink, against the server
+    # scripts/influxdb-live.sh starts, each verified by reading the measurement
+    # back with Flux. They skip without it.
+    if(TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_influxdb_recovery.cpp)
+        target_include_directories(clink_integration_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/impls/http_connector/tests)
+    endif()
     # The Kinesis source's recovery cells, against the LocalStack stream
     # scripts/kinesis-live.sh starts; they skip without it. The test creates,
     # writes and reshards the stream with the SDK's Kinesis client, found here
