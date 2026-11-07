@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**A SQL source table no longer turns a record it cannot decode into a row of
+nulls.** The JSON bridge that decodes each record of a text-reading source
+(Kafka, RabbitMQ, NATS, Pulsar, Kinesis, `http_poll`, Pub/Sub, Redis, the
+change streams and the table readers) handed on an empty row for a record that
+was not a JSON object it could read: malformed JSON, a number or an array, or an
+integer past 64 bits. Every column read as null, so a sink wrote a row of nulls
+and an aggregate counted it, although the bridge's comment said such records
+were dropped. The columnar Kafka decoder's fallback did the same. Such a record
+is now dropped as the comment said, counted in `dropped_events_total` and
+reported with its payload to the dead-letter queue, which logs it by default.
+`on_decode_error='fail'` (new for these sources) instead stops the job, naming
+the table, the partition, the record's size and why, but not its contents. An
+empty payload, such as a Kafka tombstone, carries no row and is skipped under
+either. `on_decode_error` takes `'fail'` or `'drop'`, a misspelling of it is
+refused when the table is created, and changing it leaves the fingerprint a
+resumed `clink run` checks alone (but on the Pub/Sub and PostgreSQL CDC
+sources, which read it themselves), so a job stopped under `'fail'` resumes
+under `'drop'`. Covered by `JsonRowBridge`, the columnar decoder's tests against the
+row bridge, `JobGraphFingerprint.IgnoresTheDecodeErrorPolicyWhereItKeepsNoState`,
+`SqlPhysical.TheJsonBridgeTakesTheTablesDecodeErrorPolicy`,
+`SqlUnsupportedSemantics.OnDecodeErrorIsAClosedDomain` and `SqlJsonDecode`,
+which runs `clink run` over a feed with a number among its objects.
+
 **The HTTP polling source checks every page against its cursor contract before
 it emits a record or moves the cursor.** A response without its records array,
 with the array null or of another type, or with malformed JSON read as a page

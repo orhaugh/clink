@@ -227,3 +227,18 @@ the float64 value itself. Text clink writes and reads back itself (operator
 state, the row codec between operators, the JSON in front of an Avro or
 Protobuf encoder) keeps the value exactly; see
 [the SQL frontend internals](../internals/sql-frontend.md).
+
+## Records the JSON decoding cannot read
+
+A source table with `format='json'` over a connector that reads text has each record decoded into a row by the planner's JSON bridge: Kafka (`format='json'`, and the registry formats, which decode to JSON first), RabbitMQ, NATS, Pulsar, Kinesis, `http_poll`, Pub/Sub, Redis, the MySQL, PostgreSQL and MongoDB change streams, and the ClickHouse, MySQL and PostgreSQL table readers. A record the bridge cannot decode is one that is not a JSON object clink's JSON reader can read: malformed JSON, another JSON value such as a number or an array, or an object holding a number the reader has no value for (an integer past 64 bits, or a number past a double's range). The table option `on_decode_error` decides what happens to it:
+
+| `on_decode_error` | A record the bridge cannot decode |
+| --- | --- |
+| `'drop'` (default) | Skipped. Each is counted in `clink_connector_dropped_events_total` for its source and reported, with its payload, to the job's dead-letter queue, which logs it by default (rate-limited, the payload cut short). A record replayed after a restart is reported again |
+| `'fail'` | Stops the job. The error names the table, the source partition when the source reads partitions, the record's size and why it was refused, but not its contents. The job restarts from its last checkpoint and meets the same record again, so it stops each time until the record is removed or the table says `'drop'` |
+
+An empty payload carries no row and is skipped under either value, without a report: a Kafka tombstone, for instance. A record that decodes, but whose values do not match the declared column types, is not refused; the bridge hands its values on as they came.
+
+Changing `on_decode_error` leaves the fingerprint a resumed `clink run` checks alone, so a job that `'fail'` stopped resumes from its checkpoint with `'drop'`. The Pub/Sub source also reads the option, for message data that is not base64, and the PostgreSQL change stream for values its contract cannot carry; on those two the option is part of the job's identity, as it was before. Left unset, each layer keeps its own default: `'fail'` for Pub/Sub's base64 check and `'drop'` for the JSON decoding. The option takes `'fail'` or `'drop'` and nothing else, and a misspelling of it is refused when the table is created.
+
+Before this, such a record became a row whose every column was null, and reached the sinks like any other row, although the bridge's own comment said such records were dropped.

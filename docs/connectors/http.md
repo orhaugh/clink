@@ -342,7 +342,7 @@ Shared Pub/Sub options:
 | `ack_deadline_s` | No | `60` | The lease the source takes on each message it holds: set on receipt with `modifyAckDeadline` and renewed at half this period while the message waits for its checkpoint. 10 to 600. |
 | `max_lease_s` | No | `3600` | How long one message's lease is renewed. Past it the server delivers the message again under a new ackId. At least `ack_deadline_s`. |
 | `max_outstanding` | No | `10000` | Most messages a subtask holds unacknowledged; at the bound pulls pause until a checkpoint completes. |
-| `on_decode_error` | No | `fail` | A message whose `data` is not valid base64. `fail` stops the subtask without acknowledging it; `drop` acknowledges it with its checkpoint, emits nothing and counts it in `dropped_events_total`. |
+| `on_decode_error` | No | `fail` | A message whose `data` is not valid base64. `fail` stops the subtask without acknowledging it; `drop` acknowledges it with its checkpoint, emits nothing and counts it in `dropped_events_total`. In SQL the same option, when set, also decides what the JSON decoding does with data that is not a JSON object it can read; left unset, that decoding drops it (see [Records the JSON decoding cannot read](README.md#records-the-json-decoding-cannot-read)). |
 
 Authentication note: this build does not mint OAuth2 tokens. Supply a bearer token via `auth_token` (static) or `headers`, or via `auth_token_file` (re-read per request, so an external refresher rotating the file is picked up without a restart); against the Pub/Sub emulator no auth is needed.
 

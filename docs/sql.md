@@ -198,6 +198,7 @@ Per-connector options live in the [connector reference](connectors/README.md).
 | `delivery_guarantee` | `'at_least_once'` (default) or `'exactly_once'` |
 | `partition_by` | partition column(s) for a file or object-store sink |
 | `json_non_finite` | how a sink that writes JSON writes NaN and the infinities: `'null'` (default) or `'string'` (`"NaN"`, `"Infinity"`, `"-Infinity"`); see [NaN and infinity in JSON output](connectors/README.md#nan-and-infinity-in-json-output) |
+| `on_decode_error` | what a source table's decoding does with a record it cannot read: `'drop'` (default) skips the record and reports it to the dead-letter queue, `'fail'` stops the job; see [Records the JSON decoding cannot read](connectors/README.md#records-the-json-decoding-cannot-read) |
 
 ### Event time and watermarks
 
