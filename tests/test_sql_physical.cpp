@@ -2990,7 +2990,8 @@ TEST(SqlPhysical, MysqlUpsertSinkSelected) {
         "CREATE TABLE src_t (k BIGINT, v BIGINT) "
         "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
         "CREATE TABLE mup (k BIGINT, v BIGINT) "
-        "WITH (connector='mysql', dsn='host=localhost', mode='upsert', primary_key='k')");
+        "WITH (connector='mysql', host='localhost', table='mup', mode='upsert', "
+        "primary_key='k')");
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
     cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
     auto plan = bind_insert(cat, "INSERT INTO mup SELECT k, v FROM src_t");
@@ -3000,6 +3001,58 @@ TEST(SqlPhysical, MysqlUpsertSinkSelected) {
     ASSERT_NE(sink, nullptr);
     EXPECT_EQ(sink->params.at("key_columns"), "k");
     EXPECT_EQ(find_op(spec, "mysql_sink"), nullptr);
+}
+
+namespace {
+
+// The planner's message for a connector='mysql' sink table declared with `with`,
+// or "" when it plans.
+std::string mysql_sink_refusal(const std::string& with, bool upsert) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE my_out (k BIGINT, v BIGINT) WITH (connector='mysql', format='json', "
+        "host='localhost', table='my_out'" +
+        std::string{upsert ? ", mode='upsert', primary_key='k'" : ""} + with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO my_out SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+// A connector='mysql' sink table's options: one the sinks do not read is
+// refused, naming the ones they read; the sources' options pass, as the table
+// may also be read; and mode='upsert' keys rows by the PRIMARY KEY and writes
+// every column, so it takes no key_columns, update_columns or on_duplicate.
+TEST(SqlPhysical, MysqlSinkTablesTakeOnlyOptionsTheSinksRead) {
+    EXPECT_EQ(mysql_sink_refusal(", batch_records='10', max_bytes='4096', max_record_bytes='512', "
+                                 "max_statement_bytes='2048', lock_wait_timeout_s='5', "
+                                 "max_retries='1', linger_ms='100'",
+                                 false),
+              "");
+    EXPECT_EQ(mysql_sink_refusal(", on_duplicate='update', update_columns='v'", false), "");
+    EXPECT_EQ(mysql_sink_refusal(", cursor_column='k', server_id='9'", false), "");
+    auto why = mysql_sink_refusal(", dsn='host=x'", false);
+    EXPECT_NE(why.find("does not read option 'dsn'"), std::string::npos) << why;
+    EXPECT_NE(why.find("max_statement_bytes"), std::string::npos) << why;
+    why = mysql_sink_refusal(", key_columns='k'", true);
+    EXPECT_NE(why.find("PRIMARY KEY"), std::string::npos) << why;
+    why = mysql_sink_refusal(", update_columns='v'", true);
+    EXPECT_NE(why.find("not read with mode='upsert'"), std::string::npos) << why;
+    why = mysql_sink_refusal(", on_duplicate='update'", true);
+    EXPECT_NE(why.find("not read with mode='upsert'"), std::string::npos) << why;
+    why = mysql_sink_refusal(", timestamp_columns='k:ts'", false);
+    EXPECT_NE(why.find("names the TIMESTAMP columns itself"), std::string::npos) << why;
+    EXPECT_EQ(mysql_sink_refusal(", batch_records='10', max_retries='0'", true), "");
 }
 
 TEST(SqlPhysical, RedisUpsertSinkSelected) {

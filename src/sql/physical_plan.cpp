@@ -194,6 +194,7 @@ std::string string_source_factory_for(const TableDef& table) {
 }
 
 void check_cassandra_options(const TableDef& table, bool upsert);
+void check_mysql_sink_options(const TableDef& table, bool upsert);
 
 std::string string_sink_factory_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
@@ -447,6 +448,81 @@ void check_cassandra_options(const TableDef& table, bool upsert) {
             unsupported("table '" + table.name + "': a connector='cassandra' sink needs '" +
                         required + "'");
         }
+    }
+}
+
+// A connector='mysql' sink table's options: an option the sinks do not read is
+// refused rather than ignored, and the refusal lists the ones they read. The
+// table may also be read, so the sources' options pass. mode='upsert' keys rows
+// by the table's PRIMARY KEY and writes every column, so it takes neither
+// key_columns, update_columns nor on_duplicate.
+void check_mysql_sink_options(const TableDef& table, bool upsert) {
+    static const std::vector<std::string> kConnection = {"host",
+                                                         "port",
+                                                         "user",
+                                                         "password",
+                                                         "database",
+                                                         "ssl",
+                                                         "ssl_ca",
+                                                         "ssl_cert",
+                                                         "ssl_key",
+                                                         "ssl_verify"};
+    static const std::vector<std::string> kSink = {"table",
+                                                   "columns",
+                                                   "batch_records",
+                                                   "max_bytes",
+                                                   "max_record_bytes",
+                                                   "max_statement_bytes",
+                                                   "lock_wait_timeout_s",
+                                                   "max_retries"};
+    static const std::vector<std::string> kAppend = {"on_duplicate", "update_columns", "linger_ms"};
+    static const std::vector<std::string> kSources = {"cursor_column",
+                                                      "id_column",
+                                                      "initial_cursor",
+                                                      "batch_size",
+                                                      "poll_ms",
+                                                      "jitter_frac",
+                                                      "bounded",
+                                                      "server_id",
+                                                      "tables",
+                                                      "start_file",
+                                                      "start_pos",
+                                                      "initial_snapshot",
+                                                      "snapshot_lock",
+                                                      "snapshot_lock_wait_s",
+                                                      "heartbeat_ms"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        (void)value;
+        const auto listed = [&key](const std::vector<std::string>& v) {
+            return std::find(v.begin(), v.end(), key) != v.end();
+        };
+        if (listed(kConnection) || listed(kSink) || listed(kSources) || listed(interpreted)) {
+            continue;
+        }
+        if (listed(kAppend)) {
+            if (!upsert) {
+                continue;
+            }
+            unsupported("table '" + table.name + "': '" + key +
+                        "' is not read with mode='upsert', which keys rows by the table's "
+                        "PRIMARY KEY and writes every column of each row");
+        }
+        if (key == "key_columns" || key == "timestamp_columns") {
+            unsupported("table '" + table.name + "': connector='mysql' takes no '" + key +
+                        "' in SQL: " +
+                        (key == "key_columns"
+                             ? std::string{"mode='upsert' keys rows by the table's PRIMARY KEY"}
+                             : std::string{"the planner names the TIMESTAMP columns itself"}));
+        }
+        std::string accepted;
+        for (const auto* list : {&kConnection, &kSink, &kAppend}) {
+            for (const auto& o : *list) {
+                accepted += (accepted.empty() ? "" : ", ") + o;
+            }
+        }
+        unsupported("table '" + table.name + "': a connector='mysql' sink does not read option '" +
+                    key + "'; it reads " + accepted + " (the last three without mode='upsert')");
     }
 }
 
@@ -1500,6 +1576,7 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     if (connector == "mysql") {
         // MySQL sink (batched INSERT). At-least-once. Each row -> JSON object
         // string -> columns by name. exactly_once (XA 2PC) is not supported.
+        check_mysql_sink_options(table, upsert);
         if (exactly_once) {
             unsupported(
                 "connector='mysql' sink is at-least-once; exactly-once delivery is not supported");
