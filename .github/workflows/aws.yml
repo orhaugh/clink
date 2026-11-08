@@ -13,7 +13,15 @@ name: aws
 # under two subtasks, latest mode restored before its first record, a missing
 # and a recreated stream), and the recovery cells, a coordinator and two workers
 # reading the emulator's stream into the file 2PC sink with a worker killed while
-# records are in flight and the stream resharded under the job.
+# records are in flight and the stream resharded under the job. Its second phase
+# is the Kinesis sink's, its evidence kept apart under sink/: the partition-key
+# rules, the response judge and the sink's write path against a model of
+# PutRecords (limits, partial failures resent with their keys, retry bounds,
+# ambiguous responses, permanent errors, a lost reply, cancellation, the failed
+# state, replay), the SDK path against an in-process stand-in for PutRecords,
+# the live cases read back by a client of their own, and the recovery cells, a
+# worker killed after a store no checkpoint covers or before a send, and a SQL
+# job, each output stream checked for every record at least once with its key.
 #
 # scripts/dynamodb-live.sh, the DynamoDB sink: item identity, the record checks
 # and DynamoDB's size rules, and the sink's write path against a model of
@@ -57,7 +65,7 @@ concurrency:
 
 jobs:
   live:
-    name: The Kinesis source and the DynamoDB and Firehose sinks hold their contracts against the emulator and the models
+    name: The Kinesis source and the Kinesis, DynamoDB and Firehose sinks hold their contracts against the emulator and the models
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -85,7 +93,7 @@ jobs:
       # CLINK_WITH_AWS=ON, not AUTO: an SDK missing from the image fails the
       # configure rather than leaving the gate without its binaries. Debug
       # without DWARF and stripped, as the build job builds.
-      - name: Build the AWS tests, the recovery cells and the node binary
+      - name: Build the AWS tests, the recovery cells, the node binary and the SQL submitter
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ccache"
@@ -102,7 +110,7 @@ jobs:
                 -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_AWS=ON -DCMAKE_C_FLAGS_DEBUG=-g0 \
                 -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
               cmake --build build --target clink_aws_tests clink_integration_tests clink_node \
-                -j "$(( $(nproc) / 2 + 1 ))"
+                clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
               ccache -s | tail -3'
       - name: Save compiler cache
         if: always()
@@ -110,7 +118,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/ccache
           key: ccache-aws-${{ github.run_id }}
-      - name: Run the Kinesis gate
+      - name: Run the Kinesis gate, the source's phase and the sink's
         run: |
           set -euo pipefail
           export REPORT_DIR="${RUNNER_TEMP}/kinesis-live-reports"
@@ -118,6 +126,7 @@ jobs:
             -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
             -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
             -e CLINK_KINESIS_TEST_ENDPOINT -e CLINK_KINESIS_RECOVERY_LOG_DIR \
+            -e CLINK_KINESIS_SINK_RECOVERY_LOG_DIR \
             -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION -e AWS_REGION \
             -e AWS_EC2_METADATA_DISABLED \
             ${TOOLCHAIN}"
@@ -153,8 +162,8 @@ jobs:
         # carry the recovery cells' verdict lines and the fault framework's
         # witness lines; recovery-logs/ holds every cell's coordinator and worker
         # logs; provenance.txt names the commit, the build's configuration and the
-        # emulator. On failure the report directory also holds the emulator's own
-        # log.
+        # emulator; sink/ holds the same for the sink's phase. On failure the
+        # report directory also holds the emulator's own log.
         if: always()
         uses: actions/upload-artifact@v4
         with:
