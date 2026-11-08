@@ -113,7 +113,7 @@ trap remove_server EXIT
         grep -E "^${key}:" "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null || echo "${key}: (unset)"
     done
     # shellcheck disable=SC2086 # PIN_RUNNER is a command prefix, split on purpose
-    echo "client library: $(${PIN_RUNNER:-} sh -c 'mariadb_config --cc_version 2>/dev/null || pkg-config --modversion libmariadb 2>/dev/null || echo unknown')"
+    echo "client library: mariadb-connector-c $(${PIN_RUNNER:-} sh -c 'mariadb_config --cc_version 2>/dev/null || /opt/homebrew/opt/mariadb-connector-c/bin/mariadb_config --cc_version 2>/dev/null || pkg-config --modversion libmariadb 2>/dev/null || echo unknown')"
     echo "recovery cells: $( [ "${MYSQL_CDC_LIVE_RECOVERY}" = 1 ] && echo run || echo left out)"
     echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"${REPORT_DIR}/provenance.txt"
