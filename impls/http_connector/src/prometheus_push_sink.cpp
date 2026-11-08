@@ -626,7 +626,7 @@ std::string pushgateway_redact(const std::string& body) {
             // Skip to the closing quote, past escaped ones.
             ++i;
             while (i < first.size() && first[i] != '"') {
-                i += first[i] == '\\' ? 2 : 1;
+                i += first[i] == '\\' ? std::size_t{2} : std::size_t{1};
             }
             ++i;
             out += "\"...\"";
