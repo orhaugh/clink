@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+**The MySQL sinks stay failed rather than forget a write, apply a changelog in
+the order its keys changed, and write each value exactly or not at all.** After
+a failed flush both sinks cleared the rows they had buffered and let a later
+empty flush, and so the next checkpoint, succeed, and `close()` flushed even
+when the task was cancelled. The upsert sink netted a flush by its JSON key and
+then applied every upsert before every delete, so two keys the table treats as
+one row (`'abc'` and `'ABC'` under a case-insensitive collation, `'a'` and
+`'a '`, `1` and `"1"`) could end with a delete winning over the later upsert,
+and it took an unknown `__row_kind` as an insert. Decimals went through a
+double, integers past the signed 64-bit range were refused, the session took
+the server's `sql_mode`, so a server that was not strict stored converted
+values, warnings went unread, errors quoted whole records, nothing bounded a
+statement against `max_allowed_packet`, a misspelt `on_duplicate` meant a plain
+insert, and nothing checked the table's unique indexes against the key the sink
+wrote by. Now each flush is one transaction of statements bounded by
+`max_statement_bytes` and the server's packet limit. A failure fails the sink,
+which refuses every later record, barrier and flush until it is opened again; a
+deadlock or lock wait timeout is tried again within `max_retries` where a
+rollback undoes the attempt; a cancel ends the statement in flight; and a
+`COMMIT` whose reply is lost is reported as an unknown outcome, not as a
+rollback. The session is strict and in UTC, any warning fails the flush,
+numbers are written exactly (a `FLOAT` or `DOUBLE` column takes the number as
+written), and errors replace the values the server quotes with `<value>`. At
+open the sinks check the table: one unique index for `on_duplicate='update'`,
+and for `mysql_upsert_sink` a transactional engine, one unique index on exactly
+its key, `update_columns` naming every non-key column and, above parallelism 1,
+key columns MySQL compares as the stream does. The upsert sink applies a
+flush's changes in the order each key last changed and fails on an unknown
+marker; the append sink refuses retractions. Options are read strictly
+(`max_bytes='0'` now means the 16 MiB default), a SQL sink table takes only the
+options its sink reads, and the capability records state MySQL 8.0.19 or later
+for the keyed statements. `scripts/mysql-cdc-live.sh` becomes
+`scripts/mysql-live.sh`, with a `cdc` and a `sink` phase. The sink phase runs
+`MysqlSinkFailures` against a scripted server, `MysqlSinkContractLive` against
+MySQL 8.0.46 and 8.4.13, where keys are compared with a reference table MySQL
+applies each change to, and recovery cells that kill a worker before and after
+a flush's `COMMIT`.
+
 **The MySQL change stream keeps transactions and the initial snapshot whole
 across checkpoints, stops rather than skip a change it cannot decode, and
 restores only from a checkpoint it can trust.** It checkpointed wherever a
@@ -34,8 +72,8 @@ JSON it cannot parse (it wrote `null`) and an ENUM or SET value past its
 members, and reads ENUM index 0 as the empty string. A MariaDB server is
 refused, options are read strictly, and the checkpoint row has a new layout (an
 earlier release's still restores). Verified against MySQL 8.0.46 and 8.4.13 by
-`scripts/mysql-cdc-live.sh`, with recovery cells that kill a worker inside the
-snapshot and inside a 20000-row transaction.
+the `cdc` phase of `scripts/mysql-live.sh`, with recovery cells that kill a
+worker inside the snapshot and inside a 20000-row transaction.
 
 **A source can hold the checkpoint barriers it is given until it reaches a
 point a checkpoint may cut at.** `Source::barrier_ready()` defaults to true; a

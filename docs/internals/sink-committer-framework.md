@@ -230,6 +230,15 @@ that the SELECT projects it.
   [Cassandra](../connectors/cassandra.md#delivery-ordering-and-the-final-state)).
 - **Redis upsert**: a key-value view (`SET`/`DEL` by the PK-derived key), distinct
   from the append-only Streams sink.
+- **MySQL upsert**: a flush is one transaction of runs of
+  `INSERT ... AS clink_new ON DUPLICATE KEY UPDATE` and
+  `DELETE ... WHERE k IN (...)`, applied in the order each key last changed
+  rather than every upsert before every delete: the table's collation, padding
+  or numeric coercion can make two of the stream's keys one row, and the row
+  must end as the later change left it. The sink checks at open that the table
+  is transactional and has one unique index, on exactly the key, and above
+  parallelism 1 that the key columns compare in MySQL as the stream does (see
+  [MySQL](../connectors/mysql.md#keys-and-order)).
 
 ## Source
 

@@ -4,7 +4,7 @@
 
 ## Overview
 
-This connector integrates a MySQL server over the synchronous C API of mariadb-connector-c. The client library being MariaDB's does not make a MariaDB server supported: the change stream refuses one at start, and the polling source and the sinks are tested against MySQL only. It provides three factories on the `std::string` channel: a polling cursor source (`mysql_source`) that issues incremental `SELECT` statements, a binlog CDC source (`mysql_cdc_source`) that streams row-level changes from the master's binary log, and a sink (`mysql_sink`) that writes records as batched multi-row `INSERT` statements. Every record on the wire is a JSON-object string keyed by column name; the SQL Row path bridges these via `json_string_to_row` (source) and `row_to_json_string` (sink). Both sources deliver every cell as a JSON string (the cursor source speaks the MySQL text protocol, and the CDC decoder renders each binlog value as text), and the SQL bridge takes a numeric token into a declared `BIGINT`, `INTEGER`, `DOUBLE` or `REAL` column as that type, so a `TINYINT(1)` declared `BIGINT` arrives as `1`, not `"1"`. The CDC source emits flat JSON change rows carrying `__op`, `__table`, `__lsn` and `__xid` metadata.
+This connector integrates a MySQL server over the synchronous C API of mariadb-connector-c. The client library being MariaDB's does not make a MariaDB server supported: the change stream refuses one at start, the sinks' keyed statements use a row alias a MariaDB server does not accept, and the polling source is tested against MySQL only. It provides four factories on the `std::string` channel: a polling cursor source (`mysql_source`) that issues incremental `SELECT` statements, a binlog CDC source (`mysql_cdc_source`) that streams row-level changes from the master's binary log, a sink (`mysql_sink`) that appends records, or inserts or updates them by key, in batched multi-row `INSERT` statements, and a changelog sink (`mysql_upsert_sink`) that maintains a table by its key. Every record on the wire is a JSON-object string keyed by column name; the SQL Row path bridges these via `json_string_to_row` (source) and `row_to_json_string` (sink). Both sources deliver every cell as a JSON string (the cursor source speaks the MySQL text protocol, and the CDC decoder renders each binlog value as text), and the SQL bridge takes a numeric token into a declared `BIGINT`, `INTEGER`, `DOUBLE` or `REAL` column as that type, so a `TINYINT(1)` declared `BIGINT` arrives as `1`, not `"1"`. The CDC source emits flat JSON change rows carrying `__op`, `__table`, `__lsn` and `__xid` metadata.
 
 ## Dependency and version
 
@@ -12,7 +12,7 @@ This connector integrates a MySQL server over the synchronous C API of mariadb-c
 | --- | --- | --- |
 | mariadb-connector-c (libmariadb) | System package via apt (Debian `libmariadb-dev`) / brew (macOS `mariadb-connector-c`) | Not pinned by clink |
 
-The change stream is tested against MySQL 8.0 and 8.4: its live gate pins MySQL 8.0.46 and 8.4.13 by digest (see [Testing](#testing)). MySQL 5.7 is not tested.
+The change stream and the sinks are tested against MySQL 8.0 and 8.4: the connector's live gate pins MySQL 8.0.46 and 8.4.13 by digest (see [Testing](#testing)). The sinks' insert-or-update and changelog statements use the row alias of MySQL 8.0.19 (`INSERT ... AS clink_new ON DUPLICATE KEY UPDATE`), so they need 8.0.19 or later. MySQL 5.7 is not tested, and a MariaDB server is not supported.
 
 TLS support is built into mariadb-connector-c, so no separate TLS dependency is required. This connector does not use Apache Arrow on its data path; records are JSON-object strings.
 
@@ -41,11 +41,11 @@ The target compiles only where the client library is present, defining `CLINK_HA
 | `mysql_source` | Source | `std::string` (JSON object per row) |
 | `mysql_cdc_source` | Source | `std::string` (flat JSON change row) |
 | `mysql_sink` | Sink | `std::string` (JSON object per row) |
-| `mysql_upsert_sink` | Sink | `Row` (changelog upsert/delete by PRIMARY KEY) |
+| `mysql_upsert_sink` | Sink | `std::string` (JSON object per change; `__row_kind` marks a delete) |
 
 ## Configuration
 
-### Connection options (shared by all three factories)
+### Connection options (shared by every factory)
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -66,18 +66,38 @@ Source: `conn_options_from` in `impls/mysql/src/register_factories.cpp` and the 
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `table` | Yes | (none) | Target table. |
-| `columns` | See note | (none) | Comma-separated projection and column order. On the SQL path it defaults to the declared table schema (`schema_columns`), so it is only required when the sink is built outside SQL. Each column is looked up by name in the row's JSON object; an absent or null value becomes SQL NULL. |
-| `on_duplicate` | No | `` (empty) | Empty performs a plain `INSERT`. `on_duplicate='update'` appends `ON DUPLICATE KEY UPDATE` for an idempotent insert-or-update by primary key on replay. This is not clink `mode='upsert'` (a changelog contract with delete tombstones, which this sink does not implement). |
-| `update_columns` | No | `` (empty) | Comma-separated `ON DUPLICATE KEY UPDATE` SET list; empty means all columns. |
-| `batch_records` | No | `1000` | Flush threshold by record count; `0` is coerced to `1`. |
-| `max_bytes` | No | `0` | Byte-based flush threshold; `0` disables it. |
-| `linger_ms` | No | `0` | Linger before flushing a partial batch, in milliseconds; `0` disables it. |
-| `timestamp_columns` | No | derived | Comma-separated `<column>:ts` or `<column>:tstz`: the columns written as timestamps. On the SQL path the planner names every `TIMESTAMP` column. Taken by `mysql_upsert_sink` too. |
+| `table` | Yes | (none) | Target table, `name` or `database.name`. |
+| `columns` | See note | (none) | Comma-separated projection and column order. On the SQL path it defaults to the declared table schema (`schema_columns`), so it is only required when the sink is built outside SQL. Each column is looked up by name in the record's JSON object; an absent or null member becomes SQL NULL. |
+| `on_duplicate` | No | `` (empty) | Empty writes a plain `INSERT`. `'update'` writes `INSERT ... ON DUPLICATE KEY UPDATE` by the table's one PRIMARY KEY or UNIQUE index (see [Modes](#modes)). Any other value is refused. This is not clink `mode='upsert'`, the changelog contract of `mysql_upsert_sink`. |
+| `update_columns` | No | `` (empty) | The `ON DUPLICATE KEY UPDATE` SET list; empty sets every column. Taken only with `on_duplicate='update'`, and each must be one of `columns`. |
+| `batch_records` | No | `1000` | Flush at this many buffered rows, 1 to 1000000. |
+| `max_bytes` | No | `16777216` | Flush once the buffered rows reach this many bytes of SQL text, 0 to 1073741824; `0` means the default, 16 MiB. |
+| `max_record_bytes` | No | `1048576` | The most one record's row may take as SQL text, 64 up to `max_statement_bytes`. A larger record fails the sink. |
+| `max_statement_bytes` | No | `4194304` | The most one statement may take, 1024 to 1073741824, and never more than the server's `max_allowed_packet` less 1024 bytes. |
+| `linger_ms` | No | `0` | Flush rows buffered this long, checked as each record arrives; 0 (off) to 3600000. |
+| `lock_wait_timeout_s` | No | `30` | The session's `innodb_lock_wait_timeout` and `lock_wait_timeout`, 1 to 3600 seconds. |
+| `max_retries` | No | `3` | How many times a flush that met a deadlock or a lock wait timeout is tried again, 0 to 10. |
+| `timestamp_columns` | No | derived | Comma-separated `<column>:ts` or `<column>:tstz`: the columns written as timestamps (see [Values](#values)). On the SQL path the planner names every `TIMESTAMP` column. |
 
-**Timestamps.** The SQL Row path carries a `TIMESTAMP` as epoch milliseconds, and the sink writes a column named in `timestamp_columns` as its time in UTC (`'2026-10-24 17:41:28.105'`) instead of that number. Both MySQL sinks run their session with `time_zone = '+00:00'`, so a `DATETIME` column holds the UTC wall time and a `TIMESTAMP` column the same instant whatever the server's time zone. A value outside years 1 to 9999 fails the batch. To store epoch milliseconds in a `BIGINT` column, declare the SQL column `BIGINT`.
+Every option is read strictly: a value the sink cannot use (a number with trailing text, a value out of range, an `on_duplicate` other than `'update'`) is refused when the job is built, never replaced by the default.
 
 Source: the `mysql_sink` lambda in `impls/mysql/src/register_factories.cpp` and `MysqlSinkOptions` in `impls/mysql/include/clink/mysql/mysql_sink.hpp`.
+
+### `mysql_upsert_sink`
+
+| Option | Required | Default | Description |
+| --- | --- | --- | --- |
+| `table` | Yes | (none) | Target table. |
+| `columns` | See note | (none) | The full projection, as for `mysql_sink`. |
+| `key_columns` | Yes | (none) | The row's identity: the columns of the table's PRIMARY KEY or UNIQUE index. On the SQL path, the table's PRIMARY KEY. |
+| `update_columns` | No | `` (empty) | The upsert's SET list; empty sets every column. When set it must name every non-key column. Not taken on the SQL path. |
+| `batch_records` | No | `1000` | Flush at this many buffered keys, 1 to 1000000. A key's later change replaces its earlier one in the buffer. |
+| `max_record_bytes` | No | `1048576` | The most one record's row, or its key for a delete, may take as SQL text. |
+| `max_bytes`, `max_statement_bytes`, `lock_wait_timeout_s`, `max_retries`, `timestamp_columns` | No | as for `mysql_sink` | As for `mysql_sink`. |
+
+The upsert sink takes no `linger_ms`, and reads its options as strictly.
+
+Source: the `mysql_upsert_sink` lambda in `impls/mysql/src/register_factories.cpp` and `MysqlJsonUpsertSinkOptions` in `impls/mysql/include/clink/mysql/mysql_json_upsert_sink.hpp`.
 
 ### `mysql_source` (incremental cursor)
 
@@ -187,9 +207,110 @@ On the SQL path one `on_decode_error` on a `mode='cdc'` table governs both the c
 - An event earlier releases skipped now stops the source unless the table says `'drop'`: they dropped a row event they could not decode and counted it, and did not check for statement-logged changes, partial row images or XA transactions at all.
 - The row decoder refuses a width or precision outside MySQL's limits (earlier releases read it), binary JSON it cannot parse (earlier releases wrote `null`), and an ENUM index or SET member past the definition's members (earlier releases wrote the number, or dropped the member). An ENUM column's error value, index 0, now arrives as the empty string, as MySQL shows it; earlier releases sent `0`.
 
+## The sinks
+
+Both sinks share one core, `impls/mysql/src/mysql_sink_core.cpp`: the session, the table checks, each flush's transaction, the failure state, retries, cancellation and the statement bound. The record rules (the JSON reader, values, keys, statements and the changelog buffer) are in `impls/mysql/src/mysql_sink_rules.cpp`.
+
+### Modes
+
+| Mode | Selected by | Statements | Delivery |
+| --- | --- | --- | --- |
+| Append | `mysql_sink` | `INSERT INTO t (...) VALUES (...),(...)` | At-least-once: a replay appends its rows again. |
+| Insert-or-update | `mysql_sink` with `on_duplicate='update'` | `INSERT ... AS clink_new ON DUPLICATE KEY UPDATE c = clink_new.c, ...` | At-least-once; a replay rewrites rows by key. |
+| Changelog upsert | `mysql_upsert_sink`, or SQL `mode='upsert'` | that upsert for `insert` and `update_after`, and `DELETE FROM t WHERE k IN (...)` for `delete` and `update_before` | Effectively-once on the table, for a stable key, a deterministic query and one writer per key. |
+
+A record is one JSON object. A sink writes the members named in `columns`; a member the record lacks is written as NULL, as a null member is, so a column's default does not apply. In the changelog sink a `__row_kind` of `insert` or `update_after`, or none, upserts the row, and `delete` or `update_before` deletes it by key; any other value, or one that is not a string, fails the sink. The append sink refuses `delete` and `update_before` records, which it cannot apply: appended, a retraction would add the row it removes.
+
+### The table each mode needs
+
+When a sink opens, it reads the table's definition from `information_schema` and refuses a table its mode cannot write as declared, naming every problem:
+
+- Every mode: the table exists, every column in `columns` exists and is not generated, and a column in `timestamp_columns` is `DATETIME` or `TIMESTAMP`.
+- Insert-or-update: exactly one PRIMARY KEY or UNIQUE index, all of whose columns the sink writes. With none, a replay inserts every row again; with a second, `ON DUPLICATE KEY UPDATE` updates whichever row a new row collides with first, which need not be the row the key names.
+- Changelog upsert: a transactional engine (InnoDB); a PRIMARY KEY or UNIQUE index on exactly `key_columns`; no other unique index, since an upsert colliding with it would update the row that index names; and `update_columns`, when set, naming every non-key column, so that a row always holds its key's last record.
+- Append: any engine, and a view. On a table without transactions (MyISAM), a failed flush leaves what its statements wrote before the failure, and the flush is not tried again.
+
+Both keyed modes refuse a view, which has no keys to write by, and a unique index on a prefix of a column (`UNIQUE KEY (name(10))`), on which rows whose values differ after the prefix collide.
+
+### Keys and order
+
+The changelog sink buffers changes by the key as the stream writes it: the key members' JSON kinds and texts, with a number taken by its value, so `1`, `1.0` and `1.00` are one key. Within a flush a key's later change replaces its earlier one, and the surviving changes are applied in the order in which each key last changed: consecutive upserts as one `INSERT`, consecutive deletes as one `DELETE`, the runs in order, all in one transaction. Which keys are one row is the table's to decide: two keys the stream holds apart and the table treats as one (`'abc'` and `'ABC'` under a case-insensitive collation, `'a'` and `'a '` under a PAD SPACE collation, `1` and `"1"` in an `INT` column) reach the table in the order they changed, and the row ends as the last change left it. The live suite checks this against a reference table to which MySQL applies each change in turn.
+
+That holds within one subtask. With more than one, two changes to a row reach the table in either order unless they reach the same subtask, so a parallel sink needs key columns that MySQL tells apart exactly as the stream does: an integer type, `DECIMAL`, `VARBINARY`, a `VARCHAR` with a binary NO PAD collation (`utf8mb4_0900_bin`; `utf8mb4_bin` pads), or a `DATETIME` or `TIMESTAMP` of at least millisecond precision written from epoch milliseconds. A table with any other key column is refused when the sink opens. Each record's key must also be written as its column compares, a number for a numeric or timestamp column and a string for a `VARCHAR` or `VARBINARY` one, or the record fails the sink. The SQL planner routes a sink's rows by the key's typed value; with the Dag API, partition the stream by the value the table keys by.
+
+The sinks assume they own the rows they write. One writer per key is a condition of the changelog sink's convergence: a replay rewrites the rows its checkpoint did not cover, and can overwrite a change another writer made to them since. A row another writer inserted is updated by the sink's upsert, not duplicated; a row another writer deleted is inserted again by the sink's next upsert of its key.
+
+### Values
+
+Records are read strictly: one JSON object, valid UTF-8, with no member repeated at the top level and at most 256 levels of nesting; anything else fails the sink. Each value is written as a SQL literal:
+
+| JSON value | Written as |
+| --- | --- |
+| `null`, or a missing member | `NULL` |
+| `true`, `false` | `1`, `0` |
+| A string | a quoted literal, escaped by the client library for the connection's character set, `utf8mb4` |
+| An object or array | its JSON text, quoted |
+| A number | its exact plain decimal (`1.5E3` as `1500`, `18446744073709551615` as written), so a `DECIMAL` or `BIGINT UNSIGNED` column takes it exactly; one longer than 100 characters fails the sink |
+| A number, for a `FLOAT` or `DOUBLE` column | the number as written, which the server reads as the nearest value of the type; one past a `DOUBLE`'s range fails the sink |
+| A number, for a column in `timestamp_columns` | its UTC time, from epoch milliseconds |
+
+**Timestamps.** The SQL Row path carries a `TIMESTAMP` as epoch milliseconds, and the sink writes a column named in `timestamp_columns` as its time in UTC (`'2026-10-24 17:41:28.105'`) instead of that number. Both sinks run their session with `time_zone = '+00:00'`, so a `DATETIME` column holds the UTC wall time and a `TIMESTAMP` column the same instant whatever the server's time zone. A value that is not a whole number of milliseconds, that lies outside years 1 to 9999, or whose milliseconds the column's fractional precision would round away fails the sink; a `TIMESTAMP` column's narrower range, 1970 to 2038, is the server's to refuse. To store epoch milliseconds in a `BIGINT` column, declare the SQL column `BIGINT`.
+
+**A strict session.** Each sink sets its session's `sql_mode` to `STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION`, whatever the server's global mode (the changelog sink adds `NO_AUTO_VALUE_ON_ZERO`, so a key of 0 in an `AUTO_INCREMENT` column names that row). A value a column cannot hold fails the statement rather than land converted: a string too long for its column, a number out of range, a date that does not exist, a character the column's character set lacks, `NULL` for a `NOT NULL` column. The sink also reads every statement's warnings and fails the flush on any, notes included, so a rounding the column makes (`1.234` into `DECIMAL(10,2)`) is not a successful write. Escaping is the client library's and the session's mode is the sink's, so a server whose global mode is `NO_BACKSLASH_ESCAPES` stores the same bytes.
+
+### Transactions, failures and acknowledgement
+
+A flush is one transaction: `START TRANSACTION`, its statements in order, `COMMIT`. A sink flushes at its count, byte and linger thresholds and at every checkpoint barrier, and passes the barrier on, so acknowledging the checkpoint, only after that flush has committed. A checkpoint therefore completes only once every row the sink received before it is committed, and a restored job writes the rows after its checkpoint again.
+
+A failure fails the sink. A failed sink refuses every later record, barrier and flush, an empty flush included, until it is opened again, which the job's restart does before it replays from its last checkpoint:
+
+| Failure | What the table holds | What the error says |
+| --- | --- | --- |
+| A record that cannot be read or written as declared, or one too large for a statement | Nothing of the record: it fails the sink before it is buffered | Which member, and why, without its value |
+| A statement the server refuses, or one that raises a warning | Nothing of the flush, which is rolled back (on a table without transactions, what its earlier statements wrote stays) | The server's code and message, with the values it quotes replaced by `<value>` |
+| A deadlock or lock wait timeout | Nothing: the transaction is rolled back and tried again up to `max_retries` times, after 100 ms, then twice as long each time, up to 5 s; then the sink fails | The last error and the retries spent |
+| The connection lost before `COMMIT` | Nothing of the flush | That nothing was committed |
+| `COMMIT` refused by the server | Nothing of the flush | That nothing was committed |
+| `COMMIT` sent and its reply lost | Unknown: the flush may or may not have been committed | That the outcome is unknown; the job replays, so a committed flush is written twice by the append sink and rewritten by key otherwise |
+| The task cancelled | The statement in flight is ended and the server rolls its transaction back; a cancel during `COMMIT` is the unknown outcome above | That the task was cancelled |
+
+A statement waits for a lock for at most `lock_wait_timeout_s`, and the connection's read and write timeouts are that plus 60 seconds, so a server that stops answering fails the flush rather than holding it. A cancel ends a statement in flight, or a wait between tries, within about 20 ms.
+
+`close()` never throws: it discards what is buffered (a restored job writes it again), rolls back a transaction left open and releases the connection. A clean end of input flushes before `close()`; a cancelled task does not. Neither sink is two-phase commit, and neither is exactly-once.
+
+### Bounds
+
+| Bound | Option | Default |
+| --- | --- | --- |
+| Rows buffered (append), or keys buffered (changelog) | `batch_records` | 1000 |
+| SQL text buffered | `max_bytes` | 16 MiB |
+| One record's row or key, as SQL text | `max_record_bytes` | 1 MiB |
+| One statement | `max_statement_bytes`, and the server's `max_allowed_packet` less 1024 bytes | 4 MiB |
+| One wait for a lock | `lock_wait_timeout_s` | 30 s |
+| Tries after a deadlock or lock wait timeout | `max_retries` | 3 |
+
+The thresholds are checked as each record is buffered, so a large batch flushes part-way through. The byte bounds count the SQL text the records render to, escapes included, which is what the server receives; they are not a bound on the sink's memory, which also holds each buffered key's bookkeeping in the changelog sink. A flush longer than one statement is split into several, all in its one transaction, and a record longer than one statement can hold fails the sink before it is buffered.
+
+### Changes from earlier releases
+
+The sinks were rewritten in this release. Against earlier releases:
+
+- A failed flush fails the sink until it is opened again. Earlier releases cleared the rows they had buffered and let a later empty flush, and so a checkpoint, succeed.
+- `close()` discards what is buffered. Earlier releases flushed it, even when the task was cancelled.
+- The changelog sink applies a flush's changes in the order each key last changed. Earlier releases applied every upsert before every delete, which left the wrong row when two keys the table treats as one changed in turn.
+- An unknown `__row_kind`, or one that is not a string, fails the changelog sink, where earlier releases upserted the record; the append sink refuses retractions, which earlier releases appended.
+- The sinks check the table when they open and refuse one their mode cannot write: no unique index, a second unique index or a prefix index for either keyed mode, no transactions for `mysql_upsert_sink`, and `update_columns` that leave out a non-key column. A parallel `mysql_upsert_sink` refuses key columns MySQL does not tell apart as the stream does.
+- Numbers are written exactly. Earlier releases wrote a decimal through a double, losing digits past the seventeenth, and refused an integer outside the signed 64-bit range.
+- The session is strict, and a statement's warnings fail the flush. Earlier releases wrote under the server's mode, so a server that was not strict stored converted values.
+- Options are read strictly: an `on_duplicate` other than `'update'`, `update_columns` without it, and a number out of range are refused. `batch_records` must be at least 1, where earlier releases took `0` as 1, and `max_bytes='0'` means the 16 MiB default, where earlier releases took it as no byte threshold. `max_bytes` counts SQL text rather than record bytes.
+- Errors no longer include records. Earlier releases put the whole record in the message.
+- A deadlock or lock wait timeout is tried again, up to `max_retries` times, where earlier releases failed the flush.
+- The capability records state MySQL 8.0.19 or later for the insert-or-update and upsert statements, whose row alias has always needed it; earlier records said MySQL 5.7.
+- A SQL sink table takes only the options its sink reads (see [SQL usage](#sql-usage)).
+
 ## SQL usage
 
-The connector is mapped under `connector='mysql'` in `src/sql/physical_plan.cpp`. The source factory is selected by the `mode` property: `mode='cdc'` selects `mysql_cdc_source`, otherwise `mysql_source`. The sink maps to `mysql_sink`.
+The connector is mapped under `connector='mysql'` in `src/sql/physical_plan.cpp`. The source factory is selected by the `mode` property: `mode='cdc'` selects `mysql_cdc_source`, otherwise `mysql_source`. A sink table maps to `mysql_sink`, or with `mode='upsert'` to `mysql_upsert_sink`.
 
 Source table (incremental cursor):
 
@@ -248,7 +369,9 @@ CREATE TABLE orders_out (
 );
 ```
 
-On the SQL path, `columns` defaults to the declared table schema, so it does not need to be repeated. `mode='upsert'` with a PRIMARY KEY selects the changelog-aware upsert sink (`mysql_upsert_sink`, see Delivery semantics), which lets a retracting query maintain the table; `on_duplicate='update'` is the lighter append-stream idempotent-by-key option on the default sink. Exactly-once (XA 2PC) delivery is not supported.
+On the SQL path, `columns` defaults to the declared table schema, so it does not need to be repeated. `mode='upsert'` with a PRIMARY KEY (or `primary_key='...'`) selects the changelog sink, `mysql_upsert_sink`, which lets a retracting query (a GROUP BY, TOP-N or outer join) maintain the table; `on_duplicate='update'` writes an append-only query's rows by key on the default sink. A query that produces a changelog into a table without `mode='upsert'` is refused when it is planned. Exactly-once (XA two-phase commit) delivery is not supported.
+
+A sink table takes only the options its sink reads: the connection options, the sink's options above, the source options (a table can be read and written), and the options the planner interprets (`connector`, `format`, `mode`, `primary_key` and the like). The planner sets `key_columns` from the PRIMARY KEY and `timestamp_columns` from the `TIMESTAMP` columns, so a table that sets either is refused, as is one with `mode='upsert'` that sets `on_duplicate`, `update_columns` or `linger_ms`, and one that sets any other option. With more than one subtask the changelog sink takes the key rules in [Keys and order](#keys-and-order).
 
 A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
 
@@ -287,12 +410,12 @@ src_opts.batch_size = 500;
 auto source = make_mysql_poll_source(src_opts);
 ```
 
-The factories are also reachable through the registry on the `string` channel as `mysql_sink`, `mysql_source` and `mysql_cdc_source` once `clink::mysql::install(registry)` has run.
+The factories are also reachable through the registry on the `string` channel as `mysql_sink`, `mysql_upsert_sink`, `mysql_source` and `mysql_cdc_source` once `clink::mysql::install(registry)` has run.
 
 ## Delivery semantics
 
-- `mysql_sink`: at-least-once. A replay after a failed checkpoint re-runs the `INSERT`. A plain insert appends duplicates on replay; with `on_duplicate='update'` (and a PRIMARY KEY or UNIQUE index) the insert-or-update is idempotent and so effectively-once by key. Buffered rows are flushed on the count, byte and linger thresholds and on every checkpoint barrier. A flush failure drops the connection, clears the pending buffer and rethrows so the job replays from the last checkpoint. Exactly-once (XA 2PC) is not supported.
-- `mysql_upsert_sink` (`mode='upsert'`): effectively-once on the sink table for a stable PRIMARY KEY and a deterministic defining query. Consumes the changelog by key - insert/update_after `INSERT ... ON DUPLICATE KEY UPDATE`, delete/update_before `DELETE ... WHERE <pk> IN (...)` - netted by key within a flush and applied in one transaction, so a replay converges the table to the same state. Lets a retracting query (GROUP BY, TOP-N, outer join) maintain a MySQL table. Not two-phase commit.
+- `mysql_sink`: at-least-once. Each flush is one transaction, committed before the barrier that asked for it is passed on, and a restored job writes again the rows after its checkpoint: a plain insert appends them a second time, and `on_duplicate='update'` rewrites them by key. The recovery cells show both sides: killed before a flush's `COMMIT`, no record ends in two rows; killed after it and before its checkpoint completed, exactly the records committed after the restored checkpoint do. A failure fails the sink until it is opened again, and a `COMMIT` whose reply is lost leaves its flush's outcome unknown. Not two-phase commit; exactly-once is not supported.
+- `mysql_upsert_sink` (`mode='upsert'`): effectively-once on the table for a stable key, a deterministic defining query and one writer per key. A flush's changes are applied in the order each key last changed, in one transaction, so a replay converges the table to the same rows whichever keys the table treats as one. Not two-phase commit. See [The sinks](#the-sinks).
 - `mysql_source`: at-least-once. The cursor is checkpointed as operator state (via `PollingSource`) and replayed on restart; the exclusive `>` comparison avoids re-emitting the boundary row. A NULL cursor or id value in a delivered row is fatal rather than silently stalling the cursor.
 - `mysql_cdc_source`: at-least-once. The checkpoint holds the binlog coordinate of the last transaction boundary, and the source holds barriers inside a transaction and through the initial snapshot, so a restore replays whole transactions from that coordinate and never part of a snapshot. An event the source cannot decode stops it by default; with `on_decode_error='drop'` it is skipped and reported, and the job is at-most-once at its source. The snapshot-to-stream boundary is exact with `snapshot_lock='true'` and at-least-once with `snapshot_lock='false'`. See [The change stream](#the-change-stream).
 
@@ -308,12 +431,15 @@ The factories are also reachable through the registry on the `string` channel as
 - With `binlog_row_metadata=MINIMAL`, a change to a captured table's columns stops the change stream; there is no schema history. Compressed transactions, partial JSON updates and XA transactions on captured tables are not supported, and binlog coordinates do not survive a failover to another server.
 - CDC `initial_snapshot` requires `tables` to be a non-empty list of existing, fully-qualified InnoDB tables.
 - `mysql_sink` does not implement clink `mode='upsert'`: on a sink table, `mode='upsert'` selects `mysql_upsert_sink` instead. For idempotent insert-or-update on the append sink, use `on_duplicate='update'`.
-- Exactly-once delivery is not supported by the sink.
+- Neither sink is exactly-once or two-phase commit: the append sink writes replayed rows again, and a `COMMIT` whose reply is lost leaves its flush's outcome unknown.
+- The sinks' insert-or-update and changelog statements need MySQL 8.0.19 or later; the sinks are tested against MySQL 8.0 and 8.4, and a MariaDB server is not supported.
+- `mysql_upsert_sink` needs a transactional engine and one unique index, on exactly its key; with more than one subtask its key columns must be of the types in [Keys and order](#keys-and-order). It converges only with one writer per key.
+- The sinks' byte bounds count SQL text, and are not a bound on their memory.
 - The channel is `std::string` only (JSON-object rows); there is no typed int64 channel and no Arrow or Parquet encoding on this connector's data path.
 
 ## Testing
 
-In-process tests cover factory registration and the change stream's options, sink and source SQL building, row decoding and snapshot logic without a server (`impls/mysql/tests/test_factory_registration.cpp`, `test_mysql_sink_logic.cpp`, `test_mysql_source_logic.cpp`, `test_mysql_cdc_decode.cpp`, `test_mysql_snapshot.cpp`). The change stream's rules (`test_mysql_cdc_rules.cpp`: the checkpoint row and its strict reading, event and statement classes, the transaction tracker, TABLE_MAP metadata, definitions) and its event processing (`test_mysql_cdc_processor.cpp`: boundaries, both decode policies, partial images, definitions in force, DDL, XA, unsupported events) run from events built by hand.
+In-process tests cover factory registration and options, the polling source's SQL, row decoding and snapshot logic without a server (`impls/mysql/tests/test_factory_registration.cpp`, `test_mysql_sink_logic.cpp`, `test_mysql_source_logic.cpp`, `test_mysql_cdc_decode.cpp`, `test_mysql_snapshot.cpp`). The change stream's rules (`test_mysql_cdc_rules.cpp`: the checkpoint row and its strict reading, event and statement classes, the transaction tracker, TABLE_MAP metadata, definitions) and its event processing (`test_mysql_cdc_processor.cpp`: boundaries, both decode policies, partial images, definitions in force, DDL, XA, unsupported events) run from events built by hand. The sinks' rules (`test_mysql_sink_rules.cpp`: the JSON reader, values, key spelling, statements and their bounds, the changelog buffer, the table checks) run without a server, and their failure state runs against a scripted server (`test_mysql_sink_failures.cpp`, `MysqlSinkFailures`): every failure followed by another record, barrier and flush, reopening, refused records and markers, a failed statement, a lost and a refused `COMMIT`, deadlock and lock wait retries, a table without transactions, warnings, a cancel during a statement and during `COMMIT`, `close()`, statement splitting and the packet limit, the byte threshold, order and netting in the changelog buffer, and the identities a sink refuses.
 
 The live suites are skipped unless `CLINK_MYSQL_TEST_DSN` names a server, a space-separated `key=value` DSN:
 
@@ -323,6 +449,8 @@ export CLINK_MYSQL_TEST_DSN="host=localhost port=3306 user=root password=mysql d
 
 `test_mysql_cdc_live.cpp` (`MysqlCdcLive`) covers the change stream's round trips and `test_mysql_cdc_contract_live.cpp` (`MysqlCdcContractLive`) its contract: signedness after YEAR and BIT columns under both metadata modes, long CHAR columns, transactions larger than one `produce()` call, checkpoints inside and after them, rotation, purged, corrupt, foreign and earlier-release checkpoints, statement-logged changes, partial row images, servers without row logging, compressed transactions, partial JSON updates, XA, TRUNCATE, column changes under MINIMAL and FULL metadata and restores across them, the snapshot under concurrent writes with and without the lock, the snapshot's lock wait, a failed snapshot's connection, and snapshot table checks. Each case reads its expectation from the server, not from what the source emitted.
 
-The recovery cells (`tests/integration/test_mysql_cdc_recovery.cpp`, `MysqlCdcRecovery`) run a coordinator and two workers reading the binlog into the file two-phase-commit sink, one of them a SQL job, and kill a worker inside the initial snapshot and inside a 20000-row transaction. They check that the coordinator triggered checkpoints and none completed while the snapshot or transaction was open, and that the committed output equals the table, read through the mysql client in the server's container, with every row committed once.
+`test_mysql_sink_contract_live.cpp` (`MysqlSinkContractLive`) covers the sinks' contract against the server. Keys the table treats as one (a case- and accent-insensitive collation, trailing spaces under PAD SPACE and NO PAD collations, numbers written as strings, with decimals and with exponents) are applied in one flush and in a flush per change, and the table is compared row for row with a reference table to which MySQL applied each change in turn; composite and timestamp keys are checked too. The suite also covers the tables each mode refuses (two unique indexes, none, a prefix index, MyISAM for the changelog sink, partial `update_columns`, a case-insensitive key at parallelism 2, a generated column, a missing table); exact values (`BIGINT UNSIGNED`'s maximum, `DECIMAL(65,30)`, characters outside the Basic Multilingual Plane, quotes and backslashes, NUL and control bytes, JSON, `DATETIME` and `TIMESTAMP` at their limits, a large `DOUBLE`, null and missing members); values a column cannot hold, each failing its flush with nothing committed, the sink writing again once opened; a server whose global mode is `NO_BACKSLASH_ESCAPES` and not strict; 40 statements rolled back as one flush; statements kept under a 64 KiB `max_allowed_packet`; another session's lock failing a flush within its bound; a cancel ending a flush that waits for a lock; a connection killed while its `COMMIT` is on its way, reported as unknown; and the factories' sinks writing a table.
 
-`scripts/mysql-cdc-live.sh` runs all of this against MySQL 8.0.46 and 8.4.13 (pinned by digest), one server after the other, and fails on any skipped case, a suite that ran short, a missing binary or a server that never answers. It keeps each run's reports, the cells' logs and a provenance file (commit, build configuration, client library, each server's version, image and binlog settings), without credentials. The `mysql` CI workflow runs it.
+The recovery cells run a coordinator and two workers, and read their results through the mysql client in the server's container, never from what clink reports. The change stream's (`tests/integration/test_mysql_cdc_recovery.cpp`, `MysqlCdcRecovery`) read the binlog into the file two-phase-commit sink, one of them a SQL job, and kill a worker inside the initial snapshot and inside a 20000-row transaction. They check that the coordinator triggered checkpoints and none completed while the snapshot or transaction was open, and that the committed output equals the table, with every row committed once. The sinks' (`tests/integration/test_mysql_sink_recovery.cpp`, `MysqlSinkRecovery`) poll a feed the test serves into each sink and kill a worker at `mysql.sink_before_commit`, with a flush's statements executed and not committed, and at `mysql.sink_after_commit`, with the flush committed and its checkpoint not complete. For the append sink, every record's row is present with its columns, and the records with two rows are exactly those committed after the checkpoint the job restored: none when the kill came before `COMMIT`, about one checkpoint interval's when it came after. For the upsert sink, and for a SQL job writing it at parallelism 2 through a binary NO PAD key, the table holds every row the input's last records leave, column for column, and none of the rows they delete. Each cell checks the single restart, the replay, and the fault firing where it names, and before `COMMIT` that the server held the flush's rows in an open transaction.
+
+`scripts/mysql-live.sh` runs all of this against MySQL 8.0.46 and 8.4.13 (pinned by digest), one server after the other, in two phases on each: `cdc`, the change stream's suites and recovery cells, and `sink`, the sinks'. It fails on any skipped case, a suite that ran short, a case outside both phases, a missing binary or a server that never answers. It keeps each phase's reports and the cells' logs, with a provenance file (commit, build configuration, client library, each server's version, image and binlog settings, each phase's result), without credentials. The `mysql` CI workflow runs it.
