@@ -742,6 +742,17 @@ public:
         std::lock_guard lock(barrier_mu_);
         pending_barriers_.push_back(b);
     }
+    // Whether a checkpoint barrier may pass the source now. A source whose
+    // records come in units no checkpoint may split (an open database
+    // transaction, an initial snapshot that has not finished) returns false
+    // while it is inside one: the runner keeps the barriers it was given
+    // pending, and goes on calling produce(), until this returns true. A
+    // barrier then cuts the stream after the whole unit, and snapshot_offset
+    // records a position covering exactly what was emitted. Before the final
+    // checkpoint of a graceful stop, the runner lets produce() run until the
+    // source is ready, the task is cancelled, or the source ends. Called on
+    // the runner's thread, between produce() calls.
+    [[nodiscard]] virtual bool barrier_ready() const { return true; }
     std::optional<CheckpointBarrier> take_pending_barrier() {
         std::lock_guard lock(barrier_mu_);
         if (pending_barriers_.empty()) {

@@ -528,7 +528,13 @@ public:
             // there's no race between record emission and offset capture.
             bool armed_drained = false;
             auto drain_pending_barriers = [&]() {
-                while (auto b = source->take_pending_barrier()) {
+                // A source inside a unit no checkpoint may split holds its
+                // barriers until the unit ends (Source::barrier_ready).
+                while (source->barrier_ready()) {
+                    const auto b = source->take_pending_barrier();
+                    if (!b) {
+                        break;
+                    }
                     if (ctx.has_state_backend()) {
                         source->snapshot_offset(*ctx.state_backend(), id, b->id());
                         // Pin the offset AS OF THIS BARRIER. The durable
@@ -611,6 +617,10 @@ public:
                     DrainMarker{.subtask_idx = static_cast<std::uint32_t>(ctx.runner_subtask_idx()),
                                 .target_parallelism = 0});
             } else if (!should_stop()) {
+                // A source inside a unit no checkpoint may split finishes it
+                // before the final checkpoint, which then cuts after it.
+                while (!source->barrier_ready() && !should_stop() && source->produce(emitter)) {
+                }
                 source->flush(emitter);
                 // BATCH-1 end-of-input drain: a bounded source that exhausted
                 // cleanly has reached genuine end-of-input, so advance event
@@ -3843,7 +3853,13 @@ public:
                 const auto& ack_cb = ctx.checkpoint_ack();
                 bool armed_drained = false;
                 auto drain_pending_barriers = [&]() {
-                    while (auto b = source->take_pending_barrier()) {
+                    // Held while the source is inside a unit no checkpoint may
+                    // split, as in the single-subtask runner.
+                    while (source->barrier_ready()) {
+                        const auto b = source->take_pending_barrier();
+                        if (!b) {
+                            break;
+                        }
                         if (ctx.has_state_backend()) {
                             source->snapshot_offset(*ctx.state_backend(), id, b->id());
                             // Pin the offset AS OF THIS BARRIER - same tear
@@ -3925,6 +3941,11 @@ public:
                     drained = true;
                 }
                 if (!should_stop() && !drained) {
+                    // Finish a unit no checkpoint may split before the final
+                    // checkpoint, as in the single-subtask runner.
+                    while (!source->barrier_ready() && !should_stop() &&
+                           source->produce(typed_emitter)) {
+                    }
                     source->flush(typed_emitter);
                     // BATCH-1 end-of-input drain (parallel-source path): same
                     // contract as the single-source runner. A bounded source

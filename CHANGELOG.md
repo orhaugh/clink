@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A source can hold the checkpoint barriers it is given until it reaches a
+point a checkpoint may cut at.** `Source::barrier_ready()` defaults to true; a
+source that returns false keeps its pending barriers queued while the runner
+goes on calling `produce()`, in the single and the parallel source runner, and
+a graceful stop reads on until the source is ready before the final
+checkpoint. The coordinator's rules are unchanged: a held barrier reaches its
+source later, which the specification already allows. It adds a virtual to
+`operator_base.hpp`, a header on the plugin ABI surface, so the fingerprint
+rotates and job modules are rebuilt against this release.
+`SourceBarrierReady.*` pins both runners and the graceful stop.
+
 **The Kinesis sink routes every record by its own partition key, checks every
 `PutRecords` response, and stops rather than forget a failed write.** It read a
 numeric key through a double, so `9007199254740993` and `9007199254740992`
