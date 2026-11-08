@@ -1,17 +1,29 @@
 name: postgres-cdc
 
-# The PostgreSQL CDC gate (scripts/postgres-cdc-live.sh): every PostgreSQL
-# connector test against a real server, PostgreSQL 16.15 pinned by digest in
-# docker/integration-services.yml; the SQL CDC round trip through the upsert
-# sink; the CDC recovery cells, a coordinator and two workers capturing a
-# table into ClickHouse with a worker killed at each phase boundary of the
-# source and the server restarted, checked against the table and against
-# every row version the workload committed; and a column added through
-# `clink stop` and a restore, backfilled into the same ClickHouse tables with
-# and without a worker killed during the backfill, with no key holding two
-# different rows under one __version. A live test skips when its server or
-# binary is missing and gtest counts that as a pass, so the gate fails on any
-# skip and on any required suite that did not run.
+# The PostgreSQL connector's gate (scripts/postgres-live.sh), in two phases
+# against a real server, PostgreSQL 16.15 pinned by digest in
+# docker/integration-services.yml.
+#
+# The change stream (cdc): its suites and the SQL CDC round trip through the
+# upsert sink; the CDC recovery cells, a coordinator and two workers capturing
+# a table into ClickHouse with a worker killed at each phase boundary of the
+# source and the server restarted, checked against the table and against every
+# row version the workload committed; and a column added through `clink stop`
+# and a restore, backfilled into the same ClickHouse tables with and without a
+# worker killed during the backfill, with no key holding two different rows
+# under one __version.
+#
+# The sinks (sink): their rules and failure state, their contract against the
+# server (keys the table treats as one, refused tables and values, exact
+# values, transactions, lock waits, a cancel, a lost COMMIT reply), the older
+# round trips and the two-phase-commit sink's cases; and their recovery cells,
+# a coordinator and two workers polling a feed into each sink, one of them a
+# SQL job at parallelism 2, with a worker killed before a flush's COMMIT and
+# after it.
+#
+# A live test skips when its server or binary is missing and gtest counts that
+# as a pass, so the gate fails on any skip, on any required suite that did not
+# run in full, and on a case outside both phases.
 #
 # Plain runner steps that `docker run` the toolchain image, as the ClickHouse
 # recovery workflow does: the tests reach the servers on the runner's
@@ -38,7 +50,7 @@ env:
 
 jobs:
   live:
-    name: PostgreSQL CDC holds its contract against real servers
+    name: The PostgreSQL change stream and sinks hold their contracts against PostgreSQL 16
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -106,19 +118,20 @@ jobs:
             -v "${RUNNER_TEMP}/docker/docker:/usr/local/bin/docker:ro" \
             -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
             -v /tmp:/tmp -v "${RUNNER_TEMP}:${RUNNER_TEMP}" \
-            -e REPORT_DIR="${RUNNER_TEMP}/postgres-cdc-reports" \
+            -e REPORT_DIR="${RUNNER_TEMP}/postgres-live-reports" \
             -e CLINK_POSTGRES_CDC_TEST_DSN="host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres" \
-            "${TOOLCHAIN}" scripts/postgres-cdc-live.sh build 2>&1 | tee "${RUNNER_TEMP}/postgres-cdc-gate.log"
+            "${TOOLCHAIN}" scripts/postgres-live.sh build 2>&1 | tee "${RUNNER_TEMP}/postgres-cdc-gate.log"
       - name: Keep the reports and the recovery cells' evidence
-        # The gate log carries each cell's "[pg-cdc]" line (rows, committed
-        # versions, change-log rows, restarts) and the fault framework's
-        # witness lines; the reports carry every case's result.
+        # The gate log carries each cell's "[pg-cdc]" and
+        # "[postgres-sink-recovery]" line and the fault framework's witness
+        # lines; the reports carry every case's result, per phase, with
+        # provenance.txt naming the commit, the build and each phase's result.
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: postgres-cdc-gate
           path: |
-            ${{ runner.temp }}/postgres-cdc-reports/**
+            ${{ runner.temp }}/postgres-live-reports/**
             ${{ runner.temp }}/postgres-cdc-gate.log
           if-no-files-found: warn
           retention-days: 14
