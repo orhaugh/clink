@@ -1,19 +1,30 @@
 name: mysql
 
-# The MySQL CDC source's gate (scripts/mysql-cdc-live.sh): every MySQL test
-# against pinned MySQL 8.0 and 8.4 servers, one after the other: the offline
-# suites (the change stream's checkpoint row, event and statement classes,
-# event processing and row decoding; the snapshot; the sinks); the change
-# stream's round trips and contract (decode failures under both policies,
-# schema changes under both row-metadata modes, restores from rotated, purged,
-# corrupt and foreign coordinates, large transactions across checkpoints, the
-# snapshot's locks and concurrent writes); the sinks' and polling source's live
-# cases; and the recovery cells, a coordinator and two workers reading the
-# binlog into the file two-phase-commit sink, one of them a SQL job, with a
-# worker killed inside the initial snapshot and inside a large transaction,
-# each verified through the mysql client in the server's container. A live test
-# skips when its server or binary is missing and gtest counts that as a pass,
-# so the gate fails on any skip and on any required suite that did not run.
+# The MySQL connector's gate (scripts/mysql-live.sh), in two phases against
+# pinned MySQL 8.0 and 8.4 servers, one server after the other.
+#
+# The change stream (cdc): its checkpoint row, event and statement classes,
+# event processing and row decoding, the snapshot and the polling source; its
+# round trips and contract (decode failures under both policies, schema changes
+# under both row-metadata modes, restores from rotated, purged, corrupt and
+# foreign coordinates, large transactions across checkpoints, the snapshot's
+# locks and concurrent writes); and its recovery cells, a coordinator and two
+# workers reading the binlog into the file two-phase-commit sink, one of them a
+# SQL job, with a worker killed inside the initial snapshot and inside a large
+# transaction.
+#
+# The sinks (sink): the record reader, values, statements and bounds, the
+# changelog buffer, the table checks and the failure state; their contract
+# against the server (keys the table treats as one, refused tables and values,
+# exact values, transactions, packet limits, lock waits, a cancel, a lost
+# COMMIT reply); and their recovery cells, a coordinator and two workers
+# polling a feed into each sink, one of them a SQL job at parallelism 2, with a
+# worker killed before a flush's COMMIT and after it.
+#
+# Every cell is verified through the mysql client in the server's container. A
+# live test skips when its server or binary is missing and gtest counts that as
+# a pass, so the gate fails on any skip, on any required suite that did not run
+# in full, and on a case outside both phases.
 #
 # The script runs on the runner, where it starts and removes each server with
 # Docker; the test binaries run inside the toolchain image through PIN_RUNNER,
@@ -40,7 +51,7 @@ env:
 
 jobs:
   live:
-    name: The MySQL CDC source holds its contract against MySQL 8.0 and 8.4
+    name: The MySQL change stream and sinks hold their contracts against MySQL 8.0 and 8.4
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -104,7 +115,7 @@ jobs:
       - name: Run the gate
         run: |
           set -euo pipefail
-          export REPORT_DIR="${RUNNER_TEMP}/mysql-cdc-live-reports"
+          export REPORT_DIR="${RUNNER_TEMP}/mysql-live-reports"
           export PIN_RUNNER="docker run --rm --user root --network host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v ${RUNNER_TEMP}/docker/docker:/usr/local/bin/docker:ro \
@@ -113,21 +124,22 @@ jobs:
             -e CLINK_MYSQL_TEST_DSN -e CLINK_MYSQL_TEST_CONTAINER \
             -e CLINK_MYSQL_RECOVERY_LOG_DIR \
             ${TOOLCHAIN}"
-          scripts/mysql-cdc-live.sh build 2>&1 | tee "${RUNNER_TEMP}/mysql-gate.log"
+          scripts/mysql-live.sh build 2>&1 | tee "${RUNNER_TEMP}/mysql-gate.log"
       - name: Keep the reports and the cells' evidence
-        # The reports carry every case's result, per server; each run's log
-        # carries the recovery cells' "[mysql-cdc-recovery]" lines and the fault
-        # framework's witness lines; recovery-logs/ holds every cell's
-        # coordinator and worker logs; provenance.txt names the commit, the
-        # build's configuration, the client library and each server's version,
-        # image and binlog settings. On failure a server's directory also holds
+        # The reports carry every case's result, per server and phase; each
+        # run's log carries the recovery cells' "[mysql-cdc-recovery]" and
+        # "[mysql-sink-recovery]" lines and the fault framework's witness lines;
+        # each phase's recovery-logs/ holds every cell's coordinator and worker
+        # logs; provenance.txt names the commit, the build's configuration, the
+        # client library and each server's version, image and binlog settings,
+        # and each phase's result. On failure a server's directory also holds
         # its own log.
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mysql-gate
           path: |
-            ${{ runner.temp }}/mysql-cdc-live-reports/**
+            ${{ runner.temp }}/mysql-live-reports/**
             ${{ runner.temp }}/mysql-gate.log
           if-no-files-found: warn
           retention-days: 90

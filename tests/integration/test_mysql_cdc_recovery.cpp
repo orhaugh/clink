@@ -26,7 +26,7 @@
 // completed while the unit was open, the fault and the restart are witnessed
 // through the coordinator's metrics, its checkpoint directory and the logs.
 //
-// Needs the server scripts/mysql-cdc-live.sh starts (CLINK_MYSQL_TEST_DSN and
+// Needs the server scripts/mysql-live.sh starts (CLINK_MYSQL_TEST_DSN and
 // CLINK_MYSQL_TEST_CONTAINER) and the clink_node binary of a build with fault
 // injection (clink_submit_sql too for cell 3). Each cell prints one
 // "[mysql-cdc-recovery]" line and, with CLINK_MYSQL_RECOVERY_LOG_DIR set, keeps
@@ -170,7 +170,7 @@ protected:
         container_ = env_or_empty("CLINK_MYSQL_TEST_CONTAINER");
         if (dsn.empty() || container_.empty()) {
             GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN and CLINK_MYSQL_TEST_CONTAINER "
-                            "(scripts/mysql-cdc-live.sh does)";
+                            "(scripts/mysql-live.sh does)";
         }
         if (!std::filesystem::exists(node_binary())) {
             GTEST_SKIP() << "the clink_node binary is not built";

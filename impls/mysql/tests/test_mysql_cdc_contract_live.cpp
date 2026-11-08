@@ -1,6 +1,6 @@
 // The MySQL CDC source's contract against a live server. SKIPPED unless
 // CLINK_MYSQL_TEST_DSN names a MySQL server writing binlog_format=ROW and
-// binlog_row_image=FULL; scripts/mysql-cdc-live.sh runs it against pinned
+// binlog_row_image=FULL; scripts/mysql-live.sh runs it against pinned
 // MySQL 8.0 and 8.4 servers and fails when any case is skipped.
 //
 // Each case reads its expectation from the server independently (a query of
