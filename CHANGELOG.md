@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+**The Kinesis sink routes every record by its own partition key, checks every
+`PutRecords` response, and stops rather than forget a failed write.** It read a
+numeric key through a double, so `9007199254740993` and `9007199254740992`
+were sent under one key and `0.0000001` as `0.000000`; it cut keys at 256
+bytes, inside a UTF-8 sequence when one fell there; it routed a record without
+a usable key by a counter; it took `FailedRecordCount` 0 as success whatever
+the entries said and indexed failed entries by unchecked positions; the SDK's
+three retries stacked under its own, with blocking waits; and after a failed
+flush it forgot the records and acknowledged the next barrier. Now a key is
+the member's string as it is, its number's exact value in plain decimal, or
+its boolean's word, and a record without one, a key past 256 characters
+(UTF-16 code units) or holding U+0000, and a record whose data and key exceed
+`max_record_bytes` are refused before buffering: `dlq='fail'` stops the sink,
+`dlq='drop'` dead-letters the record, and errors from the service are never
+dropped. Requests stay within 500 records and `max_request_bytes` of data and
+keys (5 MiB by default, up to 10 MiB). A response counts only when it accounts
+for every record; only failed entries are resent, with their keys; anything
+else fails the sink. Retries are bounded in attempts and time and cut short by
+a cancellation, with the SDK's own off, and a failed sink refuses every later
+barrier until it is opened again. Numeric keys past 2^53 and fractions now
+route by a different key than earlier releases sent; records without a usable
+key, over-long keys and out-of-range options are refused, and a SQL sink table
+refuses options it does not read. Verified against a model of the service, the
+SDK against an in-process stand-in, and LocalStack, recovery cells included;
+not against AWS.
+
 **The Splunk HEC sink writes each record as exactly one event, confirms only
 what HEC accepted, and can wait for indexer acknowledgement.** It embedded each
 record in its envelope as it came, so a record that was not one JSON object

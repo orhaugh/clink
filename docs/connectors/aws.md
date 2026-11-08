@@ -38,7 +38,7 @@ All four are registered on the `string` channel in `impls/aws/src/register_facto
 
 ## Configuration
 
-All factories share `region` and `endpoint_override` for the AWS client (`endpoint_override` targets LocalStack or a custom endpoint). The client also applies fixed timeouts and a retry count from `AwsClientOptions` (3000 ms connect, 10000 ms request, 3 SDK-level retries); those are not exposed as connector params. The Kinesis source turns the SDK's retries off and paces and bounds its own (see [the Kinesis source](#the-kinesis-source)).
+All factories share `region` and `endpoint_override` for the AWS client (`endpoint_override` targets LocalStack or a custom endpoint). Every connector here turns the SDK's own retries off and paces and bounds its own, so each attempt it counts is one request. The client's connect and request timeouts default to 3000 ms and 10000 ms; the three sinks take them as `connect_timeout_ms` and `request_timeout_ms`, and the source uses the defaults.
 
 ### `kinesis_source`
 
@@ -57,16 +57,21 @@ All factories share `region` and `endpoint_override` for the AWS client (`endpoi
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `stream` | Yes | (none) | Stream name or ARN. ARN sets `StreamARN`, else `StreamName`. |
-| `partition_key` | No | (none) | Record JSON field whose scalar value is used as the Kinesis `PartitionKey`. When absent, empty, or non-scalar, a rotating counter is used to spread records across shards. A value over 256 chars is truncated. |
-| `batch_records` | No | `500` | Records per `PutRecords` call. Coerced to `500` if 0 or above 500. |
-| `max_retries` | No | `8` | Failed-subset resend attempts. Clamped to `0..20`. |
-| `dlq` | No | `fail` | `fail` throws on an oversized record (over the 1 MiB per-record limit); `drop` routes it to the bad-record path and continues. |
-| `linger_ms` | No | `0` | Flush a partial batch once it is this old (0 disables linger). |
+| `stream` | Yes | (none) | Stream name (1 to 128 characters from `a-z`, `A-Z`, `0-9`, `_`, `.` and `-`) or stream ARN (`arn:<partition>:kinesis:<region>:<account>:stream/<name>`). An ARN sets `StreamARN`, else `StreamName`. |
+| `partition_key` | No | (none) | The record's top-level JSON member whose value is its partition key: a string as it is, a number as its exact value in plain decimal, a boolean as `true` or `false`. A record without a usable key is refused. When unset, records are numbered per sink instance instead (see [partition keys](#partition-keys)). |
+| `batch_records` | No | `500` | Records per `PutRecords` call, 1 to 500. |
+| `max_record_bytes` | No | `1048576` | The stream's maximum record size, which a record's data plus its key's UTF-8 bytes must not exceed: 1 to 10485760. Raise it only with the stream's `MaxRecordSizeInKiB`. |
+| `max_request_bytes` | No | the larger of `5242880` and `max_record_bytes` | The most one request may carry in data and keys, from `max_record_bytes` to 10485760. |
+| `max_retries` | No | `8` | Retries in a row that store nothing (a failed request, or failed entries that did not shrink) before the sink fails, 0 to 20; 0 fails at the first such attempt. |
+| `retry_timeout_ms` | No | `60000` | The longest one request's records may take with every retry and wait, 1 to 3600000. |
+| `linger_ms` | No | `0` | Flush a partial batch once its oldest record is this old, checked when a record arrives (0 disables linger). |
+| `dlq` | No | `fail` | A record refused before it is sent (no usable key, over `max_record_bytes`): `fail` stops the sink, and the job's restart replays it; `drop` sends it to the job's dead-letter path and writes the rest. Errors from the service are never dropped. |
 | `region` | No | SDK default | AWS region. |
-| `endpoint_override` | No | (none) | Custom endpoint URL. |
+| `endpoint_override` | No | (none) | Custom endpoint: an `http://` or `https://` URL without user information. |
+| `connect_timeout_ms` | No | `3000` | The SDK's connect timeout, 1 to 600000. |
+| `request_timeout_ms` | No | `10000` | The SDK's request timeout, 1 to 600000 (see [failures and retries](#failures-and-retries-1) for what it bounds). |
 
-The sink also flushes on an internal byte threshold (just under the 5 MiB request cap); this is not a configurable param.
+A value outside its range, a `dlq` other than `fail` or `drop`, and a malformed `stream` fail the job's build with the rule they break. The sink needs `kinesis:PutRecords` on its stream.
 
 ### `firehose_sink`
 
@@ -134,6 +139,8 @@ CREATE TABLE click_counts (
 
 A NaN or infinite double in a row reaches this sink through the `row_to_json_string` bridge as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` when the sink table sets `json_non_finite='string'`; the sink handles it as it handles any null or string value. See [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).
 
+A `connector='kinesis'` sink table reads only the options in the table above (plus `format='json'` and the generic table options); any other option is refused when the job is planned, naming the ones it reads, so a misspelt `partition_key` cannot route every row by a number instead. `stream` is required. Each row reaches the sink as one JSON object, so `partition_key` names a column: a `BIGINT` column keys by its exact digits and a `STRING` column by its text.
+
 Each row reaches the DynamoDB sink as one JSON object and is written as one item. A SELECT that produces a changelog is refused at bind time unless the sink table declares `changelog='true'`; with it, every change row is written as an item, a deletion included, because the sink only puts and never deletes.
 
 ## Example
@@ -185,7 +192,7 @@ The factories are also reachable through the registry by their registered names 
 ## Delivery semantics
 
 - **`kinesis_source`**: at-least-once. Each shard has one owning subtask; the last record handed downstream from each shard is checkpointed, and a restore resumes right after it once the service has shown that record is still in the stream. A replay re-reads the records emitted after the last completed checkpoint. See [the Kinesis source](#the-kinesis-source) for ordering, start positions, rescaling and failures.
-- **`kinesis_sink`**: at-least-once. Kinesis has no producer dedup key. `PutRecords` is partial-success; on a partial failure only the failed entries (by response index) are resent, so already-committed records are not re-sent within a call, but a barrier replay can duplicate.
+- **`kinesis_sink`**: at-least-once, with no producer deduplication and no per-key order. A checkpoint covers records Kinesis has stored. Only failed entries are resent, with the keys they were sent with; a lost reply, an entry that failed with `InternalFailure` after all, or a replay can store a record twice. See [the Kinesis sink](#the-kinesis-sink) for keys, limits, responses, retries and the routing changes from earlier releases.
 - **`firehose_sink`**: at-least-once into Firehose, with no partition key, no ordering and no producer deduplication. A checkpoint covers acceptance by Firehose, not delivery to the destination. See [the Firehose sink](#the-firehose-sink) for limits, responses, retries and duplicates.
 - **`dynamodb_sink`**: at-least-once writes. A replayed record rewrites its item rather than add one, and an item ends at the last record written for it when every record of the item reaches one sink subtask in order; it is not exactly-once and does not guard against other writers. See [the DynamoDB sink](#the-dynamodb-sink) for identity, limits, retries and the exact contract.
 
@@ -270,6 +277,107 @@ The source reports `records_in`, `bytes_in`, consumer lag from `MillisBehindLate
 ### Retention
 
 The source owes every record from each shard's position onward, so it must reach each shard before its records pass the stream's retention period (24 hours by default). A saved position that has passed is detected, as above. Not detected: a shard the source tracks but has not read yet, such as a child waiting for a slow parent or any shard while the job is down, whose oldest records pass the retention period before the first read. It starts at what the stream still holds.
+
+## The Kinesis sink
+
+The sink writes each record's bytes, untouched, as one Kinesis record with `PutRecords`, keyed as below. The logic is `impls/aws/src/kinesis_sink.cpp`; the AWS SDK call is behind the `KinesisWriteService` interface in `impls/aws/src/kinesis_sink_sdk_service.cpp`.
+
+### Partition keys
+
+With `partition_key` set, each record must be one JSON object (RFC 8259, UTF-8) holding that top-level member, and the member's value is the record's partition key:
+
+| Value | Key |
+| --- | --- |
+| string | The string as it is, escapes decoded. |
+| number | Its exact value in plain decimal: no exponent, no leading zeros, no point for an integer and no trailing zeros after one, `-` for a negative value and `0` for zero of either sign. `9007199254740993` stays itself, `1.50` and `15E-1` are both `1.5`, `1e3` is `1000`. Nothing passes through a double. |
+| `true`, `false` | The word. |
+
+A number and the string with the same text are the same key. The record is refused, by its position and the rule it breaks, when:
+
+- it is not one JSON object, is not valid JSON, or is not valid UTF-8;
+- the member is missing, `null`, an object or an array, or appears twice at the top level;
+- the key is empty, or longer than 256 characters;
+- the key holds U+0000: the AWS SDK for C++ cuts a string at its first NUL when it writes the request, so the record would be routed by a shorter key;
+- a string escapes half of a surrogate pair, which no UTF-8 key can hold;
+- a number's plain decimal form is longer than 256 characters.
+
+The documentation limits a key to 256 characters without saying what a character is. The sink counts UTF-16 code units, so a character outside the Basic Multilingual Plane, such as an emoji, counts as two. That reading never accepts a key a count of code points would refuse, and it is how the emulator counts. A key's UTF-8 bytes count against the record size.
+
+Without `partition_key`, the sink numbers records `0`, `1`, `2` and so on per sink instance, so records spread across shards, and never reads them. A key is fixed when its record is buffered, so every retry carries the key the record was first sent with. A restarted instance numbers afresh and each subtask numbers on its own, so a replayed record can land on another shard than its first copy.
+
+On a stream that uses the `AUTO` record distribution strategy (on-demand streams only), Kinesis ignores partition keys and places records itself.
+
+### Records and requests
+
+| Limit | Value | How the sink counts it |
+| --- | --- | --- |
+| Record | The data (before base64) and the key, against the stream's maximum record size: 1 MiB unless the stream was raised, at most 10 MiB | `max_record_bytes`, the record's bytes plus its key's UTF-8 bytes. A record over it is refused before it is buffered. |
+| Records per request | 500 | `batch_records`, at most 500. |
+| Request | 10 MiB of data and partition keys | `max_request_bytes`, every record's bytes and key. Default 5 MiB, the limit the documentation gave before records over 1 MiB were introduced in October 2025; raise it to 10 MiB where the stream's region takes the current limit. |
+| Partition key | 1 to 256 characters | UTF-16 code units, as above. |
+
+The buffer is sent before a record that would take the next request past its count or byte limit is added, so no request is ever built over a limit, and a record that cannot fit alone is refused. An empty record is allowed. A record's bytes are never parsed without `partition_key`, so any bytes go, binary included.
+
+Records over 1 MiB need the stream's maximum raised (`UpdateMaxRecordSize`, or `MaxRecordSizeInKiB` at creation) and `max_record_bytes` with it. The sink does not read the stream's setting: a `max_record_bytes` above it lets records through that the service refuses, which fails the sink as a permanent error naming the setting to check.
+
+### Refused records
+
+Under `dlq='fail'`, the default, a refused record stops the sink: the sink checks a whole input batch before buffering any of it, so a batch with a refused record adds nothing, and the sink fails as described below. Records stored by earlier sends stay stored, and the job's restart replays the rest; a refused record fails the job each time the replay reaches it, so fix it upstream.
+
+Under `dlq='drop'`, each refused record goes to the job's dead-letter path with its bytes, the reason, the connector `kinesis`, the direction `sink` and the stream as its location, and is counted as dropped; the rest of the batch is written. A dead-lettered record is handled, so a later barrier is acknowledged over it. Numbered keys go to the records kept only.
+
+Errors from the service, whatever they are, are never a refused record: they fail the sink under either policy.
+
+### Responses
+
+A response counts only when it accounts for every record sent: one entry per record, in request order, each either stored (a `SequenceNumber` of up to 129 digits with no leading zero, and a `ShardId` of 1 to 128 characters from `a-z`, `A-Z`, `0-9`, `_`, `.` and `-`) or failed (an `ErrorCode`), never both or neither, no sequence number twice, and a `FailedRecordCount` equal to the entries that failed. The SDK reads a response without `FailedRecordCount` as 0, which the entries then contradict if any failed. When a response counts, the records whose entries failed, and only those, are sent again with the keys they were first sent with. Any other response is ambiguous: the sink cannot tell which records Kinesis stored, so it fails rather than count them stored. It never reads a response entry past the request's records.
+
+### Failures and retries
+
+| Answer | Handling |
+| --- | --- |
+| Every entry stored | The records are stored. |
+| Some entries failed: `ProvisionedThroughputExceededException`, `InternalFailure`, or a code the documentation does not list | Send those records again after a backoff. An entry that failed with `InternalFailure` may have been stored after all, so its record can arrive twice. |
+| Throttled: `ProvisionedThroughputExceededException`, `LimitExceededException`, `KMSThrottlingException`, `ThrottlingException`, HTTP 429 | Nothing was stored. Send the request again after a backoff. |
+| Transient: `InternalFailure`, `ServiceUnavailable`, `ResourceInUseException`, other 5xx, no response | The request may or may not have been stored. Send it again after a backoff; its records can arrive twice. |
+| A response that does not account for its request | Ambiguous. Fail. |
+| Permanent: `InvalidArgumentException`, `ValidationException`, `ResourceNotFoundException`, the KMS errors other than throttling, access, signature and credential errors, other 4xx the SDK would not retry | Fail at once, with what to check. |
+| The task is cancelled | The backoff ends at once and the sink fails. A call still sending its request is aborted; one waiting for its reply ends with the SDK's request timeout, since the SDK looks at an abort only when data moves. |
+
+The backoff starts at 100 ms and doubles to 10 s. A request's records fail the sink once `max_retries` retries in a row have stored nothing (an attempt that stores some resets the count), or once `retry_timeout_ms` has passed since the first attempt. The SDK's own retries are off, so each attempt is one request.
+
+One call is bounded by `connect_timeout_ms` and by `request_timeout_ms`, which the SDK applies as a limit on how long a call may receive nothing, not on its total length: curl measures the transfer rate over five seconds, and the SDK asks for `100 Continue`, so a call whose reply never comes ends about six seconds later than `request_timeout_ms` alone suggests (measured: 7 s at 1000 ms, 9 s at 3000 ms). A flush therefore takes at most `retry_timeout_ms` and one call.
+
+The sink reports `records_out`, `bytes_out`, the latency of each flush, errors, permanent failures and dropped records under the connector name `kinesis`. Its `kinesis.sink` log names the stream, the key mode and the limits at open, each retry at its first and every power-of-two attempt, dropped records at the first and every power of two, and each failure with its cause. The service's messages are logged with access key ids and signed request values removed; credentials and record contents are never written.
+
+### What a checkpoint covers
+
+A barrier returns only once every record received before it has been stored by Kinesis (or, under `dlq='drop'`, dead-lettered), so a checkpoint never covers a record that is outstanding, being retried, or ambiguous.
+
+When the sink fails, by a refused record under `dlq='fail'`, an exhausted retry budget, a permanent error, an ambiguous response or a cancellation, it drops what it buffered and says how many records that was, and refuses every later record, flush and barrier, so it cannot acknowledge a checkpoint over records it dropped. `open()` starts it afresh with an empty buffer, as a restart does; `close()` sends nothing. At a clean end of input the runtime flushes before closing, so everything buffered is sent; a cancelled task's buffer is not.
+
+### Duplicates and order
+
+Delivery is at-least-once. A record can be stored twice:
+
+- when a reply is lost after Kinesis stored the request, or an entry failed with `InternalFailure` after its record was stored, and the sink sends it again;
+- when the job restarts: every record after the last completed checkpoint is sent again, including records Kinesis had already stored.
+
+Kinesis keeps no producer identity, so a consumer that needs each record once must deduplicate, by a field of the record.
+
+Records are not promised to arrive in order, even with one partition key. `PutRecords` processes a request's records independently and keeps no order between them, a failed entry is resent after records that followed it were stored, and a replay sends records again after later ones. Sharing a partition key puts records in one shard, not in the order they were produced. The sink has no ordered-write mode.
+
+### Earlier releases
+
+Records keep their bytes. What changes:
+
+- **Numeric keys are exact.** The earlier sink read a number through a double and wrote it with `std::to_string`. An integer within 2^53 routes as before, however it is written (`42`, `42.0`, `4.2e1`). An integer past 2^53 and every fraction route by a different key: the earlier sink sent `9007199254740993` and `9007199254740992` both as `9007199254740992`, `9007199254740995` as `9007199254740996`, `0.0000001` and `0.0000002` both as `0.000000`, and `1.5` as `1.500000`. A changed key moves its records to the shard the new key hashes to. The change loses and duplicates nothing; records the earlier sink put under one key were all written, but shared a shard they now do not.
+- **Long keys are refused, not cut.** The earlier sink cut a key at 256 bytes, so two keys sharing their first 256 bytes routed together, and a key cut inside a UTF-8 sequence made a request that is not valid JSON. A key of up to 256 characters that is longer than 256 bytes, such as 100 CJK characters, is now sent whole; a longer key is refused.
+- **A record without a usable key is refused.** The earlier sink routed a record with a missing, `null`, empty, object or array key, or that was not JSON, by its counter instead. It now fails the sink or, under `dlq='drop'`, goes to the dead-letter path.
+- **Responses are checked.** A response with `FailedRecordCount` 0 counted as success whatever its entries said, and a failed entry past the request's records was read out of bounds; both now fail the sink as ambiguous.
+- **A failure is final until reopened.** After a failed flush the earlier sink forgot the records and acknowledged the next barrier; it now refuses it.
+- **Retries are bounded and cancellable.** The SDK's three retries no longer stack under the sink's: against a stand-in answering every request with `InternalFailure`, the earlier sink made 36 requests for its 9 attempts. Waits are cut short by a cancellation, and permanent errors fail at once.
+- **Options are checked.** `batch_records` outside 1 to 500 and `max_retries` outside 0 to 20 fail the build instead of being clamped, and a `dlq` other than `fail` or `drop` is refused instead of meaning `fail`. `max_retries` counts retries in a row that store nothing. `max_record_bytes` now counts the key and applies under both policies; it used to count the data only, and only under `dlq='drop'`. `max_request_bytes` replaces the C++ `max_bytes`, which counted each record as its data plus 320 bytes and was checked only after a record was added. `retry_timeout_ms`, `connect_timeout_ms`, `request_timeout_ms` and the SQL option check are new.
 
 ## The DynamoDB sink
 
@@ -357,7 +465,6 @@ The sink's input and output formats are unchanged for every record an earlier re
 - **Options are checked.** `batch_records` outside 1 to 25 and `max_retries` outside 0 to 20 fail the build instead of being clamped. `max_retries` counts retries in a row that write nothing rather than every retry, and `retry_timeout_ms` bounds the total.
 - **The table is read at open.** The sink needs `dynamodb:DescribeTable`, refuses a table with a binary key, which never worked, and checks the key names it is given.
 
-"""
 ## The Firehose sink
 
 The sink sends each record, as opaque bytes, as one Firehose record with `PutRecordBatch`. It never parses a record: SQL hands it JSON, but any bytes are sent as they are. The logic is `impls/aws/src/firehose_sink.cpp`; the AWS SDK call is behind the `FirehoseWriteService` interface in `impls/aws/src/firehose_sdk_service.cpp`.
@@ -428,7 +535,11 @@ The sink sends the same bytes for every record an earlier release sent. What cha
 - `dynamodb_sink`: a refused record fails the job each time the replay reaches it; there is no dead-letter option.
 - `dynamodb_sink`: the 400 KB check does not count local secondary index entries, so such a table can still refuse an item, which fails the sink.
 - `dynamodb_sink`: puts only. With `changelog='true'` a deletion is written as an item, not applied.
-- `kinesis_sink`: a record over the 1 MiB per-record limit poisons the whole `PutRecords` batch under `dlq=fail`; use `dlq=drop` to route oversized records to the bad-record path instead.
+- `kinesis_sink`: at-least-once. A record can be stored twice after a lost reply, an `InternalFailure` entry the service had in fact stored, or a replay; there is no producer deduplication.
+- `kinesis_sink`: no per-key order. `PutRecords` keeps none within a request, and failed entries are resent after later records were stored.
+- `kinesis_sink`: without `partition_key`, records are numbered per sink instance, so a replayed record can land on another shard than its first copy.
+- `kinesis_sink`: the sink does not read the stream's maximum record size; `max_record_bytes` must match it, and a larger value fails the sink when the service refuses a record.
+- `kinesis_sink`: a cancellation ends a call waiting for its reply only when the SDK's request timeout does, about six seconds after `request_timeout_ms`.
 - `firehose_sink`: at-least-once into Firehose. A record can reach the destination twice after a lost reply, a failed entry the service had in fact processed, or a replay; there is no ordering and no producer deduplication, so deduplicate at the destination if it matters.
 - `firehose_sink`: a checkpoint covers acceptance by Firehose only. Buffering, delivery to the destination, its retries and the 24-hour retention of undelivered data are the service's, and the sink does not observe them.
 - `firehose_sink`: the destination must split concatenated records at the appended delimiter, so the delimiter must not occur inside a record.
@@ -445,18 +556,30 @@ Each connector's evidence comes at three levels, and they are kept apart: determ
 
 ### The Kinesis source
 
-**Deterministic, against a model of the service.** `impls/aws/tests/test_kinesis_source.cpp` runs the production `KinesisSource` against `impls/aws/tests/kinesis_model.hpp`, a model of `ListShards`, `GetShardIterator` and `GetRecords` with parent and child links, arrival times, retention (trimmed records, shards leaving the listing), expiring iterators, paginated and reordered listings, and a hook that fails any call. It covers ownership; discovery by an empty subtask, by a busy one, and across pages in changing order; split and merge lineage with slow parents and parents on another subtask or absent; a restore at each parent and child transition; latest-mode starts and restores; iterator expiry before and after the first record; retention loss of a saved position; missing and recreated shards; earlier checkpoints; rescaling through the runtime's own `file://` and `rocksdb://` restores; throttling, transient and permanent failures; cancellation in a wait and in a call; and bounded state across 25 reshards. `test_factory_registration.cpp` and `test_kinesis_firehose_sink.cpp` cover factory registration and the Kinesis sink in-process.
+**Deterministic, against a model of the service.** `impls/aws/tests/test_kinesis_source.cpp` runs the production `KinesisSource` against `impls/aws/tests/kinesis_model.hpp`, a model of `ListShards`, `GetShardIterator` and `GetRecords` with parent and child links, arrival times, retention (trimmed records, shards leaving the listing), expiring iterators, paginated and reordered listings, and a hook that fails any call. It covers ownership; discovery by an empty subtask, by a busy one, and across pages in changing order; split and merge lineage with slow parents and parents on another subtask or absent; a restore at each parent and child transition; latest-mode starts and restores; iterator expiry before and after the first record; retention loss of a saved position; missing and recreated shards; earlier checkpoints; rescaling through the runtime's own `file://` and `rocksdb://` restores; throttling, transient and permanent failures; cancellation in a wait and in a call; and bounded state across 25 reshards. `test_factory_registration.cpp` covers factory registration; the Kinesis sink's own cases are below.
 
 **Against the emulator.** LocalStack (`localstack/localstack:3`, which reported version 3.8.1 here) supports `SplitShard`, `MergeShards`, `UpdateShardCount`, paginated `ListShards`, and the `TRIM_HORIZON`, `AT_TIMESTAMP` and `AT_SEQUENCE_NUMBER` iterators. `impls/aws/tests/test_kinesis_live.cpp` (`KinesisLive`, eight cases) runs a sink to source round trip, a checkpoint resume, a split and a merge while one subtask reads (every key in order), a uniform reshard under two subtasks with one-shard listing pages (every shard owned once, every shard in order), a latest-mode restore before the first record, a missing stream, a recreated stream and a cancel. `tests/integration/test_kinesis_recovery.cpp` (`KinesisRecovery`, three cells) runs a coordinator and two workers reading the emulator's stream into the file two-phase-commit sink: at parallelism 1 with a split, a worker killed with records in flight and a merge after the restore; at parallelism 2 with a uniform reshard and a kill; and in latest mode killed before the first record. Each cell checks the sink's committed files against the records it wrote: every record once, nothing else, and the order the source promises.
 
 **Not verified against AWS.** Nothing here ran against AWS. The emulator does not throttle, refuses a retention period below 24 hours (so it cannot trim records under a test), and answers an unknown sequence number with `ResourceNotFoundException`, where AWS documents `InvalidArgumentException`; throttling, retention loss and iterator expiry are therefore covered by the model only. The source treats both answers to a lost position, a refusal and a later first record, as a lost position. On-demand capacity mode, whose resharding the service drives, was not exercised.
 
-The gate is `scripts/kinesis-live.sh`: it starts LocalStack on a free loopback port, runs every Kinesis suite and the recovery cells, and fails on a missing binary, an emulator that never answers, a failed case, any skip, or a suite that ran fewer cases than it should. It keeps each run's report and output, the cells' coordinator and worker logs, and `provenance.txt` (the commit, the build's configuration, the emulator's version and image) under `<build-dir>/kinesis-live-reports`. It passed locally on commit 99c8ff72 against LocalStack 3.8.1 on 2026-11-06: 46 of 46, the three recovery cells committing every record once (2,400, 2,400 and 600) with one restart each. It passed in CI on commit b932c745, 46 of 46 (run 42253565015, under the workflow's earlier name `kinesis`); the `aws` CI workflow runs it.
+The gate is `scripts/kinesis-live.sh`: it starts LocalStack on a free loopback port, runs every Kinesis suite and the recovery cells, and fails on a missing binary, an emulator that never answers, a failed case, any skip, or a suite that ran fewer cases than it should. It keeps each run's report and output, the cells' coordinator and worker logs, and `provenance.txt` (the commit, the build's configuration, the emulator's version and image) under `<build-dir>/kinesis-live-reports`. It passed locally on commit 99c8ff72 against LocalStack 3.8.1 on 2026-11-06: 46 of 46, the three recovery cells committing every record once (2,400, 2,400 and 600) with one restart each. It passed in CI on commit b932c745, 46 of 46 (run 42253565015, under the workflow's earlier name `kinesis`); the `aws` CI workflow runs it. The same script then runs the Kinesis sink's phase (below), whose suites the source's phase leaves out.
 
 ```bash
 cmake --build build --target clink_aws_tests clink_integration_tests clink_node --parallel 10
 scripts/kinesis-live.sh build
 ```
+
+### The Kinesis sink
+
+**Deterministic, against a model of the service.** `impls/aws/tests/test_kinesis_sink.cpp` covers the partition-key rules (every value type, exact numbers including neighbouring integers past 2^53 and fractions `std::to_string` collapses, Unicode and the 256-character limit counted in UTF-16 code units, every kind of refused record, a record nested 200,000 levels deep), the SDK's cutting of keys at NUL, the response judge on complete and partial responses and on every kind that does not account for its request (missing, short and oversized entry arrays, entries with both or neither result, a stored entry without its `SequenceNumber` or `ShardId`, malformed and repeated sequence numbers, a missing or contradictory `FailedRecordCount`), and the error classes. It runs the production `KinesisSink` against `impls/aws/tests/kinesis_sink_model.hpp`, a model of `PutRecords` that keeps every record it stores with its key, duplicates included, and refuses what the service refuses for a request's shape. Each call can be scripted: entries stored or failed, an error before or after storing, a hand-written response, or a call that hangs until aborted. The cases cover options and the factory's ranges; keys reaching the service as the records hold them; numbered keys kept across retries; opaque payloads; refused records under each `dlq` policy, with what reaches the dead-letter path; records and requests at their limits and one byte past; a record over the stream's own maximum; partial failures resending only the failed records with their keys; retry bounds in attempts and in time; throttled and transient requests; ambiguous responses, the false success and the out-of-bounds read of the earlier sink among them; permanent errors never dead-lettered; a lost reply; cancellation in a wait and in a call; a barrier that waits for its records; repeated barriers after a failure; the end of input and close; reopening and replay; and linger.
+
+**Deterministic, through the SDK.** `impls/aws/tests/test_kinesis_sink_sdk.cpp` runs the sink with its production SDK client against `impls/aws/tests/kinesis_http_stub.hpp`, an in-process stand-in for the `PutRecords` endpoint that records each request as sent and replies as scripted. It shows each record's key and bytes as the SDK sends them, a stream named by ARN, responses and errors read off the wire (a missing `FailedRecordCount` reads 0), ambiguous responses failing the sink, one request per attempt (the SDK's retries are off), a reply lost after the stream stored the request, and cancellation while the SDK sends and while a reply is held.
+
+**Against the emulator.** LocalStack 3.8.1 refuses a partition key past 256 UTF-16 code units (it accepts 128 emoji and refuses 129) or an empty one, and refuses data past 1 MiB. It does not count the key against the record size, has no request byte or count limit (it took 11 MB and 501 records in one request), never fails an entry, never throttles and has no maximum-record-size setting. `impls/aws/tests/test_kinesis_sink_live.cpp` (`KinesisSinkLive`, four cases) writes through the production sink and reads the stream back with a client of its own, comparing every record's bytes and partition key, and requiring each key's records to share one shard: keys of every type, the exact numbers among them, through direct construction; opaque payloads of every byte value and a record at the limit through the registered factory, and one a byte over it never sent; refused records never reaching the stream under either policy; and a missing stream. `tests/integration/test_kinesis_sink_recovery.cpp` (`KinesisSinkRecovery`, three cells) runs a coordinator and two workers reading one emulator stream into the sink, which writes a second keyed by each record's `key`, while the test writes 1,200 unique records. The cells kill worker 0 parked after a store no checkpoint covered and parked before a send, both at parallelism 1, and a SQL job (a `connector='kinesis'` table into another with `partition_key='key'`) at parallelism 2 parked after a store. Each reads the output stream back and checks every record at least once with its own key, and nothing else; the cells parked after a store also require that request's records to arrive twice, and at parallelism 1 that the output did not move while the sink was parked.
+
+**Not verified against AWS.** Nothing here ran against AWS. Partial failures, throttling, ambiguous responses and lost replies are covered by the model and the stand-in only. The emulator does not enforce the record and request limits the service documents, so the sink's own limits are shown only by what never reaches the stream. How AWS counts a key's 256 characters, and whether a stream outside the large-record regions takes 10 MiB requests, were not tested; the defaults are safe under either reading. The earlier sink was reproduced through the SDK against the stand-in: it collapsed neighbouring integer keys past 2^53 and fractions into one key, cut keys at 256 bytes, routed records without a usable key by its counter, took a response with no entries as success, made 36 requests for 9 attempts, and acknowledged a barrier after a failed flush had dropped its records.
+
+The sink's phase of `scripts/kinesis-live.sh` runs every Kinesis sink suite and the recovery cells against the same LocalStack container, after the source's phase, and keeps its reports, its `provenance.txt` and its cells' logs under `<build-dir>/kinesis-live-reports/sink`, apart from the source's. It fails on a missing binary (`clink_submit_sql` included), a failed case, any skip, or a suite that ran fewer cases than it should. The `aws` CI workflow runs it with the source's phase.
 
 ### The DynamoDB sink
 
