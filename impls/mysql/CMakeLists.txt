@@ -60,6 +60,11 @@ add_library(clink_mysql STATIC
     src/mysql_cdc_source.cpp
     src/mysql_cdc_processor.cpp
     src/mysql_cdc_rules.cpp
+    src/mysql_sink_rules.cpp
+    src/mysql_sink_server.cpp
+    src/mysql_sink_core.cpp
+    src/mysql_sink.cpp
+    src/mysql_upsert_sink.cpp
 )
 add_library(clink::mysql ALIAS clink_mysql)
 

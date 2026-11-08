@@ -103,4 +103,70 @@ TEST(MysqlFactoryRegistration, TheChangeStreamDeclaresItsOwnRecord) {
     EXPECT_EQ(clink::cluster::connector_name_for_op_type("mysql_source"), "mysql");
 }
 
+// The sinks read their options strictly too. Building a sink connects to
+// nothing, so a value is refused here before any server is involved.
+TEST(MysqlFactoryRegistration, TheSinkFactoriesReadTheirOptionsStrictly) {
+    for (const char* type : {"mysql_sink", "mysql_upsert_sink"}) {
+        const auto* f = clink::cluster::OperatorRegistry::default_instance().find_sink(
+            type, std::string{clink::cluster::kChannelString});
+        ASSERT_NE(f, nullptr) << type;
+        clink::cluster::OperatorBuildContext ctx;
+        ctx.params = {{"table", "t"}, {"columns", "id,v"}, {"key_columns", "id"}};
+        EXPECT_NO_THROW((void)f->build(ctx)) << type;
+        auto every = ctx;
+        every.params.insert({{"batch_records", "1000000"},
+                             {"max_bytes", "0"},
+                             {"max_statement_bytes", "1024"},
+                             {"max_record_bytes", "1024"},
+                             {"lock_wait_timeout_s", "3600"},
+                             {"max_retries", "10"}});
+        EXPECT_NO_THROW((void)f->build(every)) << type;
+        for (const auto& [key, value, rule] :
+             std::vector<std::tuple<std::string, std::string, std::string>>{
+                 {"batch_records", "0", "'batch_records' must be a whole number from 1"},
+                 {"batch_records", "ten", "'batch_records' must be a whole number"},
+                 {"max_bytes", "-1", "'max_bytes' must be a whole number from 0"},
+                 {"max_statement_bytes", "1023", "'max_statement_bytes' must be a whole number"},
+                 {"max_record_bytes", "8388608", "'max_record_bytes' must be a whole number"},
+                 {"lock_wait_timeout_s", "0", "'lock_wait_timeout_s' must be a whole number"},
+                 {"max_retries", "11", "'max_retries' must be a whole number from 0 to 10"}}) {
+            auto c = ctx;
+            c.params[key] = value;
+            EXPECT_NE(thrown([&] { (void)f->build(c); }).find(rule), std::string::npos)
+                << type << " " << key << "=" << value << ": " << thrown([&] { (void)f->build(c); });
+        }
+    }
+    const auto* append = clink::cluster::OperatorRegistry::default_instance().find_sink(
+        "mysql_sink", std::string{clink::cluster::kChannelString});
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"table", "t"}, {"columns", "id,v"}, {"on_duplicate", "updat"}};
+    EXPECT_NE(thrown([&] { (void)append->build(ctx); })
+                  .find("'on_duplicate' must be empty or "
+                        "'update'"),
+              std::string::npos);
+    ctx.params = {{"table", "t"}, {"columns", "id,v"}, {"update_columns", "v"}};
+    EXPECT_NE(thrown([&] { (void)append->build(ctx); }).find("which is not set"),
+              std::string::npos);
+    ctx.params = {
+        {"table", "t"}, {"columns", "id,v"}, {"on_duplicate", "update"}, {"update_columns", "w"}};
+    EXPECT_NE(thrown([&] { (void)append->build(ctx); }).find("update column 'w'"),
+              std::string::npos);
+}
+
+TEST(MysqlFactoryRegistration, TheSinkRecordsStateTheirContracts) {
+    const auto* append = clink::connectors::CapabilityRegistry::instance().find("mysql");
+    const auto* upsert = clink::connectors::CapabilityRegistry::instance().find("mysql_upsert");
+    ASSERT_NE(append, nullptr);
+    ASSERT_NE(upsert, nullptr);
+    EXPECT_TRUE(append->self_check().empty());
+    EXPECT_TRUE(upsert->self_check().empty());
+    EXPECT_EQ(append->version, "2");
+    EXPECT_EQ(upsert->version, "2");
+    EXPECT_EQ(append->delivery, clink::connectors::DeliveryGuarantee::AtLeastOnce);
+    EXPECT_EQ(upsert->delivery, clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent);
+    EXPECT_EQ(upsert->idempotency_key_option, "key_columns");
+    EXPECT_EQ(clink::cluster::connector_name_for_op_type("mysql_upsert_sink"), "mysql_upsert");
+    EXPECT_EQ(clink::cluster::connector_name_for_op_type("mysql_sink"), "mysql");
+}
+
 }  // namespace

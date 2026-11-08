@@ -274,6 +274,9 @@ impls/mysql/include/clink/mysql/mysql_json.hpp
 impls/mysql/include/clink/mysql/mysql_json_upsert_sink.hpp
 impls/mysql/include/clink/mysql/mysql_row_decode.hpp
 impls/mysql/include/clink/mysql/mysql_sink.hpp
+impls/mysql/include/clink/mysql/mysql_sink_core.hpp
+impls/mysql/include/clink/mysql/mysql_sink_rules.hpp
+impls/mysql/include/clink/mysql/mysql_sink_server.hpp
 impls/mysql/include/clink/mysql/mysql_snapshot.hpp
 impls/mysql/include/clink/mysql/mysql_source.hpp
 impls/mysql/include/clink/mysql/mysql_sql.hpp

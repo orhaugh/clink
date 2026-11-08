@@ -29,6 +29,11 @@ struct ConnectOptions {
     std::string password;
     std::string database;  // selected in-band at connect
     std::chrono::milliseconds connect_timeout{5000};
+    // How long a read or write of one packet may take; 0 leaves the library's
+    // default (no limit). The sinks set them so a statement whose server went
+    // away fails rather than waits for ever; the binlog stream leaves them.
+    std::chrono::seconds read_timeout{0};
+    std::chrono::seconds write_timeout{0};
     // TLS (mariadb-connector-c has SSL built in; no extra dependency). When ssl is
     // true the connection is encrypted (MYSQL_OPT_SSL_ENFORCE) and a non-TLS server
     // is refused. ssl_ca/cert/key are optional PEM paths (CA for server verify,
@@ -92,6 +97,14 @@ public:
             const unsigned int timeout_s =
                 static_cast<unsigned int>((o.connect_timeout.count() + 999) / 1000);
             mysql_options(h_, MYSQL_OPT_CONNECT_TIMEOUT, &timeout_s);
+        }
+        if (o.read_timeout.count() > 0) {
+            const auto s = static_cast<unsigned int>(o.read_timeout.count());
+            mysql_options(h_, MYSQL_OPT_READ_TIMEOUT, &s);
+        }
+        if (o.write_timeout.count() > 0) {
+            const auto s = static_cast<unsigned int>(o.write_timeout.count());
+            mysql_options(h_, MYSQL_OPT_WRITE_TIMEOUT, &s);
         }
         mysql_options(h_, MYSQL_SET_CHARSET_NAME, "utf8mb4");
         if (o.ssl) {
