@@ -536,6 +536,10 @@ if(CLINK_INTEGRATION_TESTS)
         find_package(aws-cpp-sdk-dynamodb CONFIG QUIET)
         if(TARGET aws-cpp-sdk-kinesis)
             target_sources(clink_integration_tests PRIVATE integration/test_kinesis_recovery.cpp)
+            # The Kinesis sink's cells write such a stream into a second one,
+            # which the test reads back with the same client.
+            target_sources(clink_integration_tests PRIVATE
+                integration/test_kinesis_sink_recovery.cpp)
             target_link_libraries(clink_integration_tests PRIVATE
                 clink::aws aws-cpp-sdk-kinesis aws-cpp-sdk-core)
             if(TARGET aws-cpp-sdk-dynamodb)
