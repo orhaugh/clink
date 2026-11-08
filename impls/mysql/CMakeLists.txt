@@ -58,6 +58,8 @@ endif()
 add_library(clink_mysql STATIC
     src/register_factories.cpp
     src/mysql_cdc_source.cpp
+    src/mysql_cdc_processor.cpp
+    src/mysql_cdc_rules.cpp
 )
 add_library(clink::mysql ALIAS clink_mysql)
 

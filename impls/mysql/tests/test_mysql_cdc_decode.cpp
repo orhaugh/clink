@@ -159,6 +159,63 @@ TEST(MysqlRowDecode, ColumnCountMismatchDrops) {
     EXPECT_EQ(res.dropped, 1u);
 }
 
+namespace {
+
+// One column of the given binlog type and metadata, decoded from `row` (its
+// null bitmap first): the value, or nullopt when the row was refused.
+std::optional<std::string> one_value(const std::string& type,
+                                     const std::string& meta,
+                                     const std::string& row,
+                                     std::vector<std::string> labels = {}) {
+    const auto types = hx(type);
+    const auto m = hx(meta);
+    const auto metas = parse_table_metadata(types.data(), 1, m.data(), m.size());
+    CdcTableSchema schema;
+    schema.db = "d";
+    schema.table = "t";
+    schema.columns = {col("c", false, std::move(labels))};
+    const auto data = hx(row);
+    auto res = decode_rows_payload(
+        data.data(), data.size(), clink::mysql::RowOp::Insert, metas, schema, "l", 0);
+    if (res.dropped > 0 || res.events.size() != 1) {
+        return std::nullopt;
+    }
+    return res.events[0].values[0].value;
+}
+
+}  // namespace
+
+// A width or precision outside MySQL's limits marks a corrupt TABLE_MAP: the
+// row is refused rather than read with it.
+TEST(MysqlRowDecode, MetadataOutsideMysqlsLimitsRefusesTheRow) {
+    EXPECT_FALSE(one_value("f6", "00 00", "00 80").has_value());        // DECIMAL(0,0)
+    EXPECT_FALSE(one_value("f6", "05 07", "00 80 00 00").has_value());  // scale over precision
+    EXPECT_FALSE(one_value("fc", "09", "00 01 00 00 00 00 00 00 00 00 41").has_value());  // BLOB
+    EXPECT_FALSE(one_value("f5", "05", "00 00 00 00 00 00").has_value());  // JSON length width
+    EXPECT_FALSE(one_value("10", "00 09", "00 01 02 03 04 05 06 07 08 09").has_value());  // BIT
+    EXPECT_FALSE(one_value("12", "07", "00 99 b8 b6 a0 00 00 00 00").has_value());  // DATETIME2(7)
+    // Within the limits they decode.
+    EXPECT_EQ(one_value("fc", "01", "00 02 68 69"), "hi");
+    EXPECT_EQ(one_value("10", "00 01", "00 05"), "5");
+}
+
+// Binary JSON that does not parse is refused, not turned into null; an empty
+// value is MySQL's JSON null.
+TEST(MysqlRowDecode, MalformedJsonRefusesTheRowAndEmptyJsonIsNull) {
+    EXPECT_FALSE(one_value("f5", "04", "00 02 00 00 00 7f 7f").has_value());
+    EXPECT_EQ(one_value("f5", "04", "00 00 00 00 00"), "null");
+}
+
+// ENUM index 0 is MySQL's error value, the empty string; an index or a SET bit
+// past the members the definition lists is refused.
+TEST(MysqlRowDecode, EnumAndSetValuesOutsideTheirMembersAreRefused) {
+    EXPECT_EQ(one_value("fe", "f7 01", "00 02", {"a", "b"}), "b");
+    EXPECT_EQ(one_value("fe", "f7 01", "00 00", {"a", "b"}), "");
+    EXPECT_FALSE(one_value("fe", "f7 01", "00 03", {"a", "b"}).has_value());
+    EXPECT_EQ(one_value("fe", "f8 01", "00 03", {"x", "y"}), "x,y");
+    EXPECT_FALSE(one_value("fe", "f8 01", "00 04", {"x", "y"}).has_value());
+}
+
 TEST(MysqlJsonb, DecodesObjectArrayStringLiterals) {
     auto bytes = [](std::initializer_list<int> b) {
         std::string s;

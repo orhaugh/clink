@@ -76,7 +76,7 @@ const std::map<std::string, std::vector<std::string>> kExpectedRecords = {
     {"http_connector",
      {"http", "elasticsearch", "opensearch", "influxdb", "prometheus", "splunk_hec", "pubsub"}},
     {"redis", {"redis", "redis_upsert"}},
-    {"mysql", {"mysql", "mysql_upsert"}},
+    {"mysql", {"mysql", "mysql_cdc", "mysql_upsert"}},
     {"mqtt", {"mqtt", "mqtt_source"}},
     {"mongodb", {"mongo_cdc", "mongo", "mongo_upsert"}},
     {"iceberg", {"iceberg"}},
@@ -293,7 +293,7 @@ bool planner_binds(const std::string& connector, bool as_source) {
 // (kafka_2pc, postgres_upsert, clickhouse_native) are reached through their
 // base name plus a WITH option, and some identities also cover a longer SQL
 // vocabulary name their impl registers factories for (s3 -> s3_parquet,
-// http -> http_poll, mongo and mongo_cdc -> mongodb).
+// http -> http_poll, mongo and mongo_cdc -> mongodb, mysql_cdc -> mysql).
 TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
     clink::plugin::PluginRegistry reg;
     clink::plugin::install_defaults(reg);
@@ -305,6 +305,7 @@ TEST(ConnectorManifestGate, EverySqlSurfaceClaimIsBoundByThePlanner) {
         {"http", {"http_poll"}},
         {"mongo", {"mongodb"}},
         {"mongo_cdc", {"mongodb"}},
+        {"mysql_cdc", {"mysql"}},
     };
     std::vector<std::string> failures;
     for (const auto& cap : clink::connectors::CapabilityRegistry::instance().all()) {

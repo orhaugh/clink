@@ -266,6 +266,8 @@ impls/mqtt/include/clink/mqtt/mqtt_protocol.hpp
 impls/mqtt/include/clink/mqtt/mqtt_sink.hpp
 impls/mqtt/include/clink/mqtt/mqtt_source.hpp
 impls/mqtt/include/clink/mqtt/mqtt_subscriber.hpp
+impls/mysql/include/clink/mysql/mysql_cdc_processor.hpp
+impls/mysql/include/clink/mysql/mysql_cdc_rules.hpp
 impls/mysql/include/clink/mysql/mysql_cdc_source.hpp
 impls/mysql/include/clink/mysql/mysql_client.hpp
 impls/mysql/include/clink/mysql/mysql_json.hpp

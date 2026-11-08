@@ -11,6 +11,7 @@
 // resolved schema (names/signedness/enum labels) and produces CdcEvents. No rpl
 // handle, so it is unit-testable with hand-built / live-captured byte strings.
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -299,6 +300,16 @@ inline std::string decode_value(const std::uint8_t* data,
         }
         return true;
     };
+    // A width or precision the TABLE_MAP gives outside MySQL's limits is a
+    // corrupt event: refused, never read (an integer read wider than 8 bytes
+    // would shift past 64 bits).
+    auto within = [&](int v, int lo, int hi) -> bool {
+        if (v < lo || v > hi) {
+            ok = false;
+            return false;
+        }
+        return true;
+    };
     switch (cm.type) {
         case MYSQL_TYPE_TINY:
             if (!need(1))
@@ -376,6 +387,8 @@ inline std::string decode_value(const std::uint8_t* data,
         case MYSQL_TYPE_NEWDECIMAL:
         case MYSQL_TYPE_DECIMAL: {
             const int precision = cm.m0, scale = cm.m1;
+            if (!within(precision, 1, 65) || !within(scale, 0, std::min(30, precision)))
+                return {};
             static const int dig2bytes[] = {0, 1, 1, 2, 2, 3, 3, 4, 4, 4};
             const int intg = precision - scale;
             const int total =
@@ -433,6 +446,8 @@ inline std::string decode_value(const std::uint8_t* data,
         }
         case MYSQL_TYPE_DATETIME2: {
             const int frac = cm.m0;
+            if (!within(frac, 0, 6))
+                return {};
             const std::size_t len = 5 + static_cast<std::size_t>((frac + 1) / 2);
             if (!need(len))
                 return {};
@@ -442,6 +457,8 @@ inline std::string decode_value(const std::uint8_t* data,
         }
         case MYSQL_TYPE_TIMESTAMP2: {
             const int frac = cm.m0;
+            if (!within(frac, 0, 6))
+                return {};
             const std::size_t len = 4 + static_cast<std::size_t>((frac + 1) / 2);
             if (!need(len))
                 return {};
@@ -451,6 +468,8 @@ inline std::string decode_value(const std::uint8_t* data,
         }
         case MYSQL_TYPE_TIME2: {
             const int frac = cm.m0;
+            if (!within(frac, 0, 6))
+                return {};
             const std::size_t len = 3 + static_cast<std::size_t>((frac + 1) / 2);
             if (!need(len))
                 return {};
@@ -485,23 +504,34 @@ inline std::string decode_value(const std::uint8_t* data,
             }
             if (real_type == MYSQL_TYPE_ENUM) {
                 const int sz = length;  // 1 or 2 bytes
-                if (!need(static_cast<std::size_t>(sz)))
+                if (!within(sz, 1, 2) || !need(static_cast<std::size_t>(sz)))
                     return {};
                 std::uint64_t idx = read_le(data + pos, sz);
                 pos += sz;
-                if (idx >= 1 && idx <= col.enum_set_labels.size()) {
-                    return col.enum_set_labels[idx - 1];
+                if (col.enum_set_labels.empty()) {
+                    return std::to_string(idx);
                 }
-                return std::to_string(idx);
+                if (idx == 0) {
+                    return {};  // MySQL's error value: the empty string
+                }
+                if (idx > col.enum_set_labels.size()) {
+                    ok = false;  // a member the definition does not have
+                    return {};
+                }
+                return col.enum_set_labels[idx - 1];
             }
             if (real_type == MYSQL_TYPE_SET) {
                 const int sz = length;  // 1..8 bytes
-                if (!need(static_cast<std::size_t>(sz)))
+                if (!within(sz, 1, 8) || !need(static_cast<std::size_t>(sz)))
                     return {};
                 std::uint64_t bits = read_le(data + pos, sz);
                 pos += sz;
                 if (col.enum_set_labels.empty()) {
                     return std::to_string(bits);
+                }
+                if (col.enum_set_labels.size() < 64 && (bits >> col.enum_set_labels.size()) != 0) {
+                    ok = false;  // members the definition does not have
+                    return {};
                 }
                 std::string out;
                 for (std::size_t i = 0; i < col.enum_set_labels.size() && i < 64; ++i) {
@@ -527,7 +557,7 @@ inline std::string decode_value(const std::uint8_t* data,
         }
         case MYSQL_TYPE_ENUM: {  // rare direct (MariaDB); m0 = pack length
             const int sz = cm.m0 ? cm.m0 : 1;
-            if (!need(static_cast<std::size_t>(sz)))
+            if (!within(sz, 1, 2) || !need(static_cast<std::size_t>(sz)))
                 return {};
             std::uint64_t idx = read_le(data + pos, sz);
             pos += sz;
@@ -540,7 +570,7 @@ inline std::string decode_value(const std::uint8_t* data,
         case MYSQL_TYPE_LONG_BLOB:
         case MYSQL_TYPE_BLOB: {
             const int lp = cm.m0 ? cm.m0 : 2;  // length-bytes count from metadata
-            if (!need(static_cast<std::size_t>(lp)))
+            if (!within(lp, 1, 4) || !need(static_cast<std::size_t>(lp)))
                 return {};
             std::size_t n = static_cast<std::size_t>(read_le(data + pos, lp));
             pos += lp;
@@ -552,7 +582,7 @@ inline std::string decode_value(const std::uint8_t* data,
         }
         case MYSQL_TYPE_JSON: {
             const int lp = cm.m0 ? cm.m0 : 4;
-            if (!need(static_cast<std::size_t>(lp)))
+            if (!within(lp, 1, 4) || !need(static_cast<std::size_t>(lp)))
                 return {};
             std::size_t n = static_cast<std::size_t>(read_le(data + pos, lp));
             pos += lp;
@@ -560,14 +590,18 @@ inline std::string decode_value(const std::uint8_t* data,
                 return {};
             std::string_view raw(reinterpret_cast<const char*>(data + pos), n);
             pos += n;
+            if (n == 0) {
+                return "null";  // MySQL reads an empty JSON value as JSON null
+            }
             if (auto text = jsonb::decode(raw)) {
                 return *text;
             }
-            return "null";
+            ok = false;  // malformed binary JSON: refused, not turned into null
+            return {};
         }
         case MYSQL_TYPE_GEOMETRY: {
             const int lp = cm.m0 ? cm.m0 : 4;
-            if (!need(static_cast<std::size_t>(lp)))
+            if (!within(lp, 1, 4) || !need(static_cast<std::size_t>(lp)))
                 return {};
             std::size_t n = static_cast<std::size_t>(read_le(data + pos, lp));
             pos += lp;
@@ -588,7 +622,7 @@ inline std::string decode_value(const std::uint8_t* data,
             const int v = cm.m0 | (cm.m1 << 8);
             const int bits = (v >> 8) * 8 + (v & 0xFF);
             const int nbytes = (bits + 7) / 8;
-            if (!need(static_cast<std::size_t>(nbytes)))
+            if (!within(nbytes, 1, 8) || !need(static_cast<std::size_t>(nbytes)))
                 return {};
             std::uint64_t val = read_be(data + pos, nbytes);  // BIT is big-endian
             pos += nbytes;
@@ -653,13 +687,16 @@ inline MysqlDecodeResult decode_rows_payload(const std::uint8_t* data,
                                              const std::vector<ColumnMeta>& metas,
                                              const CdcTableSchema& schema,
                                              const std::string& lsn,
-                                             std::int64_t xid) {
+                                             std::int64_t xid,
+                                             bool skip_update_bitmap = true) {
     MysqlDecodeResult res;
     std::size_t pos = 0;
-    // UPDATE_ROWS row_data carries the after-image column bitmap (ceil(n/8) bytes)
-    // the rpl library leaves unparsed, ONCE before the [before,after] row pairs
-    // (verified against MySQL 8.0). WRITE/DELETE have no such leading bitmap.
-    if (op == RowOp::Update) {
+    // A version 2 UPDATE_ROWS row_data carries the after-image column bitmap
+    // (ceil(n/8) bytes) the rpl library leaves unparsed, ONCE before the
+    // [before,after] row pairs (verified against MySQL 8.0). The library parses
+    // a version 1 UPDATE's itself (skip_update_bitmap false). WRITE/DELETE have
+    // no such leading bitmap.
+    if (op == RowOp::Update && skip_update_bitmap) {
         pos += (metas.size() + 7) / 8;
         if (pos > size) {
             ++res.dropped;

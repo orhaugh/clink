@@ -656,7 +656,10 @@ std::string job_graph_fingerprint(const JobGraphSpec& spec) {
         // CDC sources read it, and released planners hashed it there, so it stays
         // hashed on them and a job recorded with it still resumes. Any other
         // source ignored it; erasing it there changes only the fingerprint of a
-        // job that set it to no effect.
+        // job that set it to no effect. The MySQL change stream reads it now, and
+        // since released fingerprints already left it out there, it stays out: a
+        // MySQL CDC job stopped by an event it cannot decode resumes with the
+        // option changed.
         if (op.type == "json_string_to_row" || op.type == "json_string_to_row_columnar") {
             op.params.erase("table");
             op.params.erase("source");
