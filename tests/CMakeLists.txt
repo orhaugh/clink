@@ -499,13 +499,16 @@ if(CLINK_INTEGRATION_TESTS)
             integration/test_sql_json_decode.cpp)
         target_link_libraries(clink_integration_tests PRIVATE $<BUILD_INTERFACE:httplib::httplib>)
     endif()
-    # The MySQL CDC source's recovery cells: a coordinator and two workers
-    # reading a table's binlog into the file two-phase-commit sink, against the
-    # server scripts/mysql-cdc-live.sh starts, with faults at the source's own
-    # points and a verifier that reads the table through the mysql client in
-    # the server's container. They skip without it.
+    # The MySQL change stream's and sinks' recovery cells: a coordinator and two
+    # workers reading a table's binlog into the file two-phase-commit sink, and
+    # polling a feed the test serves into the sinks, against the server
+    # scripts/mysql-live.sh starts, with faults at the connector's own points
+    # and a verifier that reads the table through the mysql client in the
+    # server's container. They skip without it.
     if(TARGET clink::mysql AND TARGET clink::http_connector)
-        target_sources(clink_integration_tests PRIVATE integration/test_mysql_cdc_recovery.cpp)
+        target_sources(clink_integration_tests PRIVATE
+            integration/test_mysql_cdc_recovery.cpp
+            integration/test_mysql_sink_recovery.cpp)
     endif()
     # The Cassandra and ScyllaDB sinks' recovery cells: a coordinator and two
     # workers polling a feed the test serves into the sinks, against the server
