@@ -1,46 +1,47 @@
 #pragma once
 
-// PostgresJsonUpsertSink - changelog-aware Postgres sink for mode='upsert'.
+// PostgresJsonUpsertSink - changelog-aware PostgreSQL sink for mode='upsert'.
 //
-// Consumes the clink changelog convention (a "__row_kind" field on each JSON
-// row) and maintains a Postgres table by PRIMARY KEY:
-//   insert / update_after  -> INSERT ... ON CONFLICT (<pk>) DO UPDATE  (upsert)
-//   delete / update_before -> DELETE FROM <table> WHERE <pk> IN (...)  (tombstone)
-//   (a row with no __row_kind is an implicit insert)
+// Consumes the clink changelog (a "__row_kind" member on each JSON row) and
+// maintains a table by its key:
+//   insert / update_after (or no __row_kind)  -> INSERT ... ON CONFLICT (<key>) DO UPDATE
+//   delete / update_before                    -> DELETE FROM <table> WHERE <key> IN (...)
+// Any other __row_kind fails the sink.
 //
-// Within a flush interval the changelog is netted by primary key (last op wins),
-// then the surviving upserts and deletes are applied together in one
-// transaction. This is EFFECTIVELY-ONCE on the sink table for a stable primary
-// key and a deterministic defining query: every applied statement is keyed and
-// idempotent, so a replay after a failed checkpoint converges the table to the
-// same final state. It is NOT two-phase-commit (for that use
-// delivery_guarantee='exactly_once', the postgres_2pc_sink).
+// Order. Within a flush a key's later change replaces its earlier one, and the
+// surviving changes are applied in the order in which each key was last
+// changed: consecutive upserts as one INSERT, consecutive deletes as one
+// DELETE, the runs in order, all in one transaction. Two keys the stream holds
+// apart that the table treats as one row (a char(n) key with trailing spaces,
+// a nondeterministic collation, '1' and 1 in an integer column) therefore meet
+// the table in the order they were changed, and the row ends as the last change
+// left it; when two of them fall in one INSERT, which PostgreSQL refuses, the
+// flush is written again a row to a statement.
 //
-// This is what lets a RETRACTING SQL query (GROUP BY, TOP-N, outer join) maintain
-// a Postgres table: the append-only postgres_sink would drop the delete/retract
-// records; this sink applies them.
+// Identity. The table is checked when the sink opens: a table, not a view; a
+// PRIMARY KEY or UNIQUE index on exactly key_columns, over whole values and
+// every row, for ON CONFLICT to write by; and, with more than one subtask, key
+// columns that PostgreSQL tells apart exactly as the stream does
+// (pg_key_identity_exact), each record's key written as its column compares.
+// Another unique index is enforced by PostgreSQL: a change that collides on it
+// fails the flush.
 //
-// Decoupled from the SQL layer: it reads the "__row_kind" wire field from the
-// JSON directly rather than depending on clink/sql/row_kind.hpp.
+// EFFECTIVELY-ONCE on the table for a stable key, a deterministic defining
+// query and one writer per key: a restored job applies again what its last
+// checkpoint did not cover, and the rows converge. A replay rewrites rows, and
+// can overwrite a change another writer made to them since. NOT two-phase
+// commit (for that use delivery_guarantee='exactly_once', the
+// postgres_2pc_sink).
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <libpq-fe.h>
-#include <map>
-#include <memory>
-#include <stdexcept>
 #include <string>
-#include <string_view>
-#include <utility>
 #include <vector>
 
-#include "clink/config/json.hpp"
-#include "clink/connectors/postgres_json_sink.hpp"  // PgconnDeleter
-#include "clink/connectors/postgres_sql.hpp"
-#include "clink/connectors/postgres_tls.hpp"
-#include "clink/metrics/connector_metrics.hpp"
+#include "clink/connectors/sql_json_builder.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/postgres/pg_sink_core.hpp"
 
 namespace clink {
 
@@ -51,194 +52,50 @@ struct PostgresJsonUpsertSinkOptions {
     // Columns holding a TIMESTAMP, written as timestamp literals rather than
     // the epoch milliseconds the SQL Row path carries (timestamp_columns).
     sqljson::TimeColumns timestamp_columns;
-    std::vector<std::string> key_columns;  // PRIMARY KEY - conflict target + delete key (required)
-    std::size_t batch_records{1000};
+    std::vector<std::string> key_columns;  // the row's identity (required)
+    std::size_t batch_records{1000};       // flush at this many buffered keys
+    // Flush once the buffered changes' SQL reaches this many bytes; 0 means the
+    // default, 16 MiB.
+    std::size_t max_bytes{0};
+    std::size_t max_record_bytes{1U << 20};     // one record's row or key, as SQL
+    std::size_t max_statement_bytes{4U << 20};  // one statement
+    std::chrono::seconds lock_wait_timeout{30};
+    int max_retries{3};            // after a deadlock, a serialization failure or a lock wait
+    std::uint32_t parallelism{1};  // subtasks writing the table
     std::string name{"postgres_upsert_sink"};
+    postgres::PgSinkServerFactory server_factory;  // unset: a real server
 };
 
 class PostgresJsonUpsertSink : public Sink<std::string> {
 public:
-    explicit PostgresJsonUpsertSink(PostgresJsonUpsertSinkOptions opts) : opts_(std::move(opts)) {
-        if (opts_.conninfo.empty()) {
-            throw std::runtime_error(opts_.name + ": 'conninfo' is required");
-        }
-        if (opts_.table.empty()) {
-            throw std::runtime_error(opts_.name + ": 'table' is required");
-        }
-        if (opts_.columns.empty()) {
-            throw std::runtime_error(opts_.name + ": 'columns' is required (the projection)");
-        }
-        if (opts_.key_columns.empty()) {
-            throw std::runtime_error(opts_.name + ": 'key_columns' (the primary key) is required");
-        }
-        if (opts_.batch_records == 0) {
-            opts_.batch_records = 1;
-        }
-        (void)pgsql::quote_table_ident(opts_.table);
-        for (const auto& c : opts_.columns) {
-            (void)pgsql::quote_ident(c);
-        }
-        for (const auto& c : opts_.key_columns) {
-            (void)pgsql::quote_ident(c);
-        }
-    }
+    static constexpr std::size_t kDefaultMaxBytes = 16U << 20;
 
-    void open() override {
-        PGconn* c = PQconnectdb(opts_.conninfo.c_str());
-        if (PQstatus(c) != CONNECTION_OK) {
-            const std::string err = PQerrorMessage(c);
-            PQfinish(c);
-            throw std::runtime_error(opts_.name + ": connect failed: " + err);
-        }
-        // Transport assertion: never continue on a silently-downgraded
-        // connection (see postgres_tls.hpp).
-        clink::connectors::pg::assert_no_silent_downgrade(
-            c, opts_.conninfo, "postgres_json_upsert_sink");
-        conn_.reset(c);
-    }
+    explicit PostgresJsonUpsertSink(PostgresJsonUpsertSinkOptions opts);
 
-    void on_data(const Batch<std::string>& batch) override {
-        for (const auto& rec : batch) {
-            net_(rec.value());
-        }
-        if (netted_.size() >= opts_.batch_records) {
-            flush();
-        }
-    }
-
-    void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+    void open() override;
+    void on_data(const Batch<std::string>& batch) override;
+    void on_barrier(CheckpointBarrier b) override;
     // Its barrier hook writes out everything it received before the barrier,
     // which is its guarantee only while it owns its chain's checkpoint, so
     // Dag::add_sink refuses another sink beside it.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
-
-    void flush() override {
-        if (netted_.empty()) {
-            return;
-        }
-        if (!conn_) {
-            throw std::runtime_error(opts_.name + ": flush() before open()");
-        }
-        std::vector<std::string> upserts;
-        std::vector<std::string> deletes;
-        for (auto& [key, entry] : netted_) {
-            (void)key;
-            if (entry.is_delete) {
-                deletes.push_back(std::move(entry.json));
-            } else {
-                upserts.push_back(std::move(entry.json));
-            }
-        }
-        const std::size_t n = netted_.size();
-        const auto t0 = std::chrono::steady_clock::now();
-        try {
-            exec_("BEGIN");
-            // A netted key is in exactly one bucket, so upserts and deletes touch
-            // disjoint keys - statement order between them does not matter.
-            if (!upserts.empty()) {
-                exec_(pgsql::build_insert_sql(
-                    opts_.table,
-                    opts_.columns,
-                    /*on_conflict=*/"update",
-                    /*conflict_columns=*/opts_.key_columns,
-                    /*update_columns=*/{},
-                    upserts,
-                    [this](std::string_view s) { return escape_(s); },
-                    opts_.timestamp_columns));
-            }
-            if (!deletes.empty()) {
-                exec_(pgsql::build_delete_sql(
-                    opts_.table,
-                    opts_.key_columns,
-                    deletes,
-                    [this](std::string_view s) { return escape_(s); },
-                    opts_.timestamp_columns));
-            }
-            exec_("COMMIT");
-        } catch (...) {
-            (void)PQexec(conn_.get(), "ROLLBACK");
-            clink::metrics::connector::error_inc("postgres", "sink");
-            netted_.clear();
-            conn_.reset();  // drop a possibly-broken connection; re-open reconnects
-            throw;          // job replays from the last checkpoint (keyed ops are idempotent)
-        }
-        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-        clink::metrics::connector::records_out_inc("postgres", n);
-        clink::metrics::connector::commit_latency_observe("postgres",
-                                                          static_cast<std::uint64_t>(dt));
-        netted_.clear();
-    }
-
-    void close() override {
-        if (conn_) {
-            flush();
-            conn_.reset();
-        }
-    }
-
+    void flush() override;
+    // Discards what is buffered (a restored job applies it again) and releases
+    // the connection. Never throws.
+    void close() override;
     std::string name() const override { return opts_.name; }
 
 private:
-    struct Entry {
-        bool is_delete{false};
-        std::string json;
-    };
-
-    // Net one changelog row into the pending map by its primary-key tuple.
-    void net_(const std::string& json) {
-        const auto j = clink::config::parse(json);
-        if (!j.is_object()) {
-            throw std::runtime_error(opts_.name + ": sink row is not a JSON object: " + json);
-        }
-        const auto& obj = j.as_object();
-
-        // Classify the changelog kind (absent -> insert).
-        bool is_delete = false;
-        if (auto it = obj.find("__row_kind"); it != obj.end() && it->second.is_string()) {
-            const std::string& k = it->second.as_string();
-            is_delete = (k == "delete" || k == "update_before");
-        }
-
-        // Build the netting key from the primary-key columns.
-        std::string key;
-        for (const auto& kc : opts_.key_columns) {
-            auto it = obj.find(kc);
-            if (it == obj.end() || it->second.is_null()) {
-                throw std::runtime_error(opts_.name + ": changelog row missing primary key '" + kc +
-                                         "': " + json);
-            }
-            it->second.serialize_into(key);
-            key.push_back('\x1f');  // unit separator - unambiguous tuple join
-        }
-        netted_[std::move(key)] = Entry{is_delete, json};
-    }
-
-    void exec_(const std::string& sql) {
-        PGresult* r = PQexec(conn_.get(), sql.c_str());
-        const auto st = r != nullptr ? PQresultStatus(r) : PGRES_FATAL_ERROR;
-        if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
-            const std::string err =
-                r != nullptr ? PQresultErrorMessage(r) : std::string(PQerrorMessage(conn_.get()));
-            PQclear(r);
-            throw std::runtime_error(opts_.name + ": " + sql + " failed: " + err);
-        }
-        PQclear(r);
-    }
-
-    std::string escape_(std::string_view in) {
-        std::string out(in.size() * 2 + 1, '\0');
-        int err = 0;
-        const std::size_t len =
-            PQescapeStringConn(conn_.get(), out.data(), in.data(), in.size(), &err);
-        out.resize(len);
-        return out;
-    }
+    [[nodiscard]] std::vector<postgres::PgStatement> plan_(bool one_row_each) const;
 
     PostgresJsonUpsertSinkOptions opts_;
-    std::unique_ptr<PGconn, PgconnDeleter> conn_;
-    std::map<std::string, Entry> netted_;  // primary-key tuple -> latest op
+    postgres::PgSinkCore core_;
+    std::string insert_head_;
+    std::string upsert_tail_;
+    std::string delete_head_;
+    std::size_t row_capacity_{0};
+    std::size_t key_capacity_{0};
+    postgres::ChangelogBuffer buffer_;
 };
 
 }  // namespace clink

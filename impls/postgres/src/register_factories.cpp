@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -419,7 +420,8 @@ std::int64_t int_option(const clink::plugin::BuildContext& ctx,
                         const std::string& factory,
                         const std::string& key,
                         std::int64_t fallback,
-                        std::int64_t min) {
+                        std::int64_t min,
+                        std::int64_t max = std::numeric_limits<std::int64_t>::max()) {
     const auto it = ctx.params.find(key);
     if (it == ctx.params.end()) {
         return fallback;
@@ -431,11 +433,30 @@ std::int64_t int_option(const clink::plugin::BuildContext& ctx,
     } catch (const std::exception&) {
         used = 0;
     }
-    if (used == 0 || used != it->second.size() || v < min) {
-        throw std::runtime_error(factory + ": '" + key + "' must be an integer of at least " +
-                                 std::to_string(min) + " (got '" + it->second + "')");
+    if (used == 0 || used != it->second.size() || v < min || v > max) {
+        throw std::runtime_error(
+            factory + ": '" + key + "' must be an integer " +
+            (max == std::numeric_limits<std::int64_t>::max()
+                 ? "of at least " + std::to_string(min)
+                 : "from " + std::to_string(min) + " to " + std::to_string(max)) +
+            " (got '" + it->second + "')");
     }
     return v;
+}
+
+// The buffer, statement and retry bounds both JSON sinks read.
+template <typename Options>
+void read_sink_bounds(const clink::plugin::BuildContext& ctx, const std::string& who, Options& o) {
+    o.batch_records =
+        static_cast<std::size_t>(int_option(ctx, who, "batch_records", 1000, 1, 1000000));
+    o.max_bytes = static_cast<std::size_t>(int_option(ctx, who, "max_bytes", 0, 0, 1LL << 30));
+    const auto statement = int_option(ctx, who, "max_statement_bytes", 4LL << 20, 1024, 1LL << 30);
+    o.max_statement_bytes = static_cast<std::size_t>(statement);
+    o.max_record_bytes = static_cast<std::size_t>(int_option(
+        ctx, who, "max_record_bytes", std::min<std::int64_t>(1LL << 20, statement), 64, statement));
+    o.lock_wait_timeout =
+        std::chrono::seconds{int_option(ctx, who, "lock_wait_timeout_s", 30, 1, 3600)};
+    o.max_retries = static_cast<int>(int_option(ctx, who, "max_retries", 3, 0, 10));
 }
 
 std::string domain_option(const clink::plugin::BuildContext& ctx,
@@ -691,7 +712,7 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
 void install(clink::plugin::PluginRegistry& reg) {
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "postgres",
-        .version = "1",
+        .version = "2",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"libpq"},
@@ -709,7 +730,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {"connect_timeout", "statement_timeout"},
+        .timeout_options = {"connect_timeout", "lock_wait_timeout_s"},
         .available_in_sql = true,
         .limitations = {"CDC needs a logical replication slot, confirmed only by completed "
                         "checkpoints: WAL is retained while the job is stopped or not "
@@ -721,7 +742,13 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "truncating one partition publishes nothing",
                         "a CDC snapshot interrupted by a failure is taken again and converges; "
                         "it does not resume",
-                        "the plain sink is at-least-once - use postgres_2pc or the upsert sink",
+                        "the plain sink is at-least-once: a restored job writes again what its "
+                        "last checkpoint did not cover, which append duplicates and on_conflict "
+                        "writes again by key; use postgres_2pc or the upsert sink for more",
+                        "on_conflict needs a table with a PRIMARY KEY or UNIQUE index on exactly "
+                        "conflict_columns, over whole values and every row",
+                        "a failed write fails the sink until it is opened again; a COMMIT whose "
+                        "reply is lost leaves its flush's outcome unknown",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -760,7 +787,7 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "postgres_upsert",
-        .version = "1",
+        .version = "2",
         .is_source = false,
         .is_sink = true,
         .build_dependencies = {"libpq"},
@@ -783,12 +810,22 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {"connect_timeout", "statement_timeout"},
+        .timeout_options = {"connect_timeout", "lock_wait_timeout_s"},
         .available_in_sql = true,
-        .limitations = {"duplicates collapse only if key_columns really is unique for the row; "
-                        "clink cannot verify the target schema",
-                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
-                        "another sink beside it"},
+        .limitations =
+            {"requires a table with a PRIMARY KEY or UNIQUE index on exactly key_columns, over "
+             "whole values and every row; another unique index fails a flush that collides on it",
+             "with more than one subtask every key column must tell values apart as the stream "
+             "does (an integer, a numeric, text or varchar under a deterministic collation, or a "
+             "timestamp of millisecond precision or finer written from epoch milliseconds) and "
+             "each record must write its key as its column compares; at parallelism 1 two keys "
+             "the table treats as one row share it, the later change winning",
+             "converges only with one writer per key: a replay rewrites rows, and can overwrite "
+             "a change another writer made to them since",
+             "not two-phase commit; a COMMIT whose reply is lost leaves its flush's outcome "
+             "unknown, and the restored job applies it again",
+             "the sink must be the only sink on its chain: Dag::add_sink refuses another sink "
+             "beside it"},
     });
 
     using clink::plugin::BuildContext;
@@ -922,22 +959,24 @@ void install(clink::plugin::PluginRegistry& reg) {
                 std::make_shared<StringPostgresSource>(std::move(opts), "|", /*json=*/true));
         });
 
-    // postgres_sink (M4): batched multi-row INSERT of JSON-object rows. At-least-
-    // once (effectively-once with on_conflict='update' + conflict_columns). The
-    // newer string-channel + JSON pattern (cf. mysql_sink), distinct from the
-    // older vector<string>+$N PostgresSink. params:
+    // postgres_sink: rows of JSON-object records into a table, at-least-once.
+    // Every option is read strictly: a value the sink cannot use is refused
+    // rather than replaced by its default. Params:
     //   conninfo (required)
     //   table (required)
     //   columns                   - comma-separated projection; on the SQL path it
     //       defaults to the table's declared schema (schema_columns).
     //   on_conflict ("" [plain] | "update" | "nothing")
-    //   conflict_columns          - comma-separated ON CONFLICT target (required
-    //       when on_conflict is set)
-    //   update_columns            - comma-separated DO UPDATE SET list (empty = all
-    //       non-conflict columns)
-    //   batch_records (default 1000), max_bytes (0=off), linger_ms (0=off)
+    //   conflict_columns          - the ON CONFLICT target (required with on_conflict)
+    //   update_columns            - the DO UPDATE SET list (empty = all non-key columns)
+    //   batch_records (default 1000; 1 to 1000000) - flush at this many rows
+    //   max_bytes (default 16 MiB; 0 = the default) - flush at this much SQL
+    //   linger_ms (default 0 = off; to 3600000) - flush rows buffered this long
+    //   max_record_bytes (default 1 MiB), max_statement_bytes (default 4 MiB)
+    //   lock_wait_timeout_s (default 30; 1 to 3600), max_retries (default 3; 0 to 10)
     reg.register_sink<std::string>(
         "postgres_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            const std::string who = "postgres_sink";
             PostgresJsonSinkOptions o;
             o.conninfo = ctx.param_or("conninfo");
             o.table = ctx.param_or("table");
@@ -949,13 +988,12 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             o.timestamp_columns =
                 sqljson::parse_timestamp_columns(ctx.param_or("timestamp_columns", ""));
-            o.on_conflict = ctx.param_or("on_conflict", "");
+            o.on_conflict = domain_option(ctx, who, "on_conflict", "", {"", "update", "nothing"});
             o.conflict_columns = split_csv(ctx.param_or("conflict_columns", ""));
             o.update_columns = split_csv(ctx.param_or("update_columns", ""));
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
-            o.max_bytes = static_cast<std::size_t>(ctx.param_int64_or("max_bytes", 0));
-            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
-            o.name = "postgres_sink";
+            read_sink_bounds(ctx, who, o);
+            o.max_age = std::chrono::milliseconds{int_option(ctx, who, "linger_ms", 0, 0, 3600000)};
+            o.name = who;
             return std::make_shared<PostgresJsonSink>(std::move(o));
         });
 
@@ -992,15 +1030,13 @@ void install(clink::plugin::PluginRegistry& reg) {
         });
 
     // postgres_upsert_sink: changelog-aware, mode='upsert'. Maintains a table by
-    // PRIMARY KEY - insert/update_after upsert (INSERT ON CONFLICT DO UPDATE),
-    // delete/update_before DELETE by key. Effectively-once on the sink table for a
-    // stable PK (keyed idempotent ops). Lets a retracting SQL query maintain a
-    // Postgres table. params:
-    //   conninfo (required), table (required)
-    //   columns       - full projection; on the SQL Row path defaults to schema_columns
-    //   key_columns   - the PRIMARY KEY (conflict target + delete key); on the SQL
-    //                   path threaded from the table's PRIMARY KEY
-    //   batch_records (default 1000)
+    // its key - insert/update_after upsert (INSERT ON CONFLICT DO UPDATE),
+    // delete/update_before DELETE by key, applied in the order each key last
+    // changed. Effectively-once on the table for a stable key and one writer per
+    // key. Params: conninfo (required), table (required), columns (or
+    // schema_columns), key_columns (the PRIMARY KEY, threaded from the SQL path),
+    // and the bounds postgres_sink reads except linger_ms (batch_records counts
+    // buffered keys).
     reg.register_sink<std::string>(
         "postgres_upsert_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
             PostgresJsonUpsertSinkOptions o;
@@ -1013,7 +1049,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.timestamp_columns =
                 sqljson::parse_timestamp_columns(ctx.param_or("timestamp_columns", ""));
             o.key_columns = split_csv(ctx.param_or("key_columns", ""));
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
+            read_sink_bounds(ctx, "postgres_upsert_sink", o);
+            o.parallelism = ctx.parallelism;
             o.name = "postgres_upsert_sink";
             return std::make_shared<PostgresJsonUpsertSink>(std::move(o));
         });

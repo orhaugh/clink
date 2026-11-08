@@ -7,25 +7,24 @@
 #include <vector>
 
 #include "clink/operators/operator_base.hpp"
+#include "clink/postgres/pg_sink_server.hpp"
 
 namespace clink {
 
-// PostgresSink - the JdbcSink. Inserts
-// rows into a Postgres table via a user-supplied parameterized SQL
-// statement using libpq's PQexecParams binding.
+// PostgresSink - inserts rows into a PostgreSQL table through a user-supplied
+// parameterised statement, bound with libpq's PQexecParams.
 //
-// Each input record is a vector<string> of pre-bound column values,
-// one per `$N` placeholder in `opts.sql`. Upstream operators are
-// responsible for converting their typed record into the right shape
-// (commonly via a MapOperator that knows the schema).
+// Each input record is a vector<string> of column values, one per `$N`
+// placeholder in `opts.sql`, each bound as text (never NULL). Upstream
+// operators shape their typed record into it.
 //
-// Batching: at most `batch_rows` rows or `batch_interval` worth of
-// time per transaction. On flush() we COMMIT; on close() we COMMIT and
-// disconnect. Errors during execution propagate as exceptions matching
-// the contract of other clink sinks (ClickHouseSink, S3Sink).
-//
-// Build: requires CLINK_HAS_POSTGRES (libpq). When unavailable the
-// constructor throws a configuration error so submission fails loudly.
+// Batching: rows are written at `batch_rows` rows, after `batch_interval`, and
+// at every checkpoint barrier, each flush one transaction of one statement per
+// row (see clink/postgres/pg_sink_core.hpp for failures, retries and the
+// COMMIT whose outcome is unknown). Delivery is AT-LEAST-ONCE: a restored job
+// writes again what its last checkpoint did not cover. A failure fails the sink
+// until open() is called again; close() discards what is buffered and never
+// throws.
 class PostgresSink final : public Sink<std::vector<std::string>> {
 public:
     struct Options {
@@ -37,6 +36,11 @@ public:
         // Flush thresholds. Flushed on whichever fires first.
         std::size_t batch_rows{1000};
         std::chrono::milliseconds batch_interval{std::chrono::seconds{1}};
+        // How long a statement waits for a lock, and how many times a flush is
+        // tried again after a deadlock, a serialization failure or a lock wait.
+        std::chrono::seconds lock_wait_timeout{30};
+        int max_retries{3};
+        postgres::PgSinkServerFactory server_factory;  // unset: a real server
     };
 
     explicit PostgresSink(Options opts);
@@ -53,7 +57,7 @@ public:
     // covers is still waiting for a size or time trigger. That is the sink's
     // guarantee only while it owns its chain's checkpoint, so Dag::add_sink
     // refuses another sink beside it.
-    void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+    void on_barrier(CheckpointBarrier b) override;
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
     void flush() override;
     void close() override;

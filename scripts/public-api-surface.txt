@@ -285,6 +285,9 @@ impls/nats/include/clink/nats/nats_sink.hpp
 impls/nats/include/clink/nats/nats_source.hpp
 impls/onnx/include/clink/onnx/onnx_model_provider.hpp
 impls/postgres/include/clink/postgres/cdc_event_codec.hpp
+impls/postgres/include/clink/postgres/pg_sink_core.hpp
+impls/postgres/include/clink/postgres/pg_sink_rules.hpp
+impls/postgres/include/clink/postgres/pg_sink_server.hpp
 impls/postgres/include/clink/postgres/postgres_row_codec.hpp
 impls/postgres/include/clink/postgres/typed_cdc_source.hpp
 impls/pulsar/include/clink/pulsar/connection_params.hpp

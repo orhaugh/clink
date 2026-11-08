@@ -37,6 +37,11 @@ add_library(clink_postgres STATIC
     src/cdc_row_encoder.cpp
     src/postgres_decoder.cpp
     src/register_factories.cpp
+    src/pg_sink_rules.cpp
+    src/pg_sink_server.cpp
+    src/pg_sink_core.cpp
+    src/postgres_json_sink.cpp
+    src/postgres_upsert_sink.cpp
 )
 add_library(clink::postgres ALIAS clink_postgres)
 

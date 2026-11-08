@@ -4,12 +4,18 @@
 // channel types. Also smoke-tests the PostgresRow / CdcEvent codecs
 // for round-trip fidelity.
 
+#include <string>
+#include <tuple>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 #include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_graph.hpp"
+#include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/cluster/type_registry.hpp"
+#include "clink/connectors/capability.hpp"
 #include "clink/postgres/cdc_event_codec.hpp"
 #include "clink/postgres/postgres_row_codec.hpp"
 
@@ -197,6 +203,96 @@ TEST(PostgresFactoryRegistration, TheUpsertSinkIsAnalysedEffectivelyOnceWithItsK
     for (const auto& reason : report.reasons) {
         EXPECT_EQ(reason.find("was not supplied"), std::string::npos) << reason;
     }
+}
+
+template <typename F>
+std::string pg_thrown(F&& f) {
+    try {
+        std::forward<F>(f)();
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// The sinks read their options strictly. Building a sink connects to nothing,
+// so a value is refused here before any server is involved.
+TEST(PostgresFactoryRegistration, TheSinkFactoriesReadTheirOptionsStrictly) {
+    for (const char* type : {"postgres_sink", "postgres_upsert_sink"}) {
+        const auto* f = clink::cluster::OperatorRegistry::default_instance().find_sink(
+            type, std::string{clink::cluster::kChannelString});
+        ASSERT_NE(f, nullptr) << type;
+        clink::cluster::OperatorBuildContext ctx;
+        ctx.params = {{"conninfo", "host=nowhere"},
+                      {"table", "t"},
+                      {"columns", "id,v"},
+                      {"key_columns", "id"}};
+        EXPECT_NO_THROW((void)f->build(ctx)) << type;
+        auto every = ctx;
+        every.params.insert({{"batch_records", "1000000"},
+                             {"max_bytes", "0"},
+                             {"max_statement_bytes", "1024"},
+                             {"max_record_bytes", "1024"},
+                             {"lock_wait_timeout_s", "3600"},
+                             {"max_retries", "10"}});
+        EXPECT_NO_THROW((void)f->build(every)) << type;
+        for (const auto& [key, value] :
+             std::vector<std::pair<std::string, std::string>>{{"batch_records", "0"},
+                                                              {"batch_records", "ten"},
+                                                              {"max_bytes", "-1"},
+                                                              {"max_statement_bytes", "1023"},
+                                                              {"max_record_bytes", "8388608"},
+                                                              {"lock_wait_timeout_s", "0"},
+                                                              {"max_retries", "11"}}) {
+            auto c = ctx;
+            c.params[key] = value;
+            EXPECT_NE(
+                pg_thrown([&] { (void)f->build(c); }).find("'" + key + "' must be an integer"),
+                std::string::npos)
+                << type << " " << key << "=" << value;
+        }
+    }
+    const auto* plain = clink::cluster::OperatorRegistry::default_instance().find_sink(
+        "postgres_sink", std::string{clink::cluster::kChannelString});
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"conninfo", "host=nowhere"},
+                  {"table", "t"},
+                  {"columns", "id,v"},
+                  {"on_conflict", "updat"}};
+    EXPECT_NE(pg_thrown([&] { (void)plain->build(ctx); }).find("'on_conflict' must be one of"),
+              std::string::npos);
+    ctx.params = {
+        {"conninfo", "host=nowhere"}, {"table", "t"}, {"columns", "id,v"}, {"update_columns", "v"}};
+    EXPECT_NE(pg_thrown([&] { (void)plain->build(ctx); }).find("which is not set"),
+              std::string::npos);
+    ctx.params = {{"conninfo", "host=nowhere"},
+                  {"table", "t"},
+                  {"columns", "id,v"},
+                  {"on_conflict", "update"},
+                  {"conflict_columns", "id"},
+                  {"update_columns", "w"}};
+    EXPECT_NE(pg_thrown([&] { (void)plain->build(ctx); }).find("update column 'w'"),
+              std::string::npos);
+    ctx.params = {
+        {"conninfo", "host=nowhere"}, {"table", "t"}, {"columns", "id,v"}, {"linger_ms", "-1"}};
+    EXPECT_NE(pg_thrown([&] { (void)plain->build(ctx); }).find("'linger_ms' must be an integer"),
+              std::string::npos);
+}
+
+TEST(PostgresFactoryRegistration, TheSinkRecordsStateTheirContracts) {
+    const auto* plain = clink::connectors::CapabilityRegistry::instance().find("postgres");
+    const auto* upsert = clink::connectors::CapabilityRegistry::instance().find("postgres_upsert");
+    ASSERT_NE(plain, nullptr);
+    ASSERT_NE(upsert, nullptr);
+    EXPECT_TRUE(plain->self_check().empty());
+    EXPECT_TRUE(upsert->self_check().empty());
+    EXPECT_EQ(plain->version, "2");
+    EXPECT_EQ(upsert->version, "2");
+    EXPECT_EQ(plain->delivery, clink::connectors::DeliveryGuarantee::AtLeastOnce);
+    EXPECT_EQ(upsert->delivery, clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent);
+    EXPECT_EQ(upsert->idempotency_key_option, "key_columns");
+    EXPECT_EQ(upsert->timeout_options,
+              (std::vector<std::string>{"connect_timeout", "lock_wait_timeout_s"}));
 }
 
 }  // namespace

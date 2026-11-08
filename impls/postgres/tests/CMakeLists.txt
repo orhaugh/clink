@@ -14,6 +14,9 @@ add_executable(clink_postgres_tests
     test_postgres_json_sink_live.cpp
     test_postgres_2pc_sink.cpp
     test_postgres_upsert_sink.cpp
+    test_pg_sink_rules.cpp
+    test_pg_sink_failures.cpp
+    test_pg_sink_contract_live.cpp
     test_postgres_contract_suites.cpp
     test_cdc_json.cpp
     test_cdc_row_encoder.cpp
