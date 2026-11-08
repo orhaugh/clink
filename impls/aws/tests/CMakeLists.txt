@@ -15,6 +15,7 @@ add_executable(clink_aws_tests
     test_dynamodb_live.cpp
     test_firehose_sink.cpp
     test_kinesis_sink.cpp
+    test_kinesis_sink_live.cpp
     test_kinesis_source.cpp
     test_kinesis_live.cpp
     # Finalises Arrow/AWS S3 before static destruction (joins the AWS CRT threads
