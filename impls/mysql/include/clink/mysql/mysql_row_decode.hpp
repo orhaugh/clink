@@ -148,6 +148,9 @@ inline std::string decode_decimal(const std::uint8_t* data, int precision, int s
     const int ibytes = intg0 * 4 + dig2bytes[intg0x];
     const int fbytes = frac0 * 4 + dig2bytes[frac0x];
     const int total = ibytes + fbytes;
+    if (total <= 0) {
+        return {};  // no digits: decode_value refuses such metadata before calling
+    }
     std::vector<std::uint8_t> buf(data, data + total);
     const bool positive = (buf[0] & 0x80) != 0;
     buf[0] ^= 0x80;  // flip sign bit

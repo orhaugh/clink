@@ -182,7 +182,7 @@ for server in ${MYSQL_CDC_LIVE_SERVERS}; do
         --expect 'MysqlCdcCheckpointRow.*=6'
         --expect 'MysqlCdcDefinitions.*=2'
         --expect 'MysqlCdcEvents.*=1'
-        --expect 'MysqlCdcStatements.*=7'
+        --expect 'MysqlCdcStatements.*=8'
         --expect 'MysqlCdcBoundaries.*=1'
         --expect 'MysqlCdcMetadata.*=2'
         --expect 'MysqlCdcProcessor.*=18'

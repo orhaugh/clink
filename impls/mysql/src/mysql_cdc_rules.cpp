@@ -121,9 +121,11 @@ public:
         if (c == '\'' || c == '"') {
             ++p_;
             while (p_ < s_.size() && s_[p_] != c) {
-                p_ += s_[p_] == '\\' ? 2 : 1;
+                p_ += s_[p_] == '\\' ? 2U : 1U;
             }
-            ++p_;
+            // Past the closing quote, or at the end of a literal that has none
+            // (a trailing backslash would otherwise step past the text).
+            p_ = std::min(p_ + 1, s_.size());
             return {Token::Kind::Other, ""};
         }
         if (word_char(c)) {

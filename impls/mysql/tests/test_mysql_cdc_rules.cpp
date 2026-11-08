@@ -368,6 +368,18 @@ TEST(MysqlCdcStatements, StatementLoggedChangesAndTheirTables) {
     EXPECT_EQ(classify_query("GRANT SELECT ON d.* TO 'u'", "d").kind, Kind::Other);
 }
 
+// A literal that never closes, even one ending in a backslash, ends the
+// statement's text; the lexer never steps past it.
+TEST(MysqlCdcStatements, AnUnterminatedLiteralEndsTheText) {
+    EXPECT_EQ(classify_query("SELECT 'abc\\", "d").kind, Kind::Other);
+    EXPECT_EQ(classify_query("SET @a = 'x", "d").kind, Kind::Other);
+    const auto q = classify_query("INSERT INTO t VALUES ('x\\", "d");
+    EXPECT_EQ(q.kind, Kind::Dml);
+    ASSERT_EQ(q.targets.size(), 1U);
+    EXPECT_EQ(q.targets[0].table, "t");
+    EXPECT_EQ(classify_query("ALTER TABLE t COMMENT = 'open\\", "d").targets.size(), 1U);
+}
+
 // ---- transaction boundaries ---------------------------------------------------------------
 
 TEST(MysqlCdcBoundaries, MysqlGroupsCloseAtXidOrTheirStatement) {
