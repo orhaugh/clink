@@ -494,6 +494,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/connectors/capability.cpp
     src/connectors/builtin_capabilities.cpp
     src/connectors/delivery_guarantee.cpp
+    src/connectors/sink_record_rules.cpp
     src/checkpoint/checkpoint_coordinator.cpp
     src/metrics/metrics_registry.cpp
     src/metrics/otlp_export.cpp

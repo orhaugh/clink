@@ -384,6 +384,7 @@ include/clink/connectors/delta_log.hpp
 include/clink/connectors/openssl_atexit_guard.hpp
 include/clink/connectors/parquet_fs_2pc_sink.hpp
 include/clink/connectors/parquet_rolling_sink.hpp
+include/clink/connectors/sink_record_rules.hpp
 include/clink/connectors/state_parquet_export.hpp
 include/clink/connectors/txn_resume_registry.hpp
 include/clink/core/allocator_info.hpp

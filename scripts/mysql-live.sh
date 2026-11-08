@@ -20,9 +20,9 @@
 #     workers reading the binlog into the file two-phase-commit sink, one of
 #     them a SQL job submitted by clink_submit_sql, with a worker killed inside
 #     the initial snapshot and inside a large transaction.
-#   sink: clink_mysql_tests' sink suites, offline and live: the record reader,
-#     values, statements and their bounds, the changelog buffer and the table
-#     checks; the failure state against a scripted server (MysqlSinkFailures);
+#   sink: clink_mysql_tests' sink suites, offline and live: values, statements
+#     and the table checks (the record rules the SQL sinks share are tested in
+#     clink_core_tests); the failure state against a scripted server (MysqlSinkFailures);
 #     the contract against the server (MysqlSinkContractLive: keys the table
 #     treats as one, the tables the sinks refuse, exact values, refused values,
 #     the session's mode, transactions, packet limits, lock waits, a cancel, a
@@ -119,10 +119,8 @@ expectations_of() {
             ;;
         sink)
             echo 'MysqlSinkLogic.*=13'
-            echo 'MysqlSinkRecord.*=4'
-            echo 'MysqlSinkRender.*=7'
-            echo 'MysqlSinkStatements.*=3'
-            echo 'MysqlSinkChangelog.*=2'
+            echo 'MysqlSinkRender.*=5'
+            echo 'MysqlSinkStatements.*=2'
             echo 'MysqlSinkTarget.*=4'
             echo 'MysqlSinkFailures.*=24'
             echo 'MysqlUpsertSink.*=1'

@@ -157,6 +157,7 @@ add_executable(clink_core_tests
     test_disagg_metrics.cpp
     test_json.cpp
     test_sql_json_builder.cpp
+    test_sink_record_rules.cpp
     test_dag_split.cpp
     test_sliding_window_operator.cpp
     test_sliding_window_scenario.cpp

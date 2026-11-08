@@ -62,6 +62,7 @@ include/clink/connectors/parquet_rolling_sink.hpp
 include/clink/connectors/parquet_sink.hpp
 include/clink/connectors/parquet_source.hpp
 include/clink/connectors/polling_source.hpp
+include/clink/connectors/sink_record_rules.hpp
 include/clink/connectors/sql_json_builder.hpp
 include/clink/connectors/state_parquet_export.hpp
 include/clink/connectors/text_format.hpp
