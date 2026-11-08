@@ -511,9 +511,13 @@ if(CLINK_INTEGRATION_TESTS)
     # The InfluxDB sink's recovery cells: a coordinator and two workers polling a
     # feed the test serves into influxdb_sink, against the server
     # scripts/influxdb-live.sh starts, each verified by reading the measurement
-    # back with Flux. They skip without it.
+    # back with Flux. The Pushgateway sink's cells do the same into
+    # prometheus_sink, against the gateway scripts/prometheus-live.sh starts,
+    # each verified by scraping it. They skip without their server.
     if(TARGET clink::http_connector)
-        target_sources(clink_integration_tests PRIVATE integration/test_influxdb_recovery.cpp)
+        target_sources(clink_integration_tests PRIVATE
+            integration/test_influxdb_recovery.cpp
+            integration/test_prometheus_recovery.cpp)
         target_include_directories(clink_integration_tests PRIVATE
             ${CMAKE_SOURCE_DIR}/impls/http_connector/tests)
     endif()
