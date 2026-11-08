@@ -586,6 +586,50 @@ void check_splunk_options(const TableDef& table, const std::string& connector) {
     }
 }
 
+// A connector='kinesis' sink table's options: an option the sink does not read
+// is refused rather than ignored (a misspelt partition_key would otherwise route
+// every row by a counter), the refusal listing the ones it reads, and stream is
+// required.
+void check_kinesis_sink_options(const TableDef& table) {
+    static const std::vector<std::string> kOptions = {"stream",
+                                                      "partition_key",
+                                                      "region",
+                                                      "endpoint_override",
+                                                      "batch_records",
+                                                      "max_record_bytes",
+                                                      "max_request_bytes",
+                                                      "max_retries",
+                                                      "retry_timeout_ms",
+                                                      "linger_ms",
+                                                      "connect_timeout_ms",
+                                                      "request_timeout_ms",
+                                                      "dlq"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        if (std::find(kOptions.begin(), kOptions.end(), key) != kOptions.end()) {
+            continue;
+        }
+        if (key == "format" && value == "json") {
+            continue;
+        }
+        if (std::find(interpreted.begin(), interpreted.end(), key) != interpreted.end() &&
+            key != "format") {
+            continue;
+        }
+        std::string accepted;
+        for (const auto& o : kOptions) {
+            accepted += (accepted.empty() ? "" : ", ") + o;
+        }
+        unsupported("table '" + table.name +
+                    "': a connector='kinesis' sink does not read option '" + key + "'; it reads " +
+                    accepted);
+    }
+    if (const auto it = table.properties.find("stream");
+        it == table.properties.end() || it->second.empty()) {
+        unsupported("table '" + table.name + "': a connector='kinesis' sink needs 'stream'");
+    }
+}
+
 // A CDC table declared keep_rows='true': the plan keeps the latest row of every
 // key behind its source.
 bool keeps_rows(const TableDef& table) {
@@ -1417,8 +1461,9 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     if (connector == "kinesis") {
         // Kinesis Data Streams sink (PutRecords). At-least-once; no producer
         // dedup key (a retry of throttled records may duplicate). Each row -> JSON
-        // object string -> record Data; partition_key names the field used as the
-        // Kinesis PartitionKey (shard routing).
+        // object string -> record Data; partition_key names the column whose
+        // value is the Kinesis PartitionKey (shard routing).
+        check_kinesis_sink_options(table);
         if (exactly_once) {
             unsupported(
                 "connector='kinesis' sink is at-least-once (Kinesis has no producer dedup "

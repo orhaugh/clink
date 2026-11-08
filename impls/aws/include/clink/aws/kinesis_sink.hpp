@@ -1,323 +1,257 @@
 #pragma once
 
-// Kinesis Data Streams sink (PutRecords). SDK-dependent; compiled only with the
-// AWS SDK.
+// Kinesis Data Streams sink: string records written with PutRecords.
 //
-// Each input record is a string (e.g. SQL row_to_json_string JSON) sent as one
-// Kinesis record's Data. The PartitionKey is the configured field's value when
-// present, else a rotating counter (Kinesis hashes the key to pick a shard, so a
-// counter spreads load). Delivery is AT-LEAST-ONCE: Kinesis has no producer
-// dedup key, so a retry of throttled records can duplicate. PutRecords is
-// partial-success - on FailedRecordCount > 0 ONLY the failed entries (by
-// response index) are resent, never the whole batch (which would duplicate the
-// already-committed records).
+// Each record's bytes are sent as one Kinesis record's data, untouched. Its
+// partition key comes from one of two modes, chosen by partition_key:
+//
+//   - set: the record must be one JSON object holding that top-level member,
+//     and the member's value is the key. A string is used as it is, a number as
+//     its exact value in plain decimal (9007199254740993 stays itself, 1.50 and
+//     15E-1 are both "1.5", -0 is "0"), and true or false as that word. A record
+//     whose member is missing, null, an object or an array, appears twice, or
+//     would make a key Kinesis refuses is refused: the sink never routes a record
+//     by anything but its own key.
+//   - unset: the sink numbers records 0, 1, 2 and so on per instance, so records
+//     spread across shards. A key is fixed when the record is buffered, so every
+//     retry of it carries the same key; a restarted instance numbers afresh, so a
+//     replayed record can land on another shard than its first copy.
+//
+// Limits, from the service's documentation: a partition key holds 1 to 256
+// characters (counted here as UTF-16 code units, so a character outside the
+// Basic Multilingual Plane counts as two, the stricter reading); a record's
+// data plus its key's UTF-8 bytes must not exceed the stream's maximum record
+// size (1 MiB unless the stream was raised, at most 10 MiB); a request holds at
+// most 500 records and 10 MiB of data and keys. A record over a limit is refused
+// before it is buffered; the buffer is sent before a record that would take the
+// next request past its count or byte limit is added, so no request is ever
+// built over a limit. A refused record fails the sink, or under dlq='drop' goes
+// to the job's dead-letter path while the rest of the batch is written.
+//
+// A response counts only when it accounts for every record: one entry per
+// record, each either accepted (a well-formed SequenceNumber and ShardId) or
+// failed (an ErrorCode), never both or neither, no sequence number twice, and a
+// FailedRecordCount equal to the entries that failed. The records whose entries
+// failed, and only those, are sent again with the keys they were sent with. Any
+// other response is ambiguous and fails the sink. Throttling and transient
+// errors are retried with a backoff bounded in attempts and in time, which a
+// cancellation cuts short; permanent errors (access, credentials, a missing
+// stream, KMS, a refused request) fail at once and are never dead-lettered. A
+// barrier returns only once every record before it has been accepted, and a sink
+// that has failed refuses every later barrier until it is opened again.
+//
+// Delivery is at-least-once: a record resent after a reply that never arrived,
+// or replayed after a restart, can be stored twice, and Kinesis keeps no
+// producer identity. PutRecords keeps no order within a request and the sink
+// resends failed entries after later ones were stored, so records sharing a
+// partition key are not promised to arrive in order. See
+// docs/connectors/aws.md ("The Kinesis sink").
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <stdexcept>
 #include <string>
-#include <thread>
-#include <utility>
+#include <string_view>
 #include <vector>
 
-#include <aws/core/utils/memory/stl/AWSString.h>
-#include <aws/kinesis/KinesisClient.h>
-#include <aws/kinesis/KinesisErrors.h>
-#include <aws/kinesis/model/PutRecordsRequest.h>
-#include <aws/kinesis/model/PutRecordsRequestEntry.h>
-#include <aws/kinesis/model/PutRecordsResultEntry.h>
-
 #include "clink/aws/aws_client.hpp"
-#include "clink/config/json.hpp"
-#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 
 namespace clink::aws {
 
-// Whether an AWS failure is worth retrying (transient outage / throttle) or is a
-// permanent request error (a poison batch that will fail identically on replay).
-enum class FailureClass { Transient, Permanent };
+// ---- Kinesis's limits -----------------------------------------------------------------
 
-// What a sink does with a permanently-poison record (one that fails identically
-// on replay, e.g. a Kinesis record over the 1 MiB per-record limit). Fail
-// (default) = let it through / throw so the job replays (crash-loops on true
-// poison); Drop = route to the dead-letter path (count + metric) and continue.
+inline constexpr std::size_t kKinesisMaxBatchRecords = 500;
+// A stream's maximum record size unless raised (MaxRecordSizeInKiB 1024).
+inline constexpr std::size_t kKinesisDefaultMaxRecordBytes = 1024 * 1024;
+// The most a stream's maximum record size can be raised to (MaxRecordSizeInKiB 10240).
+inline constexpr std::size_t kKinesisMaxRecordBytes = 10 * 1024 * 1024;
+// A PutRecords request: every record's data and partition key.
+inline constexpr std::size_t kKinesisMaxRequestBytes = 10 * 1024 * 1024;
+// The sink's default request bound: the documented limit before records over
+// 1 MiB were introduced, within the current one.
+inline constexpr std::size_t kKinesisDefaultRequestBytes = 5 * 1024 * 1024;
+inline constexpr std::size_t kKinesisMaxPartitionKeyChars = 256;
+
+// What a sink does with a record it refuses before sending it: a missing or
+// unusable partition key, or a record over the maximum record size. Fail (the
+// default) stops the sink, and the job's restart replays the record; Drop sends
+// it to the job's dead-letter path and writes the rest. Errors from the service
+// are never dropped.
 enum class DlqPolicy { Fail, Drop };
 
-// Classify a WHOLE-CALL Kinesis error (outcome.GetError()). Throttle /
-// service-unavailable / internal / slow-down are transient (retry); validation /
-// bad-argument / access / not-found are permanent (a malformed request, e.g. an
-// oversized record or a bad stream -> DLQ rather than crash-loop). Unknown
-// defaults to Transient: replay is the safe direction (never silently drop).
-inline FailureClass classify_kinesis_error(Aws::Kinesis::KinesisErrors err) {
-    using E = Aws::Kinesis::KinesisErrors;
-    switch (err) {
-        case E::VALIDATION:
-        case E::INVALID_ARGUMENT:
-        case E::ACCESS_DENIED:
-        case E::RESOURCE_NOT_FOUND:
-        case E::RESOURCE_IN_USE:
-            return FailureClass::Permanent;
-        default:
-            return FailureClass::Transient;
-    }
-}
+// ---- partition keys -----------------------------------------------------------------
 
-// Indices of the response entries that FAILED (non-empty ErrorCode). The
-// PutRecords response is index-aligned with the request, so these map straight
-// back to the request entries that must be resent. Pure: unit-testable without
-// a live stream.
-inline std::vector<std::size_t> kinesis_failed_indices(
-    const Aws::Vector<Aws::Kinesis::Model::PutRecordsResultEntry>& results) {
+// A record's partition key under partition_key=`field`, or why there is none.
+struct KinesisKeyResult {
+    bool ok{false};
+    std::string key;  // valid when ok
+    std::string why;  // the refusal, when not ok
+};
+
+// The key `record` routes by: the value of its top-level member `field`, read
+// as the header describes. The record must be one JSON object (RFC 8259, UTF-8);
+// anything else is refused with the reason. Pure.
+[[nodiscard]] KinesisKeyResult kinesis_record_key(std::string_view record, std::string_view field);
+
+// Why `key` cannot be a partition key, or empty when it can: 1 to 256 UTF-16
+// code units of valid UTF-8 with no U+0000 (the AWS SDK for C++ cuts a string
+// at its first NUL when it writes the request). Pure.
+[[nodiscard]] std::string kinesis_key_problem(std::string_view key);
+
+// The partition key's length as the service's limit counts it: UTF-16 code
+// units of valid UTF-8. Pure.
+[[nodiscard]] std::size_t kinesis_key_chars(std::string_view key);
+
+// ---- the calls the sink makes -------------------------------------------------------
+
+enum class KinesisPutFault : std::uint8_t {
+    None,
+    Throttled,  // nothing was stored: back off and send again
+    Transient,  // the request may or may not have been stored: back off and send again
+    Permanent,  // configuration, access, a missing stream or a refused request: fail now
+    Cancelled,  // the task was cancelled while the call was in flight
+};
+
+struct KinesisPutError {
+    KinesisPutFault fault{KinesisPutFault::None};
+    std::string code;     // the service's error code, e.g. ProvisionedThroughputExceededException
+    std::string message;  // the service's message
+    int http_status{0};   // 0 when no response arrived
+    [[nodiscard]] bool ok() const noexcept { return fault == KinesisPutFault::None; }
+};
+
+// One entry of a response's Records, as the service sent it.
+struct KinesisPutResponseEntry {
+    std::string sequence_number;
+    std::string shard_id;
+    std::string error_code;
+    std::string error_message;
+};
+
+struct KinesisPutResult {
+    KinesisPutError error;
+    // A response the SDK read without FailedRecordCount reports 0 here.
+    std::int64_t failed_record_count{0};
+    std::vector<KinesisPutResponseEntry> entries;
+};
+
+// The verdict on a response: when `valid`, the positions (in the request) of the
+// records whose entries failed; otherwise why the response cannot be trusted.
+struct KinesisPutVerdict {
+    bool valid{false};
     std::vector<std::size_t> failed;
-    for (std::size_t i = 0; i < results.size(); ++i) {
-        if (!results[i].GetErrorCode().empty()) {
-            failed.push_back(i);
-        }
-    }
-    return failed;
-}
+    std::string why;
+};
+
+// Judges a response to a request of `sent` records as the header describes.
+// Never reads past the shorter of the request and the response. Pure.
+[[nodiscard]] KinesisPutVerdict judge_kinesis_response(std::size_t sent,
+                                                       const KinesisPutResult& result);
+
+// One record of a PutRecords request. Both views stay valid for the call.
+struct KinesisPutRecord {
+    std::string_view data;
+    std::string_view partition_key;
+};
+
+// The calls the sink makes. make_kinesis_write_sdk_service is the production
+// implementation; tests substitute a model of the service.
+class KinesisWriteService {
+public:
+    virtual ~KinesisWriteService() = default;
+    // One PutRecords of these records, in order, to `stream` (a name, or an ARN).
+    virtual KinesisPutResult put_records(const std::string& stream,
+                                         const std::vector<KinesisPutRecord>& records) = 0;
+    // From another thread: end the call in flight, and every later one, at once.
+    virtual void abort() noexcept {}
+};
+
+// The AWS SDK's Kinesis client with its own retries off, so every failure
+// reaches the sink, which classifies, paces and bounds them.
+[[nodiscard]] std::shared_ptr<KinesisWriteService> make_kinesis_write_sdk_service(
+    const AwsClientOptions& client);
+
+// How the sink treats a failed PutRecords, from its error code, HTTP status (0
+// when no response arrived) and whether the SDK would have retried it. Pure.
+[[nodiscard]] KinesisPutFault classify_kinesis_put_error(std::string_view code,
+                                                         int http_status,
+                                                         bool sdk_retryable);
+
+// ---- the sink -----------------------------------------------------------------------
 
 struct KinesisSinkOptions {
-    std::string stream;         // stream name or ARN (required)
-    std::string partition_key;  // record field used as the Kinesis PartitionKey (optional)
+    // Required: a stream name (1 to 128 of a-z, A-Z, 0-9, '_', '.', '-') or a
+    // stream ARN (arn:<partition>:kinesis:<region>:<account>:stream/<name>).
+    std::string stream;
+    // The record's top-level JSON member that holds its partition key; empty
+    // numbers records per instance instead.
+    std::string partition_key;
     AwsClientOptions client;
-    std::size_t batch_records{500};                        // PutRecords hard max is 500
-    std::size_t max_bytes{4u * 1024 * 1024 + 512 * 1024};  // flush under the 5 MiB request cap
-    std::size_t max_record_bytes{1024 * 1024};             // Kinesis per-record limit (1 MiB)
-    int max_retries{8};                                    // failed-subset resend attempts
+    std::size_t batch_records{500};  // records per PutRecords, 1 to 500
+    // The stream's maximum record size, which a record's data plus its key's
+    // UTF-8 bytes must not exceed: 1 to 10 MiB. Raise it only with the stream's
+    // MaxRecordSizeInKiB.
+    std::size_t max_record_bytes{kKinesisDefaultMaxRecordBytes};
+    // The most one request may carry in data and keys, from max_record_bytes
+    // (the largest record alone) to 10 MiB.
+    std::size_t max_request_bytes{kKinesisDefaultRequestBytes};
+    // Retries in a row that store nothing (a failed request, or failed entries
+    // that did not shrink) before a flush fails, 0 to kMaxRetries: 0 fails at the
+    // first such attempt.
+    int max_retries{8};
     std::chrono::milliseconds retry_base_backoff{100};
-    std::chrono::milliseconds max_age{0};   // linger: flush a partial batch this old (0 = off)
-    DlqPolicy dlq_policy{DlqPolicy::Fail};  // oversized record: throw (Fail) vs drop
+    std::chrono::milliseconds max_backoff{10000};
+    // The longest one request's records may take with every retry and wait.
+    std::chrono::milliseconds retry_timeout{60000};
+    std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old (0 = off)
+    DlqPolicy dlq_policy{DlqPolicy::Fail};
     std::string name{"kinesis_sink"};
+    // The calls the sink makes; empty means the AWS SDK.
+    std::shared_ptr<KinesisWriteService> service;
 };
 
 class KinesisSink : public Sink<std::string> {
 public:
-    static constexpr int kMaxRetries = 20;  // bound the backoff shift + attempt loop
+    static constexpr int kMaxRetries = 20;
 
-    explicit KinesisSink(KinesisSinkOptions opts) : opts_(std::move(opts)) {
-        if (opts_.stream.empty()) {
-            throw std::runtime_error(opts_.name + ": 'stream' is required");
-        }
-        if (opts_.batch_records == 0 || opts_.batch_records > 500) {
-            opts_.batch_records = 500;  // PutRecords ceiling
-        }
-        if (opts_.max_retries < 0) {
-            opts_.max_retries = 0;
-        } else if (opts_.max_retries > kMaxRetries) {
-            opts_.max_retries = kMaxRetries;  // else 1u<<(attempt-1) overflows
-        }
-    }
+    // Checks the options; touches no service.
+    explicit KinesisSink(KinesisSinkOptions opts);
+    ~KinesisSink() override;
+    KinesisSink(const KinesisSink&) = delete;
+    KinesisSink& operator=(const KinesisSink&) = delete;
+    KinesisSink(KinesisSink&&) = delete;
+    KinesisSink& operator=(KinesisSink&&) = delete;
 
-    void open() override {
-        ensure_aws_initialized();
-        client_ = std::make_unique<Aws::Kinesis::KinesisClient>(make_client_config(opts_.client));
-        pending_.clear();
-    }
-
-    void on_data(const Batch<std::string>& batch) override {
-        for (const auto& rec : batch) {
-            // A single record over the Kinesis per-record limit (1 MiB) poisons
-            // the WHOLE PutRecords batch (ValidationException on every retry -> a
-            // wedged job). Under DlqPolicy::Drop, route just that record to the
-            // dead-letter path so the rest of the batch still flows. Under Fail,
-            // let it through and PutRecords rejects the batch loudly.
-            if (rec.value().size() > opts_.max_record_bytes &&
-                opts_.dlq_policy == DlqPolicy::Drop) {
-                if (auto* rt = this->runtime(); rt != nullptr) {
-                    rt->report_bad_record(
-                        clink::BadRecord{.payload = rec.value(),
-                                         .error = "record " + std::to_string(rec.value().size()) +
-                                                  " bytes exceeds the Kinesis per-record limit (" +
-                                                  std::to_string(opts_.max_record_bytes) + ")",
-                                         .connector = "kinesis",
-                                         .direction = "sink",
-                                         .location = opts_.stream});
-                }
-                clink::metrics::connector::dropped_records_inc("kinesis", 1);
-                clink::metrics::connector::permanent_failures_inc("kinesis");
-                continue;
-            }
-            if (pending_.empty()) {
-                first_buffered_at_ = std::chrono::steady_clock::now();  // linger age clock
-            }
-            pending_.push_back(make_entry_(rec.value()));
-            // ~partition key (<=256) + framing overhead; flush on count OR bytes
-            // so a batch of large records never exceeds the 5 MiB request cap
-            // (which would be rejected on every retry -> a wedged job).
-            pending_bytes_ += rec.value().size() + 320;
-            if (pending_.size() >= opts_.batch_records || pending_bytes_ >= opts_.max_bytes ||
-                linger_elapsed_()) {
-                flush();
-            }
-        }
-    }
-
-    void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+    // Starts afresh: an empty buffer and no failure, also after an earlier one.
+    void open() override;
+    // Writes nothing: a clean end of input has flushed, and a failed or
+    // cancelled task must not send what it holds.
+    void close() override;
+    // Checks every record of the batch before buffering any. Under dlq='fail' a
+    // batch with a refused record adds nothing, and the sink fails; under
+    // dlq='drop' the refused records go to the dead-letter path and the rest are
+    // buffered.
+    void on_data(const Batch<std::string>& batch) override;
+    void on_barrier(CheckpointBarrier b) override;
     // Its barrier hook writes out everything it received before the barrier,
     // which is its guarantee only while it owns its chain's checkpoint, so
     // Dag::add_sink refuses another sink beside it.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
+    void flush() override;
+    std::string name() const override;
 
-    void flush() override {
-        if (pending_.empty()) {
-            return;
-        }
-        const std::size_t n = pending_.size();
-        const std::size_t bytes = pending_bytes_;
-        const auto t0 = std::chrono::steady_clock::now();
-        try {
-            put_with_retry_(std::move(pending_));
-        } catch (...) {
-            clink::metrics::connector::error_inc("kinesis", "sink");
-            pending_.clear();
-            pending_bytes_ = 0;
-            throw;
-        }
-        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-        clink::metrics::connector::records_out_inc("kinesis", n);
-        clink::metrics::connector::bytes_out_inc("kinesis", bytes);
-        clink::metrics::connector::commit_latency_observe("kinesis",
-                                                          static_cast<std::uint64_t>(dt));
-        pending_.clear();
-        pending_bytes_ = 0;
-    }
-
-    std::string name() const override { return opts_.name; }
+    // Records buffered and not yet accepted.
+    [[nodiscard]] std::size_t pending_records() const;
+    // True once a refused record or a failed send has stopped this instance; it
+    // then refuses every call that would send or acknowledge a barrier, until
+    // open() starts it afresh.
+    [[nodiscard]] bool failed() const;
 
 private:
-    Aws::Kinesis::Model::PutRecordsRequestEntry make_entry_(const std::string& rec) {
-        Aws::Kinesis::Model::PutRecordsRequestEntry e;
-        e.SetData(
-            Aws::Utils::ByteBuffer(reinterpret_cast<const unsigned char*>(rec.data()), rec.size()));
-        e.SetPartitionKey(partition_key_for_(rec));
-        return e;
-    }
-
-    // The Kinesis PartitionKey: the configured field's scalar value when present
-    // and non-empty, else a rotating counter (keeps writes spread across shards
-    // without forcing the user to nominate a key). Max 256 chars per the API; a
-    // field value over that is truncated.
-    std::string partition_key_for_(const std::string& rec) {
-        if (!opts_.partition_key.empty()) {
-            try {
-                auto j = clink::config::parse(rec);
-                if (j.is_object()) {
-                    const auto& obj = j.as_object();
-                    if (auto it = obj.find(opts_.partition_key);
-                        it != obj.end() && !it->second.is_null()) {
-                        std::string pk = scalar_text_(it->second);
-                        if (!pk.empty()) {
-                            return pk.size() > 256 ? pk.substr(0, 256) : pk;
-                        }
-                    }
-                }
-            } catch (...) {
-                // fall through to the counter
-            }
-        }
-        return std::to_string(counter_++);
-    }
-
-    static std::string scalar_text_(const clink::config::JsonValue& v) {
-        if (v.is_string()) {
-            return v.as_string();
-        }
-        if (v.is_bool()) {
-            return v.as_bool() ? "true" : "false";
-        }
-        if (v.is_number()) {
-            const double d = v.as_number();
-            constexpr double kInt64Lo = -9223372036854775808.0;
-            constexpr double kInt64HiExclusive = 9223372036854775808.0;
-            if (d >= kInt64Lo && d < kInt64HiExclusive &&
-                d == static_cast<double>(static_cast<std::int64_t>(d))) {
-                return std::to_string(static_cast<std::int64_t>(d));
-            }
-            return std::to_string(d);
-        }
-        return {};  // object/array/null: no usable scalar key -> caller falls back
-    }
-
-    void set_stream_(Aws::Kinesis::Model::PutRecordsRequest& req) const {
-        if (opts_.stream.rfind("arn:", 0) == 0) {
-            req.SetStreamARN(opts_.stream);
-        } else {
-            req.SetStreamName(opts_.stream);
-        }
-    }
-
-    // PutRecords + failed-subset resend. On partial failure resend ONLY the
-    // entries whose response index carries an ErrorCode; the successful ones are
-    // already committed, so resending them would duplicate. Throw on exhaustion
-    // (job replays from the last checkpoint - at-least-once, no silent drop).
-    void put_with_retry_(std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> entries) {
-        for (int attempt = 0; attempt <= opts_.max_retries; ++attempt) {
-            if (attempt > 0) {
-                sleep_backoff_(attempt);
-            }
-            Aws::Kinesis::Model::PutRecordsRequest req;
-            set_stream_(req);
-            req.SetRecords(Aws::Vector<Aws::Kinesis::Model::PutRecordsRequestEntry>(entries));
-            auto outcome = client_->PutRecords(req);
-            if (!outcome.IsSuccess()) {
-                // A permanent whole-call error (validation / access / bad stream)
-                // fails identically on retry - surface it immediately rather than
-                // burning the retry budget. Transient errors retry the whole
-                // batch (none can be assumed written) until exhausted.
-                const bool permanent = classify_kinesis_error(outcome.GetError().GetErrorType()) ==
-                                       FailureClass::Permanent;
-                if (permanent || attempt == opts_.max_retries) {
-                    throw std::runtime_error(opts_.name + ": PutRecords failed: " +
-                                             std::string(outcome.GetError().GetMessage().c_str()));
-                }
-                continue;
-            }
-            if (outcome.GetResult().GetFailedRecordCount() == 0) {
-                return;  // all records written
-            }
-            const auto failed = kinesis_failed_indices(outcome.GetResult().GetRecords());
-            if (!failed.empty()) {
-                std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> retry;
-                retry.reserve(failed.size());
-                for (std::size_t idx : failed) {
-                    retry.push_back(entries[idx]);
-                }
-                entries = std::move(retry);
-            }
-            // else: FailedRecordCount>0 but no per-entry ErrorCode (anomalous /
-            // short response). Do NOT treat as done - retry the WHOLE batch
-            // (entries unchanged) rather than silently dropping records.
-        }
-        throw std::runtime_error(opts_.name + ": PutRecords left records unwritten after " +
-                                 std::to_string(opts_.max_retries + 1) + " attempts");
-    }
-
-    void sleep_backoff_(int attempt) {
-        auto backoff = opts_.retry_base_backoff * (1u << (attempt - 1));
-        constexpr std::chrono::milliseconds kMaxBackoff{30000};
-        if (backoff > kMaxBackoff) {
-            backoff = kMaxBackoff;
-        }
-        std::this_thread::sleep_for(backoff);
-    }
-
-    bool linger_elapsed_() const {
-        return opts_.max_age.count() > 0 && !pending_.empty() &&
-               std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
-    }
-
-    KinesisSinkOptions opts_;
-    std::unique_ptr<Aws::Kinesis::KinesisClient> client_;
-    std::vector<Aws::Kinesis::Model::PutRecordsRequestEntry> pending_;
-    std::size_t pending_bytes_{0};
-    std::uint64_t counter_{0};
-    std::chrono::steady_clock::time_point first_buffered_at_{};
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace clink::aws

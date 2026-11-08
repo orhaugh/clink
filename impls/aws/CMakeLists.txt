@@ -37,6 +37,8 @@ add_library(clink_aws STATIC
     src/firehose_sdk_service.cpp
     src/firehose_sink.cpp
     src/kinesis_sdk_service.cpp
+    src/kinesis_sink.cpp
+    src/kinesis_sink_sdk_service.cpp
     src/kinesis_source.cpp
     src/register_factories.cpp
 )

@@ -14,7 +14,7 @@ add_executable(clink_aws_tests
     test_dynamodb_sink.cpp
     test_dynamodb_live.cpp
     test_firehose_sink.cpp
-    test_kinesis_firehose_sink.cpp
+    test_kinesis_sink.cpp
     test_kinesis_source.cpp
     test_kinesis_live.cpp
     # Finalises Arrow/AWS S3 before static destruction (joins the AWS CRT threads
@@ -42,6 +42,13 @@ find_package(aws-cpp-sdk-s3 CONFIG QUIET)
 if(TARGET aws-cpp-sdk-s3)
     target_sources(clink_aws_tests PRIVATE test_firehose_live.cpp)
     target_link_libraries(clink_aws_tests PRIVATE aws-cpp-sdk-s3)
+endif()
+# The Kinesis sink's SDK-path cases run the SDK's own client against an
+# in-process stand-in for PutRecords built on the vendored cpp-httplib; without
+# it they are not built, and scripts/kinesis-live.sh fails on the missing suite.
+if(TARGET httplib::httplib)
+    target_sources(clink_aws_tests PRIVATE test_kinesis_sink_sdk.cpp)
+    target_link_libraries(clink_aws_tests PRIVATE $<BUILD_INTERFACE:httplib::httplib>)
 endif()
 clink_set_warnings(clink_aws_tests)
 gtest_discover_tests(clink_aws_tests

@@ -1,7 +1,9 @@
 // AWS-family connector factory registration (Kinesis, Firehose, DynamoDB).
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -44,7 +46,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     // distinct guarantees that happen to share the AWS SDK.
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "kinesis",
-        .version = "1",
+        .version = "2",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"aws-sdk-cpp"},
@@ -65,7 +67,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {"poll_interval_ms", "discovery_interval_ms", "retry_timeout_ms"},
+        .timeout_options = {"poll_interval_ms",
+                            "discovery_interval_ms",
+                            "retry_timeout_ms",
+                            "connect_timeout_ms",
+                            "request_timeout_ms"},
         .available_in_sql = true,
         .limitations = {"source: records of one hash key keep their order across a split or "
                         "merge only at parallelism 1; above it, order holds within a shard",
@@ -74,6 +80,18 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "the source refuses a restore that lacks them)",
                         "source: a shard the source tracks but has not read yet is not checked "
                         "for records lost to retention before its first record",
+                        "sink: at-least-once; a record resent after a lost reply or replayed "
+                        "after a restart can be stored twice, and Kinesis keeps no producer "
+                        "identity",
+                        "sink: records sharing a partition key are not promised to arrive in "
+                        "order: PutRecords keeps no order within a request, and failed entries "
+                        "are resent after later ones were stored",
+                        "sink: without partition_key, records are keyed by a number each sink "
+                        "instance counts, so a replayed record can land on another shard than "
+                        "its first copy",
+                        "sink: a record over max_record_bytes, or without a usable partition key "
+                        "under partition_key, fails the sink, or goes to the dead-letter path "
+                        "under dlq='drop'",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -194,24 +212,67 @@ void install(clink::plugin::PluginRegistry& reg) {
         });
 
     // kinesis_sink: PutRecords into a Kinesis Data Stream. At-least-once (no
-    // producer dedup key). Params:
+    // producer dedup key, no per-key order). Params:
     //   stream (required)         - stream name or ARN
-    //   partition_key             - record field used as the Kinesis PartitionKey
-    //                               (else a rotating counter spreads load)
+    //   partition_key             - the record's top-level JSON member holding its
+    //                               partition key (string, number or boolean);
+    //                               unset numbers records per sink instance
     //   region, endpoint_override
-    //   batch_records (default 500; clamped to [1, 500])
-    //   max_retries (default 8)   - failed-subset resend attempts
+    //   connect_timeout_ms (default 3000), request_timeout_ms (default 10000)
+    //   batch_records (default 500; 1 to 500)
+    //   max_record_bytes (default 1048576; 1 to 10485760) - data plus key, the
+    //                               stream's maximum record size
+    //   max_request_bytes (default the larger of 5242880 and max_record_bytes;
+    //                               max_record_bytes to 10485760)
+    //   max_retries (default 8; 0 to 20) - retries in a row that store nothing
+    //   retry_timeout_ms (default 60000) - the most one request's retries may take
+    //   linger_ms (default 0)     - flush a partial batch this old
+    //   dlq ("fail" [default] | "drop") - a record refused before sending
     reg.register_sink<std::string>(
         "kinesis_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            // Each number is range-checked here, before it is narrowed.
+            const auto ranged =
+                [&ctx](const char* key, std::int64_t fallback, std::int64_t lo, std::int64_t hi) {
+                    const auto v = ctx.param_int64_or(key, fallback);
+                    if (v < lo || v > hi) {
+                        throw std::runtime_error(std::string{"kinesis_sink: '"} + key +
+                                                 "' must be " + std::to_string(lo) + " to " +
+                                                 std::to_string(hi) + "; it is " +
+                                                 std::to_string(v));
+                    }
+                    return v;
+                };
             KinesisSinkOptions o;
             o.stream = ctx.param_or("stream");
             o.partition_key = ctx.param_or("partition_key", "");
             o.client = client_options_from(ctx);
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
-            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 8));
-            o.dlq_policy =
-                ctx.param_or("dlq", "fail") == "drop" ? DlqPolicy::Drop : DlqPolicy::Fail;
-            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+            o.client.connect_timeout_ms = static_cast<int>(
+                ranged("connect_timeout_ms", o.client.connect_timeout_ms, 1, 600000));
+            o.client.request_timeout_ms = static_cast<int>(
+                ranged("request_timeout_ms", o.client.request_timeout_ms, 1, 600000));
+            o.batch_records = static_cast<std::size_t>(ranged(
+                "batch_records", 500, 1, static_cast<std::int64_t>(kKinesisMaxBatchRecords)));
+            o.max_record_bytes = static_cast<std::size_t>(
+                ranged("max_record_bytes",
+                       static_cast<std::int64_t>(kKinesisDefaultMaxRecordBytes),
+                       1,
+                       static_cast<std::int64_t>(kKinesisMaxRecordBytes)));
+            o.max_request_bytes = static_cast<std::size_t>(
+                ranged("max_request_bytes",
+                       static_cast<std::int64_t>(
+                           std::max(kKinesisDefaultRequestBytes, o.max_record_bytes)),
+                       static_cast<std::int64_t>(o.max_record_bytes),
+                       static_cast<std::int64_t>(kKinesisMaxRequestBytes)));
+            o.max_retries = static_cast<int>(ranged("max_retries", 8, 0, KinesisSink::kMaxRetries));
+            o.retry_timeout =
+                std::chrono::milliseconds{ranged("retry_timeout_ms", 60000, 1, 3600000)};
+            o.max_age = std::chrono::milliseconds{ranged("linger_ms", 0, 0, 3600000)};
+            const auto dlq = ctx.param_or("dlq", "fail");
+            if (dlq != "fail" && dlq != "drop") {
+                throw std::runtime_error("kinesis_sink: 'dlq' must be 'fail' or 'drop'; it is '" +
+                                         dlq + "'");
+            }
+            o.dlq_policy = dlq == "drop" ? DlqPolicy::Drop : DlqPolicy::Fail;
             o.name = "kinesis_sink";
             return std::make_shared<KinesisSink>(std::move(o));
         });

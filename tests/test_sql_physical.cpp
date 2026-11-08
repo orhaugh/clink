@@ -3320,6 +3320,84 @@ TEST(SqlPhysical, SplunkHecOptionsAreCheckedWhenTheJobIsPlanned) {
     EXPECT_NE(eo.find("'exactly_once' is supported only for"), std::string::npos) << eo;
 }
 
+std::string kinesis_sink_plan(const std::map<std::string, std::string>& options,
+                              const clink::cluster::OperatorSpec** sink_out = nullptr,
+                              clink::cluster::JobGraphSpec* spec_out = nullptr) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    TableDef dst;
+    dst.name = "keyed";
+    dst.columns.push_back(ColumnSpec{"k", arrow::int64()});
+    dst.columns.push_back(ColumnSpec{"v", arrow::int64()});
+    dst.properties = {{"connector", "kinesis"}, {"stream", "orders"}};
+    for (const auto& [k, v] : options) {
+        if (v.empty()) {
+            dst.properties.erase(k);
+        } else {
+            dst.properties[k] = v;
+        }
+    }
+    cat.register_table(std::move(dst));
+    try {
+        auto plan = bind_insert(cat, "INSERT INTO keyed SELECT k, v FROM src_t");
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        if (spec_out != nullptr) {
+            *spec_out = spec;
+            if (sink_out != nullptr) {
+                *sink_out = find_op(*spec_out, "kinesis_sink");
+            }
+        }
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// A connector='kinesis' sink table reaches the sink with every option it reads;
+// an option it does not read is refused naming the ones it does, so a misspelt
+// partition_key cannot quietly route every row by a counter; stream is
+// required; all when the job is planned.
+TEST(SqlPhysical, KinesisSinkOptionsAreCheckedWhenTheJobIsPlanned) {
+    clink::cluster::JobGraphSpec spec;
+    const clink::cluster::OperatorSpec* sink = nullptr;
+    EXPECT_EQ(kinesis_sink_plan({{"partition_key", "k"},
+                                 {"region", "eu-west-2"},
+                                 {"endpoint_override", "http://127.0.0.1:4566"},
+                                 {"batch_records", "100"},
+                                 {"max_record_bytes", "2097152"},
+                                 {"max_request_bytes", "10485760"},
+                                 {"max_retries", "4"},
+                                 {"retry_timeout_ms", "30000"},
+                                 {"linger_ms", "50"},
+                                 {"connect_timeout_ms", "2000"},
+                                 {"request_timeout_ms", "5000"},
+                                 {"dlq", "drop"},
+                                 {"format", "json"}},
+                                &sink,
+                                &spec),
+              "");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->params.at("partition_key"), "k");
+    EXPECT_EQ(sink->params.at("max_record_bytes"), "2097152");
+    EXPECT_EQ(sink->params.at("stream"), "orders");
+    EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+    const auto typo = kinesis_sink_plan({{"partitionkey", "k"}});
+    EXPECT_NE(typo.find("a connector='kinesis' sink does not read option 'partitionkey'"),
+              std::string::npos)
+        << typo;
+    EXPECT_NE(typo.find("partition_key"), std::string::npos) << typo;
+    // A source's option on a sink table would be ignored, so it is refused too.
+    EXPECT_NE(kinesis_sink_plan({{"initial_position", "latest"}}).find("'initial_position'"),
+              std::string::npos);
+    EXPECT_NE(kinesis_sink_plan({{"stream", ""}}).find("needs 'stream'"), std::string::npos);
+    const auto eo = kinesis_sink_plan({{"delivery_guarantee", "exactly_once"}});
+    EXPECT_NE(eo.find("exactly_once"), std::string::npos) << eo;
+}
+
 TEST(SqlPhysical, CommitGroupThreadsThroughToSinkParams) {
     // commit_group property on the table flows through the
     // physical planner into OperatorSpec.params, where sink factories
