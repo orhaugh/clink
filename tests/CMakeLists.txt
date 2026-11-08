@@ -511,6 +511,14 @@ if(CLINK_INTEGRATION_TESTS)
             integration/test_mysql_cdc_recovery.cpp
             integration/test_mysql_sink_recovery.cpp)
     endif()
+    # The PostgreSQL sinks' recovery cells: a coordinator and two workers
+    # polling a feed the test serves into the sinks, against the server
+    # scripts/postgres-live.sh names, with faults at the sinks' own points and a
+    # verifier that reads the table through a libpq connection of its own. They
+    # skip without it.
+    if(TARGET clink::postgres AND TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_postgres_sink_recovery.cpp)
+    endif()
     # The Cassandra and ScyllaDB sinks' recovery cells: a coordinator and two
     # workers polling a feed the test serves into the sinks, against the server
     # scripts/cassandra-live.sh starts, with faults at the sinks' own points and
