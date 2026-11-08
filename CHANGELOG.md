@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+**The MySQL change stream keeps transactions and the initial snapshot whole
+across checkpoints, stops rather than skip a change it cannot decode, and
+restores only from a checkpoint it can trust.** It checkpointed wherever a
+barrier found it: inside a transaction, so a restore resumed at a row event
+whose TABLE_MAP it had not read and dropped the rest of the transaction; and
+inside the initial snapshot, so a restore streamed from the snapshot point with
+only part of the snapshot behind it. It dropped and counted a row event it
+could not decode and did not notice statement-logged changes, partial row
+images or XA transactions; it decoded every event with today's columns from
+`information_schema`, whatever the event was written with; it read any
+checkpoint row it could parse and otherwise started at the server's current
+coordinate; on MySQL 8.4, which removed `SHOW MASTER STATUS`, it could start
+only from `start_file` or a checkpoint; and with `snapshot_lock='false'` it could lose a change MySQL had
+written to the binlog but not yet committed when the snapshot started. Now the
+source holds checkpoint barriers from a transaction's GTID event to its commit
+and through the snapshot (`Source::barrier_ready`), and the checkpoint holds the
+last transaction boundary's coordinate, the server's UUID and the definitions
+in force for events written without column names. A restore refuses a corrupt
+row, a purged file, a position past its file, another server's UUID and a
+mid-snapshot checkpoint. An event it cannot decode stops it, after everything
+before it is passed on, unless the table says `on_decode_error='drop'`, which
+skips and dead-letters it and makes the delivery analyser report the job as
+at-most-once at its source (a new `replay_lost_with_options` capability field).
+Under `binlog_row_metadata=FULL` each event is decoded with its own definition;
+under MINIMAL a change to a captured table's columns stops the source instead
+of being guessed. The unlocked snapshot takes `LOCK TABLES ... READ` on its
+tables while it reads its coordinate. The row decoder refuses a width or
+precision outside MySQL's limits (it read them, shifting past 64 bits), binary
+JSON it cannot parse (it wrote `null`) and an ENUM or SET value past its
+members, and reads ENUM index 0 as the empty string. A MariaDB server is
+refused, options are read strictly, and the checkpoint row has a new layout (an
+earlier release's still restores). Verified against MySQL 8.0.46 and 8.4.13 by
+`scripts/mysql-cdc-live.sh`, with recovery cells that kill a worker inside the
+snapshot and inside a 20000-row transaction.
+
 **A source can hold the checkpoint barriers it is given until it reaches a
 point a checkpoint may cut at.** `Source::barrier_ready()` defaults to true; a
 source that returns false keeps its pending barriers queued while the runner
