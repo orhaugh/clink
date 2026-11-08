@@ -513,11 +513,14 @@ if(CLINK_INTEGRATION_TESTS)
     # scripts/influxdb-live.sh starts, each verified by reading the measurement
     # back with Flux. The Pushgateway sink's cells do the same into
     # prometheus_sink, against the gateway scripts/prometheus-live.sh starts,
-    # each verified by scraping it. They skip without their server.
+    # each verified by scraping it. They skip without their server. The Splunk
+    # HEC sink's cells write to a stub HEC the test serves (hec_stub.hpp) and
+    # need no service, only the node and SQL binaries.
     if(TARGET clink::http_connector)
         target_sources(clink_integration_tests PRIVATE
             integration/test_influxdb_recovery.cpp
-            integration/test_prometheus_recovery.cpp)
+            integration/test_prometheus_recovery.cpp
+            integration/test_splunk_recovery.cpp)
         target_include_directories(clink_integration_tests PRIVATE
             ${CMAKE_SOURCE_DIR}/impls/http_connector/tests)
     endif()
