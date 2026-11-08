@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+**The Pushgateway sink keeps each series its own, says which series each push
+carries, and fails rather than drop a record or a push.** It silently dropped
+malformed JSON, non-objects and records with a missing or non-numeric value; it
+rewrote field names into the label grammar, so `device-id` and `device_id`
+became one label; it wrote integer labels through a double, so neighbouring
+integers above 2^53 became one series; it dropped a field named like a grouping
+label whatever its value; it pushed `{a=""}` and `{}` as two series, which
+Prometheus reads as one; and a failed push cleared what it carried with no
+failed state, so a later barrier could cover samples no push delivered. Now a
+record is checked whole before anything is buffered: label names must be label
+names and are refused, never rewritten; numbers are labelled with their JSON text
+exactly as written; an empty or null label is absent; a field named after a
+grouping label must carry the group's value; the value must be a number (an
+integer within 2^53), a boolean, a decimal string read without regard to locale,
+or a NaN or infinity spelling. A refused record is dead-lettered under
+`dlq='drop'`, and under `fail`, the default, stops the sink until it opens again.
+`push_series` makes the replacement explicit: the gateway's POST replaces the
+group's series of the metric, `batch` (the default) keeps the earlier
+behaviour of pushing the series since the previous push, and `all` holds the
+latest value of every series, up to `max_series`, and pushes them all, a run
+restored from a checkpoint first adopting the series the group holds. A push
+counts on 200 or 202 only; a 400 fails at once and keeps what it carried;
+credentials, throttling, outages and lost replies are retried, then fail. Pushes
+are bounded by `batch_bytes`, samples by `max_sample_bytes`, requests by the new
+`connect_timeout_ms` and `request_timeout_ms`, and a cancel interrupts a push in
+flight. The sink runs on one subtask, the group's only writer: the factory
+refuses a parallelism above 1, and SQL keeps the sink on one subtask and refuses
+options it does not read and `changelog='true'`. Covered by `PromRender`,
+`PromPushResult`, `PromSink` against a stub gateway,
+`SqlPhysical.PrometheusOptionsAreCheckedWhenTheJobIsPlanned`, and the gate
+`scripts/prometheus-live.sh` against Pushgateway 1.10.0 with `PushgatewayLive` and
+three recovery cells (`PushgatewayRecovery`).
+
 **The InfluxDB sink writes exactly one point per accepted record, requires the
 timestamp it is told to use, and reports partial writes as such.** A record whose
 `timestamp_field` was missing or not a number was written with the server's

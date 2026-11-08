@@ -268,16 +268,111 @@ Records the previous sink wrote correctly are written the same way, with the sam
 
 ### `prometheus_sink`
 
-Pushes batched records as gauge samples to a Prometheus Pushgateway. This sink does not read `batch_bytes` or `dlq`.
+Pushes each JSON-object row as one gauge sample to a Prometheus Pushgateway. One sink pushes one metric into one group: `job` and the `grouping` labels name the group, `metric_name` the gauge, `value_field` the field holding each sample's value, and every other field is a label. The sample rules, the push path and the reading of responses are in `impls/http_connector/src/prometheus_push_sink.cpp`. It is tested against Pushgateway 1.10.0.
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `job` | Yes | (empty) | Grouping job (first path segment under `/metrics/job/`). |
-| `grouping` | No | (empty) | Extra static path labels as `k=v,k2=v2`. |
-| `metric_name` | No | `clink_value` | The single gauge metric name. |
-| `value_field` | No | `value` | Record field holding the gauge value. |
-| `help` | No | (empty) | Optional `# HELP` text. |
-| `batch_records` | No | `500` | Maximum distinct series per push. |
+| `url` | Yes | | `scheme://host[:port]` of the gateway. A URL carrying credentials is refused; put them in `headers`. |
+| `job` | Yes | | The group's `job` label: any non-empty UTF-8 text. |
+| `grouping` | No | | The group's other labels, `name=value` pairs separated by commas, with the spaces around each trimmed. A name must be a label name, appear once and not be `job`; a value may be empty but cannot hold a comma. |
+| `metric_name` | No | `clink_value` | The gauge's name, `[a-zA-Z_:][a-zA-Z0-9_:]*`, other than `push_time_seconds` and `push_failure_time_seconds`, which the gateway writes itself, and, with `push_series='all'`, `labels` and `last_push_successful`, which name fields of the gateway's query API. |
+| `value_field` | No | `value` | The field holding each sample's value. |
+| `help` | No | | `# HELP` text. |
+| `push_series` | No | `batch` | Which series each push carries: `batch` or `all` (below). |
+| `batch_records` | No | `500` | `batch` only: push once this many series are buffered; 1 to 100000. |
+| `max_series` | No | `10000` | `all` only: the most series the sink holds; 1 to 1000000. |
+| `batch_bytes` | No | `4194304` | The most bytes one push carries; 1024 to 268435456. |
+| `max_sample_bytes` | No | `65536` | The longest sample line, or half a smaller `batch_bytes`; 64 to `batch_bytes`. A record making a longer line is refused. |
+| `linger_ms` | No | `0` | Push updates once the oldest is this old, checked when a record arrives; up to 3600000. |
+| `max_retries` | No | `4` | 0 to 20 retries of a push. |
+| `connect_timeout_ms` | No | `5000` | 1 to 600000. |
+| `request_timeout_ms` | No | `30000` | 1 to 600000: how long one push or read may wait for its reply. |
+| `dlq` | No | `fail` | `fail` or `drop`: what a refused record does (below). |
+| `verify_tls`, `headers` | No | `true`, none | As the other HTTP sinks; `headers` carries basic auth for a gateway or proxy that asks for it. |
+
+Every option is read strictly: a value outside its set or range, or a number with anything after its digits, fails the build. The sink runs on one subtask: the factory refuses a parallelism above 1, and the SQL planner keeps the sink on one subtask whatever the job's parallelism.
+
+#### Series identity
+
+A series is the metric name and its label set, and a record's labels are every field but `value_field`:
+
+| JSON value | Label value |
+| --- | --- |
+| string | the string, which must be valid UTF-8; an empty string means the label is absent |
+| number | its JSON text exactly as written: an integer keeps every digit, past 2^53 and past 64 bits, and `1.50` stays `1.50` |
+| `true`, `false` | `true`, `false` |
+| `null` | the label is absent |
+| object or array | refused |
+
+A label value is text, so the string `"42"` and the number `42` name one series, while `1` and `1.0` name two. An empty string and `null` both mean the label is absent, which is how Prometheus reads an empty label value. A field name must be a Prometheus label name, `[a-zA-Z_][a-zA-Z0-9_]*` and not starting with `__`; any other name is refused, never rewritten, so `device-id` cannot merge with `device_id`. A field named after a grouping label, `job` included, must be absent or carry the group's value: Pushgateway 1.10.0 replaces such a label with the group's value without a word, which would merge distinct series. In a label value, backslash, double quote and line feed are escaped, and every other character, carriage returns, tabs and NUL included, is written as it is; a scrape of the gateway returns each unchanged.
+
+Within the sink a later record replaces an earlier record's value for the same series, so a push carries each series once, as the gateway requires.
+
+#### Values
+
+`value_field` must hold one of:
+
+- a JSON number; an integer within plus or minus 2^53, which a gauge (an IEEE double) holds exactly; any other number becomes the nearest double;
+- `true` or `false`, pushed as 1 or 0;
+- a string holding a decimal number in JSON's grammar, read without regard to locale, on the same terms;
+- the string `NaN`, `Infinity`, `-Infinity`, `+Inf` or `-Inf`.
+
+Anything else is refused: `null`, a missing field, an out-of-range number, or a string such as `" 1"`, `"1,5"` or `"0x10"`. A value is pushed in its shortest exact form, NaN and the infinities as `NaN`, `+Inf` and `-Inf`. A SQL `DOUBLE` that is NaN or infinite reaches the sink as `null` unless the table sets `json_non_finite='string'`, which writes the spellings above.
+
+#### The group and its path
+
+Pushes are POSTs to `/metrics/job/<job>` followed by `/<name>/<value>` for each grouping label. A value of letters, digits, `-`, `_` and `.` is written as it is; any other value, an empty one included, takes the gateway's base64 form (`<name>@base64/<value>`, URL-safe alphabet). The gateway decodes `%2F` before it splits the path, so a slash survives only in base64.
+
+#### Which series each push carries
+
+The gateway's POST replaces every series of the pushed metric in the group with the series the push carries, and leaves the group's other metrics alone. What a scrape of the gateway shows therefore depends on what each push carries:
+
+- **`push_series='batch'`** (the default, and how earlier releases behaved): a push carries the series of the records since the previous push. Pushes happen when `batch_records` series are buffered, before the buffer passes `batch_bytes`, after `linger_ms`, at every checkpoint barrier and at end of input, and each replaces the series of the one before it. A series no record named since the previous push disappears from the gateway.
+- **`push_series='all'`**: the sink holds the latest value of every series it was given, up to `max_series` and `batch_bytes`, and every push carries them all, so no trigger hides a series. Pushes happen after `linger_ms`, at end of input and at every checkpoint barrier, where the sink pushes what it holds even when nothing changed, so a gateway that restarted without persistence has the series again. A record that would take the set past `max_series` or `batch_bytes` fails the sink, since a push of part of the set would hide the rest. A series stays until the group is deleted from the gateway. A run restored from a checkpoint first reads the group's series of the metric from the gateway's query API (`/api/v1/metrics`, at most 64 MiB read) and holds them too, the records it receives taking precedence, so the series its predecessor pushed stay visible though the replay never names them again. A fresh start does not read them, and its first push replaces them.
+
+Pushgateway 1.10.0 checks each push against everything it holds. Measured locally with one group of 400,000 series held, a push took 0.2 to 0.8 seconds, against a few milliseconds without it. The gateway is meant for a modest number of series.
+
+#### When a push counts
+
+| Response | Meaning | Handling |
+| --- | --- | --- |
+| 200 | the gateway applied the push | the push is done |
+| 202 | the gateway queued the push without its consistency check (`--push.disable-consistency-check`) | the push is done |
+| another 2xx | not a confirmation | sent again, then the sink fails |
+| 400 | the gateway refused the push whole and applied none of it, as for a metric another group holds with another type | the sink fails at once, keeping what the push carried |
+| 401, 403, 404, 413 | credentials refused, no push API at this URL, a push larger than a proxy takes | sent again, then the sink fails |
+| 429, 5xx, no reply | throttling, a server error, or a reply lost after the gateway may have applied the push | sent again after a backoff, then the sink fails |
+
+No response dead-letters a record. A resend carries the same series with the same values, so a resend after a lost reply changes nothing. A gateway message is repeated with every quoted value removed, and header values never appear in a message.
+
+#### Refused records
+
+A record that breaks a rule above never reaches the gateway, and because it is checked whole before anything is buffered it never replaces a valid sample. Under `dlq='drop'` it goes to the dead-letter queue with the rule it broke and is counted in `dropped_records_total`. Under `dlq='fail'` the sink fails, and because it keeps no copy of the record it refuses every later record, flush and barrier until it opens again. Refusals name the rule and the field, never a value.
+
+#### Checkpoints and failure
+
+A barrier returns only once a push carrying everything received before it was confirmed, so a checkpoint never covers a sample that no confirmed push carried. A failed push keeps what it carried, and the next push sends it again. A cancelled task stops at once, interrupting a push in flight or a pause before a retry. `close()` pushes nothing; end of input pushes what is pending first. Records count as written (`records_total`) when a confirmed push first carries them.
+
+#### Delivery, ownership and replay
+
+- **The gateway keeps values, not samples.** Prometheus sees what the gateway holds when it scrapes, so a value replaced before a scrape is never observed, and nothing here says every record reached Prometheus. Samples are durable only once Prometheus has stored them, and the gateway keeps nothing across its own restart unless run with persistence.
+- **Pushes are at-least-once.** A restored job pushes again the records after its checkpoint, and each push replaces the series it carries, so the replay ends at each series' latest value. Until it gets there, a series can show an older value than before the failure.
+- **One writer per group and metric.** Each push replaces every series of the metric in the group, so another writer's push replaces the sink's series and the sink's replaces theirs, as the live suite shows. The sink runs on one subtask, and no other sink or job may push the same metric to the same group. A series takes its values in the sink's input order.
+
+The SQL frontend refuses `exactly_once`, `mode='upsert'`, `changelog='true'` (a pushed gauge has no delete, and `__row_kind` is not a label name) and options the sink does not read.
+
+#### Earlier releases
+
+Records the previous sink pushed without dropping or rewriting anything are pushed the same way, as the same series, and `push_series='batch'` keeps its replacement behaviour. What changes:
+
+- **Bad records fail the sink by default.** Malformed JSON, a non-object, and a missing, null or non-numeric value used to be dropped without a word, and nested fields left out. They are now refused under `dlq`, `fail` by default; `dlq='drop'` dead-letters them.
+- **Names are refused, not rewritten.** A field name outside the label grammar used to be rewritten, so two fields could merge into one label, and the metric name was rewritten too. Both are now refused.
+- **Integer labels keep every digit.** Numbers used to be written through a double, so neighbouring integers above 2^53 became one series.
+- **Grouping conflicts are refused.** A field named after a grouping label used to be dropped from the push whatever its value; one carrying another value is now refused, and one carrying the group's value is accepted. A `grouping` entry without `=` used to be skipped; it now fails the build, as does a repeated name or `job`.
+- **An empty label value is the label absent**, as Prometheus reads it: `{a=""}` and `{}` used to be two series in one push.
+- **A failed push keeps what it carried** instead of clearing it, and a 400 fails at once instead of being retried.
+- **Values are read strictly.** An integer past 2^53 is refused rather than rounded, and a decimal string is read in JSON's grammar, without regard to locale.
+- **New options:** `push_series`, `max_series`, `max_sample_bytes`, `connect_timeout_ms`, `request_timeout_ms` and `dlq`; `batch_bytes` is now read. Options are read strictly, and a parallelism above 1 is refused.
 
 ### `http_poll_source`
 
@@ -450,6 +545,8 @@ Several of these connectors are mapped in `src/sql/physical_plan.cpp`. The SQL `
 
 `http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, and `prometheus_sink` are not registered as standalone SQL source/sink names; they are reached only through these `connector` aliases. The SQL planner rejects `exactly_once` and `upsert` modes on these sinks (they are at-least-once).
 
+For `connector='influxdb'` and `connector='prometheus'` the planner also refuses an option the sink does not read, naming the ones it does, and `changelog='true'`. It keeps a `connector='prometheus'` sink on one subtask whatever the job's parallelism, the operators in front fanning in to it, since a second subtask would replace the first one's series.
+
 Sink example (Elasticsearch):
 
 ```sql
@@ -520,10 +617,11 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 
 ## Delivery semantics
 
-- Sinks (`http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, `prometheus_sink`, `pubsub_sink`) are at-least-once. The shared `BatchedHttpBulkSink` flushes on every checkpoint barrier (before the sink acks), on the size and linger thresholds, and at end-of-stream. On permanent failure with retries exhausted it throws rather than dropping, keeping the batch, so the job replays from the last checkpoint. A record a sink refuses before sending is dead-lettered under `dlq='drop'`; under `dlq='fail'` the sink throws and, keeping no copy of it, refuses every later record and barrier until it opens again. A response that refuses some records without naming them (an InfluxDB partial write) fails the sink under `fail` and is dead-lettered as one report under `drop`. There is no two-phase commit, so a replay re-delivers buffered records.
+- Sinks (`http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, `prometheus_sink`, `pubsub_sink`) are at-least-once. The shared `BatchedHttpBulkSink`, which every one of them but `prometheus_sink` builds on, flushes on every checkpoint barrier (before the sink acks), on the size and linger thresholds, and at end-of-stream. On permanent failure with retries exhausted it throws rather than dropping, keeping the batch, so the job replays from the last checkpoint. A record a sink refuses before sending is dead-lettered under `dlq='drop'`; under `dlq='fail'` the sink throws and, keeping no copy of it, refuses every later record and barrier until it opens again. A response that refuses some records without naming them (an InfluxDB partial write) fails the sink under `fail` and is dead-lettered as one report under `drop`. There is no two-phase commit, so a replay re-delivers buffered records.
 - `elasticsearch_sink` / `opensearch_sink` are at-least-once. Without `document_id` a resend or a replay indexes the record again; a reply lost after the server applied the request is enough to duplicate a batch. With `document_id` each record replaces its id's document, so a replay converges on each id's latest record, ordered within a sink subtask as [Ordering](#ordering) describes. A batch counts as written only when the bulk response confirms every operation, and failures are classified as [the table above](#when-a-batch-counts-as-written) sets out.
 - `influxdb_sink` is at-least-once. With `timestamp_field` a rewritten point lands on its own series and time, where InfluxDB merges it into the point already there; without it every write is a new point, so a replay duplicates. [Its section](#influxdb_sink) has the contract.
-- `splunk_hec_sink` and `prometheus_sink` are at-least-once with no dedup key; HEC ingestion is append, and the Pushgateway stores the latest value per series (last-write-wins within a push). Each push is a POST, which replaces every series of the metric in its group with the series the push carries, and a push carries the series of the records since the previous one. So a series no record has named since the previous push disappears from the gateway rather than keeping its last value; give every series a record in each checkpoint interval if they must all stay visible.
+- `splunk_hec_sink` is at-least-once with no dedup key; HEC ingestion is append, so a replay indexes again.
+- `prometheus_sink` is at-least-once into a store of latest values: each push replaces the group's series of the metric, so a replay ends at each series' latest value, and `push_series` decides which series each push carries. [Its section](#prometheus_sink) has the contract.
 - `pubsub_sink` is at-least-once with no producer dedup; a replay re-publishes.
 - `http_poll_source` in cursor mode replays from its checkpointed cursor: at-least-once into the job, and exactly-once into a two-phase-commit sink, while the endpoint answers the records strictly after the cursor, ascending and each value unique, and keeps what it served. Every page is checked against what the source can see of that before anything is emitted, and one that fails fails the poll (see [the source's section](#http_poll_source)). Its capability record, `http_poll`, declares replay only with `cursor_field` and `cursor_param`, so the delivery analyser reports a job over a source in resource mode as `AT_MOST_ONCE_SOURCE` and refuses `at_least_once` and above for it, naming the options that would make it replay. Before, the source shared the `http` record, which claimed replay however the source was set up.
 - `pubsub_source` is at-least-once. It pulls, leases what it holds, and acknowledges once the checkpoint that covers a message completes; the server delivers again whatever was not acknowledged, which is also the crash-recovery mechanism. The contract, in detail:
@@ -544,7 +642,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - No two-phase commit on any sink; exactly-once delivery is not offered. The SQL planner rejects `exactly_once` and `upsert` modes on these sinks.
 - `elasticsearch_sink` / `opensearch_sink`: records of one `document_id` are ordered only within one sink subtask, and not against other writers; a replay can show a document at an older record's value until it reaches the latest; `document_id` values outside [the id rules](#document-ids) are refused. Only the `index` action is written: no update, delete or external versioning. The sink takes one URL and does not discover other nodes.
 - HTTPS works only if cpp-httplib was built with OpenSSL; otherwise an `https://` URL is rejected at construction.
-- `prometheus_sink` targets a Pushgateway, which is a latest-value store for low-cardinality service metrics, not a high-throughput event TSDB. Records whose `value_field` is missing or non-numeric are dropped (no sample). Remote-write is not implemented.
+- `prometheus_sink` targets a Pushgateway, a store of each series' latest value for a modest number of series, not a time-series database: Prometheus sees only the values present when it scrapes. The sink must be its group's only writer of its metric and runs on one subtask. With `push_series='batch'` a series not named since the previous push disappears; with `'all'` a series stays until the group is deleted. Label names outside the label grammar and integer values past 2^53 are refused. Remote-write is not implemented.
 - `http_poll_source` replays only in cursor mode, and only from an endpoint that answers strictly after the cursor, ascending by a unique `cursor_field`, and keeps what it served; it refuses a page that breaks what it can check of that, including a value shared by two records. Page tokens, offsets and cursors of several fields are not supported. One subtask polls. A bounded run ends only on an empty page (cursor mode) or after one response (resource mode). Records with an integer past 64 bits or a number past a double's range are refused, since clink's JSON reader cannot decode them.
 - `pubsub_source` holds at most `max_outstanding` unacknowledged messages per subtask, and a job that completes no checkpoint stops pulling there. A message held past `max_lease_s` is delivered again (a duplicate). Subscriptions with exactly-once delivery enabled are not handled specially.
 - Pub/Sub uses the synchronous REST `Pull` with `returnImmediately`; gRPC StreamingPull is not used. The build does not mint OAuth2 tokens itself; a static `auth_token` expires after its lifetime, but `auth_token_file` lets an external refresher rotate the token without a restart. Multiple subtasks pull the same subscription and Pub/Sub load-balances across them (no client-side sharding).
@@ -553,7 +651,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 
 ## Testing
 
-The module's tests live in `impls/http_connector/tests/` and carry the ctest label `http_connector`. Most are in-process or mock tests (factory registration, framing, the Splunk and Prometheus body builders) and run in a normal build:
+The module's tests live in `impls/http_connector/tests/` and carry the ctest label `http_connector`. Most are in-process or mock tests (factory registration, framing, the Splunk body builder, the Pushgateway sample rules) and run in a normal build:
 
 ```bash
 ctest --test-dir build -L http_connector
@@ -567,8 +665,9 @@ The live integration tests are skipped unless their endpoint environment variabl
 | OpenSearch (`OpenSearch/SearchSinkLive`, same file) | `CLINK_OPENSEARCH_TEST_ENDPOINT` | `opensearchproject/opensearch:2.17.1`, security plugin off |
 | InfluxDB (`InfluxDbLive`, `test_influxdb_live.cpp`) | `CLINK_INFLUXDB_TEST_ENDPOINT`, plus `CLINK_INFLUXDB_TEST_ORG` / `_BUCKET` / `_TOKEN` (defaults `clink` / `clink` / `clink-token`) and `_VERSION` | `influxdb:2.7.12`, pinned by digest in `scripts/influxdb-live.sh` |
 | Pub/Sub (`test_pubsub_live.cpp`) | `CLINK_PUBSUB_EMULATOR_HOST` (e.g. `localhost:8085`) | `gcr.io/google.com/cloudsdktool/cloud-sdk:emulators` |
+| Pushgateway (`PushgatewayLive`, `test_prometheus_live.cpp`) | `CLINK_PUSHGATEWAY_TEST_ENDPOINT`, plus `CLINK_PUSHGATEWAY_TEST_VERSION` | `prom/pushgateway:v1.10.0`, pinned by digest in `scripts/prometheus-live.sh` |
 
-There is no live test for `splunk_hec_sink` or `prometheus_sink`; these are covered by in-process and mock tests. `http_poll_source` has a gate of its own against local servers, below, and also feeds the search recovery cells, from a feed the test serves.
+There is no live test for `splunk_hec_sink`; it is covered by in-process and mock tests. `http_poll_source` has a gate of its own against local servers, below, and also feeds the search recovery cells, from a feed the test serves.
 
 `pubsub_source`'s acknowledgement contract is tested in process by `PubSubSourceAck` (`test_pubsub.cpp`), against a stub of the REST endpoints that leases each delivery under a new ackId, honours `modifyAckDeadline`, acknowledges only through a current ackId and can fail acknowledges: an aborted checkpoint, crashes after the barrier and after completion, failed and retried acknowledges, notifications out of order, leases held across a delayed checkpoint and given up past `max_lease`, the `max_outstanding` bound, close after a cancel, and both `on_decode_error` policies. `PubSubSourceAckLive` (`test_pubsub_live.cpp`) repeats the abort, the crash after completion and the delayed checkpoint against the emulator. `test_factory_registration.cpp` pins the capability record and the analyser's verdict. `scripts/ack-sources-live.sh [build-dir]` is the required gate: it runs `PubSubLive` and `PubSubSourceAckLive` against a one-off emulator container, with the other acknowledging sources' suites, and fails on a missing binary, an emulator that never answers, a failed or skipped case, or a short suite (see the [Redis page](redis.md#testing)). The `ack-sources` CI workflow runs it.
 
@@ -583,6 +682,16 @@ Without a server: `InfluxRender` (point identity, every escape and refusal, time
 `scripts/influxdb-live.sh [build-dir]` is the gate: it starts InfluxDB 2.7.12, pinned by digest, on a free loopback port with a throwaway token, runs the suites above, and fails on a missing binary, a server that never becomes ready, a failed or skipped case or a short suite, keeping each run's report, the cells' cluster logs and a provenance file (never the token) in `build/influxdb-live-reports/`. The `http` CI workflow runs it.
 
 The gate passed locally on commit 50bdbaa6, 37 of 37, on 2026-11-07 (reports not published). In the timestamped cell 3,000 records left exactly 3,000 points after the kill and replay; in server-time mode 294 of the 318 replayed records were written twice, leaving 3,294 points; the SQL cell left 3,000. The previous sink's defects (a missing or fractional timestamp, a missing tag, line breaks in names, malformed records sent as broken lines, nested values dropped, a 422 dead-lettering written points) were found by reading its code and are each covered by a case above; they were not run against the server with the old code.
+
+### Pushgateway
+
+Without a gateway: `PromRender` (series identity, label names refused rather than rewritten, every label value kept and escaped, numbers labelled as written with neighbours above 2^53 and integers past 64 bits, empty and null labels absent, the value's types and refusals, grouping conflicts, the sample bound, refusals that name no value, the path's encoding, the options), `PromPushResult` (each response class, and a 400's quoted values removed) and `PromSink`, the sink against a stub gateway: the push's path, content type and body; repeated updates; each trigger in each `push_series` mode; the bounds in all mode; refused records under each policy, never replacing a valid sample; a 400 refused once and kept; throttling and outages retried; refused credentials, never dead-lettered and never in a message; a reply lost after the gateway received the push; retries ended by a cancel and spent; a push in flight cancelled; a restored run adopting its group, and refusing one it cannot adopt; the factory's strict options and its refusal of a parallelism above 1. `SqlPhysical.PrometheusOptionsAreCheckedWhenTheJobIsPlanned` covers the planner.
+
+`PushgatewayLive` pushes through the sink and reads the gateway back with a scrape of its own: the version; labels with control characters, Unicode and escapes, neighbours above 2^53 and integers past 64 bits; group values a path segment cannot carry; values as the gauge holds them; refused records beside good ones; each batch-mode trigger replacing the previous push while another metric of the group stays; all mode keeping every series at its latest value; a restored run adopting the group's series and a fresh one replacing them; two writers of one group replacing each other; a type conflict with another group refused at once and pushed once it clears; a reply withheld by a proxy after the gateway applied the push; and a group deleted under the sink pushed again at the next barrier.
+
+`PushgatewayRecovery` (`tests/integration/test_prometheus_recovery.cpp`) runs a coordinator and two workers polling a feed into the sink, where record n sets series `k<n mod 100>` to n and five early series appear only in the first 150 records, and kills a worker parked at `prometheus_sink.after_write` after a push the gateway applied and no checkpoint covered. In all mode, as a job graph and as a SQL job at parallelism 2, the gateway must end with every series at its latest value, the early ones included, which only the restored run's adoption of the group can keep, since the job restores past their records; in batch mode, with the series of the last push, each at its latest, and no early one. Each cell checks where the worker parked, one restart, the restore point, and that the parked push carried records past it.
+
+`scripts/prometheus-live.sh [build-dir]` is the gate: it starts Pushgateway 1.10.0, pinned by digest, on a free loopback port, runs the suites above, and fails on a missing binary, a gateway that never becomes ready, a failed or skipped case or a short suite. It keeps each run's report, the cells' cluster logs and final scrapes, and a provenance file in `build/prometheus-live-reports/`. The `http` CI workflow runs it.
 
 ### Elasticsearch and OpenSearch
 
