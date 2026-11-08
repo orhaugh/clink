@@ -299,6 +299,16 @@ protected:
             std::ofstream(dir / ("killed-worker-" + std::to_string(i) + ".log"))
                 << archived_logs_[i];
         }
+        // The cell's verdict rests on this scrape: each series the gateway
+        // showed at the end, beside the value the feed says is its latest.
+        std::ofstream scrape(dir / "final-scrape.txt");
+        const auto latest = feed_->latest();
+        for (const auto& [id, v] : shown()) {
+            const auto it = latest.find(id);
+            scrape << metric_ << "{id=\"" << id << "\"} " << v << " (latest "
+                   << (it == latest.end() ? std::string{"none"} : std::to_string(it->second))
+                   << ")\n";
+        }
     }
 
     void kill_and_replace(Cluster& cluster, std::size_t idx) {

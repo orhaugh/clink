@@ -34,6 +34,17 @@ name: http
 # after writes the server applied, timestamped, in server-time mode and as a SQL
 # job. It runs whenever the build succeeded, whatever the other gates did.
 #
+# The Prometheus Pushgateway sink's gate (scripts/prometheus-live.sh), against
+# Pushgateway 1.10.0 pinned by digest in the script: the sample rules (series
+# identity, names, label values, the value, grouping conflicts, bounds), the
+# reading of push responses, the sink against a stub gateway in both
+# push_series modes, the live suite, which reads every series back by scraping
+# the gateway (labels and group values, values, refused records, each mode's
+# replacement, a restored run, two writers, a type conflict, a reply lost after
+# the gateway applied a push), and the recovery cells, a worker killed after a
+# push the gateway applied and no checkpoint covered, in each mode and as a SQL
+# job. It runs whenever the build succeeded, whatever the other gates did.
+#
 # A live test skips when its server or binary is missing and gtest counts that
 # as a pass, so each gate fails on any skip and on any required suite that did
 # not run in full. This workflow was named search until the polling source's
@@ -63,7 +74,7 @@ concurrency:
 
 jobs:
   live:
-    name: The search and InfluxDB sinks and the polling source hold their contracts
+    name: The search, InfluxDB and Pushgateway sinks and the polling source hold their contracts
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -192,6 +203,34 @@ jobs:
           path: |
             ${{ runner.temp }}/influxdb-live-reports/**
             ${{ runner.temp }}/influxdb-gate.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Run the Pushgateway sink's gate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_PUSHGATEWAY_TEST_ENDPOINT -e CLINK_PUSHGATEWAY_TEST_VERSION \
+            -e CLINK_PUSHGATEWAY_RECOVERY_LOG_DIR \
+            ${TOOLCHAIN}"
+          REPORT_DIR="${RUNNER_TEMP}/prometheus-live-reports" \
+            scripts/prometheus-live.sh build 2>&1 | tee "${RUNNER_TEMP}/prometheus-gate.log"
+      - name: Keep the Pushgateway sink's reports and the cells' evidence
+        # The reports carry every case's result; the gate log and each run's log
+        # carry the "[prometheus-live]" and "[prometheus-recovery]" lines and the
+        # fault framework's witness lines; recovery-logs/ holds every cell's
+        # coordinator and worker logs and the final scrape its verdict rests on;
+        # provenance.txt names the commit, the build's configuration and the
+        # gateway. On failure the report directory also holds the gateway's log.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: prometheus-gate
+          path: |
+            ${{ runner.temp }}/prometheus-live-reports/**
+            ${{ runner.temp }}/prometheus-gate.log
           if-no-files-found: warn
           retention-days: 90
       - name: Keep the polling source's reports and the cells' evidence
