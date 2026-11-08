@@ -1,5 +1,6 @@
 // HTTP connector factory registration.
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -247,7 +248,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "prometheus",
-        .version = "1",
+        .version = "2",
         .is_source = false,
         .is_sink = true,
         .build_dependencies = {"cpp-httplib"},
@@ -257,20 +258,33 @@ void install(clink::plugin::PluginRegistry& reg) {
         .replayable = false,
         .offset_model = clink::connectors::OffsetModel::None,
         .checkpoint_integrated = true,
-        // Push replaces the group's series: last write wins, so a replay
-        // converges rather than duplicates - but intermediate values are
-        // overwritten, which is pushgateway semantics, not a clink choice.
+        // A push replaces the group's series of the metric, so a replay ends at
+        // each series' latest value rather than duplicating; the gateway keeps
+        // values, not samples.
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .auth_methods = {"none", "basic"},
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {},
+        .timeout_options = {"connect_timeout_ms", "request_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"pushgateway keeps only the last push per group",
-                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
-                        "another sink beside it"},
+        .limitations =
+            {"a push replaces every series of the metric in the group with the series it "
+             "carries: with push_series='batch' (the default) those of the records since the "
+             "previous push, so a series no record named since then disappears; with "
+             "push_series='all' every series the sink holds, up to max_series",
+             "the gateway keeps each series' latest value, not every sample: a scrape sees the "
+             "values present when it runs, and a replay can show an older value until it "
+             "reaches the latest",
+             "the sink must be its group's only writer of its metric and runs on one subtask; "
+             "another writer's push replaces the sink's series, and the sink's replaces theirs",
+             "with push_series='all' a series stays in the gateway until the group is deleted, "
+             "and a run restored from a checkpoint adopts the series the group holds",
+             "label names must be Prometheus label names and are refused, not rewritten; an "
+             "integer value must be within 2^53",
+             "the sink must be the only sink on its chain: Dag::add_sink refuses another sink "
+             "beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "splunk_hec",
@@ -550,23 +564,74 @@ void install(clink::plugin::PluginRegistry& reg) {
             return make_influxdb_sink(std::move(o));
         });
 
-    // prometheus_sink: push batched records as gauge samples to a Prometheus
-    // Pushgateway (POST /metrics/job/<job>{/<label>/<value>}). One gauge metric
-    // name per sink; each row's value_field is the float and the other scalar
-    // fields become labels. Dedup is last-write-wins per label set (the gateway
-    // rejects duplicate series in one push). At-least-once. Params:
-    //   url (required)        - pushgateway base, e.g. http://pushgateway:9091
-    //   job (required)        - grouping job (first path segment)
-    //   grouping              - extra static path labels "k=v,k2=v2"
-    //   metric_name (default "clink_value")
-    //   value_field (default "value") - the record field holding the gauge value
-    //   help                  - optional # HELP text
-    //   headers               - optional "K: V; ..." (fronting-proxy auth)
-    //   batch_records (default 500; max DISTINCT series per push)
-    //   max_retries (default 4; clamped to [0, 20])
-    //   verify_tls ("true" [default] | "false")
+    // prometheus_sink: push each JSON-object row as one gauge sample to a
+    // Prometheus Pushgateway (POST /metrics/job/<job>{/<label>/<value>}). One
+    // gauge metric and one group per sink, which must be the group's only
+    // writer of the metric, so the sink runs on one subtask. push_series says
+    // which series each push carries (PrometheusPushSink has the contract).
+    // Every option is parsed strictly. Params:
+    //   url (required)        - gateway base, e.g. http://pushgateway:9091
+    //   job (required)        - the group's job label
+    //   grouping              - the group's other labels "k=v,k2=v2"
+    //   metric_name (default "clink_value"), value_field (default "value"), help
+    //   push_series ("batch" [default] | "all")
+    //   batch_records (default 500; 1 to 100000) - push_series='batch' only
+    //   max_series (default 10000; 1 to 1000000) - push_series='all' only
+    //   batch_bytes (default 4194304; 1024 to 268435456) - the most one push carries
+    //   max_sample_bytes (default 65536, or half a smaller batch_bytes; 64 to batch_bytes)
+    //   max_retries (default 4; 0 to 20), linger_ms (default 0; up to 3600000)
+    //   connect_timeout_ms (default 5000), request_timeout_ms (default 30000)
+    //   dlq ("fail" [default] | "drop"), headers, verify_tls ("true" [default] | "false")
     reg.register_sink<std::string>(
         "prometheus_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            const auto given = [&ctx](const char* key) { return ctx.params.contains(key); };
+            const auto refuse = [](const std::string& why) {
+                throw std::runtime_error("prometheus_sink: " + why);
+            };
+            // Read whole and within its range before it is narrowed: "12abc",
+            // "abc" and "-1" are refused rather than read as 12, the default
+            // or a wrapped size.
+            const auto ranged =
+                [&](const char* key, std::int64_t fallback, std::int64_t lo, std::int64_t hi) {
+                    if (!given(key)) {
+                        return fallback;
+                    }
+                    const std::string v = ctx.param_or(key);
+                    std::int64_t out = 0;
+                    const auto* end = v.data() + v.size();
+                    const auto [ptr, ec] = std::from_chars(v.data(), end, out);
+                    if (v.empty() || ec != std::errc{} || ptr != end) {
+                        refuse(std::string{"'"} + key + "' must be an integer; it is '" + v + "'");
+                    }
+                    if (out < lo || out > hi) {
+                        refuse(std::string{"'"} + key + "' must be from " + std::to_string(lo) +
+                               " to " + std::to_string(hi) + "; it is " + v);
+                    }
+                    return out;
+                };
+            const auto one_of = [&](const char* key,
+                                    const std::string& fallback,
+                                    const std::vector<std::string>& allowed) {
+                const std::string v = ctx.param_or(key, fallback);
+                for (const auto& a : allowed) {
+                    if (v == a) {
+                        return v;
+                    }
+                }
+                std::string list;
+                for (const auto& a : allowed) {
+                    list += (list.empty() ? "'" : ", '") + a + "'";
+                }
+                refuse(std::string{"'"} + key + "' must be one of " + list + "; it is '" + v + "'");
+                return fallback;
+            };
+            if (ctx.parallelism > 1) {
+                refuse(
+                    "runs on one subtask, as its group's only writer of its metric: each "
+                    "push replaces every series of the metric in the group, so " +
+                    std::to_string(ctx.parallelism) +
+                    " subtasks would replace one another's series; run it at parallelism 1");
+            }
             PromPushOptions o;
             o.url = ctx.param_or("url");
             o.job = ctx.param_or("job", "");
@@ -575,10 +640,37 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.value_field = ctx.param_or("value_field", "value");
             o.help = ctx.param_or("help", "");
             o.headers = ctx.param_or("headers", "");
-            o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
-            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
-            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+            o.verify_tls = one_of("verify_tls", "true", {"true", "false"}) == "true";
+            o.push_series = one_of("push_series", "batch", {"batch", "all"}) == "all"
+                                ? PromPushSeries::All
+                                : PromPushSeries::Batch;
+            if (o.push_series == PromPushSeries::All && given("batch_records")) {
+                refuse(
+                    "'batch_records' applies to push_series='batch'; with 'all' every push "
+                    "carries every series the sink holds, bounded by 'max_series'");
+            }
+            if (o.push_series == PromPushSeries::Batch && given("max_series")) {
+                refuse(
+                    "'max_series' applies to push_series='all'; with 'batch' a push carries "
+                    "at most 'batch_records' series");
+            }
+            o.batch_records = static_cast<std::size_t>(ranged("batch_records", 500, 1, 100000));
+            o.max_series = static_cast<std::size_t>(ranged("max_series", 10000, 1, 1000000));
+            o.batch_bytes =
+                static_cast<std::size_t>(ranged("batch_bytes", 4 * 1024 * 1024, 1024, 268435456));
+            // Unless given, 64 KiB or half of a smaller batch_bytes, so a small
+            // batch_bytes alone still holds a sample.
+            o.max_sample_bytes = static_cast<std::size_t>(ranged(
+                "max_sample_bytes",
+                std::min<std::int64_t>(64 * 1024, static_cast<std::int64_t>(o.batch_bytes / 2)),
+                64,
+                static_cast<std::int64_t>(o.batch_bytes)));
+            o.max_retries = static_cast<int>(ranged("max_retries", 4, 0, 20));
+            o.max_age = std::chrono::milliseconds{ranged("linger_ms", 0, 0, 3600000)};
+            o.connect_timeout_ms = static_cast<int>(ranged("connect_timeout_ms", 5000, 1, 600000));
+            o.request_timeout_ms = static_cast<int>(ranged("request_timeout_ms", 30000, 1, 600000));
+            o.dlq_policy = one_of("dlq", "fail", {"fail", "drop"}) == "drop" ? DlqPolicy::Drop
+                                                                             : DlqPolicy::Fail;
             o.name = "prometheus_sink";
             return make_prometheus_pushgateway_sink(std::move(o));
         });

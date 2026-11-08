@@ -492,6 +492,48 @@ void check_influxdb_options(const TableDef& table) {
     }
 }
 
+// A connector='prometheus' sink table's options: an option the sink does not
+// read is refused rather than ignored, and the refusal lists the ones it reads.
+void check_prometheus_options(const TableDef& table) {
+    static const std::vector<std::string> kOptions = {"url",
+                                                      "job",
+                                                      "grouping",
+                                                      "metric_name",
+                                                      "value_field",
+                                                      "help",
+                                                      "headers",
+                                                      "verify_tls",
+                                                      "push_series",
+                                                      "batch_records",
+                                                      "max_series",
+                                                      "batch_bytes",
+                                                      "max_sample_bytes",
+                                                      "max_retries",
+                                                      "linger_ms",
+                                                      "connect_timeout_ms",
+                                                      "request_timeout_ms",
+                                                      "dlq"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        if (std::find(kOptions.begin(), kOptions.end(), key) != kOptions.end()) {
+            continue;
+        }
+        if (key == "format" && value == "json") {
+            continue;
+        }
+        if (std::find(interpreted.begin(), interpreted.end(), key) != interpreted.end() &&
+            key != "format") {
+            continue;
+        }
+        std::string accepted;
+        for (const auto& o : kOptions) {
+            accepted += (accepted.empty() ? "" : ", ") + o;
+        }
+        unsupported("table '" + table.name + "': connector='prometheus' does not read option '" +
+                    key + "'; it reads " + accepted);
+    }
+}
+
 // A CDC table declared keep_rows='true': the plan keeps the latest row of every
 // key behind its source.
 bool keeps_rows(const TableDef& table) {
@@ -1275,8 +1317,10 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     if (connector == "prometheus") {
         // Prometheus Pushgateway. At-least-once; the gateway stores the latest
-        // value per series. Each row -> JSON object string; the sink extracts
-        // value_field as the gauge value and the other scalar fields as labels.
+        // value per series. Each row -> JSON object string; the sink takes
+        // value_field as the gauge value and every other column as a label.
+        // A gauge has no delete, so a changelog is refused.
+        check_prometheus_options(table);
         if (exactly_once) {
             unsupported(
                 "connector='prometheus' (Pushgateway) sink is at-least-once; exactly-once "
@@ -1284,6 +1328,12 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         if (upsert) {
             unsupported("connector='prometheus' sink does not support mode='upsert'");
+        }
+        if (const auto cl = table.properties.find("changelog");
+            cl != table.properties.end() && cl->second == "true") {
+            unsupported(
+                "connector='prometheus' sink does not support changelog='true': a pushed gauge "
+                "has no delete, and the __row_kind marker is not a label name");
         }
         return RowConnectorBinding{"prometheus_sink", kChannelString, "row_to_json_string"};
     }
@@ -3074,6 +3124,14 @@ std::string compile_node(const LogicalPlan& node,
                 // table, and a subtask beside it would drop its share of the
                 // rows. Kept on one subtask whatever the job's parallelism, with
                 // the operators in front fanning in to it.
+                op.params[std::string{cluster::kForcedSingletonParam}] = "true";
+                op.parallelism = 1;
+            }
+            if (op.type == "prometheus_sink") {
+                // A group's only writer of its metric: each push replaces every
+                // series of the metric in the group, so a second subtask would
+                // replace the first's series with its own. Kept on one subtask,
+                // with the operators in front fanning in to it.
                 op.params[std::string{cluster::kForcedSingletonParam}] = "true";
                 op.parallelism = 1;
             }

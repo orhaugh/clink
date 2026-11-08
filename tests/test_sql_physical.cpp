@@ -1636,6 +1636,9 @@ TEST(SqlPhysical, PrometheusConnectorSinkLowersToPushSink) {
     EXPECT_EQ(snk->params.at("job"), "clink");
     EXPECT_EQ(snk->params.at("value_field"), "a");
     EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+    // The group's only writer: one subtask whatever the job's parallelism.
+    EXPECT_EQ(snk->parallelism, 1U);
+    EXPECT_EQ(snk->params.at(std::string{clink::cluster::kForcedSingletonParam}), "true");
 }
 
 // exactly-once on connector='http' is rejected (http is at-least-once only).
@@ -3174,6 +3177,70 @@ TEST(SqlPhysical, InfluxDbOptionsAreCheckedWhenTheJobIsPlanned) {
     EXPECT_NE(influxdb_plan({{"changelog", "true"}}).find("does not support changelog='true'"),
               std::string::npos);
     EXPECT_NE(influxdb_plan({{"mode", "upsert"}, {"primary_key", "k"}}).find("mode='upsert'"),
+              std::string::npos);
+}
+
+std::string prometheus_plan(const std::map<std::string, std::string>& options,
+                            const clink::cluster::OperatorSpec** sink_out = nullptr,
+                            clink::cluster::JobGraphSpec* spec_out = nullptr,
+                            std::uint32_t parallelism = 1) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    TableDef dst;
+    dst.name = "gauges";
+    dst.columns.push_back(ColumnSpec{"k", arrow::int64()});
+    dst.columns.push_back(ColumnSpec{"v", arrow::int64()});
+    dst.properties = {{"connector", "prometheus"},
+                      {"url", "http://pushgateway:9091"},
+                      {"job", "j"},
+                      {"value_field", "v"}};
+    for (const auto& [k, v] : options) {
+        dst.properties[k] = v;
+    }
+    cat.register_table(std::move(dst));
+    try {
+        auto plan = bind_insert(cat, "INSERT INTO gauges SELECT k, v FROM src_t");
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        clink::cluster::apply_job_parallelism(spec, parallelism);
+        if (spec_out != nullptr) {
+            *spec_out = spec;
+            if (sink_out != nullptr) {
+                *sink_out = find_op(*spec_out, "prometheus_sink");
+            }
+        }
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+TEST(SqlPhysical, PrometheusOptionsAreCheckedWhenTheJobIsPlanned) {
+    clink::cluster::JobGraphSpec spec;
+    const clink::cluster::OperatorSpec* sink = nullptr;
+    EXPECT_EQ(prometheus_plan({{"push_series", "all"},
+                               {"max_series", "50"},
+                               {"grouping", "region=eu"},
+                               {"dlq", "drop"},
+                               {"request_timeout_ms", "5000"}},
+                              &sink,
+                              &spec,
+                              /*parallelism=*/4),
+              "");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->params.at("push_series"), "all");
+    EXPECT_EQ(sink->params.at("grouping"), "region=eu");
+    // Pinned to one subtask at a job parallelism of 4: the group's only writer.
+    EXPECT_EQ(sink->parallelism, 1U);
+    const auto typo = prometheus_plan({{"push_serie", "all"}});
+    EXPECT_NE(typo.find("does not read option 'push_serie'"), std::string::npos) << typo;
+    EXPECT_NE(typo.find("push_series"), std::string::npos) << typo;
+    EXPECT_NE(prometheus_plan({{"changelog", "true"}}).find("does not support changelog='true'"),
+              std::string::npos);
+    EXPECT_NE(prometheus_plan({{"mode", "upsert"}, {"primary_key", "k"}}).find("mode='upsert'"),
               std::string::npos);
 }
 
