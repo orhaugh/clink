@@ -4,7 +4,7 @@
 
 ## Overview
 
-The PostgreSQL connector integrates a PostgreSQL server through the libpq client library. It provides two read paths and one write path. The SELECT source runs a single query at `open()` and emits the materialised result set as a finite stream. The CDC source subscribes to a logical replication slot and emits transaction boundaries plus row-level INSERT/UPDATE/DELETE changes, optionally preceded by a snapshot of the rows already in the table; through SQL it captures one table, keyed by its primary key, as a changelog or as one row per change (see [Capturing a table](#capturing-a-table-cdc)). The sink buffers records and writes them as batched multi-row INSERT statements. Records cross the connector boundary either on the typed channels (`PostgresRow`, `CdcEvent`) or as JSON-object strings keyed by column name; the SQL frontend uses the string/JSON path.
+The PostgreSQL connector integrates a PostgreSQL server through the libpq client library. It provides two read paths and four write paths. The SELECT source runs a single query at `open()` and emits the materialised result set as a finite stream. The CDC source subscribes to a logical replication slot and emits transaction boundaries plus row-level INSERT/UPDATE/DELETE changes, optionally preceded by a snapshot of the rows already in the table; through SQL it captures one table, keyed by its primary key, as a changelog or as one row per change (see [Capturing a table](#capturing-a-table-cdc)). The at-least-once sink writes records as batched multi-row INSERT statements, optionally `ON CONFLICT` by key; the changelog sink maintains a table by its key; the two-phase-commit sink commits each checkpoint's rows at completion; and, from C++, `PostgresSink` binds rows into a parameterised statement (see [The sinks](#the-sinks)). Records cross the connector boundary either on the typed channels (`PostgresRow`, `CdcEvent`) or as JSON-object strings keyed by column name; the SQL frontend uses the string/JSON path.
 
 ## Dependency and version
 
@@ -39,7 +39,7 @@ cmake --build build -j
 | `postgres_cdc_event_source` | Source | `CdcEvent` (typed channel) |
 | `postgres_sink` | Sink | `std::string` (JSON object per row) |
 | `postgres_2pc_sink` | Sink | `std::string` (JSON object per row; two-phase commit via `PREPARE TRANSACTION`) |
-| `postgres_upsert_sink` | Sink | `Row` (changelog upsert/delete by PRIMARY KEY) |
+| `postgres_upsert_sink` | Sink | `std::string` (JSON object per change; `__row_kind` marks a delete) |
 
 `postgres_source`, `postgres_text_source` and `postgres_row_source` are the SELECT source in three encodings. `postgres_cdc_source`, `postgres_cdc_text_source` and `postgres_cdc_event_source` are the logical-replication CDC source in three encodings. The typed `PostgresRow` and `CdcEvent` channels are registered with the registry by `install()` so pipelines can carry full row/event records without flattening to a string.
 
@@ -89,20 +89,40 @@ The programmatic `PostgresCdcSource::Options` also carries `proto_version` (1; s
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `conninfo` | Yes | none | libpq connection string. Carries authentication. |
-| `table` | Yes | none | Target table. Validated as a quoted identifier at construction. |
+| `conninfo` | Yes | none | libpq connection string. Carries authentication. Its own settings override the sink's connection defaults (a 10-second connect timeout, TCP keepalives and a 60-second `tcp_user_timeout`). |
+| `table` | Yes | none | Target table, `name` or `schema.name`. Validated as a quoted identifier at construction. |
 | `columns` | Yes (see note) | derived | Comma-separated projection. A column absent from or null in a row becomes SQL NULL. On the SQL path it defaults to the declared table schema (`schema_columns`). |
-| `on_conflict` | No | `""` | `""` (plain INSERT), `update` (ON CONFLICT DO UPDATE), or `nothing` (ON CONFLICT DO NOTHING). |
-| `conflict_columns` | Conditional | none | Comma-separated ON CONFLICT target. Required when `on_conflict` is `update` or `nothing`. |
-| `update_columns` | No | all non-conflict | Comma-separated DO UPDATE SET list. Empty means all non-conflict columns. |
-| `batch_records` | No | `1000` | Flush threshold in records. A value of 0 is clamped to 1. |
-| `max_bytes` | No | `0` | Byte-based flush threshold; 0 disables it. |
-| `linger_ms` | No | `0` | Maximum buffer age before flush, in milliseconds; 0 disables it. |
-| `timestamp_columns` | No | derived | Comma-separated `<column>:ts` or `<column>:tstz`: the columns written as timestamps. On the SQL path the planner names every `TIMESTAMP` column. Taken by the three sinks on this page. |
+| `on_conflict` | No | `""` | `""` (plain INSERT), `update` (ON CONFLICT DO UPDATE), or `nothing` (ON CONFLICT DO NOTHING). Any other value is refused. |
+| `conflict_columns` | Conditional | none | The ON CONFLICT target, required with `on_conflict`; each must be one of `columns`. |
+| `update_columns` | No | all non-conflict | The DO UPDATE SET list; empty means every column outside the conflict target. Taken only with `on_conflict='update'`, and each must be one of `columns`. |
+| `batch_records` | No | `1000` | Flush at this many buffered rows, 1 to 1000000. |
+| `max_bytes` | No | `16777216` | Flush once the buffered rows reach this many bytes of SQL text, 0 to 1073741824; `0` means the default, 16 MiB. |
+| `max_record_bytes` | No | `1048576` | The most one record's row may take as SQL text, 64 up to `max_statement_bytes`. A larger record fails the sink. |
+| `max_statement_bytes` | No | `4194304` | The most one statement may take, 1024 to 1073741824. |
+| `linger_ms` | No | `0` | Flush rows buffered this long, checked as each record arrives; 0 (off) to 3600000. |
+| `lock_wait_timeout_s` | No | `30` | The session's `lock_timeout`, 1 to 3600 seconds; its `statement_timeout` is a minute longer. |
+| `max_retries` | No | `3` | How many times a flush that met a deadlock, a serialization failure or a lock wait timeout is tried again, 0 to 10. |
+| `timestamp_columns` | No | derived | Comma-separated `<column>:ts` or `<column>:tstz`: the columns written as timestamps (see [Values](#values)). On the SQL path the planner names every `TIMESTAMP` column. |
+
+Every option is read strictly: a value the sink cannot use (a number with trailing text, a value out of range, an `on_conflict` other than `update` or `nothing`) is refused when the job is built, never replaced by the default.
 
 Note: `columns` is required at the `PostgresJsonSink` level; on the SQL Row path it is filled from the table DDL via `schema_columns`, so it need not be repeated in the WITH clause.
 
-**Timestamps.** The SQL Row path carries a `TIMESTAMP` as epoch milliseconds, and each sink writes a column named in `timestamp_columns` as a timestamp literal instead of that number: a `TIMESTAMP` as its time in UTC (`'2026-10-24 17:41:28.105'`), for a `timestamp` column, and a `TIMESTAMP WITH TIME ZONE` as that instant (`'2026-10-24 17:41:28.105+00'`), so a `timestamptz` column stores the same instant whatever the session's time zone. A value outside years 1 to 9999 fails the batch. A `DATE` is written as `'YYYY-MM-DD'`. To store epoch milliseconds in a `bigint` column, declare the SQL column `BIGINT`.
+### Changelog upsert sink (`postgres_upsert_sink`)
+
+| Option | Required | Default | Description |
+| --- | --- | --- | --- |
+| `conninfo`, `table`, `columns` | As for `postgres_sink` | | |
+| `key_columns` | Yes | none | The row's identity: the columns of the table's PRIMARY KEY or UNIQUE index. On the SQL path, the table's PRIMARY KEY. |
+| `batch_records` | No | `1000` | Flush at this many buffered keys, 1 to 1000000. A key's later change replaces its earlier one in the buffer. |
+| `max_record_bytes` | No | `1048576` | The most one record's row, or its key for a delete, may take as SQL text. |
+| `max_bytes`, `max_statement_bytes`, `lock_wait_timeout_s`, `max_retries`, `timestamp_columns` | No | as for `postgres_sink` | As for `postgres_sink`. |
+
+The upsert sink sets every non-key column, takes no `linger_ms`, and reads its options as strictly.
+
+### C++ `PostgresSink`
+
+`clink::PostgresSink` (`clink/connectors/postgres_sink.hpp`) binds each record, a `std::vector<std::string>`, into a parameterised statement of the caller's (`INSERT INTO t (a, b) VALUES ($1, $2)`), every value as text, never NULL. It writes at `batch_rows` rows, after `batch_interval` and at every checkpoint barrier, each flush one transaction of one statement per row, and takes `lock_wait_timeout` and `max_retries` as the JSON sinks do. It checks no table, since the statement is the caller's. It has no factory.
 
 ## Transport security
 
@@ -127,6 +147,115 @@ transport that was actually established (`PQsslInUse`) and:
 
 Plaintext to a database on a trusted private network remains a supported
 deployment. Only the silence is removed.
+
+## The sinks
+
+The at-least-once and upsert sinks, and the C++ `PostgresSink`, share one core, `impls/postgres/src/pg_sink_core.cpp`: the session, the table check, each flush's transaction, the failure state, retries and cancellation. Values, keys and statements in PostgreSQL's dialect are in `impls/postgres/src/pg_sink_rules.cpp`; the JSON reader, stream keys, the changelog marker, statement packing and the changelog buffer are the record rules the SQL sinks share (`include/clink/connectors/sink_record_rules.hpp`). The two-phase-commit sink keeps its own path (see [the exactly-once sink](#exactly-once-sink-postgres_2pc_sink)).
+
+### Modes
+
+| Mode | Selected by | Statements | Delivery |
+| --- | --- | --- | --- |
+| Append | `postgres_sink` | `INSERT INTO t (...) VALUES (...),(...)` | At-least-once: a replay appends its rows again. |
+| Insert-or-update | `postgres_sink` with `on_conflict='update'` | `INSERT ... ON CONFLICT (k) DO UPDATE SET c = EXCLUDED.c, ...` | At-least-once; a replay rewrites rows by key. |
+| Insert-or-skip | `postgres_sink` with `on_conflict='nothing'` | `INSERT ... ON CONFLICT (k) DO NOTHING` | At-least-once; a replay finds its rows there and leaves them. |
+| Changelog upsert | `postgres_upsert_sink`, or SQL `mode='upsert'` | the insert-or-update for `insert` and `update_after`, and `DELETE FROM t WHERE k IN (...)` for `delete` and `update_before` | Effectively-once on the table, for a stable key, a deterministic query and one writer per key. |
+
+A record is one JSON object. A sink writes the members named in `columns`; a member the record lacks is written as NULL, as a null member is, so a column's default does not apply. In the changelog sink a `__row_kind` of `insert` or `update_after`, or none, upserts the row, and `delete` or `update_before` deletes it by key; any other value, or one that is not a string, fails the sink. The append sink refuses `delete` and `update_before` records, which it cannot apply: appended, a retraction would add the row it removes. In the keyed modes a record whose key member is missing or null fails the sink: a NULL never conflicts, so a replay would insert the row again.
+
+### The table each mode needs
+
+When a sink opens, it reads the table's definition from `pg_catalog` and refuses a table its mode cannot write as declared, naming every problem:
+
+- Every mode: the table exists, every column in `columns` exists, is not a generated column and is not `GENERATED ALWAYS AS IDENTITY`, and a column in `timestamp_columns` is `timestamp` or `timestamptz`.
+- The keyed modes (`on_conflict` and the changelog sink): a table or partitioned table, not a view or a foreign table, with a PRIMARY KEY or UNIQUE index on exactly the key columns, over whole values (not an expression) and every row (not a partial index), which `ON CONFLICT` needs to write by.
+- Append: a table, or a view PostgreSQL can insert through.
+
+Another unique index on the table is PostgreSQL's to enforce, unlike MySQL's `ON DUPLICATE KEY UPDATE`: a row that collides on it fails its flush with a unique violation, and the replay fails the same way until the conflict is resolved.
+
+### Keys and order
+
+The at-least-once sink writes its rows in the order they arrived, and in the keyed modes never puts two rows of one key in a statement, which `ON CONFLICT DO UPDATE` refuses: a key's later row goes in a later statement, so the row ends as applying each record in order leaves it.
+
+The changelog sink buffers changes by the key as the stream writes it: the key members' JSON kinds and texts, with a number taken by its value, so `1`, `1.0` and `1.00` are one key. Within a flush a key's later change replaces its earlier one, and the surviving changes are applied in the order in which each key last changed: consecutive upserts as one `INSERT`, consecutive deletes as one `DELETE`, the runs in order, all in one transaction.
+
+Which keys are one row is the table's to decide: two keys the stream holds apart and the table treats as one (`'abc'` and `'ABC'` under a nondeterministic collation, `'a'` and `'a '` in a `char(n)` column, `1` and `"1"` in an `integer` column) reach the table in the order they changed. When two of them fall in one `INSERT`, PostgreSQL refuses it (SQLSTATE 21000, a command that would change one row twice), and the sink rolls the flush back and writes it again a row to a statement, in the same order, so the row ends as the last change left it. The live suite checks this against a reference table to which PostgreSQL applies each change in turn.
+
+That holds within one subtask. With more than one, two changes to a row reach the table in either order unless they reach the same subtask, so a parallel changelog sink needs key columns that PostgreSQL tells apart exactly as the stream does: an integer type, `numeric`, `text` or `varchar` under a deterministic collation, or a `timestamp` or `timestamptz` of at least millisecond precision written from epoch milliseconds. A table with any other key column (`char(n)`, a nondeterministic collation, `uuid`, `date`) is refused when the sink opens. Each record's key must also be written as its column compares, a number for a numeric or timestamp column and a string for a `text` or `varchar` one, or the record fails the sink. The SQL planner routes a sink's rows by the key's typed value; with the Dag API, partition the stream by the value the table keys by.
+
+The sinks assume they own the rows they write. One writer per key is a condition of the changelog sink's convergence: a replay rewrites the rows its checkpoint did not cover, and can overwrite a change another writer made to them since. A row another writer inserted is updated by the sink's upsert, not duplicated; a row another writer deleted is inserted again by the sink's next upsert of its key.
+
+### Values
+
+Records are read strictly: one JSON object, valid UTF-8, with no member repeated at the top level and at most 256 levels of nesting; anything else fails the sink. Each value is written as a PostgreSQL literal:
+
+| JSON value | Written as |
+| --- | --- |
+| `null`, or a missing member | `NULL` |
+| `true`, `false` | `TRUE`, `FALSE` |
+| A string | a quoted literal escaped by libpq for the connection; refused when it holds U+0000, which PostgreSQL text cannot hold |
+| A string, for a `bytea` column | its UTF-8 bytes, U+0000 included, in hex |
+| An object or array | its JSON text, quoted, for a `json` or `jsonb` column |
+| A number | exactly: its plain decimal up to 4096 characters, else the token itself, which PostgreSQL reads as an exact `numeric` too |
+| A number, for a `real` or `double precision` column | the number as written, which the server reads as the nearest value of the type; one past a `double precision`'s range fails the sink |
+| A number, for a column in `timestamp_columns` | its UTC time, from epoch milliseconds |
+
+PostgreSQL rounds some values without a word, so the sink refuses them before they are buffered: a number with a fraction for an `integer`, `bigint` or `smallint` column; a number, or a string holding one, with more digits after the point than a `numeric(p, s)` column keeps (or, from PostgreSQL 15, not a multiple of the power of ten a negative scale keeps); and a string longer than a `varchar(n)` or `char(n)` column holds, counted in characters, which PostgreSQL would otherwise cut when the excess is spaces. Everything else a column cannot hold (a number out of its range, a string that is not a date, `NULL` for a `NOT NULL` column, a failed check constraint) the server refuses, and the flush fails.
+
+**Timestamps.** The SQL Row path carries a `TIMESTAMP` as epoch milliseconds, and the sink writes a column named in `timestamp_columns` as a timestamp literal instead of that number: a `TIMESTAMP` as its time in UTC (`'2026-10-24 17:41:28.105'`), for a `timestamp` column, and a `TIMESTAMP WITH TIME ZONE` as that instant (`'2026-10-24 17:41:28.105+00'`), so a `timestamptz` column stores the same instant whatever the session's time zone. A value that is not a whole number of milliseconds, that lies outside years 1 to 9999, or whose milliseconds a `timestamp(0)`, `(1)` or `(2)` column would round away fails the sink. To store epoch milliseconds in a `bigint` column, declare the SQL column `BIGINT`. A string written to a `timestamp` or `date` column is PostgreSQL's to parse, and it rounds fractional seconds to the column's precision.
+
+**The session.** Each connection runs with `TIME ZONE 'UTC'`, `client_encoding 'UTF8'` and `standard_conforming_strings on`, whatever the server's, the database's or the role's settings, so a database set to another time zone or to `standard_conforming_strings off` stores the same values. Its `lock_timeout` is `lock_wait_timeout_s` and its `statement_timeout` a minute longer.
+
+### Transactions, failures and acknowledgement
+
+A flush is one transaction: `BEGIN`, its statements in order, `COMMIT`. A sink flushes at its count, byte and linger thresholds and at every checkpoint barrier, and passes the barrier on, so acknowledging the checkpoint, only after that flush has committed. A checkpoint therefore completes only once every row the sink received before it is committed, and a restored job writes the rows after its checkpoint again.
+
+A failure fails the sink. A failed sink refuses every later record, barrier and flush, an empty flush included, until it is opened again, which the job's restart does before it replays from its last checkpoint:
+
+| Failure | What the table holds | What the error says |
+| --- | --- | --- |
+| A record that cannot be read or written as declared, or one too large for a statement | Nothing of the record: it fails the sink before it is buffered | Which member, and why, without its value |
+| A statement the server refuses | Nothing of the flush, which is rolled back | The SQLSTATE and the server's primary message, with the values it quotes replaced by `<value>`; never its DETAIL, which can quote a whole row |
+| A deadlock (40P01), a serialization failure (40001) or a lock wait past `lock_timeout` (55P03) | Nothing: the transaction is rolled back and tried again up to `max_retries` times, after 100 ms, then twice as long each time, up to 5 s; then the sink fails | The last error and the retries spent |
+| Two keys of one table row in one upsert (21000) | Nothing of the first try: the flush is written again a row to a statement | Nothing, unless the second try fails too |
+| The connection lost before `COMMIT` | Nothing of the flush | That nothing was committed |
+| `COMMIT` refused by the server, or answered `ROLLBACK` | Nothing of the flush | That nothing was committed |
+| `COMMIT` sent and its reply lost | Unknown: the flush may or may not have been committed | That the outcome is unknown; the job replays, so a committed flush is written twice by the append sink and rewritten by key otherwise |
+| The task cancelled | The statement in flight is cancelled through libpq's cancel request and the transaction rolled back; a cancel during `COMMIT` is the unknown outcome above | That the task was cancelled |
+
+A statement waits for a lock for at most `lock_wait_timeout_s`, and runs for at most a minute longer, after which the server cancels it; the connection's TCP keepalives and send timeout end a statement whose server has gone away. A cancel ends a statement in flight, or a wait between tries, within about 20 ms.
+
+`close()` never throws: it discards what is buffered (a restored job writes it again), rolls back a transaction left open and releases the connection. A clean end of input flushes before `close()`; a cancelled task does not. Neither sink is two-phase commit, and neither is exactly-once; for that, use the [exactly-once sink](#exactly-once-sink-postgres_2pc_sink).
+
+### Bounds
+
+| Bound | Option | Default |
+| --- | --- | --- |
+| Rows buffered (`postgres_sink`), or keys buffered (changelog) | `batch_records` | 1000 |
+| SQL text buffered | `max_bytes` | 16 MiB |
+| One record's row or key, as SQL text | `max_record_bytes` | 1 MiB |
+| One statement | `max_statement_bytes` | 4 MiB |
+| One wait for a lock | `lock_wait_timeout_s` | 30 s |
+| One statement's run | `lock_wait_timeout_s` plus 60 s | 90 s |
+| Tries after a deadlock, a serialization failure or a lock wait | `max_retries` | 3 |
+
+The thresholds are checked as each record is buffered, so a large batch flushes part-way through. The byte bounds count the SQL text the records render to, escapes included, which is what the server receives; they are not a bound on the sink's memory, which also holds each buffered key's bookkeeping in the changelog sink. A flush longer than one statement is split into several, all in its one transaction, and a record longer than one statement can hold fails the sink before it is buffered.
+
+### Changes from earlier releases
+
+The at-least-once and upsert sinks, and `PostgresSink`, were rewritten in this release. Against earlier releases:
+
+- A failed flush fails the sink until it is opened again. Earlier releases cleared the rows they had buffered and let a later empty flush, and so a checkpoint, succeed; `PostgresSink` could also run the next flush inside a transaction its failed `COMMIT` had left.
+- `close()` discards what is buffered. Earlier releases flushed it, even when the task was cancelled (`PostgresSink` swallowing the error).
+- The changelog sink applies a flush's changes in the order each key last changed, and writes a flush again a row to a statement when two of its keys are one table row. Earlier releases applied every upsert before every delete, and keyed the buffer by the key's JSON text, so `1` and `1.0` were two keys in one statement, which PostgreSQL refused and the replay refused again.
+- An unknown `__row_kind`, or one that is not a string, fails the changelog sink, where earlier releases upserted the record; the append sink refuses retractions, which earlier releases appended; a keyed sink refuses a null key.
+- The sinks check the table when they open: missing, generated and identity columns, and for the keyed modes a missing, partial or expression unique index, which earlier releases met as an error at the first flush, and a view. A parallel changelog sink refuses key columns PostgreSQL does not tell apart as the stream does.
+- Numbers are written exactly. Earlier releases wrote a decimal through a double, losing digits past the seventeenth, and could not read an integer outside the signed 64-bit range. A value PostgreSQL would round or cut is refused (see [Values](#values)).
+- The session is UTC, UTF8 and `standard_conforming_strings on`; earlier releases took the server's settings.
+- A deadlock, serialization failure or lock wait is tried again, up to `max_retries` times, where earlier releases failed the flush; a statement's lock wait and run are bounded.
+- Options are read strictly: an `on_conflict` other than `update` or `nothing`, `update_columns` without `on_conflict='update'`, a conflict column outside `columns`, and a number out of range are refused. `batch_records` must be at least 1, where earlier releases took `0` as 1, and `max_bytes='0'` means the 16 MiB default, where earlier releases took it as no byte threshold. `max_bytes` counts SQL text rather than record bytes.
+- Errors no longer include records, SQL or the server's DETAIL. Earlier releases put the whole statement, and so every buffered record, in the upsert sink's message.
+- A SQL sink table takes only the options its sink reads (see [SQL usage](#sql-usage)).
 
 ## SQL usage
 
@@ -180,7 +309,9 @@ CREATE TABLE agg_sink (user_id BIGINT, total BIGINT) WITH (
 );
 ```
 
-It consumes the clink changelog (`__row_kind`): insert/update_after `INSERT ... ON CONFLICT (<pk>) DO UPDATE` (upsert), delete/update_before `DELETE ... WHERE <pk> IN (...)`. Within a flush the changelog is netted by primary key (last op wins) and applied in one transaction. This is **effectively-once on the sink table** for a stable primary key and a deterministic defining query - every applied statement is keyed and idempotent, so a replay converges the table to the same final state. It is not two-phase commit; for that use `delivery_guarantee='exactly_once'`. This is what lets a retracting SQL query maintain a Postgres table (the append-only `postgres_sink` would drop the retract records).
+It consumes the clink changelog (`__row_kind`): insert/update_after `INSERT ... ON CONFLICT (<pk>) DO UPDATE` (upsert), delete/update_before `DELETE ... WHERE <pk> IN (...)`. Within a flush a key's later change replaces its earlier one, and the changes are applied in the order each key last changed, in one transaction (see [Keys and order](#keys-and-order)). This is effectively-once on the sink table for a stable primary key, a deterministic defining query and one writer per key: a replay converges the table to the same rows. It is not two-phase commit; for that use `delivery_guarantee='exactly_once'`. This is what lets a retracting SQL query maintain a PostgreSQL table; a changelog into a table without `mode='upsert'` is refused when it is planned.
+
+An at-least-once or upsert sink table takes only the options its sink reads: `conninfo`, the sink's options above, the source options (a table can be read and written), and the options the planner interprets (`connector`, `format`, `mode`, `primary_key` and the like). The planner sets `key_columns` from the PRIMARY KEY and `timestamp_columns` from the `TIMESTAMP` columns, so a table that sets either is refused, as is one with `mode='upsert'` that sets `on_conflict`, `conflict_columns`, `update_columns` or `linger_ms`, and one that sets any other option. The exactly-once sink's table keeps its own options (`commit_group`).
 
 ### Exactly-once sink (`postgres_2pc_sink`)
 
@@ -476,9 +607,9 @@ clink::postgres::install(env.registry());
 
 ## Delivery semantics
 
-Sink (default, `postgres_sink`): at-least-once. A replay after a failed checkpoint re-runs the buffered INSERT, appending duplicates. With `on_conflict='update'` and `conflict_columns` the INSERT is idempotent by key, which is effectively-once for keyed upserts. Rows of one flush that share a key are merged into the row that applying them in order would leave, because PostgreSQL refuses an `ON CONFLICT DO UPDATE` that touches one key twice; before that merge such a flush failed, and its replay failed the same way, so the job never got past it. Integer values are written exactly, past 2^53 included. On a flush error the connection is dropped, the buffer cleared, and the exception propagated so the job replays from the last checkpoint. The sink flushes on every checkpoint barrier.
+Sink (default, `postgres_sink`): at-least-once. Each flush is one transaction, committed before the barrier that asked for it is passed on, and a restored job writes again the rows after its checkpoint: a plain insert appends them a second time, `on_conflict='update'` rewrites them by key, and `on_conflict='nothing'` leaves the rows it finds. Rows are applied in the order they arrived, a key's later row in a later statement. The recovery cells show both sides: killed before a flush's `COMMIT`, no record ends in two rows; killed after it and before its checkpoint completed, exactly the records committed after the restored checkpoint do. A failure fails the sink until it is opened again, and a `COMMIT` whose reply is lost leaves its flush's outcome unknown. See [The sinks](#the-sinks).
 
-Sink (`mode='upsert'`, `postgres_upsert_sink`): effectively-once on the sink table for a stable PRIMARY KEY and a deterministic defining query. Applies the changelog by key (upsert on insert/update_after, DELETE on delete/update_before), netted per key within a flush and applied in one transaction; a replay re-applies keyed idempotent statements. See the changelog upsert sink section above.
+Sink (`mode='upsert'`, `postgres_upsert_sink`): effectively-once on the sink table for a stable key, a deterministic defining query and one writer per key. Applies the changelog by key (upsert on insert/update_after, DELETE on delete/update_before) in the order each key last changed, one transaction per flush, so a replay converges the table to the same rows whichever keys the table treats as one. Not two-phase commit.
 
 Sink (`delivery_guarantee='exactly_once'`, `postgres_2pc_sink`): exactly-once via two-phase commit (`PREPARE TRANSACTION` / `COMMIT PREPARED`). Rows land iff their checkpoint completes globally; a prepared-but-uncommitted transaction survives a crash and is committed on restart, and a prepared transaction the restore does not hold is rolled back at open, its checkpoint one no restore chooses again. Requires `max_prepared_transactions > 0` on the server. See the exactly-once sink section above.
 
@@ -496,7 +627,9 @@ SELECT source: the cursor is the row index into the materialised result set. A r
 ## Limitations
 
 - Each sink must be the only sink on its chain: at every checkpoint barrier the at-least-once and upsert sinks write out what they received before the barrier, and the exactly-once sink prepares its transaction and stages its handle in the checkpoint, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
-- The default sink (`postgres_sink`) writes one batched multi-row INSERT per flush and is at-least-once. Exactly-once needs `delivery_guarantee='exactly_once'` (the `postgres_2pc_sink` variant) and a server with `max_prepared_transactions > 0`.
+- The default sink (`postgres_sink`) is at-least-once: it writes replayed rows again, and a `COMMIT` whose reply is lost leaves its flush's outcome unknown. Exactly-once needs `delivery_guarantee='exactly_once'` (the `postgres_2pc_sink` variant) and a server with `max_prepared_transactions > 0`.
+- The keyed modes need a table with a PRIMARY KEY or UNIQUE index on exactly their key, over whole values and every row; with more than one subtask the changelog sink's key columns must be of the types in [Keys and order](#keys-and-order). The changelog sink converges only with one writer per key.
+- The sinks' byte bounds count SQL text, and are not a bound on their memory. The sinks are tested against PostgreSQL 16 only.
 - `mode='upsert'` requires a PRIMARY KEY (the conflict target + delete key) and is effectively-once, not two-phase commit. `mode='upsert'` combined with `delivery_guarantee='exactly_once'` is rejected (pick one). For a plain append stream, `on_conflict='update'` on the default sink is the lighter idempotent-by-key option.
 - The SELECT source is snapshot mode only: it runs the query once at `open()` and closes when the result set is exhausted. There is no incremental polling or `refresh_interval` behaviour (the field is reserved and ignored).
 - The CDC source needs `wal_level=logical`, a role with `REPLICATION`, and `pgoutput` for the SQL contract. Several tables can share a slot and its source, with no transaction atomicity across them downstream. Of a table's schema changes it follows one, a column added and then declared on a restore with `keep_rows='true'`.
@@ -526,12 +659,16 @@ ctest --test-dir build -L postgres -j1
 
 The CDC recovery cells (`Cells/PostgresCdcClickHouseRecovery.*` in `clink_integration_tests`) run the SQL job in a cluster, a coordinator and two `clink_node` workers, capturing a table with `changelog_mode='append'` into a ClickHouse change log while a workload commits inserts, updates and deletes. A ClickHouse materialised view feeds a `ReplacingMergeTree(__version, __deleted)`. Each cell parks the source's worker at a fault point and kills it once the fault framework's witness line shows the phase was reached: during the snapshot after a checkpoint completed in it, at the transition to streaming, after a streaming checkpoint recorded its position but before it completed, and just after a completed checkpoint was confirmed to the slot. A fifth restarts the PostgreSQL server while the job streams, which the source must ride out with no job restart. After a marker row arrives through the stream, every cell requires the table read with `FINAL`, and rebuilt from the log with `argMax`, to equal the PostgreSQL table in every column; every committed row version and delete to be in the log; and exactly the restarts it names. `PostgresCdcSlot.ASlotThatLostItsWalIsRefused` gives a slot a low `max_slot_wal_keep_size` on its own server, lets the server invalidate it, and requires the restore to refuse. These start their own PostgreSQL and ClickHouse containers.
 
-`scripts/postgres-cdc-live.sh` runs all of the above, with each binary's googletest JSON report, then `scripts/check-gtest-reports.py`, which fails the run on any skipped or failed case and on any required suite that ran fewer cases than it should: a live test skips when its server is missing, and googletest counts a skip as a pass. The `postgres-cdc` workflow (`.github/workflows/postgres-cdc.yml`) runs it on every push and pull request, against the pinned `postgres-cdc` service, and keeps the reports and the cells' evidence lines. Run the PostgreSQL live tests one process at a time: the two-phase-commit sink cases name their prepared transactions, which collide across processes on one server.
+The sinks' PostgreSQL rules (`test_pg_sink_rules.cpp`: values and the roundings they refuse, key spelling, statement heads, message redaction, the table checks) and the record rules the SQL sinks share (`tests/test_sink_record_rules.cpp`) run without a server, and their failure state runs against a scripted server (`test_pg_sink_failures.cpp`, `PgSinkFailures`): every failure followed by another record, barrier and flush, reopening, refused records and markers, a failed statement, a `COMMIT` refused, answered `ROLLBACK` and lost, deadlock and lock wait retries, the one-row replan after 21000, a cancel during a statement and during `COMMIT`, `close()`, statement splitting, the byte threshold, the table checks, order and netting, and `PostgresSink`. `test_pg_sink_contract_live.cpp` (`PgSinkContractLive`) covers the contract against the server: keys the table treats as one (a nondeterministic ICU collation, `char(n)` padding, numbers written as strings, with decimals and exponents), applied in one flush and in a flush per change and compared row for row with a reference table to which PostgreSQL applied each change in turn; composite and timestamp keys; two keys of one row in one flush; the tables each mode refuses; exact values (`bigint` at both ends, a 60-digit `numeric`, a 100-digit plain `numeric`, characters outside the Basic Multilingual Plane, quotes and backslashes, `bytea` with NUL and control bytes, `jsonb`, `timestamp` and `timestamptz` at their limits, a large `double precision`, null and missing members); values the server refuses, each failing its flush with nothing committed; values the column would round or cut, refused before they are written; a database set to another time zone and to `standard_conforming_strings off`; 40 statements rolled back as one flush; another session's lock failing a flush within its bound; a cancel ending a flush that waits for a lock; a connection ended while its `COMMIT` is on its way, reported as unknown; the factories' sinks; and `PostgresSink`.
+
+The sinks' recovery cells (`tests/integration/test_postgres_sink_recovery.cpp`, `PostgresSinkRecovery`) run a coordinator and two workers polling a feed the test serves into each sink, and kill a worker at `postgres.sink_before_commit`, with a flush's statements executed and not committed, and at `postgres.sink_after_commit`, with the flush committed and its checkpoint not complete. Read through a libpq connection of the test's own: for the append sink, every record's row present with its columns, and the records with two rows exactly those committed after the checkpoint the job restored, none when the kill came before `COMMIT`; for the upsert sink, and for a SQL job writing it at parallelism 2, the table holds every row the input's last records leave, column for column, and none of the rows they delete. Each cell checks the single restart, the replay, and the fault firing where it names, and before `COMMIT` that the server held a writing transaction open.
+
+`scripts/postgres-live.sh` runs all of the above in two phases: `cdc`, the change stream's suites and cells, and `sink`, the sinks'. It keeps each phase's googletest JSON reports and runs `scripts/check-gtest-reports.py`, which fails the run on any skipped or failed case, on any required suite that ran fewer cases than it should, and on a case outside both phases: a live test skips when its server is missing, and googletest counts a skip as a pass. The `postgres-cdc` workflow (`.github/workflows/postgres-cdc.yml`) runs it on every push and pull request, against the pinned `postgres-cdc` service, and keeps the reports, a provenance file and the cells' evidence lines. Run the PostgreSQL live tests one process at a time: the two-phase-commit sink cases name their prepared transactions, which collide across processes on one server.
 
 ```bash
 docker compose -f docker/integration-services.yml up -d --wait postgres-cdc
 CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres password=postgres dbname=postgres" \
-  scripts/postgres-cdc-live.sh build
+  scripts/postgres-live.sh build
 ```
 
 The convenience script `scripts/sanitize_connectors.sh` networks a PostgreSQL instance against the `clink-build:latest` image and sets the DSN automatically.

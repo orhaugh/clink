@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+**The PostgreSQL sinks stay failed rather than forget a write, apply a
+changelog in the order its keys changed, and write each value exactly or refuse
+it.** After a failed flush `postgres_sink` and `postgres_upsert_sink` cleared
+the rows they had buffered and let a later empty flush, and so the next
+checkpoint, succeed; `close()` flushed even when the task was cancelled; and
+the C++ `PostgresSink` could run its next flush inside the transaction a failed
+`COMMIT` had left. The upsert sink keyed its buffer by the key's JSON text and
+applied every upsert before every delete, so `1` and `1.0` met in one
+`ON CONFLICT` statement, which PostgreSQL refused (SQLSTATE 21000) and the
+replay refused again, and two keys the table treats as one row could end with a
+delete winning over the later upsert; it took an unknown `__row_kind` as an
+insert. Decimals went through a double, integers past 64 bits could not be
+read, PostgreSQL rounded a fraction into an integer or `numeric(p, s)` column
+without a word, errors quoted whole statements and the server's DETAIL, and
+nothing checked the table. Now each flush is one transaction of statements
+bounded by `max_statement_bytes`. A failure fails the sink until it is opened
+again; a deadlock, serialization failure or lock wait is tried again within
+`max_retries`; a flush whose upserts name one row twice is written again a row
+to a statement; a cancel ends the statement in flight through libpq's cancel
+request; and a `COMMIT` whose reply is lost is reported as an unknown outcome.
+Numbers are written exactly, a value PostgreSQL would round or cut is refused,
+the session is UTC and UTF8 with `standard_conforming_strings` on and bounded
+lock waits, and errors carry the SQLSTATE and the primary message with the
+values it quotes redacted. At open the sinks check the table's columns and, in
+the keyed modes, a unique index on exactly the key; a parallel upsert sink
+needs key columns PostgreSQL compares as the stream does. Options are read
+strictly (`max_bytes='0'` now means the 16 MiB default), a SQL sink table takes
+only the options its sink reads, and the record rules are shared with the MySQL
+sinks. `scripts/postgres-cdc-live.sh` becomes `scripts/postgres-live.sh`, with
+a `cdc` and a `sink` phase. The sink phase runs `PgSinkFailures` against a
+scripted server, `PgSinkContractLive` against PostgreSQL 16.15, where keys are
+compared with a reference table PostgreSQL applies each change to, and recovery
+cells that kill a worker before and after a flush's `COMMIT`.
+
 **The MySQL sinks stay failed rather than forget a write, apply a changelog in
 the order its keys changed, and write each value exactly or not at all.** After
 a failed flush both sinks cleared the rows they had buffered and let a later
