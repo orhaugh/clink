@@ -3055,6 +3055,59 @@ TEST(SqlPhysical, MysqlSinkTablesTakeOnlyOptionsTheSinksRead) {
     EXPECT_EQ(mysql_sink_refusal(", batch_records='10', max_retries='0'", true), "");
 }
 
+namespace {
+
+std::string postgres_sink_refusal(const std::string& with, bool upsert) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE pg_out (k BIGINT, v BIGINT) WITH (connector='postgres', format='json', "
+        "conninfo='host=localhost', table='pg_out'" +
+        std::string{upsert ? ", mode='upsert', primary_key='k'" : ""} + with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO pg_out SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+// A connector='postgres' sink table's options, as for MySQL: one the sinks do
+// not read is refused, naming the ones they read; the sources' options pass;
+// mode='upsert' takes no on_conflict, conflict_columns or update_columns; the
+// planner derives key_columns and timestamp_columns itself.
+TEST(SqlPhysical, PostgresSinkTablesTakeOnlyOptionsTheSinksRead) {
+    EXPECT_EQ(postgres_sink_refusal(", batch_records='10', max_bytes='4096', "
+                                    "max_record_bytes='512', max_statement_bytes='2048', "
+                                    "lock_wait_timeout_s='5', max_retries='1', linger_ms='100'",
+                                    false),
+              "");
+    EXPECT_EQ(postgres_sink_refusal(
+                  ", on_conflict='update', conflict_columns='k', update_columns='v'", false),
+              "");
+    EXPECT_EQ(postgres_sink_refusal(", slot_name='s', publication_names='p'", false), "");
+    auto why = postgres_sink_refusal(", dsn='host=x'", false);
+    EXPECT_NE(why.find("does not read option 'dsn'"), std::string::npos) << why;
+    EXPECT_NE(why.find("max_statement_bytes"), std::string::npos) << why;
+    why = postgres_sink_refusal(", key_columns='k'", true);
+    EXPECT_NE(why.find("PRIMARY KEY"), std::string::npos) << why;
+    why = postgres_sink_refusal(", on_conflict='update'", true);
+    EXPECT_NE(why.find("not read with mode='upsert'"), std::string::npos) << why;
+    why = postgres_sink_refusal(", timestamp_columns='k:ts'", false);
+    EXPECT_NE(why.find("names the TIMESTAMP columns itself"), std::string::npos) << why;
+    EXPECT_EQ(postgres_sink_refusal(", batch_records='10', max_retries='0'", true), "");
+    // The two-phase-commit sink keeps its own options.
+    EXPECT_EQ(postgres_sink_refusal(", delivery_guarantee='exactly_once', commit_group='g'", false),
+              "");
+}
+
 TEST(SqlPhysical, RedisUpsertSinkSelected) {
     Catalog cat;
     auto s = parse(
