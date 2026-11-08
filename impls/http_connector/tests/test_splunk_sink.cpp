@@ -438,12 +438,12 @@ TEST(HecReply, IndexerModeNeedsExactlyOneAckIdAndTheOtherModeNone) {
     EXPECT_EQ(get(R"(,"ackID":"7")").ack_id, 7U);  // as Splunk's documentation writes it
     EXPECT_EQ(get(R"(,"ackId":7,"ackID":"7")").ack_id, 7U);
     EXPECT_EQ(get(R"(,"ackId":0)").kind, Kind::Accepted);
-    for (const std::string& bad : {R"(,"ackId":7,"ackID":"8")",
-                                   R"(,"ackId":-1)",
-                                   R"(,"ackId":"x")",
-                                   R"(,"ackId":1.5)",
-                                   R"(,"ackId":null)",
-                                   R"(,"ackID":"")"}) {
+    for (const char* bad : {R"(,"ackId":7,"ackID":"8")",
+                            R"(,"ackId":-1)",
+                            R"(,"ackId":"x")",
+                            R"(,"ackId":1.5)",
+                            R"(,"ackId":null)",
+                            R"(,"ackID":"")"}) {
         EXPECT_EQ(get(bad).kind, Kind::Failed) << bad;
     }
     const auto none = get("");
