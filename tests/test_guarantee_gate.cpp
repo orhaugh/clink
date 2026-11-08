@@ -156,6 +156,43 @@ private:
     std::vector<std::pair<std::string, std::optional<connectors::ConnectorCapabilities>>> previous_;
 };
 
+// The MySQL change stream given on_decode_error=drop skips an event it cannot
+// decode: the gate reads the option's value off the job graph and caps the job
+// at its source, and no other option's value (the password) enters the facts.
+// The core suite links no impl, so the record is stood in for here.
+TEST_F(GuaranteeGateTest, AChangeStreamGivenDropIsCappedAtItsSource) {
+    const GateScopedRecords records({connectors::ConnectorCapabilities{
+        .name = "mysql_cdc",
+        .version = "1",
+        .is_source = true,
+        .replayable = true,
+        .offset_model = connectors::OffsetModel::Lsn,
+        .checkpoint_integrated = true,
+        .delivery = connectors::DeliveryGuarantee::AtLeastOnce,
+        .replay_lost_with_options = {"on_decode_error=drop"},
+    }});
+    for (const char* policy : {"fail", "drop"}) {
+        JobGraphSpec g;
+        g.ops.push_back(op("mysql_cdc_source",
+                           "src",
+                           {},
+                           {{"server_id", "7"},
+                            {"password", "on_decode_error=drop"},
+                            {"on_decode_error", policy}}));
+        g.ops.push_back(op("file_2pc_sink_string", "snk", {"src"}, {{"dir", "/tmp/o"}}));
+        connectors::GuaranteeReport report;
+        (void)check_delivery_guarantee(g, durable_checkpointing(), &report);
+        if (std::string{policy} == "fail") {
+            EXPECT_EQ(report.level, connectors::EndToEndGuarantee::EndToEndExactlyOnce)
+                << report.limiting_factor;
+        } else {
+            EXPECT_EQ(report.level, connectors::EndToEndGuarantee::AtMostOnceSource)
+                << report.limiting_factor;
+            EXPECT_EQ(report.limiting_factor, "source 'mysql_cdc_source' (on_decode_error=drop)");
+        }
+    }
+}
+
 // The native ClickHouse sink's factory name starts with both "clickhouse" and
 // "clickhouse_native". Resolving it to the legacy record would report the
 // legacy sink's claims (no retries, no TLS) for the native sink. The core

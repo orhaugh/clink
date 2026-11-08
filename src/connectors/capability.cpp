@@ -173,6 +173,18 @@ std::vector<std::string> ConnectorCapabilities::self_check() const {
         problems.emplace_back(name +
                               ": lists options its replay requires but is no replayable source");
     }
+    if (!replay_lost_with_options.empty() && !(is_source && replayable)) {
+        problems.emplace_back(name +
+                              ": lists options that lose records on replay but is no replayable "
+                              "source");
+    }
+    for (const auto& o : replay_lost_with_options) {
+        const auto eq = o.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 == o.size()) {
+            problems.emplace_back(name + ": replay_lost_with_options entry '" + o +
+                                  "' is not of the form key=value");
+        }
+    }
     return problems;
 }
 

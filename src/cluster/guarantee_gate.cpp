@@ -55,6 +55,22 @@ connectors::PipelineConnector connector_of(const OperatorSpec& op, bool is_sourc
     for (const auto& [k, _] : op.params) {
         pc.supplied_options.push_back(k);
     }
+    // A configuration that loses records is named "key=value" in the record;
+    // only those entries are matched against the values given, so no other
+    // option's value (a password among them) enters the analysis.
+    if (const auto* caps = connectors::CapabilityRegistry::instance().find(pc.connector_name);
+        caps != nullptr) {
+        for (const auto& entry : caps->replay_lost_with_options) {
+            const auto eq = entry.find('=');
+            if (eq == std::string::npos) {
+                continue;
+            }
+            const auto it = op.params.find(entry.substr(0, eq));
+            if (it != op.params.end() && it->second == entry.substr(eq + 1)) {
+                pc.supplied_options.push_back(entry);
+            }
+        }
+    }
     // Carried so the analyser can tell whether transactional sinks commit
     // as a unit or independently.
     if (const auto cg = op.params.find("commit_group"); cg != op.params.end()) {

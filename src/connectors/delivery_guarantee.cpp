@@ -120,6 +120,8 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
     std::string weakest_source;
     std::string weakest_source_why;  // why it cannot replay, when its record says
     std::string redelivered_source;
+    std::string lossy_source;  // replays, but skips records in its configuration
+    std::string lossy_option;
     for (const auto& c : facts.connectors) {
         if (!c.is_source) {
             continue;
@@ -158,6 +160,19 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
         } else if (caps != nullptr && caps->checkpoint_integrated && caps->replayable) {
             reasons.emplace_back("source '" + c.op_type + "' replays from " +
                                  std::string(to_string(caps->offset_model)));
+            // Replaying does not bring back what the source skipped.
+            for (const auto& lossy : caps->replay_lost_with_options) {
+                if (has_option(c, lossy)) {
+                    if (lossy_source.empty()) {
+                        lossy_source = c.op_type;
+                        lossy_option = lossy;
+                    }
+                    reasons.emplace_back("source '" + c.op_type + "' was given " + lossy +
+                                         ", so it skips a record it cannot read, and a restore "
+                                         "does not bring a skipped record back");
+                    break;
+                }
+            }
         } else if (caps != nullptr && caps->checkpoint_integrated &&
                    caps->offset_model == OffsetModel::Acknowledgement) {
             if (redelivered_source.empty()) {
@@ -191,6 +206,19 @@ GuaranteeReport analyse_pipeline(const PipelineFacts& facts) {
                 (weakest_source_why.empty() ? std::string{} : " (" + weakest_source_why + ")") +
                 "; records in flight at the moment of failure are lost, so no stronger guarantee "
                 "is achievable");
+        }
+        return r;
+    }
+    if (!lossy_source.empty()) {
+        r.level = EndToEndGuarantee::AtMostOnceSource;
+        r.limiting_factor = "source '" + lossy_source + "' (" + lossy_option + ")";
+        if (facts.requested.has_value() &&
+            strength(*facts.requested) > strength(DeliveryGuarantee::AtMostOnce)) {
+            r.rejections.emplace_back(
+                std::string("requested ") + std::string(to_string(*facts.requested)) +
+                " but source '" + lossy_source + "' was given " + lossy_option +
+                ", so a record it cannot read is skipped and lost; no stronger guarantee is "
+                "achievable while that option is set");
         }
         return r;
     }

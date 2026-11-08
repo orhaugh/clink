@@ -185,6 +185,13 @@ struct ConnectorCapabilities {
     // is told where the cursor goes and where it comes from.
     std::vector<std::string> replay_requires_options;
 
+    // For a replayable source that, in one configuration, skips a record it
+    // cannot read: the options that select it, each "key=value". Given one, the
+    // delivery analyser counts the source as one that loses records, since a
+    // restore does not bring a skipped record back. The MySQL change stream
+    // given on_decode_error=drop skips an event it cannot decode.
+    std::vector<std::string> replay_lost_with_options;
+
     // Internal consistency of the record itself. A declaration that claims
     // two-phase commit but not `transactional`, or exactly-once from a
     // non-replayable source, is a bug in the DECLARATION and is caught by

@@ -392,6 +392,77 @@ TEST_F(ConnectorCapabilityTest, ASourceThatReplaysOnlyWhenConfiguredNeedsItsOpti
         << r.rejections[0];
 }
 
+TEST_F(ConnectorCapabilityTest, ASourceGivenAnOptionThatSkipsRecordsLosesThem) {
+    // A replayable source that, in one configuration, skips a record it cannot
+    // read (the MySQL change stream given on_decode_error=drop) names that
+    // configuration "key=value". Given it, a restore does not bring the skipped
+    // record back, so no stronger guarantee than at-most-once holds; without it
+    // the source replays as usual.
+    CapabilityRegistry::instance().declare(ConnectorCapabilities{
+        .name = "test_skipping",
+        .version = "1",
+        .is_source = true,
+        .replayable = true,
+        .offset_model = OffsetModel::Lsn,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+        .replay_lost_with_options = {"on_decode_error=drop"},
+    });
+    struct Undeclare {
+        ~Undeclare() { CapabilityRegistry::instance().undeclare("test_skipping"); }
+    } cleanup;
+    EXPECT_TRUE(CapabilityRegistry::instance().find("test_skipping")->self_check().empty());
+
+    PipelineFacts f;
+    f.checkpointing_enabled = true;
+    f.durable_state_backend = true;
+    f.requested = DeliveryGuarantee::ExactlyOnceTwoPhaseCommit;
+    f.connectors = {src("test_skipping", {"on_decode_error"}), snk("file_2pc", {"dir"})};
+    const auto failing = analyse_pipeline(f);
+    EXPECT_EQ(failing.level, EndToEndGuarantee::EndToEndExactlyOnce) << failing.render_text();
+
+    f.requested = DeliveryGuarantee::AtLeastOnce;
+    f.connectors = {src("test_skipping", {"on_decode_error", "on_decode_error=drop"}),
+                    snk("file_2pc", {"dir"})};
+    const auto r = analyse_pipeline(f);
+    EXPECT_EQ(r.level, EndToEndGuarantee::AtMostOnceSource) << r.render_text();
+    EXPECT_EQ(r.limiting_factor, "source 'test_skipping_source' (on_decode_error=drop)");
+    ASSERT_EQ(r.rejections.size(), 1U) << r.render_text();
+    EXPECT_NE(r.rejections[0].find("was given on_decode_error=drop, so a record it cannot read "
+                                   "is skipped and lost"),
+              std::string::npos)
+        << r.rejections[0];
+}
+
+TEST_F(ConnectorCapabilityTest, SelfCheckRejectsMalformedLossyOptions) {
+    const ConnectorCapabilities not_replayable{
+        .name = "x",
+        .version = "1",
+        .is_source = true,
+        .replayable = false,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtMostOnce,
+        .replay_lost_with_options = {"on_decode_error=drop"},
+    };
+    auto problems = not_replayable.self_check();
+    ASSERT_EQ(problems.size(), 1U);
+    EXPECT_NE(problems[0].find("lose records on replay"), std::string::npos);
+
+    const ConnectorCapabilities no_value{
+        .name = "y",
+        .version = "1",
+        .is_source = true,
+        .replayable = true,
+        .offset_model = OffsetModel::Lsn,
+        .checkpoint_integrated = true,
+        .delivery = DeliveryGuarantee::AtLeastOnce,
+        .replay_lost_with_options = {"on_decode_error"},
+    };
+    problems = no_value.self_check();
+    ASSERT_EQ(problems.size(), 1U);
+    EXPECT_NE(problems[0].find("key=value"), std::string::npos);
+}
+
 TEST_F(ConnectorCapabilityTest, SelfCheckRejectsReplayOptionsWithoutReplay) {
     const ConnectorCapabilities c{
         .name = "x",
