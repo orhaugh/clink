@@ -534,6 +534,58 @@ void check_prometheus_options(const TableDef& table) {
     }
 }
 
+// A connector='splunk_hec' (or 'splunk') sink table's options: an option the
+// sink does not read is refused rather than ignored, the refusal listing the
+// ones it reads, and url and token are required.
+void check_splunk_options(const TableDef& table, const std::string& connector) {
+    static const std::vector<std::string> kOptions = {"url",
+                                                      "token",
+                                                      "path",
+                                                      "sourcetype",
+                                                      "source",
+                                                      "host",
+                                                      "index",
+                                                      "headers",
+                                                      "verify_tls",
+                                                      "batch_records",
+                                                      "batch_bytes",
+                                                      "max_retries",
+                                                      "linger_ms",
+                                                      "connect_timeout_ms",
+                                                      "request_timeout_ms",
+                                                      "ack",
+                                                      "max_pending_acks",
+                                                      "ack_poll_ms",
+                                                      "ack_timeout_ms",
+                                                      "dlq"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        if (std::find(kOptions.begin(), kOptions.end(), key) != kOptions.end()) {
+            continue;
+        }
+        if (key == "format" && value == "json") {
+            continue;
+        }
+        if (std::find(interpreted.begin(), interpreted.end(), key) != interpreted.end() &&
+            key != "format") {
+            continue;
+        }
+        std::string accepted;
+        for (const auto& o : kOptions) {
+            accepted += (accepted.empty() ? "" : ", ") + o;
+        }
+        unsupported("table '" + table.name + "': connector='" + connector +
+                    "' does not read option '" + key + "'; it reads " + accepted);
+    }
+    for (const char* required : {"url", "token"}) {
+        if (const auto it = table.properties.find(required);
+            it == table.properties.end() || it->second.empty()) {
+            unsupported("table '" + table.name + "': a connector='" + connector + "' sink needs '" +
+                        required + "'");
+        }
+    }
+}
+
 // A CDC table declared keep_rows='true': the plan keeps the latest row of every
 // key behind its source.
 bool keeps_rows(const TableDef& table) {
@@ -1303,8 +1355,10 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
     }
     if (connector == "splunk_hec" || connector == "splunk") {
         // Splunk HTTP Event Collector. At-least-once; HEC ingestion is append
-        // (re-delivery on replay indexes the event again). Each row -> JSON
-        // object string -> wrapped in the HEC {"event":...} envelope.
+        // (an event sent again is indexed again). Each row -> JSON object
+        // string -> the "event" of one HEC envelope. changelog='true' writes
+        // each change as an event carrying its __row_kind.
+        check_splunk_options(table, connector);
         if (exactly_once) {
             unsupported("connector='" + connector +
                         "' (Splunk HEC) sink is at-least-once; exactly-once delivery is not "

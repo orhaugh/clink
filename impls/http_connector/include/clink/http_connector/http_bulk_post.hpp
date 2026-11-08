@@ -13,8 +13,8 @@
 #include "clink/http_connector/http_request.hpp"
 
 // The retry/backoff core shared by every HTTP-family sink (the batched bulk
-// sink, the Elasticsearch/Splunk renderers built on it, and the Prometheus
-// pushgateway sink which buffers differently but POSTs the same way). Keeping
+// sink, the Elasticsearch renderer built on it, and the Prometheus and Splunk
+// sinks which buffer differently but POST the same way). Keeping
 // the delivery semantics in ONE place means at-least-once + bounded backoff is
 // defined once, not re-derived per sink.
 namespace clink::http_connector {
@@ -86,7 +86,7 @@ inline bool status_rejects_records(int status) {
 }
 
 // Whole-batch verdict from a bool validator: the batch is all-or-nothing. Used
-// when a sink supplies no per-item ResponseHandler (http_sink, Splunk). A
+// when a sink supplies no per-item ResponseHandler (http_sink). A
 // rejected response classifies ALL records the same way by HTTP status: a 4xx
 // that refuses the records (status_rejects_records) -> failed_permanent;
 // anything else (0, 3xx, any other 4xx, 5xx, or a 2xx the validator rejected)

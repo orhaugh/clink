@@ -3244,6 +3244,82 @@ TEST(SqlPhysical, PrometheusOptionsAreCheckedWhenTheJobIsPlanned) {
               std::string::npos);
 }
 
+std::string splunk_plan(const std::map<std::string, std::string>& options,
+                        const clink::cluster::OperatorSpec** sink_out = nullptr,
+                        clink::cluster::JobGraphSpec* spec_out = nullptr,
+                        const std::string& connector = "splunk_hec") {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    TableDef dst;
+    dst.name = "events";
+    dst.columns.push_back(ColumnSpec{"k", arrow::int64()});
+    dst.columns.push_back(ColumnSpec{"v", arrow::int64()});
+    dst.properties = {
+        {"connector", connector}, {"url", "https://splunk:8088"}, {"token", "env://HEC_TOKEN"}};
+    for (const auto& [k, v] : options) {
+        if (v.empty()) {
+            dst.properties.erase(k);
+        } else {
+            dst.properties[k] = v;
+        }
+    }
+    cat.register_table(std::move(dst));
+    try {
+        auto plan = bind_insert(cat, "INSERT INTO events SELECT k, v FROM src_t");
+        PhysicalPlanner pp;
+        auto spec = pp.compile(static_cast<const LogicalSink&>(*plan));
+        if (spec_out != nullptr) {
+            *spec_out = spec;
+            if (sink_out != nullptr) {
+                *sink_out = find_op(*spec_out, "splunk_hec_sink");
+            }
+        }
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// Both connector names reach the sink with every option it reads, an option it
+// does not read is refused naming the ones it does, and url and token are
+// required, all when the job is planned.
+TEST(SqlPhysical, SplunkHecOptionsAreCheckedWhenTheJobIsPlanned) {
+    for (const std::string connector : {"splunk_hec", "splunk"}) {
+        clink::cluster::JobGraphSpec spec;
+        const clink::cluster::OperatorSpec* sink = nullptr;
+        EXPECT_EQ(splunk_plan({{"ack", "indexer"},
+                               {"ack_timeout_ms", "60000"},
+                               {"max_pending_acks", "10"},
+                               {"ack_poll_ms", "500"},
+                               {"sourcetype", "_json"},
+                               {"dlq", "drop"},
+                               {"format", "json"},
+                               {"request_timeout_ms", "5000"}},
+                              &sink,
+                              &spec,
+                              connector),
+                  "")
+            << connector;
+        ASSERT_NE(sink, nullptr) << connector;
+        EXPECT_EQ(sink->params.at("ack"), "indexer");
+        EXPECT_EQ(sink->params.at("token"), "env://HEC_TOKEN");
+        EXPECT_NE(find_op(spec, "row_to_json_string"), nullptr);
+    }
+    const auto typo = splunk_plan({{"sourcetpye", "_json"}});
+    EXPECT_NE(typo.find("connector='splunk_hec' does not read option 'sourcetpye'"),
+              std::string::npos)
+        << typo;
+    EXPECT_NE(typo.find("sourcetype"), std::string::npos) << typo;
+    EXPECT_NE(splunk_plan({{"token", ""}}).find("needs 'token'"), std::string::npos);
+    EXPECT_NE(splunk_plan({{"url", ""}}, nullptr, nullptr, "splunk").find("needs 'url'"),
+              std::string::npos);
+    const auto eo = splunk_plan({{"delivery_guarantee", "exactly_once"}});
+    EXPECT_NE(eo.find("'exactly_once' is supported only for"), std::string::npos) << eo;
+}
+
 TEST(SqlPhysical, CommitGroupThreadsThroughToSinkParams) {
     // commit_group property on the table flows through the
     // physical planner into OperatorSpec.params, where sink factories

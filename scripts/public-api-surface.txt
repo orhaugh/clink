@@ -242,6 +242,7 @@ impls/http_connector/include/clink/http_connector/http_request.hpp
 impls/http_connector/include/clink/http_connector/influxdb_sink.hpp
 impls/http_connector/include/clink/http_connector/prometheus_push_sink.hpp
 impls/http_connector/include/clink/http_connector/pubsub.hpp
+impls/http_connector/include/clink/http_connector/splunk_hec_sink.hpp
 impls/http_connector/include/clink/http_connector/token_source.hpp
 impls/iceberg/include/clink/iceberg/iceberg_row_sink.hpp
 impls/iceberg/include/clink/iceberg/iceberg_row_source.hpp

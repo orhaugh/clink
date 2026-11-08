@@ -12,6 +12,7 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "clink/connectors/capability.hpp"
 #include "clink/http_connector/batched_http_bulk_sink.hpp"
@@ -23,6 +24,7 @@
 #include "clink/http_connector/install.hpp"
 #include "clink/http_connector/prometheus_push_sink.hpp"
 #include "clink/http_connector/pubsub.hpp"
+#include "clink/http_connector/splunk_hec_sink.hpp"
 #include "clink/http_connector/token_source.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
@@ -288,7 +290,10 @@ void install(clink::plugin::PluginRegistry& reg) {
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "splunk_hec",
-        .version = "1",
+        // 2: each record must be one JSON object, checked and written exactly;
+        // the reply is read as HEC's; ack='indexer' waits for indexer
+        // acknowledgement at every barrier.
+        .version = "2",
         .is_source = false,
         .is_sink = true,
         .build_dependencies = {"cpp-httplib"},
@@ -304,9 +309,17 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {},
+        .timeout_options = {"connect_timeout_ms", "request_timeout_ms", "ack_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"no dedup key: a replayed batch is re-indexed",
+        .limitations = {"no dedup key: an event HEC accepted is indexed again when it is sent "
+                        "again, after a lost reply, a busy server or a replay",
+                        "a request HEC refuses may have been partly accepted; the sink sends "
+                        "every event but a refused one again",
+                        "with ack='none' a barrier waits for HEC's acceptance, not for indexing; "
+                        "ack='indexer' waits for indexer acknowledgement, which is not "
+                        "searchability",
+                        "each record must be one JSON object; raw events, per-event time and "
+                        "indexed fields are not written",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
@@ -444,20 +457,68 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_sink<std::string>("elasticsearch_sink", es_factory("elasticsearch_sink"));
     reg.register_sink<std::string>("opensearch_sink", es_factory("opensearch_sink"));
 
-    // splunk_hec_sink: POST batched JSON events to a Splunk HTTP Event Collector
-    // (/services/collector/event) with `Authorization: Splunk <token>`. Each row
-    // is wrapped in the HEC event envelope. At-least-once. Params:
+    // splunk_hec_sink: write each JSON-object row as the "event" of one HEC
+    // envelope and POST them, one per line, to a Splunk HTTP Event Collector
+    // with `Authorization: Splunk <token>`. At-least-once; with ack='indexer' a
+    // barrier also waits for HEC's indexer acknowledgement of every request
+    // before it (SplunkHecSink has the contract). Every option is parsed
+    // strictly. Params:
     //   url (required)        - scheme://host[:port], e.g. https://splunk:8088
-    //   token (required)      - HEC token (sets the Authorization header)
-    //   path (default "/services/collector/event")
-    //   sourcetype            - e.g. "_json" to auto-extract the event fields
-    //   source, host, index   - optional event metadata (index must be writable)
-    //   headers               - extra "K: V; ..." (rarely needed)
-    //   batch_records (default 500), batch_bytes (default 4194304)
-    //   max_retries (default 4; clamped to [0, 20])
-    //   verify_tls ("true" [default] | "false")
+    //   token (required)      - HEC token; env://VAR keeps it out of the job spec
+    //   path (default "/services/collector/event"; or .../event/1.0 or /services/collector)
+    //   sourcetype, source, host, index - optional metadata for every event
+    //   headers               - extra "K: V; ..." (never Authorization or the channel)
+    //   batch_records (default 500; 1 to 100000) - the most events one request carries
+    //   batch_bytes (default 4194304; 1024 to 268435456) - the most bytes one request carries
+    //   max_retries (default 4; 0 to 20), linger_ms (default 0; up to 3600000)
+    //   connect_timeout_ms (default 5000), request_timeout_ms (default 30000)
+    //   ack ("none" [default] | "indexer")
+    //   max_pending_acks (default 100; 1 to 10000), ack_poll_ms (default 1000; 10 to
+    //   60000), ack_timeout_ms (default 120000; 1000 to 3600000) - ack='indexer' only
+    //   dlq ("fail" [default] | "drop"), verify_tls ("true" [default] | "false")
     reg.register_sink<std::string>(
         "splunk_hec_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            const auto given = [&ctx](const char* key) { return ctx.params.contains(key); };
+            const auto refuse = [](const std::string& why) {
+                throw std::runtime_error("splunk_hec_sink: " + why);
+            };
+            // Read whole and within its range before it is narrowed: "12abc",
+            // "abc" and "-1" are refused rather than read as 12, the default
+            // or a wrapped size.
+            const auto ranged =
+                [&](const char* key, std::int64_t fallback, std::int64_t lo, std::int64_t hi) {
+                    if (!given(key)) {
+                        return fallback;
+                    }
+                    const std::string v = ctx.param_or(key);
+                    std::int64_t out = 0;
+                    const auto* end = v.data() + v.size();
+                    const auto [ptr, ec] = std::from_chars(v.data(), end, out);
+                    if (v.empty() || ec != std::errc{} || ptr != end) {
+                        refuse(std::string{"'"} + key + "' must be an integer; it is '" + v + "'");
+                    }
+                    if (out < lo || out > hi) {
+                        refuse(std::string{"'"} + key + "' must be from " + std::to_string(lo) +
+                               " to " + std::to_string(hi) + "; it is " + v);
+                    }
+                    return out;
+                };
+            const auto one_of = [&](const char* key,
+                                    const std::string& fallback,
+                                    const std::vector<std::string>& allowed) {
+                const std::string v = ctx.param_or(key, fallback);
+                for (const auto& a : allowed) {
+                    if (v == a) {
+                        return v;
+                    }
+                }
+                std::string list;
+                for (const auto& a : allowed) {
+                    list += (list.empty() ? "'" : ", '") + a + "'";
+                }
+                refuse(std::string{"'"} + key + "' must be one of " + list + "; it is '" + v + "'");
+                return fallback;
+            };
             SplunkHecOptions o;
             o.url = ctx.param_or("url");
             o.token = ctx.param_or("token", "");
@@ -467,13 +528,32 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.host = ctx.param_or("host", "");
             o.index = ctx.param_or("index", "");
             o.headers = ctx.param_or("headers", "");
-            o.verify_tls = ctx.param_or("verify_tls", "true") != "false";
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
+            o.verify_tls = one_of("verify_tls", "true", {"true", "false"}) == "true";
+            o.batch_records = static_cast<std::size_t>(ranged("batch_records", 500, 1, 100000));
             o.batch_bytes =
-                static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
-            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
-            o.dlq_policy = parse_dlq(ctx);
-            o.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
+                static_cast<std::size_t>(ranged("batch_bytes", 4 * 1024 * 1024, 1024, 268435456));
+            o.max_retries = static_cast<int>(ranged("max_retries", 4, 0, 20));
+            o.max_age = std::chrono::milliseconds{ranged("linger_ms", 0, 0, 3600000)};
+            o.connect_timeout_ms = static_cast<int>(ranged("connect_timeout_ms", 5000, 1, 600000));
+            o.request_timeout_ms = static_cast<int>(ranged("request_timeout_ms", 30000, 1, 600000));
+            o.ack = one_of("ack", "none", {"none", "indexer"}) == "indexer" ? SplunkHecAck::Indexer
+                                                                            : SplunkHecAck::None;
+            if (o.ack == SplunkHecAck::None) {
+                for (const char* key : {"max_pending_acks", "ack_poll_ms", "ack_timeout_ms"}) {
+                    if (given(key)) {
+                        refuse(std::string{"'"} + key +
+                               "' applies to ack='indexer'; with ack='none' a request is done "
+                               "once HEC accepts it");
+                    }
+                }
+            }
+            o.max_pending_acks =
+                static_cast<std::size_t>(ranged("max_pending_acks", 100, 1, 10000));
+            o.ack_poll_interval = std::chrono::milliseconds{ranged("ack_poll_ms", 1000, 10, 60000)};
+            o.ack_timeout =
+                std::chrono::milliseconds{ranged("ack_timeout_ms", 120000, 1000, 3600000)};
+            o.dlq_policy = one_of("dlq", "fail", {"fail", "drop"}) == "drop" ? DlqPolicy::Drop
+                                                                             : DlqPolicy::Fail;
             o.name = "splunk_hec_sink";
             return make_splunk_hec_sink(std::move(o));
         });

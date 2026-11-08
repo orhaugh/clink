@@ -44,6 +44,7 @@ impls/clickhouse/include/clink/connectors/clickhouse_sink.hpp:ClickHouseSink own
 impls/clickhouse/src/native/native_sink.hpp:NativeSink owns
 impls/http_connector/include/clink/http_connector/batched_http_bulk_sink.hpp:BatchedHttpBulkSink owns
 impls/http_connector/include/clink/http_connector/prometheus_push_sink.hpp:PrometheusPushSink owns
+impls/http_connector/include/clink/http_connector/splunk_hec_sink.hpp:SplunkHecSink owns
 impls/kafka/include/clink/connectors/kafka_sink.hpp:KafkaSink owns
 impls/kafka/src/register_factories.cpp:StringKafkaSink owns
 impls/kafka/src/register_factories.cpp:UpsertKafkaSink owns
