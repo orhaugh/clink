@@ -62,7 +62,7 @@ These keys are read by every connector unless noted otherwise (defaults and the 
 | `linger_ms` | No | `0` | Flush a partial batch once its oldest record is this old (evaluated on record arrival, not on a timer). `0` disables. |
 | `dlq` | No | `fail` | `drop` routes records the endpoint refuses as records (HTTP 400, 409 or 422) to the dead-letter path (a `BadRecord` report plus metrics) instead of failing the job. A refusal about the endpoint rather than the records, such as 401, 403, 404, 408 or 413, is never dead-lettered: it is retried and then fails the job, which replays. Any other value keeps the fail-and-replay default. |
 
-`http_poll_source` and the Prometheus sink do not use all of these; their connector-specific keys are below.
+`http_poll_source`, the Prometheus sink and the Splunk HEC sink do not use all of these, and the two sinks judge refusals by their own rules; their sections below set out their keys and rules.
 
 ### `http_sink`
 
@@ -152,16 +152,86 @@ None of this is exactly-once; the delivery analyser reports these sinks as at-le
 
 ### `splunk_hec_sink`
 
-Posts events to a Splunk HTTP Event Collector with `Authorization: Splunk <token>`.
+Writes each record as one event to a Splunk HTTP Event Collector (HEC), with `Authorization: Splunk <token>`. The event rules, the reading of replies and the acknowledgement loop are in `impls/http_connector/src/splunk_hec_sink.cpp`, its options in `impls/http_connector/include/clink/http_connector/splunk_hec_sink.hpp`. It has been tested against a protocol stub only, never against a Splunk server; see [Testing](#splunk-hec).
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `token` | Yes | (empty) | HEC token; sets the `Authorization` header. |
-| `path` | No | `/services/collector/event` | HEC event endpoint. |
-| `sourcetype` | No | (empty) | Event `sourcetype` (e.g. `_json` to auto-extract fields). |
-| `source` | No | (empty) | Event `source` metadata. |
-| `host` | No | (empty) | Event `host` metadata. |
-| `index` | No | (empty) | Target index (must be writable by the token). |
+| `url` | Yes | (none) | `scheme://host[:port]`. A URL with credentials, a query, a fragment or a path is refused. |
+| `token` | Yes | (none) | HEC token, sent as `Authorization: Splunk <token>`. `env://VAR` reads it from the environment and keeps it out of the job spec. No message shows it. |
+| `path` | No | `/services/collector/event` | The event endpoint: `/services/collector/event`, `/services/collector/event/1.0` or `/services/collector`, behind any prefix a proxy adds. Any other path, the raw, health and acknowledgement endpoints among them, is refused. |
+| `sourcetype`, `source`, `host`, `index` | No | (empty) | Metadata written in every envelope; empty leaves it to the token's defaults. Valid UTF-8 without control characters. `index` must be one the token may write to. |
+| `headers` | No | (empty) | Extra request headers as `"K1: V1; K2: V2"`. `Authorization`, `X-Splunk-Request-Channel`, `Content-Type`, `Content-Length`, `Transfer-Encoding` and `Host` are refused in any letter case, so no second credential or channel can be sent. |
+| `batch_records` | No | `500` | The most events one request carries, 1 to 100,000. |
+| `batch_bytes` | No | `4194304` | The most bytes one request carries, 1,024 to 268,435,456. Keep it below the server's `max_content_length`. |
+| `max_retries` | No | `4` | Attempts beyond the first for a reply that may be transient, 0 to 20. |
+| `linger_ms` | No | `0` | Send buffered events this old, checked when a record arrives. `0` disables. |
+| `connect_timeout_ms`, `request_timeout_ms` | No | `5000`, `30000` | The longest a connection, and a whole request, may take. |
+| `ack` | No | `none` | `none`: a request is done once HEC accepts it. `indexer`: indexer acknowledgement, [below](#acknowledgement). |
+| `max_pending_acks` | No | `100` | `ack='indexer'` only: the most accepted requests awaiting acknowledgement, 1 to 10,000. |
+| `ack_poll_ms` | No | `1000` | `ack='indexer'` only: the pause between acknowledgement queries, 10 to 60,000. |
+| `ack_timeout_ms` | No | `120000` | `ack='indexer'` only: how long an accepted request may wait for its acknowledgement, 1,000 to 3,600,000. |
+| `dlq` | No | `fail` | `drop` dead-letters a record the sink refuses and an event HEC refuses; `fail` fails the sink. |
+| `verify_tls` | No | `true` | `true` or `false`. |
+
+Every option is parsed strictly: a number that is not whole or is out of range, an unknown value, and an acknowledgement option given with `ack='none'` are refused when the sink is built.
+
+#### Records
+
+A record is exactly one JSON object (RFC 8259, strict), with only whitespace around it. It becomes the `event` of one envelope, `{"event":<record>,<metadata>}`, on a line of its own. The record is written without the whitespace between its tokens and otherwise exactly as given: numbers keep their digits (an integer past 2^64 and a decimal with a trailing zero arrive as written), strings their escapes, and keys their order.
+
+Before anything is sent, the sink refuses:
+
+- text that is not JSON, JSON that is not an object (an array, a string, a number, a boolean or null), and anything after the object;
+- a string that is not valid UTF-8, or holds a raw control character or an unpaired surrogate escape;
+- a key repeated within one object, compared after unescaping (`"a"` and `"a"` are the same key);
+- nesting deeper than 100 levels;
+- an envelope longer than `batch_bytes`, which no request may carry.
+
+So a record cannot add members to its envelope or events to the request: `{"a":1},"index":"other"` and `{"a":1}{"event":"x"}` are refused, not written. Metadata comes only from the sink's options. Keys inside the record named like metadata (`time`, `host`, `source`, `sourcetype`, `index`, `fields`) stay event content and set nothing; with `sourcetype='_json'` Splunk may still show them as fields when searched. The sink writes no `time`, so Splunk stamps each event. A refusal names the rule and a byte offset, never the record's content.
+
+Under `dlq='drop'` a refused record goes to the dead-letter queue, whose default logs its first 512 bytes, and the sink goes on. Under `dlq='fail'` the sink throws and then refuses every later record, flush and barrier until it is opened again: it keeps no copy of the record, and a later barrier would otherwise cover it as written.
+
+#### Requests and replies
+
+A request carries at most `batch_records` events and `batch_bytes` bytes, one envelope per line as in Splunk's documented batch example, with no line break after the last. Requests go out at every checkpoint barrier, at end of input, after `linger_ms`, and when the next event would pass either bound. Each reply is judged by its HTTP status and its HEC body together, against the status codes Splunk documents:
+
+| Reply | Meaning | What the sink does |
+| --- | --- | --- |
+| 200, code 0 | accepted | done (with `ack='indexer'`, once acknowledged) |
+| 200, code 24 or 25 | accepted; HEC is nearing a capacity limit | done, with a warning logged |
+| 200 with any other code (17, the health check's, among them) or a body that is not HEC's JSON | not an acceptance | fails at once, events kept |
+| 400, code 6, 12 or 13, with an `invalid-event-number` naming an event of the request | HEC would not read that event | `dlq='fail'`: fails, events kept. `drop`: that event dead-lettered, every other event of the request sent again |
+| 400, code 6, 12 or 13, naming no event of the request | cannot be attributed | fails at once, events kept |
+| 401, 403, or 400 with code 21 or 22 | the token was refused | fails at once, events kept; never dead-lettered |
+| 400, code 7 | the index does not exist or the token may not write to it | fails at once; never dead-lettered |
+| 400, code 10 | the token requires indexer acknowledgement | fails at once: set `ack='indexer'` |
+| 400, code 14 | the token does not use indexer acknowledgement | fails at once: set `ack='none'` |
+| any other 400, a 400 with a code HEC sends with another status, 404, 413, any other 4xx, a 3xx, a 2xx other than 200 | not confirmed, and repeating it would not help | fails at once, events kept; a 413 asks for a lower `batch_bytes` |
+| 429 (codes 26, 27), 5xx (codes 8, 9, 18 to 20, 23), a lost or cut reply | not confirmed, possibly transient | sent again after a backoff, up to `max_retries` times, then fails with the events kept |
+
+A request HEC did not confirm may still have been partly or wholly accepted. HEC reads a request's events one after another, so the events before a refused one may be in (reports of HEC's behaviour say so; its documentation does not); a busy server takes events until its queue blocks and drops the rest; and a reply can be lost after the server applied the request. The sink never takes a refusal to mean that nothing was accepted, and never confirms what the reply does not: every event of the request but a refused one is sent again, so those events can be indexed twice. A failure keeps the events, so a later barrier sends them again rather than passing over them.
+
+A message carries the HTTP status and, for HEC's own reply, its code and text; for any other reply only its content type and length. The token, the `Authorization` header and event content never appear in one.
+
+#### Acknowledgement
+
+With `ack='none'`, the default, a barrier returns once HEC has accepted every event received before it. Acceptance means the events entered Splunk's pipeline; it does not confirm they were indexed, and an event lost after acceptance, by an indexer failure for instance, is not sent again.
+
+With `ack='indexer'` the token must have indexer acknowledgement enabled (`useACK`). The sink chooses a random channel GUID when it opens and sends it as `X-Splunk-Request-Channel` with every request. An accepted request must return an ackId (`ackId`, or `ackID` as Splunk's documentation writes it, as a number or a string of digits); a reply without one fails the sink, since nothing could confirm those events. A barrier, and end of input, return only once HEC has reported every request accepted before them true: the sink queries `/services/collector/ack` with those ackIds every `ack_poll_ms` and forgets each one reported true, as HEC does. A false or missing ackId is pending: Splunk documents false as either not yet indexed or unknown. At most `max_pending_acks` requests wait at once; the next send first waits for one.
+
+A request still unacknowledged `ack_timeout_ms` after it was accepted (Splunk's documentation gives five minutes as an example of when to resend), or an acknowledgement reply that cannot be read (not HEC's, naming an ackId not asked about, a value neither true nor false, code 14), fails the sink, which then refuses every later record, flush and barrier until it opens again. It holds the ackIds but not the events, so the job's restore from its last checkpoint is what sends them again, and events whose acknowledgement was only late are then indexed twice. A query that may be transient (429, 5xx, a lost reply) is asked again until then. A restored or reopened run sends on a new channel; the acknowledgements its predecessor awaited are abandoned, and their events come again by replay.
+
+Indexer acknowledgement confirms indexing as Splunk reports it, not that a search finds the events yet. Splunk Cloud Platform supports it only for Firehose senders, according to its documentation, and a channel's requests and queries must reach the same HEC instance, which a load balancer needs stickiness for and the sink cannot check.
+
+#### Delivery
+
+At-least-once. There is no dedup key: an event HEC accepted is indexed again whenever it is sent again, after a lost reply, a busy server's partial acceptance, a refused event's neighbours, or a replay of everything since the last checkpoint. The sink must be the only sink on its chain. A cancelled task stops at once, a request in flight interrupted and a pause cut short, with the events kept. Fault points `splunk_hec_sink.before_write` and `splunk_hec_sink.after_write` let recovery tests stop a task at either side of a request.
+
+#### Earlier releases
+
+The previous sink wrote each record into the envelope as it came, so a record that was not one JSON object produced a malformed request or added envelope members or events of its own (`{"a":1},"index":"other"` set the index). It counted any 2xx as accepted without reading the body, sent every 400 to `dlq='drop'`, HEC's 400s for a refused token, a missing index and a token that needs a channel among them, so good records were dead-lettered while the configuration was wrong, had no indexer acknowledgement, and sent an `Authorization` header from `headers` written in another letter case beside the token's. These defects were found by reading its code; it was never run against a Splunk server.
+
+For existing jobs: records that are not exactly one JSON object, paths other than the event endpoints and the headers listed above are now refused; options are parsed strictly; a request no longer ends with a line break.
 
 ### `influxdb_sink`
 
@@ -545,7 +615,7 @@ Several of these connectors are mapped in `src/sql/physical_plan.cpp`. The SQL `
 
 `http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, and `prometheus_sink` are not registered as standalone SQL source/sink names; they are reached only through these `connector` aliases. The SQL planner rejects `exactly_once` and `upsert` modes on these sinks (they are at-least-once).
 
-For `connector='influxdb'` and `connector='prometheus'` the planner also refuses an option the sink does not read, naming the ones it does, and `changelog='true'`. It keeps a `connector='prometheus'` sink on one subtask whatever the job's parallelism, the operators in front fanning in to it, since a second subtask would replace the first one's series.
+For `connector='influxdb'` and `connector='prometheus'` the planner also refuses an option the sink does not read, naming the ones it does, and `changelog='true'`. For `connector='splunk_hec'` and `'splunk'` it refuses an option the sink does not read and requires `url` and `token`; `changelog='true'` writes each change as an event carrying its `__row_kind`. It keeps a `connector='prometheus'` sink on one subtask whatever the job's parallelism, the operators in front fanning in to it, since a second subtask would replace the first one's series.
 
 Sink example (Elasticsearch):
 
@@ -617,10 +687,10 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 
 ## Delivery semantics
 
-- Sinks (`http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, `prometheus_sink`, `pubsub_sink`) are at-least-once. The shared `BatchedHttpBulkSink`, which every one of them but `prometheus_sink` builds on, flushes on every checkpoint barrier (before the sink acks), on the size and linger thresholds, and at end-of-stream. On permanent failure with retries exhausted it throws rather than dropping, keeping the batch, so the job replays from the last checkpoint. A record a sink refuses before sending is dead-lettered under `dlq='drop'`; under `dlq='fail'` the sink throws and, keeping no copy of it, refuses every later record and barrier until it opens again. A response that refuses some records without naming them (an InfluxDB partial write) fails the sink under `fail` and is dead-lettered as one report under `drop`. There is no two-phase commit, so a replay re-delivers buffered records.
+- Sinks (`http_sink`, `elasticsearch_sink`, `opensearch_sink`, `splunk_hec_sink`, `influxdb_sink`, `prometheus_sink`, `pubsub_sink`) are at-least-once. The shared `BatchedHttpBulkSink`, which every one of them but `prometheus_sink` and `splunk_hec_sink` builds on, flushes on every checkpoint barrier (before the sink acks), on the size and linger thresholds, and at end-of-stream. On permanent failure with retries exhausted it throws rather than dropping, keeping the batch, so the job replays from the last checkpoint. A record a sink refuses before sending is dead-lettered under `dlq='drop'`; under `dlq='fail'` the sink throws and, keeping no copy of it, refuses every later record and barrier until it opens again. A response that refuses some records without naming them (an InfluxDB partial write) fails the sink under `fail` and is dead-lettered as one report under `drop`. There is no two-phase commit, so a replay re-delivers buffered records.
 - `elasticsearch_sink` / `opensearch_sink` are at-least-once. Without `document_id` a resend or a replay indexes the record again; a reply lost after the server applied the request is enough to duplicate a batch. With `document_id` each record replaces its id's document, so a replay converges on each id's latest record, ordered within a sink subtask as [Ordering](#ordering) describes. A batch counts as written only when the bulk response confirms every operation, and failures are classified as [the table above](#when-a-batch-counts-as-written) sets out.
 - `influxdb_sink` is at-least-once. With `timestamp_field` a rewritten point lands on its own series and time, where InfluxDB merges it into the point already there; without it every write is a new point, so a replay duplicates. [Its section](#influxdb_sink) has the contract.
-- `splunk_hec_sink` is at-least-once with no dedup key; HEC ingestion is append, so a replay indexes again.
+- `splunk_hec_sink` is at-least-once with no dedup key: an event HEC accepted is indexed again when it is sent again, after a lost reply, a busy server's partial acceptance, a refused event's neighbours or a replay. With `ack='none'` a barrier waits for HEC's acceptance, with `ack='indexer'` for indexer acknowledgement. [Its section](#splunk_hec_sink) has the contract.
 - `prometheus_sink` is at-least-once into a store of latest values: each push replaces the group's series of the metric, so a replay ends at each series' latest value, and `push_series` decides which series each push carries. [Its section](#prometheus_sink) has the contract.
 - `pubsub_sink` is at-least-once with no producer dedup; a replay re-publishes.
 - `http_poll_source` in cursor mode replays from its checkpointed cursor: at-least-once into the job, and exactly-once into a two-phase-commit sink, while the endpoint answers the records strictly after the cursor, ascending and each value unique, and keeps what it served. Every page is checked against what the source can see of that before anything is emitted, and one that fails fails the poll (see [the source's section](#http_poll_source)). Its capability record, `http_poll`, declares replay only with `cursor_field` and `cursor_param`, so the delivery analyser reports a job over a source in resource mode as `AT_MOST_ONCE_SOURCE` and refuses `at_least_once` and above for it, naming the options that would make it replay. Before, the source shared the `http` record, which claimed replay however the source was set up.
@@ -642,6 +712,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - No two-phase commit on any sink; exactly-once delivery is not offered. The SQL planner rejects `exactly_once` and `upsert` modes on these sinks.
 - `elasticsearch_sink` / `opensearch_sink`: records of one `document_id` are ordered only within one sink subtask, and not against other writers; a replay can show a document at an older record's value until it reaches the latest; `document_id` values outside [the id rules](#document-ids) are refused. Only the `index` action is written: no update, delete or external versioning. The sink takes one URL and does not discover other nodes.
 - HTTPS works only if cpp-httplib was built with OpenSSL; otherwise an `https://` URL is rejected at construction.
+- `splunk_hec_sink` has no dedup key, so a resend or a replay indexes an event again; each record must be one JSON object, and raw events, per-event time and indexed fields are not written; with `ack='none'` a barrier confirms acceptance, not indexing, and indexer acknowledgement does not confirm that a search finds the events. It has not been run against a Splunk server.
 - `prometheus_sink` targets a Pushgateway, a store of each series' latest value for a modest number of series, not a time-series database: Prometheus sees only the values present when it scrapes. The sink must be its group's only writer of its metric and runs on one subtask. With `push_series='batch'` a series not named since the previous push disappears; with `'all'` a series stays until the group is deleted. Label names outside the label grammar and integer values past 2^53 are refused. Remote-write is not implemented.
 - `http_poll_source` replays only in cursor mode, and only from an endpoint that answers strictly after the cursor, ascending by a unique `cursor_field`, and keeps what it served; it refuses a page that breaks what it can check of that, including a value shared by two records. Page tokens, offsets and cursors of several fields are not supported. One subtask polls. A bounded run ends only on an empty page (cursor mode) or after one response (resource mode). Records with an integer past 64 bits or a number past a double's range are refused, since clink's JSON reader cannot decode them.
 - `pubsub_source` holds at most `max_outstanding` unacknowledged messages per subtask, and a job that completes no checkpoint stops pulling there. A message held past `max_lease_s` is delivered again (a duplicate). Subscriptions with exactly-once delivery enabled are not handled specially.
@@ -651,7 +722,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 
 ## Testing
 
-The module's tests live in `impls/http_connector/tests/` and carry the ctest label `http_connector`. Most are in-process or mock tests (factory registration, framing, the Splunk body builder, the Pushgateway sample rules) and run in a normal build:
+The module's tests live in `impls/http_connector/tests/` and carry the ctest label `http_connector`. Most are in-process or mock tests (factory registration, framing, the Splunk event rules, the Pushgateway sample rules) and run in a normal build:
 
 ```bash
 ctest --test-dir build -L http_connector
@@ -666,8 +737,9 @@ The live integration tests are skipped unless their endpoint environment variabl
 | InfluxDB (`InfluxDbLive`, `test_influxdb_live.cpp`) | `CLINK_INFLUXDB_TEST_ENDPOINT`, plus `CLINK_INFLUXDB_TEST_ORG` / `_BUCKET` / `_TOKEN` (defaults `clink` / `clink` / `clink-token`) and `_VERSION` | `influxdb:2.7.12`, pinned by digest in `scripts/influxdb-live.sh` |
 | Pub/Sub (`test_pubsub_live.cpp`) | `CLINK_PUBSUB_EMULATOR_HOST` (e.g. `localhost:8085`) | `gcr.io/google.com/cloudsdktool/cloud-sdk:emulators` |
 | Pushgateway (`PushgatewayLive`, `test_prometheus_live.cpp`) | `CLINK_PUSHGATEWAY_TEST_ENDPOINT`, plus `CLINK_PUSHGATEWAY_TEST_VERSION` | `prom/pushgateway:v1.10.0`, pinned by digest in `scripts/prometheus-live.sh` |
+| Splunk HEC (`SplunkHecLive`, `test_splunk_live.cpp`) | `CLINK_SPLUNK_HEC_TEST_ENDPOINT`, `_TOKEN`, `_ACK_TOKEN`, and `CLINK_SPLUNK_TEST_INDEX`, `_SEARCH_ENDPOINT`, `_SEARCH_USER`, `_SEARCH_PASSWORD` | A Splunk server someone supplies; none is started, and the suite has not run against one |
 
-There is no live test for `splunk_hec_sink`; it is covered by in-process and mock tests. `http_poll_source` has a gate of its own against local servers, below, and also feeds the search recovery cells, from a feed the test serves.
+`splunk_hec_sink` has a simulated gate against a protocol stub and a live suite that needs a server someone supplies; see [Splunk HEC](#splunk-hec). `http_poll_source` has a gate of its own against local servers, below, and also feeds the search recovery cells, from a feed the test serves.
 
 `pubsub_source`'s acknowledgement contract is tested in process by `PubSubSourceAck` (`test_pubsub.cpp`), against a stub of the REST endpoints that leases each delivery under a new ackId, honours `modifyAckDeadline`, acknowledges only through a current ackId and can fail acknowledges: an aborted checkpoint, crashes after the barrier and after completion, failed and retried acknowledges, notifications out of order, leases held across a delayed checkpoint and given up past `max_lease`, the `max_outstanding` bound, close after a cancel, and both `on_decode_error` policies. `PubSubSourceAckLive` (`test_pubsub_live.cpp`) repeats the abort, the crash after completion and the delayed checkpoint against the emulator. `test_factory_registration.cpp` pins the capability record and the analyser's verdict. `scripts/ack-sources-live.sh [build-dir]` is the required gate: it runs `PubSubLive` and `PubSubSourceAckLive` against a one-off emulator container, with the other acknowledging sources' suites, and fails on a missing binary, an emulator that never answers, a failed or skipped case, or a short suite (see the [Redis page](redis.md#testing)). The `ack-sources` CI workflow runs it.
 
@@ -694,6 +766,18 @@ Without a gateway: `PromRender` (series identity, label names refused rather tha
 `scripts/prometheus-live.sh [build-dir]` is the gate: it starts Pushgateway 1.10.0, pinned by digest, on a free loopback port, runs the suites above, and fails on a missing binary, a gateway that never becomes ready, a failed or skipped case or a short suite. It keeps each run's report, the cells' cluster logs and final scrapes, and a provenance file in `build/prometheus-live-reports/`. The `http` CI workflow runs it.
 
 The gate passed locally on commit `680fd645`, 50 of 50, on 2026-11-08 (reports not published). In the all-mode cell the worker parked after a push carrying records up to 1,187 while the job restored from the cursor at 882, and the gateway ended with all 105 series at their latest values, the five early series among them; the SQL cell at parallelism 2 parked after a push up to 1,171, restored from 874 and ended the same way; in batch mode the gateway ended with 90 series, each at its latest value, and no early one. The previous sink was not run against the gateway: its defects were found by reading its code. The gateway behaviours the new rules answer were measured on 1.10.0 directly: a body label differing from the group's replaced without a word, `{a=""}` and `{}` accepted as two series in one push, a label value that is not UTF-8 refused with a 400, and `%2F` in a grouping value read as a path separator.
+
+### Splunk HEC
+
+No Splunk server took part in testing this sink. None was available locally, and the round acquired no licence or trial, so every result below is against a protocol stub, `impls/http_connector/tests/hec_stub.hpp`, which answers the event and acknowledgement endpoints as Splunk documents them and reads each request with its own parser. It is evidence about the sink and the engine, not about Splunk.
+
+Without a server: `HecRender` (one object per record, numbers and strings as written, metadata, every refusal, injection attempts, repeated keys, nesting, the size bound, the options), `HecReply` (every documented code with its status, contradictory and foreign replies, both ackId spellings, acknowledgement replies, messages without bodies that are not HEC's) and `HecSink`, the sink against the stub: the request's lines, token and metadata; both bounds and linger; refused records and a refused event under each policy; a busy server's partial acceptance and a reply lost after acceptance, sent again; spent retries keeping the events; throttling; refused tokens and indexes, never dead-lettered; replies that are not HEC's; each token used in the other mode; a cancel in a pause, in a request and in the wait for acknowledgements; indexer acknowledgement delayed, never arriving, unreadable and bounded, and a reopened sink on a new channel. `HecFactory` covers the factory's strict options and `SqlPhysical.SplunkHecOptionsAreCheckedWhenTheJobIsPlanned` the planner and both connector names.
+
+`SplunkHecRecovery` (`tests/integration/test_splunk_recovery.cpp`) runs a coordinator and two workers polling a feed into the sink, pointed at the stub, and kills a worker parked at `splunk_hec_sink.after_write` after the eighth request the stub accepted, which no checkpoint covered while earlier checkpoints covered records: with `ack='none'`, with `ack='indexer'` against a token that requires acknowledgement, and as a SQL job at parallelism 2. Read from the stub's own acceptance log, every record must be present with exactly its payload and the sink's metadata, and only records past the restore point may appear twice; each cell checks where the worker parked, one restart, a restore point past accepted records, that the parked request carried records past it, and, with indexer acknowledgement, a channel per run. The cells need no service and run in the integration suite.
+
+`scripts/splunk-hec-gate.sh [build-dir]` is the simulated gate: it runs the suites above and fails on a missing binary, a failed or skipped case or a short suite, keeping each run's report, the cells' cluster logs and the stub's acceptance logs, and a provenance file that names the stub and states that no live server took part, in `build/splunk-hec-reports/simulated/`. The `http` CI workflow runs it.
+
+`SplunkHecLive` (`test_splunk_live.cpp`) writes through the sink to a Splunk server someone supplies and finds every event again with a search through the REST API: payloads, refused records absent, indexer acknowledgement before the barrier, and a refused token, a missing index and each token used in the other mode. Whether `_raw` keeps the numbers' text as sent is printed, not asserted. `scripts/splunk-live.sh [build-dir]` is its gate: it starts no server, and without every variable it needs it refuses to run, exits 2 and says that live verification did not happen. It has not been run, so live verification is incomplete: nothing here confirms how a Splunk server answers the cases the stub models, the reported prefix acceptance of a refused batch and the ackId spelling among them.
 
 ### Elasticsearch and OpenSearch
 

@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+**The Splunk HEC sink writes each record as exactly one event, confirms only
+what HEC accepted, and can wait for indexer acknowledgement.** It embedded each
+record in its envelope as it came, so a record that was not one JSON object
+produced a malformed request or added envelope members and events of its own
+(`{"a":1},"index":"other"` set the index); it counted any 2xx as accepted
+without reading the body; it sent every 400 to `dlq='drop'`, HEC's 400s for a
+refused token, a missing index and a token that needs a channel among them, so
+good records were dead-lettered while the configuration was wrong; and an
+`Authorization` header in `headers` written in another letter case was sent
+beside the token's. Now each record must be exactly one strict JSON object,
+checked whole before it is buffered, and is written without the whitespace
+between its tokens and otherwise exactly as given, numbers and escapes
+included; metadata comes only from the options. Replies are read by HTTP
+status and HEC body together against Splunk's documented codes: 200 with code
+0, 24 or 25 accepts; an event HEC refuses by number fails the sink under
+`fail` and is dead-lettered under `drop`, every other event of the request
+sent again; token, index, channel and contradictory replies fail at once and
+are never dead-lettered; throttling, failing servers and lost replies are
+retried, then fail with the events kept. `ack='indexer'` sends a channel per
+run and holds each barrier until HEC has acknowledged every request before
+it, within `max_pending_acks` and `ack_timeout_ms`. The default, `ack='none'`,
+still confirms acceptance only. Records that are not one JSON object, paths
+other than the event endpoints and an `Authorization` or channel header in
+`headers` are now refused, and options are parsed strictly. Verified against a
+protocol stub and recovery cells only; the live suite needs a Splunk server
+someone supplies and has not run.
+
 **The Pushgateway sink keeps each series its own, says which series each push
 carries, and fails rather than drop a record or a push.** It silently dropped
 malformed JSON, non-objects and records with a missing or non-numeric value; it
