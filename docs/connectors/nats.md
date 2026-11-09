@@ -53,7 +53,7 @@ All options are parsed in `impls/nats/src/register_factories.cpp` and map onto t
 | `connect_timeout_ms` | No | `2000` | The longest the connect may take, 1 to 300,000 ms (nats.c's own default). |
 | `write_timeout_ms` | No | `5000` | The longest a write to the server may wait for the socket, 1 to 3,600,000 ms. Without it a server that stops reading would hold a publish, an acknowledgement or a fetch for as long as it stopped. |
 
-The timeouts and the sink's options are read strictly: a number outside its range fails the job's build rather than reading as the default.
+The timeouts, the source's options and the sink's are read strictly: a number outside its range fails the job's build rather than reading as the default. Releases up to and including v0.15.0 read the source's own options leniently: `ack_wait_s='1.5'` read as 1, a typo as the default, and `max_ack_pending` past 2^31-1 wrapped to a negative number.
 
 ### Source (`nats_source_string`)
 
@@ -62,11 +62,11 @@ The timeouts and the sink's options are read strictly: a number outside its rang
 | `subject` | Yes | (none) | Subject to consume. Construction throws if empty. |
 | `stream` | No | (empty) | Bind to this JetStream stream; if blank, the stream is resolved by subject. |
 | `durable` | No | `clink` | Durable consumer name, shared across subtasks. |
-| `batch` | No | `256` | Messages fetched per pull. |
-| `fetch_timeout_ms` | No | `1000` | Fetch wait in milliseconds; also bounds cancel latency. |
-| `ack_wait_s` | No | `60` | Consumer AckWait in seconds. A message waiting for its checkpoint is kept in progress (`natsMsg_InProgress`) at half this period. At least 1. |
-| `max_lease_s` | No | `3600` | How long one message is kept in progress; past it JetStream redelivers it once AckWait runs out. At least `ack_wait_s`. |
-| `max_ack_pending` | No | `2048` | The durable consumer's bound on held, unacknowledged messages, shared by every subtask on the durable. None is acknowledged before its checkpoint completes, so this is the most the job reads per checkpoint. At least 1. |
+| `batch` | No | `256` | Messages fetched per pull. 1 to 1000000. |
+| `fetch_timeout_ms` | No | `1000` | Fetch wait in milliseconds; also bounds cancel latency. 1 to 600000. |
+| `ack_wait_s` | No | `60` | Consumer AckWait in seconds. A message waiting for its checkpoint is kept in progress (`natsMsg_InProgress`) at half this period. 1 to 31536000 (a year). |
+| `max_lease_s` | No | `3600` | How long one message is kept in progress; past it JetStream redelivers it once AckWait runs out. At least `ack_wait_s`, at most a year. |
+| `max_ack_pending` | No | `2048` | The durable consumer's bound on held, unacknowledged messages, shared by every subtask on the durable. None is acknowledged before its checkpoint completes, so this is the most the job reads per checkpoint. 1 to 2147483647. |
 
 ### Sink (`nats_sink_string`)
 
@@ -191,7 +191,7 @@ The capability record declares the source's position model as `acknowledgement`,
 
 ## Testing
 
-Offline tests in `impls/nats/tests/test_nats.cpp` cover required-parameter validation and clean failure against a dead endpoint, and `test_factory_registration.cpp` the factories, the sink's options read strictly and the record. `NatsSinkFailures` (`test_nats_sink_failures.cpp`) drives the sink against a scripted server: a refusal, answers that do not come, a closed connection and a publish the library refuses, each followed by a record, a barrier and a flush; reopening; a cancel during a wait and before a publish; `close()`; and the count and byte windows. These need no broker.
+Offline tests in `impls/nats/tests/test_nats.cpp` cover required-parameter validation and clean failure against a dead endpoint, and `test_factory_registration.cpp` the factories, the source's and the sink's options read strictly, and the record. `NatsSinkFailures` (`test_nats_sink_failures.cpp`) drives the sink against a scripted server: a refusal, answers that do not come, a closed connection and a publish the library refuses, each followed by a record, a barrier and a flush; reopening; a cancel during a wait and before a publish; `close()`; and the count and byte windows. These need no broker.
 
 The live tests in `impls/nats/tests/test_nats_live.cpp` are skipped unless `CLINK_NATS_TEST_ENDPOINT` is set to a JetStream-enabled NATS URL (for example `nats://localhost:4222`); each creates its stream up front. `NatsLive` covers the round trip and the sink's refusal. `NatsSourceAckLive` holds the source to its acknowledgement contract, judged by what another subscriber of the same durable receives once the source has gone, with a 2 s AckWait: an aborted checkpoint, a crash after a completion and before its ack, notifications out of order, close after a cancel, the `max_ack_pending` bound, and a checkpoint three times as slow as AckWait. The close and slow-checkpoint cases failed against the source before this contract, and pass.
 

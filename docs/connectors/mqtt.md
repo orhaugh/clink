@@ -93,11 +93,13 @@ Every boolean takes only `true` or `false` and every number is checked against i
 | `topic` | Yes | (none) | Topic filter to subscribe to. |
 | `qos` | No | `1` | Subscription QoS. Must be 0, 1 or 2. |
 | `shared_group` | No | (empty) | Non-empty subscribes to `$share/<group>/<topic>` so the broker load-balances across parallel subtasks. Empty means only subtask 0 is active. |
-| `include_topic` | No | `false` | `true` emits each message as `{"topic":...,"payload":...}` JSON; otherwise the payload is emitted verbatim. |
-| `block_ms` | No | `500` | Longest wait for a message in one `produce()` call, in milliseconds (bounds cancellation latency); a value of 0 or less is reset to 500. |
+| `include_topic` | No | `false` | `true` emits each message as `{"topic":...,"payload":...}` JSON; otherwise the payload is emitted verbatim. `true` or `false`. |
+| `block_ms` | No | `500` | Longest wait for a message in one `produce()` call, in milliseconds (bounds cancellation latency). 1 to 600000. |
 | `protocol_version` | No | `5` | `5` (MQTT 5) or `3.1.1`. A broker that does not speak MQTT 5 refuses the connection, and the error names this option. |
 | `receive_maximum` | No | `10000` | MQTT 5: how many QoS 1 and 2 messages the broker may send unacknowledged, 1 to 65535. The source acknowledges only at checkpoint completion, so this is the most one subtask reads per checkpoint interval. Not sent under MQTT 3.1.1. |
 | `session_expiry_s` | No | `4294967295` (never) | MQTT 5: how long the broker keeps the session after its connection ends, at least 1. A session that ends with its connection would deliver nothing again. |
+
+Every source option is read strictly: a number outside its range, or a boolean other than `true` or `false`, fails the job's build rather than reading as the default. Releases up to and including v0.15.0 read `qos`, `block_ms`, `receive_maximum` and `session_expiry_s` leniently, `qos='1.5'` as 1 and a typo as the default, and `include_topic='True'` emitted bare payloads.
 
 The source always holds a persistent session (clean session or clean start off) under its client id; it has no `clean_session` option, since its recovery is the broker delivering again what the session holds unacknowledged.
 
@@ -227,7 +229,7 @@ The sink's recovery cells, `tests/integration/test_mqtt_sink_recovery.cpp` (`Mqt
 
 `docker/integration-services.yml` defines an `mqtt` service (`eclipse-mosquitto:2` on port 1883) with `docker/mosquitto.conf`, which raises the broker's queue per client so a test's subscriber that falls behind a burst is not dropped from, and `docker/mosquitto.acl`. `scripts/brokers-live.sh` runs the source's suites, live and offline, in its sources phase, and the sink's suites and the recovery cells in its sinks phase, against a one-off container of it, and fails on a skipped case or a short suite and when the phases between them leave a case out; the `brokers` CI workflow runs that script. The TLS case is left out there, since nothing provides the TLS broker it needs. `ONLY=mqtt scripts/run-all-live.sh` runs the live suites by hand inside the toolchain image.
 
-In-process tests run without a broker. `test_mqtt_protocol.cpp` holds each packet the source's client sends, byte for byte, and the malformed ones it refuses; `test_mqtt_source_ack.cpp` runs the source against an in-process broker (`fake_mqtt_broker.hpp`) that records every acknowledgement in the order it came, covering the same cases as `MqttSourceAckLive` plus a message sent again on the same connection, a refused connection and the keepalive's ping. `test_factory_registration.cpp` checks the registrations, both records, the analyser's verdicts and the sink factory's refusals, and `test_mqtt_sink_logic.cpp` / `test_mqtt_source_logic.cpp` exercise the sink and source options. The test executable is `clink_mqtt_tests`, labelled `mqtt`:
+In-process tests run without a broker. `test_mqtt_protocol.cpp` holds each packet the source's client sends, byte for byte, and the malformed ones it refuses; `test_mqtt_source_ack.cpp` runs the source against an in-process broker (`fake_mqtt_broker.hpp`) that records every acknowledgement in the order it came, covering the same cases as `MqttSourceAckLive` plus a message sent again on the same connection, a refused connection and the keepalive's ping. `test_factory_registration.cpp` checks the registrations, both records, the analyser's verdicts and both factories' refusals, and `test_mqtt_sink_logic.cpp` / `test_mqtt_source_logic.cpp` exercise the sink and source options. The test executable is `clink_mqtt_tests`, labelled `mqtt`:
 
 ```bash
 ctest --test-dir build -L mqtt

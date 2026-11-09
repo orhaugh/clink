@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**The RabbitMQ, NATS, Pulsar and MQTT sources read their options strictly.**
+Each broker's sink round made the sink's and the connection's options strict
+and left the sources' own options lenient: a value that did not parse fell back
+to the default, one with trailing characters was cut at them (`prefetch='1.5'`
+read as 1, `batch_size='10x'` as 10), zeros and out-of-range timeouts were taken
+as given, a NATS `max_ack_pending` past 2^31-1 wrapped to a negative number,
+`declare_queue='False'` declared the queue, and an MQTT `include_topic='True'`
+emitted bare payloads. Every source option is now the whole integer within its
+range, or `true` or `false`, or the job is refused when it is built, and a
+Pulsar `subscription_type` other than `shared` or `exclusive` is refused there
+rather than when the source opens. No default changes.
+
 **The Iceberg sink matches a commit by its own run, so a later run of a job
 into the same table no longer loses its rows.** The commit is idempotent by a
 tag on each snapshot, and the check looked for the checkpoint id anywhere in

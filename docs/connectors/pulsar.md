@@ -48,7 +48,7 @@ Shared connection options:
 | `tls_ca` | No | (empty) | PEM file of the CAs to trust for a `pulsar+ssl://` service URL, in place of the default store. Checked at open. |
 | `tls_verify_hostname` | No | `true` | `false` keeps the certificate-chain check but accepts a broker certificate that names another host. `true` or `false` only. |
 
-The connection options and the sink's options are read strictly: a number outside its range, or a boolean other than `true` or `false`, fails the job's build rather than reading as the default.
+The connection options, the source's and the sink's are read strictly: a number outside its range, a boolean other than `true` or `false`, or a `subscription_type` other than `shared` or `exclusive`, fails the job's build rather than reading as the default. Releases up to and including v0.15.0 read the source's own numbers leniently, `receive_timeout_ms='1.5'` as 1 and a typo as the default, and refused another subscription type only when the source opened.
 
 A `pulsar+ssl://` service URL connects over TLS. The client checks that each broker's certificate chains to a trusted CA (`tls_ca`, or the default store when it is empty) and that it names the host the client dials that broker by: the host in `service_url` for the first connection, and the address the lookup returns for each broker after that. libpulsar leaves the name check off unless asked, so the connector turns it on. A refused certificate surfaces as a `ConnectError` from `create_producer` or `subscribe`, and the client log says `Handshake failed: certificate verify failed`; the error clink raises says so and names `tls_verify_hostname=false`.
 
@@ -58,11 +58,11 @@ Source (`pulsar_source_string`) options:
 | --- | --- | --- | --- |
 | `topic` | Yes | (none) | Topic to subscribe to. Construction throws if empty. |
 | `subscription` | No | `clink` | Subscription name, shared across parallel subtasks (Shared subscription). |
-| `subscription_type` | No | `shared` | `shared` lets parallel subtasks split the topic, and a restart is replayed by broker redelivery. `exclusive` makes the source the subscription's only consumer and replays a restart in topic order from the checkpointed position (see "Replay after a restart"). `exclusive` needs parallelism 1 and a non-partitioned topic; the factory refuses it above parallelism 1, and `open()` refuses a partitioned topic. |
-| `subscribe_timeout_ms` | No | `60000` | `exclusive` only: how long `open()` keeps retrying a subscription a previous incarnation's consumer still holds, as it can while that incarnation is torn down. |
-| `receiver_queue_size` | No | `1000` | Prefetch size; bounds the held-unacked message buffer. |
-| `receive_timeout_ms` | No | `1000` | Per `produce()` turn receive timeout in milliseconds (cancel latency). |
-| `batch_size` | No | `256` | Maximum messages emitted per `produce()` turn. |
+| `subscription_type` | No | `shared` | `shared` lets parallel subtasks split the topic, and a restart is replayed by broker redelivery. `exclusive` makes the source the subscription's only consumer and replays a restart in topic order from the checkpointed position (see "Replay after a restart"). `exclusive` needs parallelism 1 and a non-partitioned topic; the factory refuses it above parallelism 1, and `open()` refuses a partitioned topic. Any other value is refused when the job is built. |
+| `subscribe_timeout_ms` | No | `60000` | `exclusive` only: how long `open()` keeps retrying a subscription a previous incarnation's consumer still holds, as it can while that incarnation is torn down. 1 to 3600000. |
+| `receiver_queue_size` | No | `1000` | Prefetch size; bounds the held-unacked message buffer. 0 to 1000000; 0 is the client's zero-queue consumer, which cannot receive batched messages. |
+| `receive_timeout_ms` | No | `1000` | Per `produce()` turn receive timeout in milliseconds (cancel latency). 1 to 600000. |
+| `batch_size` | No | `256` | Maximum messages emitted per `produce()` turn. At least 1. |
 
 Sink (`pulsar_sink_string`) options:
 
@@ -177,7 +177,7 @@ The capability record declares the source's position model as `acknowledgement`,
 
 ## Testing
 
-A factory-registration test (`impls/pulsar/tests/test_factory_registration.cpp`) checks that `install()` registers both string-channel factories, that the sink's factory reads its options strictly, and the record, whose authentication methods are now `none` and `token` only (it claimed passwords too). It runs without a broker. `PulsarSinkFailures` (`test_pulsar_sink_failures.cpp`) drives the sink against a scripted broker: a failed send, answers that do not come and a publish the client refuses, each followed by a record, a barrier and a flush; reopening; a cancel during a wait and before a publish; `close()`; the count and byte windows, which push the batch before they wait; and a zero send timeout refused.
+A factory-registration test (`impls/pulsar/tests/test_factory_registration.cpp`) checks that `install()` registers both string-channel factories, that the source's and the sink's factories read their options strictly, and the record, whose authentication methods are now `none` and `token` only (it claimed passwords too). It runs without a broker. `PulsarSinkFailures` (`test_pulsar_sink_failures.cpp`) drives the sink against a scripted broker: a failed send, answers that do not come and a publish the client refuses, each followed by a record, a barrier and a flush; reopening; a cancel during a wait and before a publish; `close()`; the count and byte windows, which push the batch before they wait; and a zero send timeout refused.
 
 Broker-certificate tests (`impls/pulsar/tests/test_pulsar_tls.cpp`) run without a broker too, in any build that finds OpenSSL. They open a sink against a local TLS listener (`tests/test_helpers/tls_handshake_server.hpp`), which counts the handshakes the client completes: libpulsar finishes the handshake before it sends anything, so a refused certificate never completes one. They cover a certificate naming another host (refused by default, with the error), one naming the host, the hostname opt-out, the opt-out still checking the chain, and a missing `tls_ca` file.
 

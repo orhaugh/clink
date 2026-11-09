@@ -41,7 +41,7 @@ When enabled, the impl defines `CLINK_HAS_RABBITMQ` and builds the static librar
 
 ## Configuration
 
-Connection parameters are shared by the source and sink and parsed by `parse_conn` (`impls/rabbitmq/src/register_factories.cpp`). They and the sink's options are read strictly: a number outside its range, or a boolean other than `true` or `false`, fails the job's build rather than reading as the default.
+Connection parameters are shared by the source and sink and parsed by `parse_conn` (`impls/rabbitmq/src/register_factories.cpp`). They, the source's options and the sink's are read strictly: a number outside its range, or a boolean other than `true` or `false`, fails the job's build rather than reading as the default. Releases up to and including v0.15.0 read the source's own options leniently: `prefetch='1.5'` read as 1, `batch_size='10x'` as 10, a typo as the default, and `declare_queue='False'` declared the queue.
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -59,10 +59,10 @@ Source options (`rabbitmq_source_string`, parsed in `register_factories.cpp`; st
 | --- | --- | --- | --- |
 | `queue` | Yes | none | Queue to consume from. Construction throws if empty. |
 | `consumer_tag` | No | `""` | Consumer tag; empty means the broker assigns one. |
-| `declare_queue` | No | `true` | If true, `queue.declare` (durable) runs on open; idempotent. Set `false` to skip. |
+| `declare_queue` | No | `true` | If true, `queue.declare` (durable) runs on open; idempotent. Set `false` to skip. `true` or `false`. |
 | `prefetch` | No | `10000` | `basic.qos` prefetch count: the most unacknowledged messages the broker hands the source. None is acknowledged before its checkpoint completes, so this is the most a subtask reads per checkpoint. 1 to 65535. |
-| `poll_timeout_ms` | No | `100` | Consume wait per `produce()` turn, in milliseconds. |
-| `batch_size` | No | `256` | Maximum messages emitted per `produce()` turn. |
+| `poll_timeout_ms` | No | `100` | Consume wait per `produce()` turn, in milliseconds. 1 to 600000. |
+| `batch_size` | No | `256` | Maximum messages emitted per `produce()` turn. At least 1. |
 
 Sink options (`rabbitmq_sink_string`, parsed in `register_factories.cpp`; struct in `impls/rabbitmq/include/clink/rabbitmq/rabbitmq_sink.hpp`):
 
@@ -205,7 +205,7 @@ The capability record declares the source's position model as `acknowledgement`,
 
 ## Testing
 
-Offline tests in `impls/rabbitmq/tests/test_rabbitmq.cpp` cover required-parameter validation and clean failure against a dead endpoint, and `test_factory_registration.cpp` checks that both factories are registered, that the sink's factory reads its options strictly, and the record the analyser reads. `RabbitMqSinkFailures` (`test_rabbitmq_sink_failures.cpp`) drives the sink against a scripted broker: confirms in ranges, a nack, a returned message, a closed channel, a lost connection and a confirm timeout, each followed by a record, a barrier and a flush; reopening; a cancel during a wait for confirms, during a publish the broker does not read, and before a publish; `close()`; and the record and unconfirmed bounds. These need no broker.
+Offline tests in `impls/rabbitmq/tests/test_rabbitmq.cpp` cover required-parameter validation and clean failure against a dead endpoint, and `test_factory_registration.cpp` checks that both factories are registered, that the source's and the sink's factories read their options strictly, and the record the analyser reads. `RabbitMqSinkFailures` (`test_rabbitmq_sink_failures.cpp`) drives the sink against a scripted broker: confirms in ranges, a nack, a returned message, a closed channel, a lost connection and a confirm timeout, each followed by a record, a barrier and a flush; reopening; a cancel during a wait for confirms, during a publish the broker does not read, and before a publish; `close()`; and the record and unconfirmed bounds. These need no broker.
 
 The live tests in `impls/rabbitmq/tests/test_rabbitmq_live.cpp` are skipped unless `CLINK_RABBITMQ_TEST_ENDPOINT` is set (the broker host). Port, user and password come from `CLINK_RABBITMQ_TEST_PORT`, `CLINK_RABBITMQ_TEST_USER` and `CLINK_RABBITMQ_TEST_PASSWORD` (defaults `5672` / `guest` / `guest`). `RabbitMqLive` covers the round trip and the sink's refusals. `RabbitMqSourceAckLive` holds the source to its acknowledgement contract, judged by what a fresh consumer of the queue receives once the source has gone: an aborted checkpoint, a crash after a completion and before its ack, intervals and notifications out of order, an aborted interval below a completed one, close after a cancel, the prefetch bound, and the default prefetch measured. The aborted-interval and close cases failed against the source before this contract, and pass.
 
