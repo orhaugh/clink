@@ -237,6 +237,16 @@ TEST(PulsarSinkContractLive, ASendFailedOnItsTimeoutMayStillBePersisted) {
 TEST(PulsarSinkContractLive, ACancelEndsAWaitForAnswersOnASilentBroker) {
     REQUIRE_PULSAR();
     const auto t = topic("cancel");
+    // The topic first, directly and under the default operation timeout: a
+    // new topic's creation can take a broker held to a smaller heap longer
+    // than the 2 s this case's sink needs so that its close stays short, and
+    // the open below then failed with create_producer: TimeOut.
+    {
+        PulsarSink first(sink_opts(t));
+        Attached f(first);
+        first.open();
+        first.close();
+    }
     clink::itest::TcpFaultProxy proxy(url_port());
     auto o = proxied_opts(t, proxy);
     o.conn.operation_timeout_s = 2;
