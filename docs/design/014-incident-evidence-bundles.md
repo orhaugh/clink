@@ -95,6 +95,10 @@ Exit codes: `0` every check the profile requires passed; `1` a check failed;
 `3` none failed but at least one required check is unavailable or
 unsupported (a partial result); `2` bad usage or an unreadable bundle.
 
+`protocol.conformance` validates the bundle's job alone, and a run the
+specification does not model is unsupported: the validator skips it and
+validates nothing.
+
 Two replays agreeing establishes determinism, not agreement with production;
 only `replay.recorded_output` compares with what production did, and only
 where production's output was captured. A truncated capture can establish
@@ -103,12 +107,20 @@ recorded-output check unavailable.
 
 An epoch replays from the checkpoint its events were processed from: the one
 before it, except for a restored run's first epoch, which starts from the
-checkpoint that run restored (the `RESTORED` record's `restore`, for epoch
-`next`). An epoch the `RESTORED` record passes over was processed by a run
+checkpoint that run restored. The bundle knows the restores its `RESTORED`
+record (the newest) and its traces' `Redeploy` events name. Before the newest
+restore, a job whose sinks need commit confirmation could have restored from
+any confirmed checkpoint, so there an epoch whose predecessor was never
+confirmed is unavailable rather than replayed from a state that may be wrong;
+the first epoch after a rescale is unsupported. The starting snapshot must be
+in the bundle. An epoch a recorded restore passes over was processed by a run
 the restore discarded, so `replay.expected_output` leaves it out of the union
-it compares. `replay.recorded_output` places a capture in the job graph by
-its uid or, for an operator without one, by its type and parameters, which
-the Worker copies from the graph into `op.json`.
+it compares, and an epoch whose capture holds part of it makes that check
+unavailable. `replay.recorded_output` places a capture in the job graph by its
+uid or, for an operator without one, by its type and parameters less the Row
+layout a deployment stamps, and compares each key's rows in order, since the
+engine orders nothing across keys. An operator it cannot compare by its
+topology is unsupported, and one it lacks evidence for is unavailable.
 
 ## Trust
 
