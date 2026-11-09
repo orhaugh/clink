@@ -829,14 +829,14 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
             // newest CONFIRMED checkpoint - a completed-but-unconfirmed one
             // may hold a broker transaction that died with the previous
             // leader's workers, and restoring past it loses that interval.
-            const auto confirmed_on_disk =
-                needs_confirmation ? latest_confirmed_id_on_disk(ckpt.checkpoint_dir, job_id) : 0;
             // A job that restores from its newest completed checkpoint passes
             // over the markers its newest deploy restored below, read before
             // the markers (the RESTORED record): a put still out when the job
             // restored lands afterwards, and the run that restored below it
             // has rolled its transactions back. A tracked job restores from
             // CONFIRMED markers, and its walk reads every COMPLETED one.
+            // restore_point_on_disk is that rule, which incident collection
+            // and verification evaluate too.
             std::optional<RestoredRecord> restored;
             if (!needs_confirmation) {
                 try {
@@ -849,8 +849,10 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
                     return;
                 }
             }
-            completed_on_disk = latest_completed_id_on_disk(ckpt.checkpoint_dir, job_id, restored);
-            const auto latest = needs_confirmation ? confirmed_on_disk : completed_on_disk;
+            const auto point =
+                restore_point_on_disk(ckpt.checkpoint_dir, job_id, needs_confirmation, restored);
+            completed_on_disk = point.completed;
+            const auto latest = point.chosen;
             own_restore_point = latest;
             if (latest > 0) {
                 // The job's own marker directory, so the restore is this job's

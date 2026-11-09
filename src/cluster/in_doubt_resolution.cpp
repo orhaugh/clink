@@ -207,16 +207,28 @@ std::uint64_t latest_confirmed_id_on_disk(const std::string& checkpoint_dir, Job
 
 RestorePointOnDisk restore_point_on_disk(const std::string& checkpoint_dir,
                                          JobId job_id,
-                                         bool needs_confirmation) {
+                                         bool needs_confirmation,
+                                         std::optional<RestoredRecord> restored) {
     RestorePointOnDisk out;
     out.needs_confirmation = needs_confirmation;
-    out.confirmed = latest_confirmed_id_on_disk(checkpoint_dir, job_id);
-    if (!needs_confirmation) {
-        out.restored = read_restore_point(checkpoint_dir, job_id);
+    if (needs_confirmation) {
+        out.confirmed = latest_confirmed_id_on_disk(checkpoint_dir, job_id);
+    } else {
+        out.restored = restored;
     }
     out.completed = latest_completed_id_on_disk(checkpoint_dir, job_id, out.restored);
     out.chosen = needs_confirmation ? out.confirmed : out.completed;
     return out;
+}
+
+RestorePointOnDisk restore_point_on_disk(const std::string& checkpoint_dir,
+                                         JobId job_id,
+                                         bool needs_confirmation) {
+    return restore_point_on_disk(
+        checkpoint_dir,
+        job_id,
+        needs_confirmation,
+        needs_confirmation ? std::nullopt : read_restore_point(checkpoint_dir, job_id));
 }
 
 std::string restored_record_key(JobId job_id) {

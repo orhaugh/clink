@@ -160,18 +160,28 @@ struct RestoredRecord {
 // RESTORED record does not pass over, or, for a job whose sinks need commit
 // confirmation, the newest CONFIRMED one. The walk that follows for that
 // family asks the sinks' external systems and can advance the point; nothing
-// read from disk alone can say how far. Throws as the scans and
-// read_restore_point do.
+// read from disk alone can say how far. The takeover chooses with this, and
+// `clink incident-collect` and `incident-verify` evaluate it. The CONFIRMED
+// markers are read before the COMPLETED ones, as the takeover reads them: a
+// confirmation is written only once its COMPLETED marker has landed. Throws
+// as the scans and read_restore_point do.
 struct RestorePointOnDisk {
     bool needs_confirmation{false};
     std::uint64_t completed{0};              // newest COMPLETED a restore may choose
-    std::uint64_t confirmed{0};              // newest CONFIRMED; 0 when there is none
+    std::uint64_t confirmed{0};              // newest CONFIRMED; read only with confirmation
     std::optional<RestoredRecord> restored;  // read only without confirmation
     std::uint64_t chosen{0};                 // 0: nothing to restore from
 };
 [[nodiscard]] RestorePointOnDisk restore_point_on_disk(const std::string& checkpoint_dir,
                                                        JobId job_id,
                                                        bool needs_confirmation);
+// The same over a RESTORED record the caller has already read (nullopt for
+// the confirmation family, which reads none): a takeover reads it first, and
+// handles a record that does not parse itself.
+[[nodiscard]] RestorePointOnDisk restore_point_on_disk(const std::string& checkpoint_dir,
+                                                       JobId job_id,
+                                                       bool needs_confirmation,
+                                                       std::optional<RestoredRecord> restored);
 
 // The checkpoint-id floor of a new run of the job (DeployMsg::run_checkpoint_floor):
 // a 2PC sink reads receipts and unresolved markers above the larger of its

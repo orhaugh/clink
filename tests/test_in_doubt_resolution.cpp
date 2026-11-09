@@ -699,7 +699,7 @@ TEST_F(ResolutionFixture, TheRestorePointOnDiskFollowsTheTakeoversRule) {
     auto plain = restore_point_on_disk(dir, kJob, /*needs_confirmation=*/false);
     EXPECT_EQ(plain.chosen, 6u);
     EXPECT_EQ(plain.completed, 6u);
-    EXPECT_EQ(plain.confirmed, 3u);
+    EXPECT_EQ(plain.confirmed, 0u) << "a job outside the confirmation family reads no CONFIRMED";
     EXPECT_FALSE(plain.restored.has_value());
     // A deploy restored from 3 and numbered from 6: 5 was still being put.
     ASSERT_TRUE(record_restore_point(dir, kJob, 1, {.restore = 3, .next = 6}));
@@ -711,6 +711,11 @@ TEST_F(ResolutionFixture, TheRestorePointOnDiskFollowsTheTakeoversRule) {
     ASSERT_TRUE(plain.restored.has_value());
     const auto confirmed = restore_point_on_disk(dir, kJob, /*needs_confirmation=*/true);
     EXPECT_EQ(confirmed.chosen, 3u);
+    EXPECT_EQ(confirmed.confirmed, 3u);
+    // The takeover's form, over a record it read itself, chooses the same.
+    EXPECT_EQ(restore_point_on_disk(dir, kJob, false, clink::cluster::read_restore_point(dir, kJob))
+                  .chosen,
+              3u);
     EXPECT_FALSE(confirmed.restored.has_value()) << "the confirmation family reads no record";
     EXPECT_EQ(restore_point_on_disk(dir, kJob + 1, false).chosen, 0u);
 }
