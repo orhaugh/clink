@@ -481,6 +481,9 @@ public:
         catalog_ = std::move(opened.catalog);
         id_ = std::move(opened.id);
         table_ = std::move(opened.table);
+        // This run's id, which every snapshot it commits carries beside the
+        // checkpoint id: a later run of the job starts its checkpoint ids again.
+        run_ = make_uuid();
 
         // Exactly-once recovery: commit any data files staged before a crash whose
         // checkpoint completed globally (idempotent - skips checkpoints already snapshotted).
@@ -605,8 +608,9 @@ public:
         if (!stored.has_value()) {
             return;  // nothing staged for this checkpoint (empty interval / already committed)
         }
-        auto files = parse_staged_(*stored);
-        commit_staged_(checkpoint_id, files, /*delete_data_on_commit_failure=*/false);
+        commit_staged_(checkpoint_id,
+                       parse_staged_(*stored),
+                       /*delete_data_on_commit_failure=*/false);
         state->erase_operator_state(this->id(), state_key_(checkpoint_id));
     }
 
@@ -626,7 +630,7 @@ public:
         if (!stored.has_value()) {
             return;
         }
-        for (const auto& sf : parse_staged_(*stored)) {
+        for (const auto& sf : parse_staged_(*stored).files) {
             (void)file_io_->DeleteFile(sf.path);  // best-effort orphan cleanup
         }
         state->erase_operator_state(this->id(), state_key_(checkpoint_id));
@@ -680,6 +684,13 @@ private:
         std::vector<std::string> partition;      // string-encoded partition values (data files)
         bool is_delete{false};                   // true = equality-delete file (upsert)
         std::vector<std::int32_t> equality_ids;  // delete files: the PK field ids
+    };
+
+    // One checkpoint's staged files and the run that staged them. A handle an
+    // earlier release recorded names no run.
+    struct Staged {
+        std::optional<std::string> run;
+        std::vector<StagedFile> files;
     };
 
     // The netted last-known op for one key in the current interval (upsert mode).
@@ -1128,16 +1139,19 @@ private:
         if (files.empty()) {
             return;
         }
-        commit_staged_(ckpt, files, /*delete_data_on_commit_failure=*/true);
+        commit_staged_(ckpt,
+                       Staged{run_, std::move(files)},
+                       /*delete_data_on_commit_failure=*/true);
     }
 
     // Snapshot all staged data files for a checkpoint via one FastAppend, tagging the snapshot
-    // with the checkpoint id so the commit is idempotent. The in-memory table is stale after a
-    // commit, so reload it for the next append.
+    // with the checkpoint id and the run that staged the files, so the commit is idempotent.
+    // The in-memory table is stale after a commit, so reload it for the next append.
     void commit_staged_(std::uint64_t ckpt,
-                        const std::vector<StagedFile>& files,
+                        const Staged& staged,
                         bool delete_data_on_commit_failure) {
-        if (files.empty() || already_committed_(ckpt)) {
+        const auto& files = staged.files;
+        if (files.empty() || already_committed_(ckpt, staged.run)) {
             return;  // idempotent: this checkpoint's snapshot already exists
         }
         // Build DataFiles, splitting data vs equality-delete (upsert).
@@ -1184,6 +1198,9 @@ private:
                 ensure_ok(rd->AddDelete(d), "RowDelta AddDelete");
             }
             rd->Set(kCheckpointProp, std::to_string(ckpt));
+            if (staged.run.has_value()) {
+                rd->Set(kRunProp, *staged.run);
+            }
             cst = rd->Commit();
         } else {
             auto fa = unwrap(table_->NewFastAppend(), "new fast append");
@@ -1191,6 +1208,9 @@ private:
                 fa->AppendFile(d);
             }
             fa->Set(kCheckpointProp, std::to_string(ckpt));
+            if (staged.run.has_value()) {
+                fa->Set(kRunProp, *staged.run);
+            }
             cst = fa->Commit();
         }
         if (!cst.has_value()) {
@@ -1210,12 +1230,23 @@ private:
         clink::metrics::connector::bytes_out_inc(kLabel, static_cast<std::uint64_t>(total_size));
     }
 
-    // Has a snapshot tagged with this checkpoint id already been committed?
-    bool already_committed_(std::uint64_t ckpt) const {
+    // Has the snapshot for this checkpoint of this run already been committed? A
+    // run's checkpoint ids repeat another run's, so the check matched by
+    // checkpoint id alone found an earlier run's snapshot and skipped this one.
+    // A handle an earlier release recorded names no run; it matches a snapshot
+    // that carries none, as an earlier release committed it.
+    bool already_committed_(std::uint64_t ckpt, const std::optional<std::string>& run) const {
         const std::string want = std::to_string(ckpt);
         for (const auto& snap : table_->snapshots()) {
             auto it = snap->summary.find(kCheckpointProp);
-            if (it != snap->summary.end() && it->second == want) {
+            if (it == snap->summary.end() || it->second != want) {
+                continue;
+            }
+            auto rit = snap->summary.find(kRunProp);
+            const bool same_run = run.has_value()
+                                      ? (rit != snap->summary.end() && rit->second == *run)
+                                      : rit == snap->summary.end();
+            if (same_run) {
                 return true;
             }
         }
@@ -1241,6 +1272,8 @@ private:
     // Staged state = a JSON array of {path, records, size, partition:[str,...], is_delete,
     // equality_ids:[int,...]}. JSON so an arbitrary string partition value (or a path) cannot
     // break a delimiter scheme.
+    // A handle: {"run": <this run>, "files": [...]}. An earlier release wrote the
+    // files' array alone.
     std::string serialize_staged_(const std::vector<StagedFile>& files) const {
         cfg::JsonArray arr;
         for (const auto& sf : files) {
@@ -1263,15 +1296,24 @@ private:
             }
             arr.push_back(cfg::JsonValue{std::move(o)});
         }
-        return cfg::JsonValue{std::move(arr)}.serialize(0);
+        cfg::JsonObject handle;
+        handle["run"] = cfg::JsonValue{run_};
+        handle["files"] = cfg::JsonValue{std::move(arr)};
+        return cfg::JsonValue{std::move(handle)}.serialize(0);
     }
 
-    std::vector<StagedFile> parse_staged_(const std::vector<std::byte>& blob) const {
+    Staged parse_staged_(const std::vector<std::byte>& blob) const {
         std::string s(reinterpret_cast<const char*>(blob.data()), blob.size());
-        std::vector<StagedFile> out;
+        Staged staged;
+        auto& out = staged.files;
         try {
             auto v = cfg::parse(s);
-            for (const auto& e : v.as_array()) {
+            const cfg::JsonValue* files = &v;
+            if (v.is_object()) {
+                staged.run = v.at("run").as_string();
+                files = &v.at("files");
+            }
+            for (const auto& e : files->as_array()) {
                 const auto& o = e.as_object();
                 StagedFile sf;
                 sf.path = o.at("path").as_string();
@@ -1296,7 +1338,7 @@ private:
             throw std::runtime_error(opts_.name + ": corrupt staged-commit state (" + e.what() +
                                      "): " + s);
         }
-        return out;
+        return staged;
     }
 
     // Recovery: snapshot any data files staged before a crash but not yet committed. Routed
@@ -1326,8 +1368,9 @@ private:
                 keys.emplace_back(k);
             });
         for (std::size_t i = 0; i < pending.size(); ++i) {
-            auto files = parse_staged_(pending[i].second);
-            commit_staged_(pending[i].first, files, /*delete_data_on_commit_failure=*/false);
+            commit_staged_(pending[i].first,
+                           parse_staged_(pending[i].second),
+                           /*delete_data_on_commit_failure=*/false);
             state->erase_operator_state(this->id(), keys[i]);
         }
 
@@ -1348,16 +1391,17 @@ private:
             } catch (...) {
                 continue;
             }
-            auto files = parse_staged_(blob);
-            commit_staged_(ckpt, files, /*delete_data_on_commit_failure=*/false);
+            commit_staged_(ckpt, parse_staged_(blob), /*delete_data_on_commit_failure=*/false);
             state->erase(this->id(), key);
         }
     }
 
     static constexpr const char* kCheckpointProp = "clink.checkpoint-id";
+    static constexpr const char* kRunProp = "clink.run";
 
     IcebergRowSinkOptions opts_;
     bool dormant_{false};
+    std::string run_;  // this open's run id, on every snapshot it commits
     // Serialises the runner thread (open/on_data/on_barrier/close) against the worker reader
     // thread that delivers on_commit/on_abort. Single-writer table, so contention is rare.
     mutable std::mutex mu_;

@@ -290,6 +290,132 @@ TEST(IcebergSink2PC, RecoveryCommitsPendingStagedData) {
     fs::remove_all(wh);
 }
 
+// A later run of a job into the same table starts from empty state, so its
+// checkpoint ids repeat an earlier run's. The commit's idempotency check matched
+// a snapshot by checkpoint id alone, so the later run found the earlier run's
+// snapshot for checkpoint 1, skipped its own commit and lost its rows. Each
+// snapshot now carries the run that staged it, and the check matches both.
+TEST(IcebergSink2PC, ALaterRunReusingACheckpointIdCommitsItsOwnSnapshot) {
+    auto wh = make_2pc_wh("rerun");
+    auto opts = [&]() {
+        IcebergRowSinkOptions o;
+        o.warehouse = wh.string();
+        o.table = "events";
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return o;
+    };
+    for (const std::int64_t id : {1, 2}) {
+        InMemoryStateBackend state;  // each run starts from empty state
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+        auto sink = make_iceberg_row_sink(opts());
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        Batch<Row> b;
+        b.emplace(make_row(id, "run"));
+        sink->on_data(b);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{1}});
+        sink->on_commit(1);
+        sink->close();
+    }
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 2) << "each run committed its own snapshot";
+    fs::remove_all(wh);
+}
+
+// A handle whose snapshot landed before the crash, but whose state key was not
+// yet cleared, is recognised at recovery by its run and checkpoint, and is not
+// committed a second time.
+TEST(IcebergSink2PC, ARecoveredHandleWhoseSnapshotLandedIsNotCommittedTwice) {
+    auto wh = make_2pc_wh("landed");
+    auto opts = [&]() {
+        IcebergRowSinkOptions o;
+        o.warehouse = wh.string();
+        o.table = "events";
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return o;
+    };
+    InMemoryStateBackend before_commit;
+    {
+        InMemoryStateBackend state;
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+        auto sink = make_iceberg_row_sink(opts());
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        Batch<Row> b;
+        b.emplace(make_row(7, "x"));
+        sink->on_data(b);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{3}});
+        // The state as a crash just after the commit would leave it: the
+        // handle still recorded.
+        state.scan_operator_state(
+            OperatorId{42}, [&](clink::StateBackend::KeyView k, clink::StateBackend::ValueView v) {
+                before_commit.put_operator_state(OperatorId{42}, k, v);
+            });
+        sink->on_commit(3);
+        sink->close();
+    }
+    ASSERT_EQ(count_paths_containing(wh, "snap-"), 1);
+    {
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &before_commit, /*metrics=*/nullptr);
+        auto sink = make_iceberg_row_sink(opts());
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();  // recovery finds the handle and the snapshot it already made
+        sink->close();
+    }
+    EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "the landed snapshot is not repeated";
+    fs::remove_all(wh);
+}
+
+// A handle an earlier release recorded is the staged files' array alone, with
+// no run. Recovery commits it as that release did, with a snapshot carrying the
+// checkpoint id only, and a second recovery from the same handle finds that
+// snapshot and commits nothing.
+TEST(IcebergSink2PC, AHandleAnEarlierReleaseRecordedIsCommittedOnce) {
+    auto wh = make_2pc_wh("earlier");
+    auto opts = [&]() {
+        IcebergRowSinkOptions o;
+        o.warehouse = wh.string();
+        o.table = "events";
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return o;
+    };
+    const std::string key = "_2pc_pending_sub0_4";
+    InMemoryStateBackend staged_state;
+    {
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &staged_state, /*metrics=*/nullptr);
+        auto sink = make_iceberg_row_sink(opts());
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        Batch<Row> b;
+        b.emplace(make_row(9, "old"));
+        sink->on_data(b);
+        sink->on_barrier(CheckpointBarrier{CheckpointId{4}});
+    }
+    const auto blob = staged_state.get_operator_state(OperatorId{42}, key);
+    ASSERT_TRUE(blob.has_value());
+    const auto handle =
+        cfg::parse(std::string(reinterpret_cast<const char*>(blob->data()), blob->size()));
+    ASSERT_TRUE(handle.is_object());
+    const std::string earlier = handle.at("files").serialize(0);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        InMemoryStateBackend state;
+        state.put_operator_state(OperatorId{42},
+                                 clink::StateBackend::KeyView{key.data(), key.size()},
+                                 clink::StateBackend::ValueView{earlier.data(), earlier.size()});
+        RuntimeContext rctx(OperatorId{42}, "iceberg_sink", &state, /*metrics=*/nullptr);
+        auto sink = make_iceberg_row_sink(opts());
+        sink->set_id(OperatorId{42});
+        sink->attach_runtime(&rctx);
+        sink->open();
+        sink->close();
+        EXPECT_EQ(count_paths_containing(wh, "snap-"), 1) << "recovery " << attempt;
+    }
+    fs::remove_all(wh);
+}
+
 // A rescale on a backend that hands every new subtask every old subtask's
 // operator state gives the dormant subtasks a copy of the writer's staged handle.
 // It is not theirs: they erase it, and subtask 0, which succeeds the old

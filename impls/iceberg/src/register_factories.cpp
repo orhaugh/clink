@@ -83,9 +83,13 @@ void install(clink::plugin::PluginRegistry& reg) {
         .replayable = true,
         .offset_model = clink::connectors::OffsetModel::OpaqueToken,
         .checkpoint_integrated = true,
-        // One table snapshot per checkpoint interval, single writer. A
-        // replay can re-commit an interval's snapshot: at-least-once.
-        // equality_key turns writes into changelog upserts by key.
+        // One table snapshot per checkpoint interval, single writer. Under
+        // two-phase commit the sink stages each interval at the barrier and
+        // commits its snapshot when the checkpoint completes, tagged with
+        // the run and the checkpoint, so a repeated commit is skipped. The
+        // record claims at-least-once, the guarantee without a state backend,
+        // until a run of a whole job through a failure backs the two-phase
+        // path. equality_key turns writes into changelog upserts by key.
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
         .idempotency_key_option = "equality_key",
