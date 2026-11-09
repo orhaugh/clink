@@ -41,11 +41,14 @@ name: aws
 # worker killed after an acceptance no checkpoint covers or before a send, each
 # bucket checked for every record at least once and nothing else.
 #
-# scripts/s3-live.sh, the raw S3 objects: the text sink, the multipart 2PC sink
-# and the C++ source against SILO, a fork of the MinIO server pinned by digest:
-# every page of a listing, the source's restores by key, the text sink's parts
-# per subtask and after a restore, and the 2PC sink's commit, recovery, abort and
-# contract suite. The 2PC sink's cluster-level suite runs in docker-suites.
+# scripts/s3-live.sh, S3 against SILO, a fork of the MinIO server pinned by
+# digest. Its raw phase: the text sink, the multipart 2PC sink and the C++
+# source, every page of a listing, the source's restores by key, the text sink's
+# parts per subtask and after a restore, and the 2PC sink's commit, recovery,
+# abort and contract suite; that sink's cluster-level suite runs in
+# docker-suites. Its parquet phase: the rolling sink's parts across a restore and
+# a kill, and through the factories the multi-object source's restores and the
+# exactly-once Parquet sink's commit and recovery.
 #
 # A live test skips when its endpoint or binary is missing and gtest counts that
 # as a pass, so each gate fails on any skip and on any required suite that did

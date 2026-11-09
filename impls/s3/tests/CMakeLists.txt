@@ -10,6 +10,7 @@ add_executable(clink_s3_tests
     test_s3_contract_suite.cpp
     test_builder.cpp
     test_parquet_s3.cpp
+    test_parquet_s3_live.cpp
     test_typed_sink.cpp
     test_s3_materialization_store.cpp
     test_s3_snapshot_store.cpp
