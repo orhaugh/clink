@@ -198,6 +198,33 @@ phase: `MqttSinkContractLive` against Mosquitto 2.1, through a fault proxy and
 an ACL that refuses one subtree, and recovery cells that kill a worker before
 and after a barrier's acknowledgements.
 
+**The Pulsar sink holds a burst back instead of failing on it, stays failed
+after a failed send, says what became of each message, and frees what the
+client allocates.** The client queues at most 1,000 unanswered messages by
+default and refuses the rest at once (`ProducerQueueIsFull`), and the sink
+handed it every record as it arrived: a burst faster than the broker answered
+failed the barrier, and 20,000 records published at once failed it against the
+pinned broker. After a failed send the sink cleared its flag and its list, so
+a later flush passed. `close()` flushed, so it waited for answers, even when
+the task was cancelled, and could throw; the wait could not be cancelled. Each
+successful send left behind the message id the C client allocates for its
+callback, which nothing freed. A `send_timeout_ms` of `0`, which the client
+reads as no timeout, was accepted, and the record claimed password
+authentication, which the connector does not offer. Now the sink keeps its own
+window, `max_pending` (1,000) messages and `max_pending_bytes` (64 MiB),
+pushing the batch and waiting for answers past either, and gives the client a
+queue twice that size. Every answer reaches a callback, which frees the
+message id, and a failure says how many messages were persisted, failed or
+left unanswered. A send failed on its timeout can still be persisted, and the
+failure says that too. Any failure fails the sink until it is opened again,
+waits look at the task's cancel every 100 ms, and `close()` never throws.
+Options are read strictly, `0` is refused for the send timeout, and a SQL sink
+table takes only the options the sink reads. The brokers gate gains a Pulsar
+sinks phase, with `PulsarSinkFailures`, `PulsarSinkContractLive` against
+Pulsar 3.3 and recovery cells. Before the first case it looks up enough topics
+to load every bundle of `public/default`, since the broker reports healthy
+before it can serve them.
+
 **The NATS JetStream sink stays failed after a refusal, says what became of
 each message, and cannot be held by a server that stops reading.** After a
 refusal the sink stayed open, and a later flush found nothing pending and
