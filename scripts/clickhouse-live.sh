@@ -8,9 +8,10 @@
 # For each line it brings up, runs and tears down, one profile at a time, the
 # services of docker/integration-services.yml:
 #   - the line's plain and async-default servers (the same two the pins use):
-#     ClickHouseNativeLive.*, then the SQL-linked ClickHouseNativeSqlLive.* and
-#     ClickHouseLegacySqlLive.*, which include the typed job module's plugin
-#     route;
+#     ClickHouseNativeLive.*, the SELECT source's ClickHouseSourceLive.* (its
+#     report counted, none skipped), then the SQL-linked
+#     ClickHouseNativeSqlLive.* and ClickHouseLegacySqlLive.*, which include the
+#     typed job module's plugin route;
 #   - two replicas sharing one Keeper: pin P18 first, then
 #     ClickHouseNativeLiveReplicated.*, whose failover case shuts the first
 #     replica down;
@@ -188,6 +189,9 @@ for line in ${CLICKHOUSE_LINES}; do
     run "${line} native" "${BIN}" 'ClickHouseNativeLive.*' \
         CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}" \
         CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT_PORT="${async_port}"
+    run_counted "${line} SELECT source" "${BIN}" 'ClickHouseSourceLive.*' \
+        "ClickHouseSourceLive.*=4" \
+        CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}"
     if [ "${CLICKHOUSE_LIVE_SQL}" = "1" ]; then
         run "${line} SQL-level" "${SQL_BIN}" 'ClickHouseNativeSqlLive.*' \
             CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}" \

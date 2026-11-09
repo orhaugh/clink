@@ -409,11 +409,12 @@ jobs:
     # lines (scripts/clickhouse-live.sh): every type pair, the refusals, the
     # abandoned INSERT, both deduplication hashing regimes, failover between
     # two replicas, TLS, and the SQL-level round trips, 25.3 included for the
-    # legacy sink. A plain runner for the Docker daemon; the build job's test
-    # binaries run inside the toolchain image they were built in, on the host
-    # network, so they reach the servers' published ports, with the runner's
-    # temporary directory mounted for the TLS material the live script makes. A
-    # failing pin changes the sink's design, so it blocks like any other gate.
+    # legacy sink, and the SELECT source's restores on each line. A plain
+    # runner for the Docker daemon; the build job's test binaries run inside
+    # the toolchain image they were built in, on the host network, so they
+    # reach the servers' published ports, with the runner's temporary
+    # directory mounted for the TLS material the live script makes. A failing
+    # pin changes the sink's design, so it blocks like any other gate.
     needs: [build, toolchain-manifest]
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-24.04
