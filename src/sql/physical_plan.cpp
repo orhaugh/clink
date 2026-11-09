@@ -197,6 +197,7 @@ void check_cassandra_options(const TableDef& table, bool upsert);
 void check_mysql_sink_options(const TableDef& table, bool upsert);
 void check_postgres_sink_options(const TableDef& table, bool upsert);
 void check_redis_sink_options(const TableDef& table, bool upsert);
+void check_rabbitmq_sink_options(const TableDef& table);
 
 std::string string_sink_factory_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
@@ -590,6 +591,40 @@ void check_redis_sink_options(const TableDef& table, bool upsert) {
                     key + "'; it reads stream, field, " + accepted +
                     " (maxlen, approx_maxlen and linger_ms without mode='upsert', key_prefix "
                     "with it)");
+    }
+}
+
+void check_rabbitmq_sink_options(const TableDef& table) {
+    static const std::vector<std::string> kConnection = {
+        "host", "port", "vhost", "user", "password", "heartbeat_s", "connect_timeout_ms"};
+    static const std::vector<std::string> kSink = {"exchange",
+                                                   "routing_key",
+                                                   "persistent",
+                                                   "mandatory",
+                                                   "content_type",
+                                                   "confirm_timeout_ms",
+                                                   "max_unconfirmed",
+                                                   "max_record_bytes"};
+    static const std::vector<std::string> kSources = {
+        "queue", "consumer_tag", "declare_queue", "prefetch", "poll_timeout_ms", "batch_size"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        (void)value;
+        const auto listed = [&key](const std::vector<std::string>& v) {
+            return std::find(v.begin(), v.end(), key) != v.end();
+        };
+        if (listed(kConnection) || listed(kSink) || listed(kSources) || listed(interpreted)) {
+            continue;
+        }
+        std::string accepted;
+        for (const auto* list : {&kConnection, &kSink}) {
+            for (const auto& o : *list) {
+                accepted += (accepted.empty() ? "" : ", ") + o;
+            }
+        }
+        unsupported("table '" + table.name +
+                    "': a connector='rabbitmq' sink does not read option '" + key + "'; it reads " +
+                    accepted);
     }
 }
 
@@ -1356,6 +1391,7 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         if (upsert) {
             unsupported("connector='rabbitmq' sink does not support mode='upsert'");
         }
+        check_rabbitmq_sink_options(table);
         return RowConnectorBinding{"rabbitmq_sink_string", kChannelString, "row_to_json_string"};
     }
     if (connector == "nats") {

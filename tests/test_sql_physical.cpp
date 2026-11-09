@@ -3178,6 +3178,47 @@ TEST(SqlPhysical, RedisSinkTablesTakeOnlyOptionsTheSinksRead) {
     EXPECT_NE(why.find("PRIMARY KEY"), std::string::npos) << why;
 }
 
+namespace {
+
+std::string rabbitmq_sink_refusal(const std::string& with) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE q_out (k BIGINT, v BIGINT) WITH (connector='rabbitmq', host='localhost', "
+        "routing_key='q'" +
+        with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO q_out SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+// A connector='rabbitmq' sink table's options: one the sink does not read is
+// refused, naming the ones it reads; the source's options pass.
+TEST(SqlPhysical, RabbitMqSinkTablesTakeOnlyOptionsTheSinkReads) {
+    EXPECT_EQ(rabbitmq_sink_refusal(", port='5673', vhost='/v', user='u', password='p', "
+                                    "heartbeat_s='0', connect_timeout_ms='500', exchange='ex', "
+                                    "persistent='false', mandatory='false', "
+                                    "content_type='text/plain', confirm_timeout_ms='5000', "
+                                    "max_unconfirmed='10', max_record_bytes='1024'"),
+              "");
+    EXPECT_EQ(rabbitmq_sink_refusal(", queue='q', consumer_tag='c', declare_queue='false', "
+                                    "prefetch='5', poll_timeout_ms='10', batch_size='3'"),
+              "");
+    const auto why = rabbitmq_sink_refusal(", confirm_timeout='5000'");
+    EXPECT_NE(why.find("does not read option 'confirm_timeout'"), std::string::npos) << why;
+    EXPECT_NE(why.find("confirm_timeout_ms"), std::string::npos) << why;
+}
+
 TEST(SqlPhysical, CassandraUpsertSinkSelected) {
     Catalog cat;
     auto s = parse(
