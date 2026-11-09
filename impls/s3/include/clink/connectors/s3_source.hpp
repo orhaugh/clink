@@ -36,12 +36,13 @@ public:
     // Reading every object under a fixed prefix is a finite stream (BATCH-1).
     [[nodiscard]] bool is_bounded() const noexcept override { return true; }
 
-    // #60: source replay. produce() emits one whole object per call, so the
-    // cursor is the object index into the (lexicographically sorted) listing -
-    // resuming = re-list, then skip the objects already emitted. open() sorts
-    // the listing for a stable index and clamps a restored cursor. Exactly-once
-    // holds while the object set under the prefix is unchanged between runs;
-    // objects added/removed shift the index and can re-emit or skip an object.
+    // Source replay. open() lists every object under the prefix, in key
+    // order, and produce() emits one whole object per call, so the checkpoint
+    // holds the key of the last object emitted and a restore lists again and
+    // resumes after that key. An object removed since moves nothing; one added
+    // since with a key that sorts before it is not read. A checkpoint from an
+    // earlier release holds an index, which names no object, so a restore from
+    // it reads every object again.
     void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt) override;
     bool restore_offset(StateBackend& backend, OperatorId op_id) override;
 

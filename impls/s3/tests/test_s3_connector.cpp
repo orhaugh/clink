@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -93,9 +94,10 @@ TEST(S3SourceReal, OpenAgainstDeadEndpointFailsCleanly) {
     EXPECT_NO_THROW(src.close());
 }
 
-// #60: the object-index replay cursor round-trips through restore_offset ->
-// snapshot_offset without an S3 endpoint. Proves snapshot and restore agree on
-// the state key and 8-byte LE encoding.
+// The replay position's forms, without an S3 endpoint: an earlier release's
+// 8-byte index restores and, naming no object, is written again as the
+// versioned form with none; the versioned form with a key round-trips; a form
+// neither release wrote is refused.
 TEST(S3SourceReal, ReplayOffsetRoundTrips) {
     if (!S3Source::is_real_implementation()) {
         GTEST_SKIP();
@@ -124,7 +126,40 @@ TEST(S3SourceReal, ReplayOffsetRoundTrips) {
 
     InMemoryStateBackend out;
     src.snapshot_offset(out, op, CheckpointId{1});
-    EXPECT_EQ(out.get_operator_state(op, key), seeded.get_operator_state(op, key));
+    const auto none = out.get_operator_state(op, key);
+    ASSERT_TRUE(none.has_value());
+    ASSERT_EQ(none->size(), 2U);
+    EXPECT_EQ(std::to_integer<int>((*none)[0]), 2);
+    EXPECT_EQ(std::to_integer<int>((*none)[1]), 0);
+
+    const std::string with_key = std::string{"\x02\x01"} + "p/2026/obj-7.log";
+    InMemoryStateBackend keyed;
+    keyed.put_operator_state(op, key, StateBackend::ValueView{with_key.data(), with_key.size()});
+    S3Source::Options o3;
+    o3.bucket = "x";
+    o3.key_prefix = "p";
+    o3.endpoint_override = "http://127.0.0.1:1";
+    S3Source src3(std::move(o3));
+    ASSERT_TRUE(src3.restore_offset(keyed, op));
+    InMemoryStateBackend again;
+    src3.snapshot_offset(again, op, CheckpointId{2});
+    EXPECT_EQ(again.get_operator_state(op, key), keyed.get_operator_state(op, key));
+
+    // Too short for either form, a 'none' flag with a key after it, a flag that
+    // is neither, and a version neither release wrote.
+    for (const std::string odd : {std::string("abc", 3),
+                                  std::string("\x02\x00x", 3),
+                                  std::string("\x02\x05k", 3),
+                                  std::string("\x03\x01k", 3)}) {
+        InMemoryStateBackend b;
+        b.put_operator_state(op, key, StateBackend::ValueView{odd.data(), odd.size()});
+        S3Source::Options o4;
+        o4.bucket = "x";
+        o4.key_prefix = "p";
+        o4.endpoint_override = "http://127.0.0.1:1";
+        S3Source src4(std::move(o4));
+        EXPECT_THROW((void)src4.restore_offset(b, op), std::runtime_error) << odd.size();
+    }
 
     InMemoryStateBackend empty;
     S3Source::Options o2;

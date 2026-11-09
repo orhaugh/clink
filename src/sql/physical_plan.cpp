@@ -240,7 +240,7 @@ std::string string_sink_factory_for(const TableDef& table) {
     if (connector == "s3") {
         // delivery_guarantee='exactly_once' selects the multipart-complete-on-commit
         // 2PC sink (one object per checkpoint, made visible atomically); else the
-        // at-least-once rolling PutObject sink.
+        // at-most-once rolling PutObject sink.
         return table.is_exactly_once() ? "s3_2pc_string_sink" : "s3_text_sink";
     }
     if (connector == "parquet") {

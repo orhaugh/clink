@@ -1,7 +1,12 @@
 // Verifies clink::s3::install() makes the s3_text_sink factory
 // reachable through the RunnerRegistry.
 
+#include <map>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -70,6 +75,62 @@ TEST(S3FactoryRegistration, TheParquetSinksResolveToTheirOwnRecords) {
     ASSERT_NE(caps.find("s3_parquet_2pc"), nullptr);
     EXPECT_EQ(caps.find("s3_parquet_2pc")->delivery,
               clink::connectors::DeliveryGuarantee::ExactlyOnceAtomicPublish);
+}
+
+// What a raw object sink factory makes of `params`: its refusal, or a note that
+// it built a sink. Building does not reach the store.
+std::string raw_sink_refusal(const std::string& type, std::map<std::string, std::string> params) {
+    const auto* f = clink::cluster::OperatorRegistry::default_instance().find_sink(type, "string");
+    if (f == nullptr) {
+        throw std::logic_error(type + " is not registered");
+    }
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = std::move(params);
+    try {
+        (void)f->build(ctx);
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return "(built)";
+}
+
+// rollover_bytes and part_size are read strictly. Before, a typo fell back to
+// the default unnoticed, and rollover_bytes='0' put an object for every record.
+TEST(S3FactoryRegistration, RolloverBytesAndPartSizeAreReadStrictly) {
+    for (const auto& [type, key] : std::vector<std::pair<std::string, std::string>>{
+             {"s3_text_sink", "rollover_bytes"}, {"s3_2pc_string_sink", "part_size"}}) {
+        EXPECT_EQ(raw_sink_refusal(type, {{"bucket", "b"}}), "(built)");
+        for (const char* v : {"0", "-1", "lots", "10x", "", "+5", "1.5"}) {
+            EXPECT_EQ(raw_sink_refusal(type, {{"bucket", "b"}, {key, v}}),
+                      type + ": " + key + " must be a positive integer (got '" + v + "')");
+        }
+        EXPECT_EQ(raw_sink_refusal(type, {{"bucket", "b"}, {key, "1"}}), "(built)");
+        EXPECT_EQ(raw_sink_refusal(type, {{"bucket", "b"}, {key, "6000000000"}}), "(built)");
+    }
+}
+
+// The raw object record describes the text sink and the C++ source, without the
+// Parquet modes' format, schema evolution and partition discovery, which their
+// own records carry.
+TEST(S3FactoryRegistration, TheRawObjectRecordStatesWhatTheTextSinkAndTheSourceDo) {
+    const auto* rec = clink::connectors::CapabilityRegistry::instance().find("s3");
+    ASSERT_NE(rec, nullptr);
+    EXPECT_TRUE(rec->self_check().empty());
+    EXPECT_EQ(rec->version, "2");
+    EXPECT_EQ(rec->formats, (std::vector<std::string>{"text"}));
+    EXPECT_FALSE(rec->schema_evolution);
+    EXPECT_FALSE(rec->partition_discovery);
+    EXPECT_EQ(rec->delivery, clink::connectors::DeliveryGuarantee::AtMostOnce);
+    EXPECT_EQ(rec->limitations,
+              (std::vector<std::string>{
+                  "the text sink puts a part only at rollover_bytes and at the end of input, not "
+                  "at a checkpoint: records buffered when a process dies are lost, and parts put "
+                  "after the last checkpoint are put again after a restore; use s3_2pc for output "
+                  "tied to checkpoint completion",
+                  "the C++ source emits each object whole, as one batch held in memory, and "
+                  "resumes a restore after the last object its checkpoint covered, by key: an "
+                  "object added since with a key that sorts before that one is not read",
+              }));
 }
 
 // A SQL table with declared columns reads and writes typed Parquet on the Row channel, one

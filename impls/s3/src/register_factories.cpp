@@ -1,10 +1,13 @@
 // S3 factory registration.
 
+#include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include <arrow/filesystem/filesystem.h>
@@ -50,34 +53,66 @@ ArrowBatcher<clink::sql::Row> row_batcher(const clink::plugin::BuildContext& ctx
         ctx.param_or("projected_columns")));
 }
 
+// A raw object sink's byte count: the whole value must be a positive integer.
+// param_int64_or fell back to the default on garbage, so a typo passed
+// unnoticed, and its result was cast to size_t, so rollover_bytes='0' put an
+// object for every record. Any positive count is taken, as before.
+std::size_t positive_bytes(const clink::plugin::BuildContext& ctx,
+                           const std::string& who,
+                           const std::string& key,
+                           std::size_t fallback) {
+    const auto it = ctx.params.find(key);
+    if (it == ctx.params.end()) {
+        return fallback;
+    }
+    const std::string value = clink::plugin::BuildContext::resolve_secret(it->second);
+    std::uint64_t parsed = 0;
+    const char* first = value.data();
+    const char* last = first + value.size();
+    const auto [end, ec] = std::from_chars(first, last, parsed);
+    if (value.empty() || end != last || ec != std::errc{} || parsed == 0) {
+        throw std::runtime_error(who + ": " + key + " must be a positive integer (got '" +
+                                 it->second + "')");
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
 }  // namespace
 
 void install(clink::plugin::PluginRegistry& reg) {
+    // The raw text sink (s3_text_sink) and the C++ S3Source. The record before
+    // this one still carried the Parquet modes' format, schema evolution and
+    // partition discovery, which have records of their own.
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "s3",
-        .version = "1",
+        .version = "2",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"aws-sdk-cpp", "arrow"},
         .runtime_dependencies = {"s3-compatible object store"},
-        .formats = {"parquet", "bytes", "text"},
+        .formats = {"text"},
         .boundedness = clink::connectors::Boundedness::Bounded,
         .replayable = false,
         .offset_model = clink::connectors::OffsetModel::None,
         .checkpoint_integrated = false,
         .delivery = clink::connectors::DeliveryGuarantee::AtMostOnce,
         .transactional = false,
-        .schema_evolution = true,
-        .partition_discovery = true,
+        .schema_evolution = false,
+        .partition_discovery = false,
         .auth_methods = {"env-credentials", "instance-profile", "static-key"},
         .tls = true,
         .backpressure = true,
         .retries = true,
         .timeout_options = {},
         .available_in_sql = true,
-        .limitations = {"the plain sink writes objects as it goes; use s3_2pc for output tied "
-                        "to checkpoint completion",
-                        "the source keeps no intra-object position"},
+        .limitations = {"the text sink puts a part only at rollover_bytes and at the end of "
+                        "input, not at a checkpoint: records buffered when a process dies are "
+                        "lost, and parts put after the last checkpoint are put again after a "
+                        "restore; use s3_2pc for output tied to checkpoint completion",
+                        "the C++ source emits each object whole, as one batch held in memory, "
+                        "and resumes a restore after the last object its checkpoint covered, by "
+                        "key: an object added since with a key that sorts before that one is "
+                        "not read"},
     });
 
     // The Parquet sinks over S3, which the "s3" record above (the at-most-once
@@ -178,7 +213,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     // bucket/key_prefix. Object rollover at rollover_bytes. params:
     //   bucket (required), key_prefix (default "")
     //   region (optional), endpoint_override (optional, for localstack)
-    //   rollover_bytes (default 16 MiB)
+    //   rollover_bytes (default 16 MiB, any positive integer)
     reg.register_sink<std::string>(
         "s3_text_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
             S3Sink::Options opts;
@@ -193,7 +228,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 opts.endpoint_override = endpoint;
             }
             opts.rollover_bytes =
-                static_cast<std::size_t>(ctx.param_int64_or("rollover_bytes", 16 * 1024 * 1024));
+                positive_bytes(ctx, "s3_text_sink", "rollover_bytes", 16 * 1024 * 1024);
             opts.subtask_idx = ctx.subtask_idx;
             opts.parallelism = ctx.parallelism == 0 ? 1 : ctx.parallelism;
             if (opts.bucket.empty()) {
@@ -207,7 +242,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     // object per (subtask, run, checkpoint) under <key_prefix>/sub<N>-<run>-<ckpt>.ndjson,
     // made visible atomically by CompleteMultipartUpload once the checkpoint is
     // globally durable. params: bucket (required), key_prefix, region,
-    // endpoint_override (MinIO/LocalStack), part_size (default 5 MiB).
+    // endpoint_override (MinIO/LocalStack), part_size (default 5 MiB, any
+    // positive integer; the sink raises a smaller one to S3's 5 MiB minimum).
     reg.register_sink<std::string>(
         "s3_2pc_string_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
             S3Sink2PC::Options opts;
@@ -223,7 +259,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             opts.subtask_idx = ctx.subtask_idx;
             opts.part_size =
-                static_cast<std::size_t>(ctx.param_int64_or("part_size", 5 * 1024 * 1024));
+                positive_bytes(ctx, "s3_2pc_string_sink", "part_size", 5 * 1024 * 1024);
             if (opts.bucket.empty()) {
                 throw std::runtime_error("s3_2pc_string_sink: 'bucket' is required");
             }
