@@ -3,7 +3,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "clink/connectors/capability.hpp"
@@ -18,13 +20,63 @@ namespace clink::pulsar {
 
 namespace {
 
-PulsarConnParams parse_conn(const clink::plugin::BuildContext& ctx) {
+// A boolean option: 'true' or 'false', nothing else. A typo would otherwise
+// read as the default with no word said.
+bool bool_option(const clink::plugin::BuildContext& ctx,
+                 const std::string& factory,
+                 const std::string& key,
+                 bool fallback) {
+    const auto it = ctx.params.find(key);
+    if (it == ctx.params.end()) {
+        return fallback;
+    }
+    if (it->second == "true") {
+        return true;
+    }
+    if (it->second == "false") {
+        return false;
+    }
+    throw std::runtime_error(factory + ": '" + key + "' must be 'true' or 'false' (got '" +
+                             it->second + "')");
+}
+
+std::int64_t int_option(const clink::plugin::BuildContext& ctx,
+                        const std::string& factory,
+                        const std::string& key,
+                        std::int64_t fallback,
+                        std::int64_t min,
+                        std::int64_t max = std::numeric_limits<std::int64_t>::max()) {
+    const auto it = ctx.params.find(key);
+    if (it == ctx.params.end()) {
+        return fallback;
+    }
+    std::size_t used = 0;
+    std::int64_t v = 0;
+    try {
+        v = std::stoll(it->second, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (used == 0 || used != it->second.size() || v < min || v > max) {
+        throw std::runtime_error(
+            factory + ": '" + key + "' must be an integer " +
+            (max == std::numeric_limits<std::int64_t>::max()
+                 ? "of at least " + std::to_string(min)
+                 : "from " + std::to_string(min) + " to " + std::to_string(max)) +
+            " (got '" + it->second + "')");
+    }
+    return v;
+}
+
+// The connection options the source and the sink share, read strictly.
+PulsarConnParams parse_conn(const clink::plugin::BuildContext& ctx, const std::string& who) {
     PulsarConnParams c;
     c.service_url = ctx.param_or("service_url", "pulsar://localhost:6650");
     c.token = ctx.param_or("token", "");
-    c.operation_timeout_s = static_cast<int>(ctx.param_int64_or("operation_timeout_s", 30));
+    c.operation_timeout_s =
+        static_cast<int>(int_option(ctx, who, "operation_timeout_s", 30, 1, 3600));
     c.tls_ca = ctx.param_or("tls_ca", "");
-    c.tls_verify_hostname = ctx.param_or("tls_verify_hostname", "true") != "false";
+    c.tls_verify_hostname = bool_option(ctx, who, "tls_verify_hostname", true);
     return c;
 }
 
@@ -33,7 +85,7 @@ PulsarConnParams parse_conn(const clink::plugin::BuildContext& ctx) {
 void install(clink::plugin::PluginRegistry& reg) {
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "pulsar",
-        .version = "1",
+        .version = "2",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"pulsar-client-cpp"},
@@ -49,13 +101,15 @@ void install(clink::plugin::PluginRegistry& reg) {
         .checkpoint_integrated = true,
         .delivery = clink::connectors::DeliveryGuarantee::AtLeastOnce,
         .transactional = false,
-        .auth_methods = {"none", "token", "password"},
+        .auth_methods = {"none", "token"},
         .tls = true,
         .backpressure = true,
         .retries = false,
-        .timeout_options = {},
+        .timeout_options = {"operation_timeout_s", "send_timeout_ms"},
         .available_in_sql = true,
         .limitations = {"publish has no producer dedup: a replayed tail is re-published",
+                        "close() waits at most operation_timeout_s for the broker while the "
+                        "client fails what is still unanswered",
                         "a Shared subscription does not preserve per-key order across consumers",
                         "a Shared subscription (the default) is replayed by broker redelivery, "
                         "which can hand a restarted consumer its unacknowledged messages after "
@@ -76,7 +130,7 @@ void install(clink::plugin::PluginRegistry& reg) {
         "pulsar_source_string",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             PulsarSource::Options o;
-            o.conn = parse_conn(ctx);
+            o.conn = parse_conn(ctx, "pulsar_source_string");
             o.topic = ctx.param_or("topic");
             o.subscription = ctx.param_or("subscription", "clink");
             o.receiver_queue_size =
@@ -104,15 +158,20 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     // pulsar_sink_string: async-publish to a topic, confirmed on each barrier. At-least-once
     // (producer acks awaited at flush; no producer dedup wired). Params: service_url, token,
-    //   topic (required), batching (true), send_timeout_ms (30000).
+    //   operation_timeout_s, tls_ca, tls_verify_hostname, topic (required), batching (true),
+    //   send_timeout_ms (30000), max_pending (1000), max_pending_bytes (64 MiB).
     reg.register_sink<std::string>(
         "pulsar_sink_string", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            const std::string who = "pulsar_sink_string";
             PulsarSink::Options o;
-            o.conn = parse_conn(ctx);
+            o.conn = parse_conn(ctx, who);
             o.topic = ctx.param_or("topic");
-            o.batching = ctx.param_or("batching", "true") != "false";
-            o.send_timeout =
-                std::chrono::milliseconds{ctx.param_int64_or("send_timeout_ms", 30000)};
+            o.batching = bool_option(ctx, who, "batching", true);
+            o.send_timeout = std::chrono::milliseconds{
+                int_option(ctx, who, "send_timeout_ms", 30000, 1, 3600000)};
+            o.max_pending = static_cast<int>(int_option(ctx, who, "max_pending", 1000, 1, 500000));
+            o.max_pending_bytes = static_cast<std::size_t>(
+                int_option(ctx, who, "max_pending_bytes", 64LL << 20, 1, 4LL << 30));
             o.name = "pulsar_sink";
             if (o.topic.empty()) {
                 throw std::runtime_error("pulsar_sink: 'topic' is required");

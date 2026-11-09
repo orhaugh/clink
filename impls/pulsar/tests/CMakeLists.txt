@@ -7,12 +7,19 @@ add_executable(clink_pulsar_tests
     test_factory_registration.cpp
     test_pulsar.cpp
     test_pulsar_live.cpp
+    test_pulsar_sink_contract_live.cpp
+    test_pulsar_sink_failures.cpp
 )
+# The sink's live contract suite reads each topic back through a consumer of
+# its own (libpulsar, which clink::pulsar keeps PRIVATE), and takes the TCP
+# fault proxy from tests/integration/.
 target_link_libraries(clink_pulsar_tests PRIVATE
     clink::core
     clink::pulsar
+    _clink_pulsar_external
     GTest::gtest_main
 )
+target_include_directories(clink_pulsar_tests PRIVATE ${CMAKE_SOURCE_DIR})
 # The broker-certificate tests connect to a local TLS listener
 # (test_helpers/tls_handshake_server.hpp), which needs OpenSSL; libpulsar does
 # not expose the one it carries.

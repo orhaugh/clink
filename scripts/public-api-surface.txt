@@ -292,6 +292,7 @@ impls/postgres/include/clink/postgres/pg_sink_server.hpp
 impls/postgres/include/clink/postgres/postgres_row_codec.hpp
 impls/postgres/include/clink/postgres/typed_cdc_source.hpp
 impls/pulsar/include/clink/pulsar/connection_params.hpp
+impls/pulsar/include/clink/pulsar/pulsar_publisher.hpp
 impls/pulsar/include/clink/pulsar/pulsar_sink.hpp
 impls/pulsar/include/clink/pulsar/pulsar_source.hpp
 impls/rabbitmq/include/clink/rabbitmq/connection_params.hpp

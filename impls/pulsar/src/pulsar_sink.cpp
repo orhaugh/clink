@@ -1,143 +1,251 @@
+// Pulsar sink. See pulsar_sink.hpp.
+
 #include "clink/pulsar/pulsar_sink.hpp"
 
-#include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <mutex>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
-#include <pulsar/c/message.h>
-#include <pulsar/c/producer.h>
-#include <pulsar/c/producer_configuration.h>
-
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/runtime_context.hpp"
 
-#include "pulsar_conn.hpp"
+#include "fault_points.hpp"
 
 namespace clink::pulsar {
 
 namespace {
+
 constexpr const char* kLabel = "pulsar";
+// The longest a wait sleeps before it looks at the task's cancel again.
+constexpr std::chrono::milliseconds kSlice{100};
+// How long past send_timeout a wait gives the client to report its timeouts.
+constexpr std::chrono::milliseconds kGrace{2000};
 
-// Error sink for the async send callback. A standalone struct (NOT nested in the private
-// PulsarSink::Impl) so the C callback can reference it. The callback runs on a Pulsar client
-// thread, so it touches only the atomic flag + the mutex-guarded string.
-struct SendErrorBox {
-    std::atomic<bool> failed{false};
-    std::mutex mu;
-    std::string err;
-};
-
-// Async send completion callback. ctx is a SendErrorBox*.
-void on_send(pulsar_result result, pulsar_message_id_t* /*msgId*/, void* ctx) {
-    if (result == pulsar_result_Ok) {
-        return;
+PulsarSink::Options checked(PulsarSink::Options o) {
+    if (o.topic.empty()) {
+        throw std::runtime_error(o.name + ": 'topic' is required");
     }
-    auto* box = static_cast<SendErrorBox*>(ctx);
-    box->failed.store(true, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lk(box->mu);
-    if (box->err.empty()) {
-        box->err = pulsar_result_str(result);
+    if (o.send_timeout.count() <= 0) {
+        // The client reads 0 as no timeout at all, and a barrier would then wait
+        // for ever on a message the broker never answers.
+        throw std::runtime_error(o.name + ": the send timeout must be positive");
     }
+    if (o.max_pending < 1) {
+        o.max_pending = 1;
+    }
+    if (o.max_pending_bytes == 0) {
+        o.max_pending_bytes = PulsarSink::kDefaultMaxPendingBytes;
+    }
+    if (!o.publisher_factory) {
+        o.publisher_factory = [](const PulsarPublisherSettings& s) {
+            return connect_pulsar_publisher(s);
+        };
+    }
+    return o;
 }
+
 }  // namespace
 
 struct PulsarSink::Impl {
+    explicit Impl(Options o) : opts(checked(std::move(o))) {}
+
     Options opts;
-    pulsar_client_t* client{nullptr};
-    pulsar_producer_t* producer{nullptr};
-    // Messages handed to send_async; freed at flush() once all sends have completed. Touched only
-    // on the sink thread (on_data / flush) - the send callback does NOT touch this vector.
-    std::vector<pulsar_message_t*> pending;
-    SendErrorBox send_box;  // error flag + first error message from the async send callback
-    explicit Impl(Options o) : opts(std::move(o)) {}
+    std::unique_ptr<PulsarPublisher> publisher;
+    RuntimeContext* rt{nullptr};
+    std::string failure;
+    bool open{false};
+    std::uint64_t published{0};        // since open()
+    std::uint64_t published_bytes{0};  // since open()
+    // The answers when the last complete flush ended, and what was published
+    // since.
+    PulsarAnswers base;
+    std::uint64_t interval_published{0};
+
+    [[nodiscard]] std::uint64_t unanswered(const PulsarAnswers& a) const {
+        return published - std::min(published, a.stored + a.failed);
+    }
+    [[nodiscard]] std::uint64_t unanswered_bytes(const PulsarAnswers& a) const {
+        return published_bytes - std::min(published_bytes, a.answered_bytes);
+    }
+
+    [[nodiscard]] std::string tally(const PulsarAnswers& a) const {
+        std::string s = "of the " + std::to_string(interval_published) +
+                        " messages published since the last complete flush, " +
+                        std::to_string(a.stored - base.stored) + " were persisted";
+        if (a.failed > base.failed) {
+            // A send the client failed on its timeout was on the wire, and the
+            // broker can still have persisted it.
+            s += ", " + std::to_string(a.failed - base.failed) +
+                 " failed (one failed on the client's send timeout may still be on the topic)";
+        }
+        return s + ", and the other " + std::to_string(unanswered(a)) +
+               " are unanswered and may or may not be on the topic. The job restarts from its "
+               "last checkpoint and publishes its records again";
+    }
+
+    void require_not_failed(const std::string& what) const {
+        if (!failure.empty()) {
+            throw std::runtime_error(opts.name + ": " + what +
+                                     " refused: the sink failed earlier (" + failure +
+                                     ") and has not been opened again, so nothing more is "
+                                     "published");
+        }
+    }
+    void require_usable(const std::string& what) const {
+        require_not_failed(what);
+        if (!open) {
+            throw std::runtime_error(opts.name + ": " + what + " before open()");
+        }
+    }
+
+    [[noreturn]] void fail(const std::string& why) {
+        failure = why;
+        clink::metrics::connector::error_inc(kLabel, "sink");
+        throw std::runtime_error(opts.name + ": " + why);
+    }
+
+    [[nodiscard]] bool cancel_requested() const noexcept {
+        return rt != nullptr && rt->cancel_requested();
+    }
+
+    // Waits for answers until `done(answers)`, in slices, so a cancel ends the
+    // wait at once. The client fails each message after send_timeout, so a wait
+    // longer than that, and a little grace, means the client has stopped
+    // answering, and the sink fails. `what` names the wait.
+    PulsarAnswers wait_until(const std::function<bool(const PulsarAnswers&)>& done,
+                             const std::string& what) {
+        const auto deadline = std::chrono::steady_clock::now() + opts.send_timeout + kGrace;
+        PulsarAnswers a = publisher->answers();
+        while (!done(a)) {
+            if (cancel_requested()) {
+                fail("the task was cancelled while " + what + "; " + tally(a));
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                fail("the client had not answered every message within the send timeout (" +
+                     std::to_string(opts.send_timeout.count()) + " ms) while " + what + "; " +
+                     tally(a));
+            }
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            a = publisher->wait(a.stored + a.failed,
+                                std::min(kSlice, left + std::chrono::milliseconds{1}));
+        }
+        return a;
+    }
+
+    void close_publisher() noexcept {
+        if (publisher) {
+            publisher->close();
+            publisher.reset();
+        }
+        open = false;
+    }
 };
 
-PulsarSink::PulsarSink(Options opts) : impl_(std::make_unique<Impl>(std::move(opts))) {
-    if (impl_->opts.topic.empty()) {
-        throw std::runtime_error(impl_->opts.name + ": 'topic' is required");
-    }
-}
+PulsarSink::PulsarSink(Options opts) : impl_(std::make_unique<Impl>(std::move(opts))) {}
 
 PulsarSink::~PulsarSink() {
-    for (pulsar_message_t* m : impl_->pending) {
-        pulsar_message_free(m);
-    }
-    impl_->pending.clear();
-    if (impl_->producer != nullptr) {
-        pulsar_producer_close(impl_->producer);
-        pulsar_producer_free(impl_->producer);
-    }
-    if (impl_->client != nullptr) {
-        pulsar_client_close(impl_->client);
-        pulsar_client_free(impl_->client);
-    }
+    impl_->close_publisher();
 }
 
 void PulsarSink::open() {
-    impl_->client = detail::connect(impl_->opts.conn, impl_->opts.name);
-    pulsar_producer_configuration_t* conf = pulsar_producer_configuration_create();
-    pulsar_producer_configuration_set_batching_enabled(conf, impl_->opts.batching ? 1 : 0);
-    pulsar_producer_configuration_set_send_timeout(
-        conf, static_cast<int>(impl_->opts.send_timeout.count()));
-    const pulsar_result r = pulsar_client_create_producer(
-        impl_->client, impl_->opts.topic.c_str(), conf, &impl_->producer);
-    pulsar_producer_configuration_free(conf);
-    detail::check_first_contact(r, impl_->opts.name + ": create_producer", impl_->opts.conn);
+    auto& m = *impl_;
+    m.close_publisher();
+    m.failure.clear();
+    m.published = m.published_bytes = m.interval_published = 0;
+    m.base = PulsarAnswers{};
+    m.rt = runtime();
+    PulsarPublisherSettings s;
+    s.conn = m.opts.conn;
+    s.topic = m.opts.topic;
+    s.batching = m.opts.batching;
+    s.send_timeout = m.opts.send_timeout;
+    // Above the sink's own window, so the client's queue is never full.
+    s.max_pending = m.opts.max_pending * 2;
+    m.publisher = m.opts.publisher_factory(s);
+    m.base = m.publisher->answers();
+    m.open = true;
 }
 
 void PulsarSink::on_data(const Batch<std::string>& batch) {
-    if (impl_->producer == nullptr) {
-        throw std::runtime_error(impl_->opts.name + ": on_data before open()");
+    auto& m = *impl_;
+    m.require_usable("a record");
+    if (batch.empty()) {
+        return;
+    }
+    if (m.cancel_requested()) {
+        m.fail("cancelled before publishing to '" + m.opts.topic + "'");
     }
     std::size_t bytes = 0;
+    std::size_t count = 0;
+    const auto max_pending = static_cast<std::uint64_t>(m.opts.max_pending);
+    const auto max_bytes = static_cast<std::uint64_t>(m.opts.max_pending_bytes);
     for (const auto& rec : batch) {
         const std::string& payload = rec.value();
-        pulsar_message_t* msg = pulsar_message_create();
-        pulsar_message_set_content(msg, payload.data(), payload.size());
-        pulsar_producer_send_async(impl_->producer, msg, &on_send, &impl_->send_box);
-        impl_->pending.push_back(msg);  // freed at flush(), after all sends complete
+        const auto now = m.publisher->answers();
+        if (m.unanswered(now) >= max_pending || m.unanswered_bytes(now) >= max_bytes) {
+            // What the producer batches is sent only on its delay or a flush.
+            m.publisher->push();
+            (void)m.wait_until(
+                [&](const PulsarAnswers& a) {
+                    return m.unanswered(a) < max_pending && m.unanswered_bytes(a) < max_bytes;
+                },
+                "waiting with max_pending (" + std::to_string(m.opts.max_pending) +
+                    ") or max_pending_bytes (" + std::to_string(m.opts.max_pending_bytes) +
+                    ") reached");
+        }
+        try {
+            m.publisher->publish(payload);
+        } catch (const std::exception& e) {
+            ++m.published;  // it may have reached the broker
+            ++m.interval_published;
+            m.fail(std::string{"publishing to '"} + m.opts.topic + "' failed (" + e.what() + "); " +
+                   m.tally(m.publisher->answers()));
+        }
+        ++m.published;
+        m.published_bytes += payload.size();
+        ++m.interval_published;
         bytes += payload.size();
+        ++count;
     }
-    if (!batch.empty()) {
-        clink::metrics::connector::records_out_inc(kLabel, batch.size());
-        clink::metrics::connector::bytes_out_inc(kLabel, bytes);
-    }
+    clink::metrics::connector::records_out_inc(kLabel, count);
+    clink::metrics::connector::bytes_out_inc(kLabel, bytes);
 }
 
 void PulsarSink::on_barrier(CheckpointBarrier /*b*/) {
-    flush();  // align durable delivery to the checkpoint (at-least-once)
+    auto& m = *impl_;
+    m.require_usable("a checkpoint barrier");
+    const bool publishes = m.interval_published > 0;
+    flush();
+    if (publishes) {
+        (void)CLINK_FAULT_POINT(points::kSinkAfterAck);
+    }
 }
 
 void PulsarSink::flush() {
-    if (impl_->producer == nullptr || impl_->pending.empty()) {
+    auto& m = *impl_;
+    // A failed sink refuses even an empty flush, so a clean end of input cannot
+    // pass over its failure; one never opened has nothing to flush.
+    m.require_not_failed("a flush");
+    if (!m.open || m.interval_published == 0) {
         return;
     }
+    m.publisher->push();
+    (void)CLINK_FAULT_POINT(points::kSinkBeforeAck);
     const auto t0 = std::chrono::steady_clock::now();
-    // Block until every buffered/async-sent message has been persisted by the broker. After this
-    // returns, all send callbacks have run, so send_failed reflects the whole window.
-    const pulsar_result r = pulsar_producer_flush(impl_->producer);
-    for (pulsar_message_t* m : impl_->pending) {
-        pulsar_message_free(m);
+    const auto a = m.wait_until([&m](const PulsarAnswers& x) { return m.unanswered(x) == 0; },
+                                "waiting for a flush's answers");
+    if (a.failed > m.base.failed) {
+        m.fail("the client failed " + std::to_string(a.failed - m.base.failed) + " send(s) to '" +
+               m.opts.topic + "' (first: " + a.first_failure + "); " + m.tally(a));
     }
-    impl_->pending.clear();
-    if (r != pulsar_result_Ok) {
-        clink::metrics::connector::error_inc(kLabel, "sink");
-        throw std::runtime_error(impl_->opts.name + ": flush: " + pulsar_result_str(r));
-    }
-    if (impl_->send_box.failed.exchange(false, std::memory_order_relaxed)) {
-        std::string e;
-        {
-            std::lock_guard<std::mutex> lk(impl_->send_box.mu);
-            e = std::move(impl_->send_box.err);
-            impl_->send_box.err.clear();
-        }
-        clink::metrics::connector::error_inc(kLabel, "sink");
-        throw std::runtime_error(impl_->opts.name + ": async send failed: " + e);
-    }
+    m.base = a;
+    m.interval_published = 0;
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count();
@@ -145,17 +253,9 @@ void PulsarSink::flush() {
 }
 
 void PulsarSink::close() {
-    if (impl_->producer != nullptr) {
-        flush();  // confirm anything published since the last barrier (may throw)
-        pulsar_producer_close(impl_->producer);
-        pulsar_producer_free(impl_->producer);
-        impl_->producer = nullptr;
-    }
-    if (impl_->client != nullptr) {
-        pulsar_client_close(impl_->client);
-        pulsar_client_free(impl_->client);
-        impl_->client = nullptr;
-    }
+    // Unanswered messages are not waited for here: a clean end of input flushes
+    // before close(), and the client's close fails what is left.
+    impl_->close_publisher();
 }
 
 std::string PulsarSink::name() const {

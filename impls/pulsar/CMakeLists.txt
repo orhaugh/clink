@@ -32,6 +32,7 @@ if(NOT _pulsar_found)
 endif()
 
 add_library(clink_pulsar STATIC
+    src/pulsar_publisher.cpp
     src/pulsar_source.cpp
     src/pulsar_sink.cpp
     src/register_factories.cpp
