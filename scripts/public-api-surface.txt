@@ -294,6 +294,7 @@ impls/pulsar/include/clink/pulsar/connection_params.hpp
 impls/pulsar/include/clink/pulsar/pulsar_sink.hpp
 impls/pulsar/include/clink/pulsar/pulsar_source.hpp
 impls/rabbitmq/include/clink/rabbitmq/connection_params.hpp
+impls/rabbitmq/include/clink/rabbitmq/rabbitmq_publisher.hpp
 impls/rabbitmq/include/clink/rabbitmq/rabbitmq_sink.hpp
 impls/rabbitmq/include/clink/rabbitmq/rabbitmq_source.hpp
 impls/redis/include/clink/redis/redis_client.hpp

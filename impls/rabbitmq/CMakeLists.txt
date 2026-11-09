@@ -46,6 +46,7 @@ if(NOT _rmq_found)
 endif()
 
 add_library(clink_rabbitmq STATIC
+    src/rabbitmq_publisher.cpp
     src/rabbitmq_source.cpp
     src/rabbitmq_sink.cpp
     src/register_factories.cpp

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -15,6 +16,9 @@ struct RabbitMqConnParams {
     std::string user{"guest"};
     std::string password{"guest"};
     int heartbeat_s{60};  // AMQP heartbeat interval (0 disables)
+    // The longest the TCP connect, and then the AMQP handshake and login, may
+    // each take.
+    std::chrono::milliseconds connect_timeout{10000};
 };
 
 }  // namespace clink::rabbitmq

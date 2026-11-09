@@ -1,150 +1,380 @@
+// RabbitMQ sink. See rabbitmq_sink.hpp.
+
 #include "clink/rabbitmq/rabbitmq_sink.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/runtime_context.hpp"
 
-#include "amqp_conn.hpp"
+#include "fault_points.hpp"
 
 namespace clink::rabbitmq {
 
 namespace {
-constexpr const char* kLabel = "rabbitmq";
-constexpr amqp_channel_t kChannel = 1;
 
-struct timeval to_timeval(std::chrono::milliseconds ms) {
-    struct timeval tv;
-    tv.tv_sec = static_cast<long>(ms.count() / 1000);
-    tv.tv_usec = static_cast<long>((ms.count() % 1000) * 1000);
-    return tv;
+constexpr const char* kLabel = "rabbitmq";
+
+RabbitMqSink::Options checked(RabbitMqSink::Options o) {
+    if (o.routing_key.empty()) {
+        throw std::runtime_error(o.name + ": 'routing_key' is required");
+    }
+    if (o.confirm_timeout.count() <= 0) {
+        throw std::runtime_error(o.name + ": the confirm timeout must be positive");
+    }
+    if (o.max_unconfirmed == 0) {
+        o.max_unconfirmed = 1;
+    }
+    if (o.max_record_bytes == 0) {
+        o.max_record_bytes = RabbitMqSink::kDefaultMaxRecordBytes;
+    }
+    if (!o.publisher_factory) {
+        o.publisher_factory = [](const PublisherSettings& s) {
+            return connect_rabbitmq_publisher(s);
+        };
+    }
+    return o;
 }
+
+// Shuts the connection's socket once the task is cancelled, so a publish the
+// broker no longer reads, or a wait for confirms, ends at once. One thread per
+// sink, asleep unless armed.
+class Watch {
+public:
+    Watch(RabbitMqPublisher& publisher, CancelSignal cancel)
+        : publisher_(publisher), cancel_(std::move(cancel)), thread_([this] { run(); }) {}
+    ~Watch() {
+        {
+            const std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+    Watch(const Watch&) = delete;
+    Watch& operator=(const Watch&) = delete;
+
+    void arm() {
+        {
+            const std::lock_guard<std::mutex> lock(mu_);
+            armed_ = true;
+        }
+        cv_.notify_all();
+    }
+    void disarm() {
+        const std::lock_guard<std::mutex> lock(mu_);
+        armed_ = false;
+    }
+    // True once the watch has shut the socket.
+    [[nodiscard]] bool fired() {
+        const std::lock_guard<std::mutex> lock(mu_);
+        return fired_;
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mu_);
+        while (!stop_) {
+            if (!armed_ || fired_) {
+                cv_.wait(lock, [this] { return stop_ || (armed_ && !fired_); });
+                continue;
+            }
+            cv_.wait_for(lock, std::chrono::milliseconds{20});
+            if (stop_ || !armed_ || !cancel_.requested()) {
+                continue;
+            }
+            fired_ = true;
+            lock.unlock();
+            publisher_.cancel();
+            lock.lock();
+        }
+    }
+
+    RabbitMqPublisher& publisher_;
+    CancelSignal cancel_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stop_{false};
+    bool armed_{false};
+    bool fired_{false};
+    std::thread thread_;
+};
+
 }  // namespace
 
 struct RabbitMqSink::Impl {
+    explicit Impl(Options o) : opts(checked(std::move(o))) {}
+
     Options opts;
-    amqp_connection_state_t conn{nullptr};
-    std::uint64_t next_tag{1};            // broker assigns 1,2,... per publish on a confirm channel
-    std::set<std::uint64_t> outstanding;  // published-but-unconfirmed delivery tags
-    explicit Impl(Options o) : opts(std::move(o)) {}
+    std::unique_ptr<RabbitMqPublisher> publisher;
+    std::unique_ptr<Watch> watch;
+    RuntimeContext* rt{nullptr};
+    std::string failure;
+    bool open{false};
+    std::uint64_t published{0};           // delivery tags assigned since open()
+    std::set<std::uint64_t> outstanding;  // published and not yet confirmed
+    // Since the last flush that had every message confirmed.
+    std::size_t interval_published{0};
+    std::size_t interval_acked{0};
+    std::size_t interval_returned{0};
+    std::size_t interval_nacked{0};
+    std::string first_return;
+
+    [[nodiscard]] std::string target() const {
+        return "exchange '" + opts.exchange + "', routing key '" + opts.routing_key + "'";
+    }
+
+    void require_not_failed(const std::string& what) const {
+        if (!failure.empty()) {
+            throw std::runtime_error(opts.name + ": " + what +
+                                     " refused: the sink failed earlier (" + failure +
+                                     ") and has not been opened again, so nothing more is "
+                                     "published");
+        }
+    }
+    void require_usable(const std::string& what) const {
+        require_not_failed(what);
+        if (!open) {
+            throw std::runtime_error(opts.name + ": " + what + " before open()");
+        }
+    }
+
+    // What the messages published since the last complete flush came to.
+    [[nodiscard]] std::string tally() const {
+        const auto confirmed = interval_acked - std::min(interval_acked, interval_returned);
+        std::string s = "of the " + std::to_string(interval_published) +
+                        " messages published since the last complete flush, " +
+                        std::to_string(confirmed) + " were confirmed";
+        if (interval_returned > 0) {
+            s += ", " + std::to_string(interval_returned) + " returned unroutable";
+        }
+        if (interval_nacked > 0) {
+            s += ", " + std::to_string(interval_nacked) + " refused (basic.nack)";
+        }
+        return s + ", and the other " + std::to_string(outstanding.size()) +
+               " are unconfirmed and may or may not be in a queue. The job restarts from its "
+               "last checkpoint and publishes its records again";
+    }
+
+    [[noreturn]] void fail(const std::string& why) {
+        failure = why;
+        clink::metrics::connector::error_inc(kLabel, "sink");
+        throw std::runtime_error(opts.name + ": " + why);
+    }
+
+    [[nodiscard]] bool cancel_requested() const noexcept {
+        return rt != nullptr && rt->cancel_requested();
+    }
+
+    // Removes the tags an ack or nack covers; returns how many it covered.
+    std::size_t settle(std::uint64_t tag, bool multiple) {
+        if (!multiple) {
+            return outstanding.erase(tag);
+        }
+        const auto end = outstanding.upper_bound(tag);
+        std::size_t n = 0;
+        for (auto it = outstanding.begin(); it != end; ++it) {
+            ++n;
+        }
+        outstanding.erase(outstanding.begin(), end);
+        return n;
+    }
+
+    // Reads the broker's confirms until `done()` or confirm_timeout passes, and
+    // fails the sink unless every message they settle was confirmed. A nack or a
+    // return does not stop the reading, since the broker confirms out of order
+    // (a queue refuses a publish at once and confirms a persistent one once it
+    // is on disk): the failure then says exactly what became of each message.
+    // `what` names the wait.
+    void drain(const std::function<bool()>& done, const std::string& what) {
+        const auto deadline = std::chrono::steady_clock::now() + opts.confirm_timeout;
+        if (watch) {
+            watch->arm();
+        }
+        while (!done()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                disarm();
+                fail("the broker had not confirmed every message within the confirm timeout (" +
+                     std::to_string(opts.confirm_timeout.count()) + " ms) while " + what + ": " +
+                     tally());
+            }
+            const auto left =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) +
+                std::chrono::milliseconds{1};
+            const auto e = publisher->next(left);
+            switch (e.kind) {
+                case PublisherEvent::Kind::Ack:
+                    interval_acked += settle(e.delivery_tag, e.multiple);
+                    break;
+                case PublisherEvent::Kind::Return:
+                    if (interval_returned++ == 0) {
+                        first_return = e.text;
+                    }
+                    break;
+                case PublisherEvent::Kind::Nack:
+                    interval_nacked += settle(e.delivery_tag, e.multiple);
+                    break;
+                case PublisherEvent::Kind::Timeout:
+                    break;  // the deadline check above decides
+                case PublisherEvent::Kind::Closed:
+                    disarm();
+                    fail(e.text + ", while " + what + "; " + tally());
+                case PublisherEvent::Kind::Lost: {
+                    const bool cancelled = watch && watch->fired();
+                    disarm();
+                    fail((cancelled ? std::string{"the task was cancelled"}
+                                    : "the connection to the broker failed (" + e.text + ")") +
+                         " while " + what + "; " + tally());
+                }
+            }
+        }
+        disarm();
+        if (interval_nacked > 0 || interval_returned > 0) {
+            std::string lead;
+            if (interval_nacked > 0) {
+                lead = "the broker refused " + std::to_string(interval_nacked) +
+                       " message(s) (basic.nack)";
+            }
+            if (interval_returned > 0) {
+                lead += (lead.empty() ? "the broker" : ", and") + std::string{" returned "} +
+                        std::to_string(interval_returned) +
+                        " message(s) that no queue is bound to receive (" + target() +
+                        ", first: " + first_return +
+                        "; bind a queue, or set mandatory='false' to let the exchange drop such "
+                        "messages)";
+            }
+            fail(lead + " while " + what + "; " + tally());
+        }
+    }
+
+    void disarm() {
+        if (watch) {
+            watch->disarm();
+        }
+    }
+
+    void close_publisher(bool orderly) noexcept {
+        watch.reset();
+        if (publisher) {
+            publisher->close(orderly);
+            publisher.reset();
+        }
+        open = false;
+    }
 };
 
-RabbitMqSink::RabbitMqSink(Options opts) : impl_(std::make_unique<Impl>(std::move(opts))) {
-    if (impl_->opts.routing_key.empty()) {
-        throw std::runtime_error(impl_->opts.name + ": 'routing_key' is required");
-    }
-}
+RabbitMqSink::RabbitMqSink(Options opts) : impl_(std::make_unique<Impl>(std::move(opts))) {}
 
 RabbitMqSink::~RabbitMqSink() {
-    detail::close_and_destroy(impl_->conn, kChannel);  // no flush in the dtor (must not throw)
-    impl_->conn = nullptr;
+    impl_->close_publisher(false);
 }
 
 void RabbitMqSink::open() {
-    impl_->conn = detail::connect_and_open(impl_->opts.conn, kChannel, impl_->opts.name);
-    // Publisher confirms: the broker basic.ack's each publish once it is safe (persisted for a
-    // durable queue). flush() waits for those acks, giving at-least-once delivery.
-    amqp_confirm_select(impl_->conn, kChannel);
-    detail::check_reply(amqp_get_rpc_reply(impl_->conn), impl_->opts.name + ": confirm.select");
-    impl_->next_tag = 1;
-    impl_->outstanding.clear();
+    auto& m = *impl_;
+    m.close_publisher(false);
+    m.failure.clear();
+    m.outstanding.clear();
+    m.published = 0;
+    m.interval_published = m.interval_acked = m.interval_returned = m.interval_nacked = 0;
+    m.first_return.clear();
+    m.rt = runtime();
+    PublisherSettings s;
+    s.conn = m.opts.conn;
+    s.exchange = m.opts.exchange;
+    s.routing_key = m.opts.routing_key;
+    s.persistent = m.opts.persistent;
+    s.mandatory = m.opts.mandatory;
+    s.content_type = m.opts.content_type;
+    m.publisher = m.opts.publisher_factory(s);
+    if (m.rt != nullptr) {
+        m.watch = std::make_unique<Watch>(*m.publisher, m.rt->cancel_signal());
+    }
+    m.open = true;
 }
 
 void RabbitMqSink::on_data(const Batch<std::string>& batch) {
-    if (impl_->conn == nullptr) {
-        throw std::runtime_error(impl_->opts.name + ": on_data before open()");
+    auto& m = *impl_;
+    m.require_usable("a record");
+    if (batch.empty()) {
+        return;
     }
-    amqp_basic_properties_t props;
-    props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
-    props.content_type = amqp_cstring_bytes(impl_->opts.content_type.c_str());
-    props.delivery_mode = impl_->opts.persistent ? 2 : 1;  // 2 = persistent
-    const amqp_bytes_t exchange = amqp_cstring_bytes(impl_->opts.exchange.c_str());
-    const amqp_bytes_t routing_key = amqp_cstring_bytes(impl_->opts.routing_key.c_str());
-
+    if (m.cancel_requested()) {
+        m.fail("cancelled before publishing to " + m.target());
+    }
     std::size_t bytes = 0;
+    std::size_t count = 0;
     for (const auto& rec : batch) {
         const std::string& payload = rec.value();
-        amqp_bytes_t body;
-        body.len = payload.size();
-        body.bytes = const_cast<char*>(payload.data());
-        const int rc = amqp_basic_publish(impl_->conn,
-                                          kChannel,
-                                          exchange,
-                                          routing_key,
-                                          impl_->opts.mandatory ? 1 : 0,
-                                          0 /*immediate*/,
-                                          &props,
-                                          body);
-        if (rc != AMQP_STATUS_OK) {
-            clink::metrics::connector::error_inc(kLabel, "sink");
-            throw std::runtime_error(impl_->opts.name +
-                                     ": basic.publish failed: " + amqp_error_string2(rc));
+        if (payload.size() > m.opts.max_record_bytes) {
+            m.fail("a record is " + std::to_string(payload.size()) +
+                   " bytes, more than max_record_bytes (" +
+                   std::to_string(m.opts.max_record_bytes) + "); " + m.tally());
         }
-        impl_->outstanding.insert(impl_->next_tag);
-        ++impl_->next_tag;
+        if (m.outstanding.size() >= m.opts.max_unconfirmed) {
+            m.drain([&m] { return m.outstanding.size() < m.opts.max_unconfirmed; },
+                    "waiting with max_unconfirmed (" + std::to_string(m.opts.max_unconfirmed) +
+                        ") messages unconfirmed");
+        }
+        if (m.watch) {
+            m.watch->arm();
+        }
+        try {
+            m.publisher->publish(payload);
+        } catch (const std::exception& e) {
+            const bool cancelled = m.watch && m.watch->fired();
+            m.disarm();
+            ++m.interval_published;  // it may have reached the broker
+            m.outstanding.insert(++m.published);
+            m.fail((cancelled ? std::string{"the task was cancelled"}
+                              : std::string{"publishing failed ("} + e.what() + ")") +
+                   " publishing to " + m.target() + "; " + m.tally());
+        }
+        m.disarm();
+        m.outstanding.insert(++m.published);
+        ++m.interval_published;
         bytes += payload.size();
+        ++count;
     }
-    if (!batch.empty()) {
-        clink::metrics::connector::records_out_inc(kLabel, batch.size());
-        clink::metrics::connector::bytes_out_inc(kLabel, bytes);
-    }
+    clink::metrics::connector::records_out_inc(kLabel, count);
+    clink::metrics::connector::bytes_out_inc(kLabel, bytes);
 }
 
 void RabbitMqSink::on_barrier(CheckpointBarrier /*b*/) {
-    flush();  // align durable delivery to the checkpoint (at-least-once)
+    auto& m = *impl_;
+    m.require_usable("a checkpoint barrier");
+    const bool publishes = m.interval_published > 0;
+    flush();
+    if (publishes) {
+        (void)CLINK_FAULT_POINT(points::kSinkAfterConfirm);
+    }
 }
 
 void RabbitMqSink::flush() {
-    if (impl_->conn == nullptr || impl_->outstanding.empty()) {
+    auto& m = *impl_;
+    // A failed sink refuses even an empty flush, so a clean end of input cannot
+    // pass over its failure; one never opened has nothing to flush.
+    m.require_not_failed("a flush");
+    if (!m.open || m.interval_published == 0) {
         return;
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    // Drain broker confirms until every outstanding publish has been ack'd. A nack/reject or a
-    // timeout throws, so the job replays from the last checkpoint rather than losing data.
-    while (!impl_->outstanding.empty()) {
-        amqp_publisher_confirm_t result;
-        struct timeval tv = to_timeval(impl_->opts.confirm_timeout);
-        const amqp_rpc_reply_t r = amqp_publisher_confirm_wait(impl_->conn, &tv, &result);
-        if (r.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION &&
-            r.library_error == AMQP_STATUS_UNEXPECTED_STATE) {
-            // A frame that is not a confirm: for a mandatory publish, the
-            // basic.return the broker sends ahead of the ack of a message no
-            // queue is bound to receive.
-            clink::metrics::connector::error_inc(kLabel, "sink");
-            throw std::runtime_error(
-                impl_->opts.name +
-                ": the broker answered a publish with a frame other than a "
-                "confirm, which for a mandatory publish is the return of a message no queue is "
-                "bound to receive (exchange '" +
-                impl_->opts.exchange + "', routing key '" + impl_->opts.routing_key +
-                "'); bind a queue, or set mandatory='false' to let the "
-                "exchange drop such messages");
-        }
-        if (r.reply_type != AMQP_RESPONSE_NORMAL) {
-            clink::metrics::connector::error_inc(kLabel, "sink");
-            throw std::runtime_error(
-                detail::reply_error(r, impl_->opts.name + ": publisher confirm wait"));
-        }
-        if (result.method == AMQP_BASIC_ACK_METHOD) {
-            const auto& ack = result.payload.ack;
-            if (ack.multiple != 0) {
-                impl_->outstanding.erase(impl_->outstanding.begin(),
-                                         impl_->outstanding.upper_bound(ack.delivery_tag));
-            } else {
-                impl_->outstanding.erase(ack.delivery_tag);
-            }
-        } else {
-            // basic.nack or basic.reject: the broker could not durably accept the message.
-            clink::metrics::connector::error_inc(kLabel, "sink");
-            throw std::runtime_error(impl_->opts.name +
-                                     ": broker nacked/rejected a publish (delivery not confirmed)");
-        }
+    if (m.cancel_requested() && !m.outstanding.empty()) {
+        m.fail("cancelled before the broker confirmed every message; " + m.tally());
     }
-    amqp_maybe_release_buffers(impl_->conn);
+    (void)CLINK_FAULT_POINT(points::kSinkBeforeConfirm);
+    const auto t0 = std::chrono::steady_clock::now();
+    m.drain([&m] { return m.outstanding.empty(); }, "waiting for a flush's confirms");
+    m.interval_published = m.interval_acked = 0;
     const auto dt =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count();
@@ -152,11 +382,12 @@ void RabbitMqSink::flush() {
 }
 
 void RabbitMqSink::close() {
-    if (impl_->conn != nullptr) {
-        flush();  // deliver + confirm anything published since the last barrier (may throw)
-    }
-    detail::close_and_destroy(impl_->conn, kChannel);
-    impl_->conn = nullptr;
+    auto& m = *impl_;
+    // Unconfirmed messages are not waited for: a clean end of input flushes
+    // before close(), and a cancelled or failed task must not wait on the
+    // broker.
+    m.close_publisher(m.failure.empty() && !m.cancel_requested());
+    m.outstanding.clear();
 }
 
 std::string RabbitMqSink::name() const {
