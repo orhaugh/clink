@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**The PostgreSQL SELECT source repeats rows after a restore rather than skip
+them.** It resumed a restore at the row index its checkpoint held, after
+running its query again, so rows that had moved were skipped: a query without
+`ORDER BY` can return the same rows in another order, and a row deleted, added
+or changed among those emitted moves the rest. After one of the first four
+rows was deleted, the row that moved into fourth place was never emitted. The
+checkpoint now holds a hash of the rows emitted with their count, and a
+restore resumes after them only when the query's first rows hash the same;
+otherwise, and from an earlier release's checkpoint, it emits every row again
+and says so in its log. `batch_size` is read strictly. The record states that
+the source holds its whole result in memory and that a query once sent runs
+to the end before a cancel is seen. `PostgresSourceLive` holds the restore
+cases against the server, in a new `select` phase of `scripts/postgres-live.sh`.
+
 **The generic HTTP sink refuses a record its framing cannot carry, alone and
 before it is sent, and reads its options strictly.** Every record was written
 into the body as it was, so one record that was not JSON made a `json_array`
