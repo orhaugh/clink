@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+**The MQTT sink stays failed after a failed flush, fails a flush the broker
+refused, says what became of each message, and gives each sink a client id of
+its own.** After a failed flush the sink cleared what it had buffered and
+dropped its connection, so a later empty flush, and with it the next
+checkpoint, succeeded. `close()` flushed, even when the task was cancelled, and
+could throw, and a wait for acknowledgements could not be cancelled. The sink
+spoke only MQTT 3.1.1, which has no reason codes, so a message the broker
+refused and dropped, a publish its ACL denies for one, was acknowledged and
+counted as delivered. Every sink without a `client_id` connected as
+`clink-mqtt-sink-<subtask>`, and a broker disconnects a client when another
+connects with its id: two sinks built from the same options failed all 40 of
+their flushes. A failure said nothing of what had been acknowledged, and
+options were read leniently: `tls='TRUE'` connected in the clear, and a port
+past 65535 wrapped. Now any failure fails the sink until it is opened again
+and says how many messages were acknowledged, refused or left unacknowledged,
+with the broker's reason when it ended the connection. The sink speaks MQTT 5
+by default (`protocol_version='3.1.1'` keeps the old protocol), and a refusal
+fails the flush once every message is answered, naming the broker's reason.
+Unset, the client id is a random one of the sink's own, and
+`clean_session='false'` needs a `client_id`. Waits look at the task's cancel
+every 100 ms, a record past `max_record_bytes` (16 MiB) fails the sink before
+it is published, `max_bytes` 0 means 16 MiB rather than no bound, and
+`close()` discards and never throws. Options are read strictly, the shared
+connection options for the source too. The brokers gate gains an MQTT sinks
+phase: `MqttSinkContractLive` against Mosquitto 2.1, through a fault proxy and
+an ACL that refuses one subtree, and recovery cells that kill a worker before
+and after a barrier's acknowledgements.
+
 **The NATS JetStream sink stays failed after a refusal, says what became of
 each message, and cannot be held by a server that stops reading.** After a
 refusal the sink stayed open, and a later flush found nothing pending and
