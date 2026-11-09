@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**The flight recorder writes each epoch file whole or not at all.** A capture
+epoch was written in place, so a Worker that died while writing one, or a copy
+taken meanwhile, left a prefix that read as the whole epoch: the reader stops
+quietly at a short file, and a replay of it reproduced part of the epoch as if
+it were all of it. The file is now written beside its name and renamed into
+place. Incident verification also reports an epoch whose capture holds fewer
+records than its header counts as cut short, for files an earlier build wrote.
+
 **Incident evidence bundles: collect a job's evidence, verify it offline, and
 freeze a reproduced epoch as a regression test.** `clink incident-collect`
 gathers what one incident needs from a job's own directories - the checkpoint

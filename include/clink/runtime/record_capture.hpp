@@ -539,12 +539,26 @@ private:
             h.truncated = truncated_;
             h.records_seen = seen_;
             const auto bytes = encode_capture_file(h, events_, *codec_);
-            std::ofstream out(subdir / filename, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                throw std::runtime_error("cannot open " + (subdir / filename).string());
+            // Written beside its name and renamed into place, so an epoch file
+            // is whole or absent: a runner that dies mid-write, or a reader
+            // that copies it then, never sees a prefix that would replay as
+            // the whole epoch. A leftover .tmp matches no epoch file's name.
+            const auto final_path = subdir / filename;
+            auto tmp_path = final_path;
+            tmp_path += ".tmp";
+            {
+                std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+                if (!out) {
+                    throw std::runtime_error("cannot open " + tmp_path.string());
+                }
+                out.write(reinterpret_cast<const char*>(bytes.data()),
+                          static_cast<std::streamsize>(bytes.size()));
+                out.close();
+                if (!out) {
+                    throw std::runtime_error("cannot write " + tmp_path.string());
+                }
             }
-            out.write(reinterpret_cast<const char*>(bytes.data()),
-                      static_cast<std::streamsize>(bytes.size()));
+            std::filesystem::rename(tmp_path, final_path);
         } catch (const std::exception&) {
             // Best-effort: disarm this runner's capture; never fail the job.
             disarmed_ = true;
