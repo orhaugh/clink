@@ -75,6 +75,7 @@
 #include "clink/sql/row_kind.hpp"
 #include "clink/sql/table_api.hpp"
 #include "clink/sql/view.hpp"
+#include "clink/state/coalescing_backend.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/remote_pool.hpp"
 #include "clink/state/remote_read_backend.hpp"
@@ -19964,6 +19965,48 @@ TEST(UpsertSinkLifecycle, TheNettedMultiplicitySurvivesARestore) {
                                << "row live; an empty restore nets it to gone";
     if (!rows.empty()) {
         EXPECT_EQ(*rows.begin(), R"({"k":1,"v":"r"})");
+    }
+}
+
+// A backend that defers reads takes the view too. Over one, both sinks kept
+// nothing, and a restore lost the row whose last change predated the
+// checkpoint, and the netting sink its multiplicity.
+TEST(UpsertSinkLifecycle, ARestoreOverABackendThatDefersReadsKeepsTheView) {
+    ensure_sql_installed_once();
+    for (const char* op : {"file_json_upsert_sink", "changelog_net_sink"}) {
+        const auto path = std::filesystem::temp_directory_path() /
+                          ("deferred_restore_" + std::to_string(getpid()) + "_" + op + ".ndjson");
+        std::filesystem::remove(path);
+        std::map<std::string, std::string> params{{"path", path.string()}};
+        if (std::string{op} == "file_json_upsert_sink") {
+            params["primary_key"] = "k";
+        }
+        const OperatorId op_id{9974};
+        MetricsRegistry metrics;
+        auto backend = std::make_shared<InMemoryStateBackend>();
+        Snapshot snap;
+        {
+            clink::CoalescingBackend deferring(*backend);
+            ASSERT_TRUE(deferring.supports_async_get());
+            auto sink = build_sink(op, params);
+            RuntimeContext ctx{op_id, "deferred", &deferring, &metrics};
+            sink->attach_runtime(&ctx);
+            sink->open();
+            sink_feed(*sink, 1, "pre", kRowKindInsert);
+            snap = backend->snapshot(CheckpointId{1});
+        }
+        auto restored = std::make_shared<InMemoryStateBackend>();
+        restored->restore(snap);
+        clink::CoalescingBackend deferring2(*restored);
+        auto sink2 = build_sink(op, params);
+        RuntimeContext ctx2{op_id, "deferred", &deferring2, &metrics};
+        sink2->attach_runtime(&ctx2);
+        sink2->open();
+        sink_feed(*sink2, 2, "post", kRowKindInsert);
+        const auto rows = flushed_rows(*sink2, path);
+        std::filesystem::remove(path);
+        EXPECT_TRUE(rows.count(R"({"k":1,"v":"pre"})")) << op << ": k=1 lost across the restore";
+        EXPECT_TRUE(rows.count(R"({"k":2,"v":"post"})")) << op;
     }
 }
 

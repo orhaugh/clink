@@ -9542,9 +9542,14 @@ public:
     // Write-through means the snapshot captures the aligned view by construction
     // - the strict-write model the evicting window already uses. Deletes must
     // reach the backend too, or the row comes back at the NEXT restore.
+    //
+    // Every backend takes it. A backend that defers reads (remote-read://,
+    // forst://...?defer_reads=1) answers the synchronous put, erase and scan
+    // this needs, and the sink has no asynchronous path of its own; it used to
+    // be left out, so on one the sink kept nothing and a restore lost every row
+    // whose last change predated the checkpoint.
     void open() override {
-        persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
-                         !this->runtime()->state_backend()->supports_async_get();
+        persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend();
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan([&](const std::string& key, const Row& row) { state_[key] = row; });
         }
@@ -9749,8 +9754,7 @@ public:
     // above; the netted MULTIPLICITY must survive a restore, not just the row -
     // a count of 2 restored as 1 nets to empty one delete early.
     void open() override {
-        persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend() &&
-                         !this->runtime()->state_backend()->supports_async_get();
+        persist_inmem_ = this->runtime() != nullptr && this->runtime()->has_state_backend();
         if (persist_inmem_ && state_.empty()) {
             keyed_state_().scan([&](const std::string& key, const Slot& slot) {
                 if (slot.count > 0) {
