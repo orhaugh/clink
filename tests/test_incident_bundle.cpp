@@ -881,4 +881,81 @@ TEST_F(IncidentBundleTest, TheReportSaysWhatEachExitCodeMeans) {
     EXPECT_THROW((void)required_checks("everything", false), std::invalid_argument);
 }
 
+SelectionTally tally(std::uint64_t selected,
+                     std::uint64_t passed,
+                     std::uint64_t failed,
+                     std::uint64_t unavailable,
+                     std::uint64_t unsupported) {
+    SelectionTally t;
+    t.selected = selected;
+    for (const auto& [n, v] : {std::pair{passed, Verdict::Passed},
+                               {failed, Verdict::Failed},
+                               {unavailable, Verdict::Unavailable},
+                               {unsupported, Verdict::Unsupported}}) {
+        for (std::uint64_t i = 0; i < n; ++i) {
+            t.add(v);
+        }
+    }
+    return t;
+}
+
+TEST(IncidentSelection, PassesOnlyWhenEverySelectedItemWasCheckedAndPassed) {
+    EXPECT_EQ(tally(3, 3, 0, 0, 0).verdict(), Verdict::Passed);
+    // A bound that stopped after one of three: the rest are omitted, not
+    // dropped from the selection.
+    const auto bounded = tally(3, 1, 0, 0, 0);
+    EXPECT_EQ(bounded.verdict(), Verdict::Unavailable);
+    EXPECT_EQ(bounded.checked(), 1u);
+    EXPECT_EQ(bounded.omitted(), 2u);
+    EXPECT_EQ(tally(0, 0, 0, 0, 0).verdict(), Verdict::Unavailable) << "nothing selected";
+    EXPECT_EQ(tally(2, 1, 0, 1, 0).verdict(), Verdict::Unavailable);
+    // Supported and unsupported items together are not a pass.
+    EXPECT_EQ(tally(2, 1, 0, 0, 1).verdict(), Verdict::Unsupported);
+    EXPECT_EQ(tally(2, 0, 0, 0, 2).verdict(), Verdict::Unsupported);
+    // An unsupported item does not stand in for an omitted or unavailable one.
+    EXPECT_EQ(tally(3, 1, 0, 0, 1).verdict(), Verdict::Unavailable);
+    EXPECT_EQ(tally(3, 1, 0, 1, 1).verdict(), Verdict::Unavailable);
+}
+
+TEST(IncidentSelection, AFailureFailsTheSelectionWhateverTheRestShow) {
+    EXPECT_EQ(tally(1, 0, 1, 0, 0).verdict(), Verdict::Failed);
+    // Passed, unavailable, unsupported and omitted items beside one failure.
+    const auto mixed = tally(5, 1, 1, 1, 1);
+    EXPECT_EQ(mixed.omitted(), 1u);
+    EXPECT_EQ(mixed.verdict(), Verdict::Failed);
+}
+
+TEST(IncidentSelection, TheCountsAreReportedInTextAndJson) {
+    Report r;
+    r.bundle = "b";
+    r.profile = "replay";
+    r.required = required_checks("replay", false);
+    for (const auto& id : r.required) {
+        r.checks.push_back(check_with(id, Verdict::Passed));
+    }
+    auto& det = r.checks[r.checks.size() - 2];
+    ASSERT_EQ(det.id, "replay.determinism");
+    const auto t = tally(6, 1, 0, 0, 0);
+    det.verdict = t.verdict();
+    det.counts = t.counts();
+    EXPECT_EQ(r.exit_code(), 3) << "a bounded replay is a partial result";
+    EXPECT_NE(r.render_text().find("counts: selected 6, checked 1, passed 1, failed 0, "
+                                   "unavailable 0, unsupported 0, omitted 5"),
+              std::string::npos)
+        << r.render_text();
+    const auto json = clink::config::parse(r.render_json());
+    EXPECT_EQ(json.at("exit_code").as_int(), 3);
+    for (const auto& c : json.at("checks").as_array()) {
+        if (c.string_or("id", "") == "replay.determinism") {
+            const auto& counts = c.at("counts");
+            EXPECT_EQ(counts.at("selected").as_int(), 6);
+            EXPECT_EQ(counts.at("checked").as_int(), 1);
+            EXPECT_EQ(counts.at("passed").as_int(), 1);
+            EXPECT_EQ(counts.at("omitted").as_int(), 5);
+        } else {
+            EXPECT_FALSE(c.contains("counts")) << "only a check over a selection";
+        }
+    }
+}
+
 }  // namespace

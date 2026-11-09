@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**Incident verification no longer reports incomplete verification as
+success.** A replay check passed on the epochs it reached: with
+`--max-replays` below the selection, `incident-verify` replayed that many,
+passed `replay.determinism` and `replay.recorded_output`, and exited 0, and an
+operator that could not be compared did not hold back a pass. Each replay
+check now answers for the whole selection `--op`, `--subtask` and `--epoch`
+name, reports how many epochs it selected, checked and omitted, and passes
+only when every one was checked whole and passed; a failure anywhere still
+fails it, and anything less is a partial result (exit 3). A truncated
+capture's prefix no longer passes for its epoch. The example and
+`scripts/incident-gate.sh` now verify only under network isolation proven
+against a local control endpoint, and stop where it cannot be proven;
+`ALLOW_UNISOLATED=1` runs the example without it but exits 3, as does a run
+whose conformance check was unavailable, and the gate accepts neither. New
+cases in `tests/test_incident_replay.cpp`, `tests/test_incident_bundle.cpp`
+and `scripts/tests/test_network_isolation.py` cover each path.
+
 **The flight recorder writes each epoch file whole or not at all.** A capture
 epoch was written in place, so a Worker that died while writing one, or a copy
 taken meanwhile, left a prefix that read as the whole epoch: the reader stops

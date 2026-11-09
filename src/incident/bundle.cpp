@@ -123,6 +123,54 @@ int Report::exit_code() const {
     return 0;
 }
 
+void SelectionTally::add(Verdict v) noexcept {
+    switch (v) {
+        case Verdict::Passed:
+            ++passed;
+            break;
+        case Verdict::Failed:
+            ++failed;
+            break;
+        case Verdict::Unavailable:
+            ++unavailable;
+            break;
+        case Verdict::Unsupported:
+            ++unsupported;
+            break;
+    }
+}
+
+std::uint64_t SelectionTally::checked() const noexcept {
+    return passed + failed + unavailable + unsupported;
+}
+
+std::uint64_t SelectionTally::omitted() const noexcept {
+    return selected > checked() ? selected - checked() : 0;
+}
+
+Verdict SelectionTally::verdict() const noexcept {
+    if (failed > 0) {
+        return Verdict::Failed;
+    }
+    if (selected > 0 && passed == selected) {
+        return Verdict::Passed;
+    }
+    if (selected == 0 || unavailable > 0 || omitted() > 0) {
+        return Verdict::Unavailable;
+    }
+    return Verdict::Unsupported;
+}
+
+std::vector<std::pair<std::string, std::uint64_t>> SelectionTally::counts() const {
+    return {{"selected", selected},
+            {"checked", checked()},
+            {"passed", passed},
+            {"failed", failed},
+            {"unavailable", unavailable},
+            {"unsupported", unsupported},
+            {"omitted", omitted()}};
+}
+
 std::string Report::render_text() const {
     std::ostringstream out;
     out << "bundle:  " << bundle << "\n"
@@ -131,6 +179,13 @@ std::string Report::render_text() const {
         const bool req = std::find(required.begin(), required.end(), c.id) != required.end();
         out << "[" << to_string(c.verdict) << "] " << c.id << (req ? "" : " (not required)")
             << "\n    " << c.reason << "\n";
+        if (!c.counts.empty()) {
+            out << "    counts:";
+            for (std::size_t i = 0; i < c.counts.size(); ++i) {
+                out << (i == 0 ? " " : ", ") << c.counts[i].first << " " << c.counts[i].second;
+            }
+            out << "\n";
+        }
         for (const auto& d : c.details) {
             out << "    - " << d << "\n";
         }
@@ -177,7 +232,16 @@ std::string Report::render_json() const {
             ",\"required\":" + (req ? "true" : "false") + ",\"reason\":" + json_string(c.reason) +
             ",\"evidence\":" + json_strings(c.evidence) +
             ",\"next_action\":" + json_string(c.next_action) +
-            ",\"details\":" + json_strings(c.details) + "}";
+            ",\"details\":" + json_strings(c.details);
+        if (!c.counts.empty()) {
+            out += ",\"counts\":{";
+            for (std::size_t k = 0; k < c.counts.size(); ++k) {
+                out += (k == 0 ? "" : ",") + json_string(c.counts[k].first) + ":" +
+                       std::to_string(c.counts[k].second);
+            }
+            out += "}";
+        }
+        out += "}";
     }
     out += "],\"not_run\":[";
     bool first = true;
@@ -818,7 +882,8 @@ Check refused_check(const std::string& reason) {
                  .next_action =
                      "collect the bundle again with clink incident-collect, or check "
                      "where this copy came from",
-                 .details = {}};
+                 .details = {},
+                 .counts = {}};
 }
 
 // ---- the checks ---------------------------------------------------------------
@@ -833,7 +898,8 @@ Check bundle_manifest_check(const Bundle& b) {
                 "the manifest parses, is a known format and version, and every path in it "
                 "is relative and inside the bundle",
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     c.details.push_back("format " + std::string{kFormat} + " version " +
                         std::to_string(uint_at(b.manifest, "version")) + ", job " +
                         std::to_string(b.job()) + ", checkpoint " + std::to_string(b.checkpoint()));
@@ -852,7 +918,8 @@ Check bundle_artifacts_check(const Bundle& b) {
             .evidence = {"manifest.json"},
             .reason = {},
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     std::error_code ec;
     const auto canon_root = fs::weakly_canonical(b.root, ec);
     std::vector<std::string> problems;
@@ -997,7 +1064,8 @@ Check bundle_completeness_check(const Bundle& b) {
             .evidence = {"manifest.json"},
             .reason = {},
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     std::vector<std::string> missing;
     const auto completed = marker_path(b, b.checkpoint(), "COMPLETED-");
     if (b.find(completed) == nullptr) {
@@ -1091,7 +1159,8 @@ Check checkpoint_marker_check(const Bundle& b) {
             .evidence = {rel},
             .reason = {},
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     if (b.find(rel) == nullptr) {
         c.verdict = Verdict::Failed;
         c.reason = "the bundle selects checkpoint " + std::to_string(b.checkpoint()) +
@@ -1154,7 +1223,8 @@ Check checkpoint_restore_rule_check(const Bundle& b) {
             .evidence = {"checkpoint/_jobs/" + std::to_string(b.job()) + "/"},
             .reason = {},
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     const auto& job = b.manifest.at("job");
     if (!job.contains("commit_confirmation") || !job.at("commit_confirmation").is_bool()) {
         c.verdict = Verdict::Unavailable;
@@ -1227,7 +1297,8 @@ Check checkpoint_participants_check(const Bundle& b) {
             .evidence = {},
             .reason = {},
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     cluster::RestoreSource src;
     try {
         src = cluster::resolve_restore_source(
@@ -1314,7 +1385,8 @@ Check state_decode_check(const Bundle& b) {
             .evidence = {},
             .reason = {},
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     if (!b.contains("state")) {
         c.verdict = Verdict::Unavailable;
         c.reason = "the snapshots were not collected";
@@ -1377,7 +1449,8 @@ Check trace_structure_check(const Bundle& b) {
             .evidence = {},
             .reason = {},
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     if (!b.contains("traces")) {
         c.verdict = Verdict::Unavailable;
         c.reason = "no protocol traces were collected";
@@ -1487,7 +1560,8 @@ Check protocol_conformance_check(const Bundle& b, const VerifyOptions& o, const 
             .evidence = structure.evidence,
             .reason = {},
             .next_action = {},
-            .details = {}};
+            .details = {},
+            .counts = {}};
     if (!b.contains("traces")) {
         c.reason = "no protocol traces were collected";
         c.next_action = structure.next_action;
@@ -1659,7 +1733,8 @@ Check guarded(const char* id, Run&& run) {
                      .evidence = {},
                      .reason = std::string{"the check could not read its evidence: "} + e.what(),
                      .next_action = "collect the bundle again",
-                     .details = {}};
+                     .details = {},
+                     .counts = {}};
     }
 }
 
@@ -1693,7 +1768,8 @@ std::vector<Check> verify_core(const Bundle& b, const VerifyOptions& o) {
                                 .reason = "not run: the bundle's artifacts are not as its manifest "
                                           "lists them",
                                 .next_action = "collect the bundle again",
-                                .details = {}});
+                                .details = {},
+                                .counts = {}});
         }
         return out;
     }
@@ -1719,7 +1795,8 @@ std::vector<Check> verify_core(const Bundle& b, const VerifyOptions& o) {
             .reason = "offline verification reads no destination, so whether the job's sinks "
                       "hold what it wrote is not checked",
             .next_action = "compare the destination with the job's expected output where it lives",
-            .details = {}});
+            .details = {},
+            .counts = {}});
     }
     return out;
 }

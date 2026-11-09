@@ -456,103 +456,138 @@ std::string canonical_row(std::string_view line) {
     return out + "}";
 }
 
-struct Tally {
-    std::size_t passed{0};
-    std::size_t failed{0};
-    std::size_t unavailable{0};
-    std::size_t unsupported{0};
+using incident::SelectionTally;
 
-    void add(Verdict v) {
-        switch (v) {
-            case Verdict::Passed:
-                ++passed;
-                break;
-            case Verdict::Failed:
-                ++failed;
-                break;
-            case Verdict::Unavailable:
-                ++unavailable;
-                break;
-            case Verdict::Unsupported:
-                ++unsupported;
-                break;
-        }
-    }
-};
+// What a bound left unchecked, said the same way by every replay check.
+std::string omission_note(const SelectionTally& t, std::size_t max_replays) {
+    return std::to_string(t.omitted()) + " of the " + std::to_string(t.selected) +
+           " selected epochs were not checked: --max-replays=" + std::to_string(max_replays) +
+           " stopped the replay";
+}
 
-void conclude_determinism(Check& c, const Tally& t) {
-    if (t.failed > 0) {
-        c.verdict = Verdict::Failed;
-        c.reason = std::to_string(t.failed) + " captured epoch(s) replay differently twice";
-        c.next_action =
-            "replay the epoch with clink replay --verify; an operator that reads the "
-            "wall clock or iterates unordered state replays differently";
-    } else if (t.unavailable > 0) {
-        c.verdict = Verdict::Unavailable;
-        c.reason = std::to_string(t.unavailable) +
-                   " selected epoch(s) could not be replayed for want of evidence (" +
-                   std::to_string(t.passed) + " replayed identically)";
-        c.next_action = "collect with --include-state, which carries each epoch's starting state";
-    } else if (t.passed == 0) {
-        c.verdict = Verdict::Unsupported;
-        c.reason = "none of the selected operators can be replayed by this build";
-        c.next_action =
-            "replay a plugin operator with clink replay --plugin=<so>; operators on "
-            "other channels need their job plugin";
-    } else {
-        c.verdict = Verdict::Passed;
-        c.reason =
-            std::to_string(t.passed) + " captured epoch(s) replayed twice with identical emissions";
-        if (t.unsupported > 0) {
-            c.reason += "; " + std::to_string(t.unsupported) +
-                        " are of operators this build does not replay (listed)";
+std::string raise_or_narrow(const SelectionTally& t) {
+    return "raise --max-replays to at least " + std::to_string(t.selected) +
+           ", or narrow the selection with --op, --subtask and --epoch";
+}
+
+void conclude_determinism(Check& c, const SelectionTally& t, std::size_t max_replays) {
+    c.verdict = t.verdict();
+    c.counts = t.counts();
+    const auto of = " of the " + std::to_string(t.selected) + " selected epoch(s)";
+    switch (c.verdict) {
+        case Verdict::Failed:
+            c.reason = std::to_string(t.failed) + of +
+                       " did not replay identically twice, whatever the rest show (listed)";
+            c.next_action =
+                "replay the epoch with clink replay --verify; an operator that reads the "
+                "wall clock or iterates unordered state replays differently";
+            return;
+        case Verdict::Passed:
+            c.reason = "all " + std::to_string(t.selected) +
+                       " selected epoch(s) replayed twice with identical emissions. This is "
+                       "determinism, not agreement with production.";
+            return;
+        case Verdict::Unavailable: {
+            std::vector<std::string> parts;
+            if (t.omitted() > 0) {
+                parts.push_back(omission_note(t, max_replays));
+            }
+            if (t.unavailable > 0) {
+                parts.push_back(std::to_string(t.unavailable) +
+                                " could not be replayed whole for want of evidence (listed)");
+            }
+            if (t.unsupported > 0) {
+                parts.push_back(std::to_string(t.unsupported) +
+                                " are of operators this build does not replay");
+            }
+            parts.push_back(std::to_string(t.passed) + " replayed identically");
+            c.reason = "the selection is not fully checked: ";
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                c.reason += (i == 0 ? "" : "; ") + parts[i];
+            }
+            c.next_action = t.omitted() > 0
+                                ? raise_or_narrow(t)
+                                : "collect with --include-state, which carries each epoch's "
+                                  "starting state, from captures taken without a record cap";
+            return;
         }
-        c.reason += ". This is determinism, not agreement with production.";
+        case Verdict::Unsupported:
+            c.reason = std::to_string(t.unsupported) + of +
+                       " are of operators this build does not replay (listed); " +
+                       std::to_string(t.passed) +
+                       " replayed identically, which does not establish the selection";
+            c.next_action =
+                "narrow the selection with --op to operators this build replays, or replay "
+                "a plugin operator with clink replay --plugin=<so>";
+            return;
     }
 }
 
-void conclude_recorded(Check& c, const Tally& t, std::size_t reordered) {
-    if (t.failed > 0) {
-        c.verdict = Verdict::Failed;
-        c.reason = std::to_string(t.failed) +
-                   " replayed epoch(s) disagree with what production handed the downstream "
-                   "operator";
-        c.next_action =
-            "the replay does not reproduce production for these epochs: compare with "
-            "clink replay --out and clink replay-diff, and check the build is the "
-            "job's";
-        return;
-    }
-    if (t.unavailable > 0) {
-        c.verdict = Verdict::Unavailable;
-        c.reason = std::to_string(t.unavailable) +
-                   " selected epoch(s) could not be compared for want of evidence (listed); " +
-                   std::to_string(t.passed) + " equal what production did";
-        c.next_action =
-            "collect the downstream operators' captures too (no --op filter), untruncated, "
-            "with the job manifest (--ha-dir) and each epoch's starting state";
-        return;
-    }
-    if (t.passed == 0) {
-        c.verdict = Verdict::Unsupported;
-        c.reason =
-            "no selected epoch's operator feeds a captured operator as one stream, so "
-            "nothing could be compared with production";
-        c.next_action = "select an operator whose sole consumer is captured, at parallelism 1";
-        return;
-    }
-    c.verdict = Verdict::Passed;
-    c.reason = std::to_string(t.passed) +
-               " replayed epoch(s) equal, row for row, what production handed the "
-               "downstream operator";
-    if (reordered > 0) {
-        c.reason += "; in " + std::to_string(reordered) +
-                    " of them rows of different keys came in another order, which the "
-                    "engine does not fix, and each key's own rows in the same order";
-    }
-    if (t.unsupported > 0) {
-        c.reason +=
-            "; " + std::to_string(t.unsupported) + " cannot be compared by their topology (listed)";
+void conclude_recorded(Check& c,
+                       const SelectionTally& t,
+                       std::size_t reordered,
+                       std::size_t max_replays) {
+    c.verdict = t.verdict();
+    c.counts = t.counts();
+    const auto of = " of the " + std::to_string(t.selected) + " selected epoch(s)";
+    switch (c.verdict) {
+        case Verdict::Failed:
+            c.reason = std::to_string(t.failed) + of +
+                       " disagree with what production handed the downstream operator, "
+                       "whatever the rest show (listed)";
+            c.next_action =
+                "the replay does not reproduce production for these epochs: compare with "
+                "clink replay --out and clink replay-diff, and check the build is the "
+                "job's";
+            return;
+        case Verdict::Passed:
+            c.reason = "all " + std::to_string(t.selected) +
+                       " selected epoch(s) equal, row for row, what production handed the "
+                       "downstream operator";
+            if (reordered > 0) {
+                c.reason += "; in " + std::to_string(reordered) +
+                            " of them rows of different keys came in another order, which the "
+                            "engine does not fix, and each key's own rows in the same order";
+            }
+            return;
+        case Verdict::Unavailable: {
+            std::vector<std::string> parts;
+            if (t.omitted() > 0) {
+                parts.push_back(omission_note(t, max_replays));
+            }
+            if (t.unavailable > 0) {
+                parts.push_back(std::to_string(t.unavailable) +
+                                " could not be compared for want of evidence");
+            }
+            if (t.unsupported > 0) {
+                parts.push_back(std::to_string(t.unsupported) +
+                                " cannot be compared, by their topology or because this build "
+                                "does not replay their operator");
+            }
+            parts.push_back(std::to_string(t.passed) + " equal what production did");
+            c.reason = "the selection is not fully checked: ";
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                c.reason += (i == 0 ? "" : "; ") + parts[i];
+            }
+            c.next_action =
+                t.omitted() > 0
+                    ? raise_or_narrow(t)
+                    : "collect the downstream operators' captures too (no --ops filter), "
+                      "untruncated, with the job manifest (--ha-dir) and each epoch's starting "
+                      "state";
+            return;
+        }
+        case Verdict::Unsupported:
+            c.reason = std::to_string(t.unsupported) + of +
+                       " cannot be compared (listed): the operator feeds a sink, is not one "
+                       "single-input operator at parallelism 1, or is not replayed by this "
+                       "build; " +
+                       std::to_string(t.passed) +
+                       " equal what production did, which does not establish the selection";
+            c.next_action =
+                "narrow the selection with --op to operators this build replays whose sole "
+                "consumer is captured";
+            return;
     }
 }
 
@@ -616,7 +651,7 @@ std::optional<std::map<std::string, std::vector<std::string>>> rows_by_key(
 // restored from a snapshot, and an operator that fires many keys at once may
 // visit them in another order. Anything else fails.
 void compare_with_recorded(Check& c,
-                           Tally& t,
+                           SelectionTally& t,
                            std::size_t& reordered,
                            const Entry& e,
                            const CapturedSpec& spec,
@@ -685,17 +720,24 @@ void compare_with_recorded(Check& c,
 // The selected epochs of one operator's subtask, replayed each from its own
 // starting state, against an independent expectation of their emissions. An
 // expectation need not know which epoch a row fell in, nor the order within
-// one, so the comparison is of multisets.
+// one, so the comparison is of multisets. A row the replay emitted that the
+// expectation does not hold fails it, however much of the selection was
+// replayed. Otherwise it passes only when every epoch the expectation covers
+// was replayed whole and the rows are the expected ones; a selection a bound
+// or missing evidence left incomplete is a partial result.
 Check expected_check(const Restores& restores,
                      const std::string& path,
-                     const std::vector<std::pair<Entry, Replayed>>& runs) {
+                     const std::vector<Entry>& selection,
+                     const std::vector<std::pair<Entry, Replayed>>& runs,
+                     std::size_t max_replays) {
     Check c{.id = "replay.expected_output",
             .verdict = Verdict::Unavailable,
             .evidence = {path},
             .reason = {},
             .next_action = {},
-            .details = {}};
-    if (runs.empty()) {
+            .details = {},
+            .counts = {}};
+    if (selection.empty()) {
         c.reason = "no captured epoch is selected to compare with it";
         c.next_action = "select an operator with --op, and its epochs with --epoch or none";
         return c;
@@ -707,44 +749,52 @@ Check expected_check(const Restores& restores,
         c.reason = restores.error;
         return c;
     }
-    const auto discarded = [&](const Entry& e) {
-        return incident::epoch_discarded(restores.known, e.epoch);
-    };
-    for (const auto& [entry, run] : runs) {
-        if (entry.op != runs.front().first.op || entry.subtask != runs.front().first.subtask) {
+    for (const auto& e : selection) {
+        if (e.op != selection.front().op || e.subtask != selection.front().subtask) {
             c.reason =
                 "an expected output describes one operator's subtask, and the selection "
                 "spans several";
             c.next_action = "select one with --op and --subtask";
             return c;
         }
-        if (discarded(entry)) {
-            c.details.push_back(entry_name(entry) +
-                                ": left out, as the run that processed it was discarded by the "
-                                "restore the RESTORED record describes");
-            continue;
-        }
-        c.evidence.push_back(entry.path);
-        if (run.verdict != Verdict::Passed) {
-            c.reason = entry_name(entry) + " did not replay: " + run.note;
-            c.next_action = "see replay.determinism";
-            return c;
-        }
-        // A union with part of an epoch missing is not what an expectation
-        // of the whole describes.
-        if (run.partial) {
-            c.reason = entry_name(entry) +
-                       "'s capture holds only part of the epoch, so the selection's rows "
-                       "cannot be compared with an expectation of all of them";
-            c.next_action =
-                "run the job with a --capture-records past the epoch's records, or "
-                "compare an expectation of the part";
-            return c;
+    }
+    const auto discarded = [&](const Entry& e) {
+        return incident::epoch_discarded(restores.known, e.epoch);
+    };
+    SelectionTally t;
+    for (const auto& e : selection) {
+        if (!discarded(e)) {
+            ++t.selected;
         }
     }
-    std::vector<std::string> want;
     std::vector<std::string> got;
+    std::vector<std::string> want;
     try {
+        for (const auto& [entry, run] : runs) {
+            if (discarded(entry)) {
+                c.details.push_back(entry_name(entry) +
+                                    ": left out, as the run that processed it was discarded by "
+                                    "a recorded restore");
+                continue;
+            }
+            c.evidence.push_back(entry.path);
+            if (run.verdict == Verdict::Passed && !run.partial) {
+                t.add(Verdict::Passed);
+                for (const auto& row : run.rows) {
+                    got.push_back(canonical_row(row));
+                }
+                continue;
+            }
+            // Part of an epoch, or none of it, is not what an expectation of
+            // the whole describes.
+            t.add(run.verdict == Verdict::Unsupported ? Verdict::Unsupported
+                                                      : Verdict::Unavailable);
+            c.details.push_back(entry_name(entry) + ": not compared - " +
+                                (run.verdict == Verdict::Passed
+                                     ? std::string{"the capture was truncated, so it holds only "
+                                                   "part of the epoch"}
+                                     : "it did not replay: " + run.note));
+        }
         std::ifstream in(path);
         if (!in) {
             throw std::runtime_error("cannot read " + path);
@@ -755,46 +805,79 @@ Check expected_check(const Restores& restores,
                 want.push_back(canonical_row(line));
             }
         }
-        for (const auto& [entry, run] : runs) {
-            if (discarded(entry)) {
-                continue;
-            }
-            for (const auto& row : run.rows) {
-                got.push_back(canonical_row(row));
-            }
-        }
     } catch (const std::exception& ex) {
         c.verdict = Verdict::Failed;
         c.reason = std::string{"the expected output does not read: "} + ex.what();
         c.next_action = "give one JSON object per line, one per expected row";
+        c.counts = t.counts();
         return c;
     }
+    c.counts = t.counts();
     std::sort(want.begin(), want.end());
     std::sort(got.begin(), got.end());
-    const auto span = std::to_string(runs.size()) + " epoch(s)";
-    if (want == got) {
-        c.verdict = Verdict::Passed;
-        c.reason = "the replay's " + std::to_string(got.size()) + " emissions across " + span +
-                   " equal the expected rows, as a multiset; how independent the expectation "
-                   "is rests with whoever produced it";
-        return c;
-    }
-    c.verdict = Verdict::Failed;
-    c.reason = "the replay's emissions across " + span + " are not the expected rows (" +
-               std::to_string(got.size()) + " against " + std::to_string(want.size()) + ")";
-    c.next_action = "decide which is wrong: the job's result or the expectation";
     std::vector<std::string> only_got;
     std::vector<std::string> only_want;
     std::set_difference(
         got.begin(), got.end(), want.begin(), want.end(), std::back_inserter(only_got));
     std::set_difference(
         want.begin(), want.end(), got.begin(), got.end(), std::back_inserter(only_want));
-    for (std::size_t i = 0; i < only_got.size() && i < 10; ++i) {
-        c.details.push_back("only in the replay: " + only_got[i]);
+    const auto list = [&](const std::vector<std::string>& rows, const char* label) {
+        for (std::size_t i = 0; i < rows.size() && i < 10; ++i) {
+            c.details.push_back(std::string{label} + rows[i]);
+        }
+    };
+    const bool complete = t.selected > 0 && t.passed == t.selected;
+    if (!only_got.empty()) {
+        c.verdict = Verdict::Failed;
+        c.reason = "the replay emitted " + std::to_string(only_got.size()) +
+                   " row(s) the expectation does not hold, across the " + std::to_string(t.passed) +
+                   " epoch(s) compared" +
+                   (complete ? std::string{}
+                             : "; that stands whatever the epochs not compared would show");
+        c.next_action = "decide which is wrong: the job's result or the expectation";
+        list(only_got, "only in the replay: ");
+        if (complete) {
+            list(only_want, "only expected: ");
+        }
+        return c;
     }
-    for (std::size_t i = 0; i < only_want.size() && i < 10; ++i) {
-        c.details.push_back("only expected: " + only_want[i]);
+    if (complete) {
+        if (only_want.empty()) {
+            c.verdict = Verdict::Passed;
+            c.reason = "the replay's " + std::to_string(got.size()) + " emissions across all " +
+                       std::to_string(t.selected) +
+                       " selected epoch(s) equal the expected rows, as a multiset; how "
+                       "independent the expectation is rests with whoever produced it";
+            return c;
+        }
+        c.verdict = Verdict::Failed;
+        c.reason = "the replay of every selected epoch emitted " + std::to_string(got.size()) +
+                   " row(s), and the expectation holds " + std::to_string(only_want.size()) +
+                   " more it did not emit";
+        c.next_action = "decide which is wrong: the job's result or the expectation";
+        list(only_want, "only expected: ");
+        return c;
     }
+    // Every row replayed is an expected one, and the selection is incomplete:
+    // the expected rows not emitted may belong to the epochs not compared.
+    c.verdict = t.verdict();
+    std::vector<std::string> parts;
+    if (t.omitted() > 0) {
+        parts.push_back(omission_note(t, max_replays));
+    }
+    if (t.unavailable + t.unsupported > 0) {
+        parts.push_back(std::to_string(t.unavailable + t.unsupported) +
+                        " were not compared (listed)");
+    }
+    c.reason = "the selection is not fully checked: ";
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        c.reason += (i == 0 ? "" : "; ") + parts[i];
+    }
+    c.reason += "; the " + std::to_string(got.size()) + " row(s) of the " +
+                std::to_string(t.passed) + " epoch(s) compared are all expected, and " +
+                std::to_string(only_want.size()) + " expected row(s) cannot be judged";
+    c.next_action = t.omitted() > 0 ? raise_or_narrow(t)
+                                    : "see replay.determinism for why the rest did not replay";
     return c;
 }
 
@@ -804,7 +887,8 @@ Check replay_check(const char* id) {
                  .evidence = {},
                  .reason = {},
                  .next_action = {},
-                 .details = {}};
+                 .details = {},
+                 .counts = {}};
 }
 
 }  // namespace
@@ -814,18 +898,17 @@ std::vector<Check> incident_replay_checks(const Bundle& b, const IncidentReplayO
     auto rec = replay_check("replay.recorded_output");
     const auto& all = b.captures;
     const auto restores = read_restores(b);
-    std::vector<Entry> chosen;
-    std::copy_if(all.begin(), all.end(), std::back_inserter(chosen), [&](const Entry& e) {
+    // The selection --op, --subtask and --epoch name is the scope every check
+    // answers for. --max-replays bounds how much of it one run replays; what it
+    // leaves out is counted as omitted, never dropped from the scope.
+    std::vector<Entry> selection;
+    std::copy_if(all.begin(), all.end(), std::back_inserter(selection), [&](const Entry& e) {
         return selected(e, o);
     });
-    const auto selected_count = chosen.size();
-    if (chosen.size() > o.max_replays) {
-        det.details.push_back("only the first " + std::to_string(o.max_replays) + " of " +
-                              std::to_string(chosen.size()) +
-                              " selected epochs are replayed; narrow with --op and --epoch");
-        chosen.resize(o.max_replays);
-    }
-    if (chosen.empty()) {
+    SelectionTally det_t;
+    det_t.selected = selection.size();
+    SelectionTally rec_t = det_t;
+    if (selection.empty()) {
         det.reason = b.contains("captures")
                          ? "no captured epoch in the bundle matches the selection"
                          : "the bundle holds no captured epochs";
@@ -833,29 +916,47 @@ std::vector<Check> incident_replay_checks(const Bundle& b, const IncidentReplayO
                               ? "check --op, --subtask and --epoch against the manifest's captures"
                               : "run the job with --capture-dir and collect with "
                                 "--include-captures";
+        det.counts = det_t.counts();
         rec.reason = det.reason;
         rec.next_action = det.next_action;
+        rec.counts = rec_t.counts();
         std::vector<Check> out{det, rec};
         if (!o.expected_path.empty()) {
-            out.push_back(expected_check(restores, o.expected_path, {}));
+            out.push_back(expected_check(restores, o.expected_path, selection, {}, o.max_replays));
         }
         return out;
     }
+    const auto replayed = std::min<std::size_t>(selection.size(), o.max_replays);
+    if (replayed < selection.size()) {
+        std::string names;
+        for (std::size_t i = replayed; i < selection.size() && i < replayed + 5; ++i) {
+            names += (names.empty() ? "" : ", ") + entry_name(selection[i]);
+        }
+        if (selection.size() > replayed + 5) {
+            names += ", and " + std::to_string(selection.size() - replayed - 5) + " more";
+        }
+        const auto line =
+            "not checked, beyond --max-replays=" + std::to_string(o.max_replays) + ": " + names;
+        det.details.push_back(line);
+        rec.details.push_back(line);
+    }
 
     const auto graph = bundle_graph(b);
-    Tally det_tally;
-    Tally rec_tally;
     std::size_t reordered = 0;
     std::vector<std::pair<Entry, Replayed>> runs;
-    for (const auto& e : chosen) {
+    for (std::size_t i = 0; i < replayed; ++i) {
+        const auto& e = selection[i];
         det.evidence.push_back(e.path);
         auto r = replay_twice(b, restores, e);
-        det_tally.add(r.verdict);
-        det.details.push_back(entry_name(e) + ": " + incident::to_string(r.verdict) + " - " +
-                              r.note);
+        // A truncated capture's stored prefix replaying identically does not
+        // establish the epoch: the records past the cap were never replayed.
+        const auto verdict =
+            r.verdict == Verdict::Passed && r.partial ? Verdict::Unavailable : r.verdict;
+        det_t.add(verdict);
+        det.details.push_back(entry_name(e) + ": " + incident::to_string(verdict) + " - " + r.note);
         if (r.verdict == Verdict::Passed && !r.partial) {
             compare_with_recorded(rec,
-                                  rec_tally,
+                                  rec_t,
                                   reordered,
                                   e,
                                   captured_spec(b, e),
@@ -866,8 +967,8 @@ std::vector<Check> incident_replay_checks(const Bundle& b, const IncidentReplayO
             // being made: an operator this build cannot replay cannot be
             // compared either, and a replay without its evidence, or with part
             // of it, has nothing to compare.
-            rec_tally.add(r.verdict == Verdict::Unsupported ? Verdict::Unsupported
-                                                            : Verdict::Unavailable);
+            rec_t.add(r.verdict == Verdict::Unsupported ? Verdict::Unsupported
+                                                        : Verdict::Unavailable);
             rec.details.push_back(entry_name(e) + ": not compared - " +
                                   (r.verdict == Verdict::Passed
                                        ? std::string{"the capture was truncated, so it holds "
@@ -876,24 +977,11 @@ std::vector<Check> incident_replay_checks(const Bundle& b, const IncidentReplayO
         }
         runs.emplace_back(e, std::move(r));
     }
-    conclude_determinism(det, det_tally);
-    conclude_recorded(rec, rec_tally, reordered);
+    conclude_determinism(det, det_t, o.max_replays);
+    conclude_recorded(rec, rec_t, reordered, o.max_replays);
     std::vector<Check> out{det, rec};
     if (!o.expected_path.empty()) {
-        if (selected_count > runs.size()) {
-            // A union of some of the selected epochs is not what the
-            // expectation describes.
-            Check exp = replay_check("replay.expected_output");
-            exp.evidence = {o.expected_path};
-            exp.reason = "the selection holds " + std::to_string(selected_count) +
-                         " epochs, more than the " + std::to_string(runs.size()) +
-                         " one run replays, so their union cannot be compared";
-            exp.next_action =
-                "narrow the selection with --epoch, or raise --max-replays to cover it";
-            out.push_back(exp);
-        } else {
-            out.push_back(expected_check(restores, o.expected_path, runs));
-        }
+        out.push_back(expected_check(restores, o.expected_path, selection, runs, o.max_replays));
     }
     return out;
 }

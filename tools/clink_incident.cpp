@@ -139,9 +139,12 @@ void verify_usage() {
         << "Checks a bundle offline: no cluster, no service, no network. Each check reports\n"
         << "passed, failed, unavailable or unsupported, with the evidence it used, the\n"
         << "reason and the next action. A profile names the checks a run requires\n"
-        << "(default consistency). --expected compares one replayed epoch with an\n"
-        << "independent expectation, one JSON object per line. At most --max-replays\n"
-        << "epochs (default 64) replay per run.\n"
+        << "(default consistency). --op, --subtask and --epoch select the captured\n"
+        << "epochs the replay checks answer for (default all of them). --max-replays\n"
+        << "(default 64) bounds how many of them one run replays; the rest count as not\n"
+        << "checked, and a replay check passes only when every selected epoch was\n"
+        << "checked and passed. --expected compares the selected epochs of one\n"
+        << "operator subtask with an independent expectation, one JSON object per line.\n"
         << "\n"
         << "Exit status: 0 every required check passed, 1 a check failed, 3 a partial\n"
         << "result (nothing failed, but a required check is unavailable or unsupported),\n"
@@ -414,7 +417,8 @@ int clink_cmd_incident_verify(int argc, char** argv) {
                             .reason =
                                 "the bundle's artifacts are not intact, so nothing is replayed",
                             .next_action = "see bundle.artifacts",
-                            .details = {}});
+                            .details = {},
+                            .counts = {}});
                     }
                 }
             }

@@ -11,16 +11,27 @@
 // replay.recorded_output
 //                      the replay's rows equal the rows production handed the
 //                      operator's single downstream operator in the same
-//                      epoch, read from that operator's own capture. Only where
-//                      the topology makes those the same stream (one consumer,
-//                      one input, one subtask on both sides) and neither
-//                      capture was truncated; unavailable otherwise.
+//                      epoch, read from that operator's own capture. An epoch
+//                      whose topology does not make those the same stream (one
+//                      consumer, one input, one subtask on both sides) is
+//                      unsupported; one whose capture, or its consumer's, is
+//                      missing or truncated is unavailable.
 // replay.expected_output
 //                      the selected epochs of one operator's subtask, each
 //                      replayed from its own starting state, emit an
 //                      independent expectation's rows, given as NDJSON and
 //                      compared as multisets (an expectation need not know
 //                      which epoch a row fell in, nor the order within one).
+//
+// The selection op, subtask and epoch name is the scope every check answers
+// for; max_replays bounds how many of its epochs one call replays, and the
+// epochs past it are counted as omitted, never dropped from the scope. Each
+// check reports the selection's counts (incident::SelectionTally) and concludes
+// from them: failed when any epoch failed, whatever the rest show; passed only
+// when every selected epoch was checked whole and passed; otherwise
+// unavailable when an epoch was omitted or lacked evidence (a truncated capture
+// lacks the records past its cap), and unsupported when the only gap is epochs
+// this build cannot replay or compare.
 //
 // No check writes outside the system's temporary directory or contacts a
 // service: a replay rebuilds the operator from the binary's own registry,

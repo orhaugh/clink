@@ -36,7 +36,8 @@ std::vector<clink::incident::Check> clink_incident_replay_checks(
             .evidence = {},
             .reason = kNoSql,
             .next_action = "verify with a clink built with -DCLINK_BUILD_SQL=ON",
-            .details = {}});
+            .details = {},
+            .counts = {}});
     }
     return out;
 }

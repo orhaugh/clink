@@ -102,8 +102,20 @@ validates nothing.
 Two replays agreeing establishes determinism, not agreement with production;
 only `replay.recorded_output` compares with what production did, and only
 where production's output was captured. A truncated capture can establish
-neither for the whole epoch: the replay check reports it truncated and the
-recorded-output check unavailable.
+neither for the whole epoch: every replay check reports it unavailable, and
+the determinism check's details say whether its stored prefix agreed with
+itself.
+
+Each replay check answers for the selection `--op`, `--subtask` and `--epoch`
+name, every captured epoch when none is given, and reports how many epochs it
+selected and what became of each. `--max-replays` bounds how many one run
+replays; the rest are counted as omitted, never dropped from the selection.
+A check fails when any selected epoch failed, whatever the others show, so a
+divergence is never hidden behind missing evidence elsewhere. It passes only
+when every selected epoch was checked whole and passed. Otherwise an omitted
+epoch or one without its evidence makes it unavailable, and one it cannot
+replay or compare makes it unsupported: a partial result either way, which a
+smaller selection or a larger bound can complete.
 
 An epoch replays from the checkpoint its events were processed from: the one
 before it, except for a restored run's first epoch, which starts from the
@@ -206,4 +218,9 @@ reconciliation, signing.
   truncated-capture cases.
 - A runnable example, `examples/incident-verification/`, with a worker killed
   at an asserted point and an independent oracle, which is also the
-  integration gate.
+  integration gate. Its verifications run under the operating system's
+  network isolation, proven first on that machine against a local control
+  endpoint (`scripts/network-isolation.sh`). A run without it, which only an
+  explicit development override allows, and a run whose conformance check
+  was unavailable are never a qualification: the example exits 3 and the gate
+  fails.

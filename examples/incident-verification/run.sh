@@ -7,7 +7,8 @@
 # kills the Worker running it right after it publishes a snapshot, lets the job
 # recover on the other Worker, then:
 #   1. collects the incident's evidence into a bundle and moves it elsewhere;
-#   2. verifies the bundle offline, with network access denied;
+#   2. verifies the bundle offline, with network access denied and the denial
+#      proven first (scripts/network-isolation.sh);
 #   3. replays the job's window operator across every captured epoch and
 #      compares it with an oracle that reads nothing the job wrote;
 #   4. freezes the restored run's first epoch as a regression test and runs it;
@@ -19,8 +20,17 @@
 # fault injection compiled in, as a build with tests has it), python3 and curl.
 # Everything runs on this machine on 127.0.0.1. WORK names the directory it
 # writes to (default a new temporary one); results/ inside it keeps the
-# reports, the logs and summary.txt. Exits 0 only when every step shows what
-# it should.
+# reports, the logs and summary.txt.
+#
+# Exits 0 only when every step ran and showed what it should, with every
+# verification isolated from the network; 1 when a step does not show what it
+# should; and 3 when the steps that ran passed but the run is not a
+# qualification: protocol.conformance was unavailable (the pinned TLC jars are
+# not cached), so the steps that need it did not run; a verification ran
+# without isolation, which ALLOW_UNISOLATED=1 permits where no isolation can be
+# proven (a development mode, never a qualification); or one of the isolation
+# library's test-only variables chose how isolation was proven. Without the
+# opt-in a machine that cannot prove isolation fails the run before it starts.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -55,6 +65,9 @@ cleanup() {
 trap cleanup EXIT
 
 say() { printf '\n==> %s\n' "$*" | tee -a "${R}/summary.txt"; }
+# Why a run whose steps passed is still not a qualification, "; "-separated.
+partial=""
+not_qualifying() { partial="${partial}${partial:+; }$*"; }
 note() { printf '    %s\n' "$*" | tee -a "${R}/summary.txt"; }
 fail() { printf 'run.sh: FAILED: %s\n' "$*" | tee -a "${R}/summary.txt" >&2; exit 1; }
 now() { python3 -c 'import time; print(time.time())'; }
@@ -67,16 +80,30 @@ await_http() {
 verdict() { python3 -c "import json, sys
 r = json.load(open(sys.argv[1]))
 print(next((c['verdict'] for c in r['checks'] if c['id'] == sys.argv[2]), 'absent'))" "$1" "$2"; }
-# Verify, with the network denied where this machine can deny it.
-offline() {
-    if [ "$(uname)" = Darwin ]; then
-        sandbox-exec -p '(version 1)(allow default)(deny network*)' "$@"
-    elif unshare -rn true 2>/dev/null; then
-        unshare -rn "$@"
-    else
-        "$@"
+# offline <command...>: run under network isolation proven by
+# isolation_establish (sandbox-exec on macOS, unshare -rn on Linux). Every
+# command that reads the bundle once it has moved runs under it.
+. "${HERE}/../../scripts/network-isolation.sh"
+
+say "Proving network isolation for the offline verification"
+# The library's test-only settings choose the mechanism or the control
+# endpoint, and a control endpoint that answers once would pass any wrapper
+# for isolation: a run that uses one is not a qualification.
+for override in CLINK_ISOLATION CLINK_ISOLATION_COMMAND CLINK_ISOLATION_OS \
+    CLINK_ISOLATION_PROBE_URL; do
+    if [ -n "${!override:-}" ]; then
+        note "NOT A QUALIFICATION: ${override} is set; only the platform's own isolation qualifies"
+        not_qualifying "${override} chose how isolation was proven"
     fi
-}
+done
+if isolation_establish; then
+    note "${ISOLATION_DETAIL}"
+elif [ "${ALLOW_UNISOLATED:-0}" = 1 ]; then
+    note "NOT A QUALIFICATION: network isolation is ${ISOLATION_STATE} (${ISOLATION_DETAIL});"
+    note "verification will run without it, as ALLOW_UNISOLATED=1 asks"
+else
+    fail "network isolation is ${ISOLATION_STATE}: ${ISOLATION_DETAIL}. Offline verification runs only with the network denied; ALLOW_UNISOLATED=1 runs the demonstration without it, which is never a qualification"
+fi
 
 say "Starting the feed (${RECORDS} records at ${RATE}/s), a Coordinator and worker-1"
 python3 "${HERE}/feed.py" --port="${FEED_PORT}" --records="${RECORDS}" --rate="${RATE}" \
@@ -221,18 +248,12 @@ PY
 [ -n "${window_op}" ] || fail "the bundle holds no capture of the window operator"
 python3 "${HERE}/oracle.py" --records="${RECORDS}" --shape=window >"${R}/oracle-window.ndjson"
 
-say "Verifying offline with the network denied (profile full)"
-if [ "$(uname)" = Darwin ]; then
-    if sandbox-exec -p '(version 1)(allow default)(deny network*)' \
-        curl -fsS -m 2 "http://127.0.0.1:${COORD_HTTP}/" >/dev/null 2>&1; then
-        fail "the sandbox does not deny the network"
-    fi
-    note "network denied with sandbox-exec"
-elif unshare -rn true 2>/dev/null; then
-    note "network denied with unshare -rn"
+if [ "${ISOLATION_STATE}" = enforced ]; then
+    say "Verifying offline with the network denied (profile full)"
 else
-    note "no way to deny the network here; verifying without the sandbox"
+    say "Verifying offline WITHOUT network isolation (profile full), which is not a qualification"
 fi
+note "isolation: ${ISOLATION_STATE} (${ISOLATION_MECHANISM})"
 start=$(now)
 set +e
 offline "${BIN}/clink" incident-verify "${B}" --profile=full --op="${window_op}" \
@@ -251,7 +272,10 @@ done
 conformance=$(verdict "${R}/verify-full.json" protocol.conformance)
 case "${conformance}:${code}" in
     passed:0) note "every check passed, the TLC trace validator included" ;;
-    unavailable:3) note "every check passed but protocol.conformance, unavailable here: a partial result (exit 3)" ;;
+    unavailable:3)
+        note "every check passed but protocol.conformance, unavailable here: a partial result (exit 3)"
+        not_qualifying "protocol.conformance was unavailable (the pinned TLC jars are not cached), so the forbidden trace and the unmodelled run were not checked"
+        ;;
     *) fail "protocol.conformance is ${conformance} with exit ${code}" ;;
 esac
 note "verified in ${verify_s} s"
@@ -334,9 +358,9 @@ PY
 fi
 
 say "Freezing the restored run's first epoch (${next}) as a regression test"
-"${BIN}/clink" incident-regress "${B}" --op="${window_op}" --epoch="${next}" \
+offline "${BIN}/clink" incident-regress "${B}" --op="${window_op}" --epoch="${next}" \
     --out="${WORK}/regression" | tee -a "${R}/summary.txt"
-"${BIN}/clink" replay --run-test="${WORK}/regression" | tee -a "${R}/summary.txt"
+offline "${BIN}/clink" replay --run-test="${WORK}/regression" | tee -a "${R}/summary.txt"
 python3 - "${WORK}/regression/golden.ndjson" <<'PY'
 import sys
 p = sys.argv[1]
@@ -344,10 +368,12 @@ lines = open(p).read().splitlines()
 lines[0] = lines[0].replace('"total":', '"total":1', 1)
 open(p, "w").write("\n".join(lines) + "\n")
 PY
-if "${BIN}/clink" replay --run-test="${WORK}/regression" >"${R}/regression-doctored.txt" 2>&1; then
-    fail "a doctored golden still passed"
-fi
-note "with its golden doctored it fails: $(head -c 300 "${R}/regression-doctored.txt")"
+set +e
+offline "${BIN}/clink" replay --run-test="${WORK}/regression" >"${R}/regression-doctored.txt" 2>&1
+code=$?
+set -e
+[ "${code}" = 1 ] || fail "a doctored golden gave exit ${code}, not a failure (1)"
+note "with its golden doctored it fails: $(grep -v '^offline: ' "${R}/regression-doctored.txt" | head -c 300)"
 
 say "An incomplete bundle (no snapshots) gives a partial result"
 set +e
@@ -387,4 +413,11 @@ files = sum(len(f) for _, _, f in os.walk(sys.argv[5]))
 json.dump({"collect_seconds": float(sys.argv[2]), "verify_full_seconds": float(sys.argv[3]),
            "bundle_kib": int(sys.argv[4]), "bundle_files": files}, open(sys.argv[1], "w"), indent=2)
 PY
-say "Done: every step showed what it should. Results in ${R}"
+if ! isolation_qualifies; then
+    not_qualifying "verification ran without network isolation (${ISOLATION_STATE})"
+fi
+if [ -n "${partial}" ]; then
+    say "NOT A QUALIFICATION: every step that ran showed what it should, but ${partial}. Results in ${R}"
+    exit 3
+fi
+say "Done: every step showed what it should, every verification isolated from the network. Results in ${R}"

@@ -55,6 +55,32 @@ struct Check {
     std::string reason;
     std::string next_action;           // empty when there is nothing to do
     std::vector<std::string> details;  // supporting facts, one per line
+    // For a check over a selection (the replay checks): how many items the
+    // selection named and what became of them, in a fixed order. Empty for
+    // the other checks.
+    std::vector<std::pair<std::string, std::uint64_t>> counts;
+};
+
+// What became of a selection a check was asked to cover: how many items it
+// named, and the verdict on each item the check reached. The check passes only
+// when every selected item was reached and passed. A failure fails it, whatever
+// else is unavailable, unsupported or left unchecked, so a divergence is never
+// hidden behind missing evidence elsewhere. Otherwise an item left unchecked
+// (omitted, by a bound such as --max-replays) or unavailable makes it
+// unavailable, and an unsupported one unsupported: a partial result, exit 3.
+struct SelectionTally {
+    std::uint64_t selected{0};
+    std::uint64_t passed{0};
+    std::uint64_t failed{0};
+    std::uint64_t unavailable{0};
+    std::uint64_t unsupported{0};
+
+    void add(Verdict v) noexcept;
+    [[nodiscard]] std::uint64_t checked() const noexcept;
+    [[nodiscard]] std::uint64_t omitted() const noexcept;
+    [[nodiscard]] Verdict verdict() const noexcept;
+    // selected, checked, passed, failed, unavailable, unsupported, omitted.
+    [[nodiscard]] std::vector<std::pair<std::string, std::uint64_t>> counts() const;
 };
 
 // The checks a profile requires: integrity, consistency, replay or full.

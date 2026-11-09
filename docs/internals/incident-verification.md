@@ -80,9 +80,9 @@ Each check reports `passed`, `failed`, `unavailable` (the evidence it needs is n
 | `state.decode` | every included snapshot restores through the production restore path; its state names, schema versions and fingerprints are listed | `InMemoryStateBackend::restore` |
 | `protocol.trace_structure` | every trace file holds one process, its lines parse, and its sequence numbers run from 1 without a gap | the trace files |
 | `protocol.conformance` | the TLC trace validator accepts this job's events against `formal/ExactlyOnce.tla`; a run the specification does not model (a rescale, sinks of both families, a first checkpoint above 1) is unsupported, since the validator then checks nothing | `scripts/protocol-trace-merge.py --job`, `scripts/formal-check.sh --trace` |
-| `replay.determinism` | each selected epoch, replayed twice from its starting state, emits the same rows in the same order | `EpochReplay` |
-| `replay.recorded_output` | the replay's rows equal the rows production handed the operator's single downstream operator in the same epoch, each key's in the same order | `EpochReplay`, the capture reader |
-| `replay.expected_output` | the selected epochs of one operator, each replayed from its starting state, emit an expectation's rows, compared as multisets | `EpochReplay` |
+| `replay.determinism` | every selected epoch was replayed whole, twice from its starting state, and emitted the same rows in the same order both times | `EpochReplay` |
+| `replay.recorded_output` | for every selected epoch, the replay's rows equal the rows production handed the operator's single downstream operator in the same epoch, each key's in the same order | `EpochReplay`, the capture reader |
+| `replay.expected_output` | every selected epoch of one operator was replayed whole from its starting state, and together they emit an expectation's rows, compared as multisets | `EpochReplay` |
 
 Once `bundle.artifacts` fails, the checks behind it report unavailable rather than read evidence that changed. A check that meets something it did not foresee reports failed with the reason; it does not end the run.
 
@@ -97,9 +97,9 @@ The replay checks rebuild each captured operator from its `op.json` through the 
 - **Which epochs count.** `replay.expected_output` compares the union of the selected epochs of one operator with the expectation, so an expectation need not know where epochs fell. An epoch the `RESTORED` record passes over was processed by a run the restore discarded, and its events were processed again in the restored run's first epoch, so it is left out and listed.
 
 - **Order.** Production's state is built by its own history and the replay's is restored from a snapshot, so an operator that fires many keys at one watermark can visit them in another order. The engine orders each key's rows and nothing across keys, so `replay.recorded_output` compares rows of each key in order, grouping them by the columns the operator declares (`group_key_outputs`, `partition_columns`, `partition_keys` or `partition_by`); an operator that declares none is compared row for row.
-- **Verdicts.** An operator whose consumer is a sink (which the flight recorder does not capture), or that does not feed one single-input operator at parallelism 1, cannot be compared by its topology: unsupported, which does not hold back a pass. Missing or partial evidence is unavailable, which does.
+- **Per epoch.** An operator whose consumer is a sink (which the flight recorder does not capture), or that does not feed one single-input operator at parallelism 1, cannot be compared by its topology, and an operator this build does not replay cannot be replayed or compared: that epoch is unsupported. Missing or partial evidence makes it unavailable. How these per-epoch results decide a check is the selection rule below.
 
-Two replays agreeing establishes determinism and nothing about production. A truncated capture holds a prefix of its epoch: the replay of it can still be deterministic, and the recorded-output and expected-output comparisons are unavailable for it. A capture whose header does not say it was truncated but holds fewer records than the header counts was cut short and is unavailable; the flight recorder writes each epoch file beside its name and renames it into place, so it no longer leaves one, but a bundle can hold files an earlier build wrote.
+Two replays agreeing establishes determinism and nothing about production. A truncated capture holds a prefix of its epoch: the prefix is replayed twice and the details say whether it agreed with itself, but the records past the cap were never replayed, so the epoch is unavailable to all three checks. A capture whose header does not say it was truncated but holds fewer records than the header counts was cut short and is unavailable too; the flight recorder writes each epoch file beside its name and renames it into place, so it no longer leaves one, but a bundle can hold files an earlier build wrote.
 
 Verification replays nothing that leaves the process. Operators that call an external system for each record, lookups and model inference (any operator type naming `lookup` or `predict`), report unsupported without being built, judged by the operator the replay engine loaded rather than by the manifest, and `incident-regress` refuses them; `clink replay` replays them against the services the job used. Operators that only a job plugin registers report unsupported too: verification loads no plugin. The checks write only to the system's temporary directory.
 
@@ -112,7 +112,30 @@ Verification replays nothing that leaves the process. Operators that call an ext
 | `replay` | adds `replay.determinism` and `replay.recorded_output`, and `replay.expected_output` with `--expected` |
 | `full` | adds `protocol.trace_structure` and `protocol.conformance` |
 
-`--op`, `--subtask` and `--epoch` narrow the replays. At most `--max-replays` epochs (default 64) replay per run and the rest are listed; an expectation over a selection the cap cut reports unavailable rather than compare part of it.
+### Selection and partial results
+
+`--op`, `--subtask` and `--epoch` select the captured epochs the replay checks answer for: every captured epoch that matches them, or every captured epoch in the bundle when none is given. The selection is the scope of each replay check, and nothing else changes it. `--max-replays` (default 64) bounds how many of its epochs one run replays, in the bundle's order (operator id, then subtask, then epoch). The epochs past the bound are not checked: they are counted as omitted, and the first five are named in the details. They are never dropped from the selection.
+
+Each replay check reports its selection's counts: `selected`, `checked`, `passed`, `failed`, `unavailable`, `unsupported` and `omitted` (selected minus checked), as a `counts:` line in the text report and a `counts` object in the JSON report. The check then concludes, in this order:
+
+1. `failed` when any selected epoch failed, whatever the others show, so a divergence is never hidden behind missing or unsupported evidence elsewhere.
+2. `passed` only when every selected epoch was checked whole and passed. An empty selection never passes.
+3. `unavailable` when any epoch was omitted by the bound or lacked evidence (a missing starting state, a missing downstream capture, a truncated or cut-short capture).
+4. `unsupported` when the only gap is epochs this build cannot replay or compare. Supported epochs passing beside them do not establish the selection.
+
+`replay.expected_output` compares rows rather than epochs, so it applies the same rule with one refinement. A row the replay emitted that the expectation does not hold fails the check at once, however much of the selection was replayed. An expected row the replay did not emit fails it only when every selected epoch was replayed whole; otherwise that row may belong to an epoch not replayed, and the result is unavailable.
+
+A required replay check that is unavailable or unsupported makes the run partial (exit 3), and a failed one fails it (exit 1). To complete a partial run, raise `--max-replays` to at least the selection's size, or narrow the selection with `--op`, `--subtask` and `--epoch` to the epochs that need checking: an epoch selected on its own and checked in full can pass.
+
+## Verifying with the network denied
+
+Verification opens no connection by design: it reads the bundle, the `formal/` directory and the pinned TLA+ jars, and writes only to the system's temporary directory. The example and its gate do not take that on trust. Every command the example runs on the bundle once it has moved (`incident-verify`, `incident-regress` and `replay --run-test`) runs under the operating system's network isolation, proven on that machine first by `scripts/network-isolation.sh`:
+
+- **The mechanism.** `sandbox-exec` with a profile that denies all network operations on macOS, and `unshare -rn` (a new user and network namespace, whose loopback is down) on Linux. Another platform has none.
+- **The proof.** The wrapper must first run a command, since a wrapper that runs nothing would block every probe too. A local control endpoint, an HTTP server on 127.0.0.1 with a port the system picks, must then answer a request made without isolation, and must not answer the same request made under it.
+- **The result.** `enforced` when both hold; `unavailable` when the mechanism is missing or cannot run (a Linux host that does not allow unprivileged user namespaces, for instance); `not-enforced` when the endpoint still answered under isolation; `inconclusive` when it did not answer even without isolation, which tells an isolation failure apart from an endpoint that was never reachable.
+
+Only `enforced` lets a verification run. Anything else stops the example before the job starts, naming the state and why. `ALLOW_UNISOLATED=1` is a development mode for a machine without isolation: the example then runs every step with its verifications unisolated, says so at the start and the end, and exits 3, so a run that used it is never a qualification. The library's test-only variables, which choose the mechanism, the platform or the control endpoint, make an example run not a qualification either, since a control endpoint that answers once would pass any wrapper for isolation. `scripts/incident-gate.sh` takes no such override: it refuses `ALLOW_UNISOLATED` and the test-only variables (exit 2), proves isolation before it runs the suites, fails when isolation is not enforced, and fails on any exit from the example but 0. The example also exits 3, and the gate fails, when `protocol.conformance` was unavailable, since the steps that show a forbidden trace failing and an unmodelled run reported unsupported did not run. `scripts/tests/test_network_isolation.py` takes every path on either platform by injecting the mechanism, the platform and the control endpoint, and exercises the platform's own isolation where it can run.
 
 ## Regression tests
 
@@ -149,3 +172,4 @@ Coordination stores other than the local filesystem (an `s3://` checkpoint direc
 | The commands | `tools/clink_incident.cpp`, with `tools/clink_incident_replay.cpp` or its SQL-off stub |
 | Tests | `tests/test_incident_bundle.cpp` (collection, the reader, the core checks), `tests/test_incident_replay.cpp` (replay on a real captured run) |
 | The example and gate | `examples/incident-verification/`; `scripts/incident-gate.sh` runs both suites, requires every case to have run, then the example |
+| Network isolation, proven before verification relies on it | `scripts/network-isolation.sh`, tested by `scripts/tests/test_network_isolation.py` |

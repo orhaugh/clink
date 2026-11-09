@@ -521,7 +521,11 @@ jobs:
         # scripts/check-half-time-evidence.py accepts half-time's bundle for
         # the candidate. The tests build a bundle for another commit, one with
         # a checker failing, a scene skipped or missing, a file changed after
-        # its manifest, and one that passes. No build, no toolchain.
+        # its manifest, and one that passes. The same discovery runs the
+        # network-isolation tests the incident gate depends on: isolation
+        # unavailable, not enforced, inconclusive, the development override,
+        # and the gate's refusals, with the platform's own isolation where the
+        # runner allows it. No build, no toolchain.
         run: python3 -m unittest discover -s scripts/tests -v
 
   formal:

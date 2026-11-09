@@ -83,10 +83,39 @@ std::string describe(const Check* c) {
         return "(no such check)";
     }
     std::string s = std::string{clink::incident::to_string(c->verdict)} + ": " + c->reason;
+    for (std::size_t i = 0; i < c->counts.size(); ++i) {
+        s += (i == 0 ? "\n  counts: " : ", ") + c->counts[i].first + " " +
+             std::to_string(c->counts[i].second);
+    }
     for (const auto& d : c->details) {
         s += "\n  " + d;
     }
     return s;
+}
+
+// One of a check's selection counts; fails the test when it has none.
+std::uint64_t count_of(const Check* c, const std::string& name) {
+    if (c != nullptr) {
+        for (const auto& [n, value] : c->counts) {
+            if (n == name) {
+                return value;
+            }
+        }
+    }
+    ADD_FAILURE() << "no count '" << name << "' in " << describe(c);
+    return 0;
+}
+
+// A check of a JSON report `clink incident-verify --report` wrote.
+JsonValue report_check(const fs::path& report, const std::string& id) {
+    const auto json = clink::config::parse(slurp_file(report));
+    for (const auto& c : json.at("checks").as_array()) {
+        if (c.string_or("id", "") == id) {
+            return c;
+        }
+    }
+    ADD_FAILURE() << "no " << id << " in " << report;
+    return JsonValue{clink::config::JsonObject{}};
 }
 
 // The input: five users, events 50 ms apart, so a one-second window holds
@@ -313,6 +342,46 @@ protected:
         return window;
     }
 
+    // What production handed the window operator's consumer in epoch 1, with
+    // its first row's total changed: the window's replay no longer agrees.
+    void doctor_the_windows_output() const {
+        const auto file = epoch_file(work_, op_of(work_, "row_bind_columns"), 1);
+        rewrite_capture(file, [](clink::sql::Row& row) {
+            auto obj = clink::sql::to_json_object(row.values);
+            obj["total"] = JsonValue{static_cast<std::int64_t>(999999)};
+            row.values = clink::sql::row_columns_from_json(std::move(obj));
+        });
+        relist(file, "capture_epoch");
+    }
+
+    // Where an operator's epoch falls in the selection of every captured
+    // epoch, which is replayed in the bundle's order: by operator id, then
+    // subtask, then epoch.
+    [[nodiscard]] std::size_t position_of(std::uint64_t op, std::uint64_t epoch) const {
+        const auto b = bundle();
+        for (std::size_t i = 0; i < b.captures.size(); ++i) {
+            if (b.captures[i].op == op && b.captures[i].epoch == epoch) {
+                return i;
+            }
+        }
+        ADD_FAILURE() << "no capture of op " << op << " epoch " << epoch;
+        return 0;
+    }
+
+    // `clink incident-verify <work> --profile=replay <flags>`, its JSON report
+    // at `report`; returns the exit code.
+    int verify_cli(const std::string& flags, const fs::path& report) const {
+        std::string output;
+        const auto rc =
+            run_command(std::string{CLINK_CLI_BINARY} + " incident-verify " + work_.string() +
+                            " --profile=replay " + flags + " --report=" + report.string(),
+                        &output);
+        if (rc != 0 && rc != 1 && rc != 3) {
+            ADD_FAILURE() << "exit " << rc << ": " << output;
+        }
+        return rc;
+    }
+
     // Rewrite a capture's records through `change`, keeping its header.
     static void rewrite_capture(const fs::path& file,
                                 const std::function<void(clink::sql::Row&)>& change) {
@@ -338,16 +407,24 @@ protected:
 };
 
 TEST_F(IncidentReplayTest, ARealRunReplaysDeterministicallyAndAgreesWithProduction) {
+    // Every captured epoch of the job replays identically. Every one whose
+    // consumer is captured agrees with production; the operator before the
+    // sink cannot be compared, by its topology, so the comparison does not
+    // establish the whole job's selection: unsupported, never passed.
     const auto checks = clink::sql::incident_replay_checks(bundle(), {});
     const auto* det = find_check(checks, "replay.determinism");
     const auto* rec = find_check(checks, "replay.recorded_output");
     EXPECT_EQ(det->verdict, Verdict::Passed) << describe(det);
-    EXPECT_EQ(rec->verdict, Verdict::Passed) << describe(rec);
+    EXPECT_EQ(count_of(det, "passed"), bundle().captures.size()) << describe(det);
+    EXPECT_EQ(rec->verdict, Verdict::Unsupported) << describe(rec);
+    EXPECT_EQ(count_of(rec, "unsupported"), 1u) << describe(rec);
+    EXPECT_EQ(count_of(rec, "passed") + 1, count_of(rec, "selected")) << describe(rec);
+    EXPECT_EQ(count_of(rec, "omitted"), 0u) << describe(rec);
     EXPECT_EQ(find_check(checks, "replay.expected_output"), nullptr) << "no expectation was given";
     EXPECT_NE(describe(rec).find("is a sink"), std::string::npos)
         << "the operator before the sink cannot be compared, by its topology: " << describe(rec);
     // The window operator's own epoch is among those compared with what
-    // production handed its consumer.
+    // production handed its consumer, and selected alone it passes.
     clink::sql::IncidentReplayOptions o;
     o.op = op_of(work_, "tumbling_window_row");
     const auto window = clink::sql::incident_replay_checks(bundle(), o);
@@ -421,14 +498,7 @@ TEST_F(IncidentReplayTest, RowsOfDifferentKeysMayComeInAnotherOrderButOneKeysMay
 TEST_F(IncidentReplayTest, ProductionOutputThatDiffersFailsWhileTheReplayStaysDeterministic) {
     // What production handed the window's consumer, changed: the replay still
     // agrees with itself, and no longer with production.
-    const auto bind = op_of(work_, "row_bind_columns");
-    const auto file = epoch_file(work_, bind, 1);
-    rewrite_capture(file, [](clink::sql::Row& row) {
-        auto obj = clink::sql::to_json_object(row.values);
-        obj["total"] = JsonValue{static_cast<std::int64_t>(999999)};
-        row.values = clink::sql::row_columns_from_json(std::move(obj));
-    });
-    relist(file, "capture_epoch");
+    doctor_the_windows_output();
     clink::sql::IncidentReplayOptions o;
     o.op = op_of(work_, "tumbling_window_row");
     const auto checks = clink::sql::incident_replay_checks(bundle(), o);
@@ -447,7 +517,10 @@ TEST_F(IncidentReplayTest, ATruncatedCaptureReplaysItsPrefixAndCannotStandForThe
     const auto checks = clink::sql::incident_replay_checks(bundle(), o);
     const auto* det = find_check(checks, "replay.determinism");
     const auto* rec = find_check(checks, "replay.recorded_output");
-    EXPECT_EQ(det->verdict, Verdict::Passed) << describe(det);
+    // The stored prefix replays identically twice, and the records past the
+    // cap were never replayed: the epoch is not established.
+    EXPECT_EQ(det->verdict, Verdict::Unavailable) << describe(det);
+    EXPECT_NE(describe(det).find("identical twice"), std::string::npos) << describe(det);
     EXPECT_NE(describe(det).find("truncated"), std::string::npos) << describe(det);
     EXPECT_EQ(rec->verdict, Verdict::Unavailable) << describe(rec);
     EXPECT_NE(describe(rec).find("truncated"), std::string::npos) << describe(rec);
@@ -701,6 +774,220 @@ TEST_F(IncidentReplayTest, TheCommandTakesEvery64BitOperatorIdAndRefusesAMalform
     });
     EXPECT_EQ(run_command(verify + " --json", &output), 2) << output;
     EXPECT_NE(output.find("collector.collected_at"), std::string::npos) << output;
+}
+
+// The whole job's captured epochs with room to replay one of them. The one
+// replayed once stood for all of them: both checks passed and the command
+// exited 0. The epochs the bound left out are counted and named instead, and
+// the result is partial.
+TEST_F(IncidentReplayTest, ABoundBelowTheSelectionIsPartialAndCountsWhatItLeftOut) {
+    const auto selected = bundle().captures.size();
+    ASSERT_GE(selected, 3u);
+    clink::sql::IncidentReplayOptions o;
+    o.max_replays = 1;
+    const auto checks = clink::sql::incident_replay_checks(bundle(), o);
+    for (const char* id : {"replay.determinism", "replay.recorded_output"}) {
+        const auto* c = find_check(checks, id);
+        EXPECT_EQ(c->verdict, Verdict::Unavailable) << describe(c);
+        EXPECT_EQ(count_of(c, "selected"), selected) << describe(c);
+        EXPECT_EQ(count_of(c, "checked"), 1u) << describe(c);
+        EXPECT_EQ(count_of(c, "omitted"), selected - 1) << describe(c);
+        EXPECT_NE(c->reason.find("--max-replays=1"), std::string::npos) << describe(c);
+        EXPECT_NE(c->next_action.find("at least " + std::to_string(selected)), std::string::npos)
+            << describe(c);
+        EXPECT_NE(describe(c).find("not checked, beyond --max-replays=1"), std::string::npos)
+            << describe(c);
+    }
+    const auto report = work_ / "report.json";
+    EXPECT_EQ(verify_cli("--max-replays=1", report), 3);
+    const auto det = report_check(report, "replay.determinism");
+    EXPECT_EQ(det.string_or("verdict", ""), "unavailable");
+    EXPECT_EQ(det.at("counts").at("selected").as_int(), static_cast<std::int64_t>(selected));
+    EXPECT_EQ(det.at("counts").at("checked").as_int(), 1);
+    EXPECT_EQ(det.at("counts").at("omitted").as_int(), static_cast<std::int64_t>(selected - 1));
+    EXPECT_EQ(report_check(report, "replay.recorded_output").string_or("verdict", ""),
+              "unavailable");
+    EXPECT_EQ(clink::config::parse(slurp_file(report)).string_or("result", ""), "partial");
+}
+
+// Production's output doctored where the bound does not reach: the bounded
+// run cannot see it and must not pass, and the run that reaches it fails.
+// What the window handed its consumer is the doctored record; only the
+// window's comparison reads it, and the bound stops just short of the window.
+TEST_F(IncidentReplayTest, ADivergenceBeyondTheBoundLeavesTheRunPartialAndTheWholeRunFindsIt) {
+    const auto bound = position_of(op_of(work_, "tumbling_window_row"), 1);
+    ASSERT_GE(bound, 1u) << "the premise: an operator replays before the window";
+    doctor_the_windows_output();
+    const auto selected = bundle().captures.size();
+    clink::sql::IncidentReplayOptions o;
+    o.max_replays = bound;
+    auto checks = clink::sql::incident_replay_checks(bundle(), o);
+    const auto* rec = find_check(checks, "replay.recorded_output");
+    EXPECT_EQ(rec->verdict, Verdict::Unavailable) << describe(rec);
+    EXPECT_EQ(count_of(rec, "omitted"), selected - bound) << describe(rec);
+    EXPECT_EQ(count_of(rec, "failed"), 0u) << describe(rec);
+    o.max_replays = selected;
+    checks = clink::sql::incident_replay_checks(bundle(), o);
+    rec = find_check(checks, "replay.recorded_output");
+    EXPECT_EQ(rec->verdict, Verdict::Failed) << describe(rec);
+    EXPECT_NE(describe(rec).find("999999"), std::string::npos) << describe(rec);
+
+    const auto bounded = work_ / "bounded.json";
+    const auto whole = work_ / "whole.json";
+    EXPECT_EQ(verify_cli("--max-replays=" + std::to_string(bound), bounded), 3);
+    EXPECT_EQ(report_check(bounded, "replay.recorded_output").string_or("verdict", ""),
+              "unavailable");
+    EXPECT_EQ(verify_cli("", whole), 1);
+    EXPECT_EQ(report_check(whole, "replay.recorded_output").string_or("verdict", ""), "failed");
+}
+
+// One selection holding every outcome: epochs that pass, one whose capture
+// was cut short (unavailable), the operator before the sink (unsupported for
+// the comparison), and one that disagrees with production. The disagreement
+// decides the comparison, and still does when a bound leaves an epoch out.
+TEST_F(IncidentReplayTest, AFailureFailsTheSelectionWhateverElseIsUnavailableUnsupportedOrOmitted) {
+    const auto window = add_second_epoch();
+    const auto second = epoch_file(work_, window, 2);
+    const auto bytes = slurp_file(second);
+    spill_file(second, bytes.substr(0, bytes.size() * 2 / 3));
+    relist(second, "capture_epoch");
+    doctor_the_windows_output();
+    auto checks = clink::sql::incident_replay_checks(bundle(), {});
+    const auto* rec = find_check(checks, "replay.recorded_output");
+    EXPECT_EQ(rec->verdict, Verdict::Failed) << describe(rec);
+    EXPECT_EQ(count_of(rec, "failed"), 1u) << describe(rec);
+    EXPECT_EQ(count_of(rec, "unavailable"), 1u) << describe(rec);
+    EXPECT_EQ(count_of(rec, "unsupported"), 1u) << describe(rec);
+    EXPECT_GE(count_of(rec, "passed"), 1u) << describe(rec);
+    EXPECT_NE(rec->reason.find("whatever the rest show"), std::string::npos) << describe(rec);
+    // The replays agree with each other wherever they ran.
+    const auto* det = find_check(checks, "replay.determinism");
+    EXPECT_EQ(det->verdict, Verdict::Unavailable) << describe(det);
+    EXPECT_EQ(count_of(det, "failed"), 0u) << describe(det);
+
+    // The window's first epoch is never last (its second follows it), so a
+    // bound one short of the selection still reaches it.
+    const auto selected = bundle().captures.size();
+    clink::sql::IncidentReplayOptions o;
+    o.max_replays = selected - 1;
+    checks = clink::sql::incident_replay_checks(bundle(), o);
+    rec = find_check(checks, "replay.recorded_output");
+    EXPECT_EQ(rec->verdict, Verdict::Failed) << describe(rec);
+    EXPECT_EQ(count_of(rec, "omitted"), 1u) << describe(rec);
+
+    const auto report = work_ / "report.json";
+    EXPECT_EQ(verify_cli("--max-replays=" + std::to_string(selected - 1), report), 1);
+    const auto json = report_check(report, "replay.recorded_output");
+    EXPECT_EQ(json.string_or("verdict", ""), "failed");
+    EXPECT_EQ(json.at("counts").at("failed").as_int(), 1);
+    EXPECT_EQ(json.at("counts").at("omitted").as_int(), 1);
+}
+
+// The window operator renamed to one this build never registered, and the
+// rest of the job replayable: an aggregate over the replayable epochs alone
+// would pass.
+TEST_F(IncidentReplayTest, SupportedAndUnsupportedEpochsTogetherAreNotAPass) {
+    const auto window = op_of(work_, "tumbling_window_row");
+    const auto spec_file = epoch_file(work_, window, 1).parent_path() / "op.json";
+    auto spec = clink::config::parse(slurp_file(spec_file));
+    spec.as_object()["op_type"] = JsonValue{"window_this_build_never_registered_row"};
+    spill_file(spec_file, spec.serialize(0));
+    relist(spec_file, "capture_spec");
+    const auto checks = clink::sql::incident_replay_checks(bundle(), {});
+    const auto* det = find_check(checks, "replay.determinism");
+    EXPECT_EQ(det->verdict, Verdict::Unsupported) << describe(det);
+    EXPECT_EQ(count_of(det, "unsupported"), 1u) << describe(det);
+    EXPECT_EQ(count_of(det, "passed"), bundle().captures.size() - 1) << describe(det);
+    // Nor does the comparison pass: the window it cannot replay is unsupported,
+    // and, renamed, it no longer matches its graph operator, so the operator
+    // before it has nothing to be compared with.
+    const auto* rec = find_check(checks, "replay.recorded_output");
+    EXPECT_EQ(rec->verdict, Verdict::Unavailable) << describe(rec);
+    EXPECT_GE(count_of(rec, "unsupported"), 1u) << describe(rec);
+
+    const auto report = work_ / "report.json";
+    EXPECT_EQ(verify_cli("", report), 3);
+    EXPECT_EQ(report_check(report, "replay.determinism").string_or("verdict", ""), "unsupported");
+}
+
+// The epoch the bounded whole-job run reached, selected on its own with the
+// same bound: checked in full, it passes, report and exit code alike.
+TEST_F(IncidentReplayTest, NarrowingTheSelectionToWhatIsCheckedInFullCanPass) {
+    const auto window = op_of(work_, "tumbling_window_row");
+    clink::sql::IncidentReplayOptions o;
+    o.op = window;
+    o.epoch = 1;
+    o.max_replays = 1;
+    o.expected_path = (work_ / "expected.ndjson").string();
+    {
+        std::ofstream out(o.expected_path);
+        for (const auto& row : expected_window_rows()) {
+            out << row << "\n";
+        }
+    }
+    const auto checks = clink::sql::incident_replay_checks(bundle(), o);
+    for (const char* id :
+         {"replay.determinism", "replay.recorded_output", "replay.expected_output"}) {
+        const auto* c = find_check(checks, id);
+        EXPECT_EQ(c->verdict, Verdict::Passed) << describe(c);
+        EXPECT_EQ(count_of(c, "selected"), 1u) << describe(c);
+        EXPECT_EQ(count_of(c, "omitted"), 0u) << describe(c);
+    }
+    const auto report = work_ / "report.json";
+    EXPECT_EQ(verify_cli("--op=" + std::to_string(window) + " --epoch=1 --max-replays=1 " +
+                             "--expected=" + o.expected_path,
+                         report),
+              0);
+    EXPECT_EQ(clink::config::parse(slurp_file(report)).string_or("result", ""), "satisfied");
+}
+
+// An expectation over a selection the bound cut: a row the replay emitted
+// that the expectation lacks fails at once; expected rows not emitted may
+// belong to the epochs not replayed, so they leave it partial until the
+// selection is checked in full, where they fail it.
+TEST_F(IncidentReplayTest, AnExpectationOverABoundedSelectionCanFailButNotPass) {
+    const auto window = add_second_epoch();
+    clink::sql::IncidentReplayOptions o;
+    o.op = window;
+    o.max_replays = 1;
+    o.expected_path = (work_ / "expected.ndjson").string();
+    const auto expect = [&](const std::vector<std::string>& rows) {
+        std::ofstream out(o.expected_path, std::ios::trunc);
+        for (const auto& row : rows) {
+            out << row << "\n";
+        }
+    };
+    std::vector<Check> held;
+    const auto exp_of = [&] {
+        held = clink::sql::incident_replay_checks(bundle(), o);
+        return find_check(held, "replay.expected_output");
+    };
+    auto rows = expected_window_rows();
+    expect(rows);
+    const auto* exp = exp_of();
+    EXPECT_EQ(exp->verdict, Verdict::Unavailable) << describe(exp);
+    EXPECT_EQ(count_of(exp, "selected"), 2u) << describe(exp);
+    EXPECT_EQ(count_of(exp, "omitted"), 1u) << describe(exp);
+    EXPECT_NE(exp->reason.find("--max-replays=1"), std::string::npos) << describe(exp);
+
+    auto changed = rows;
+    changed.front().replace(changed.front().find("\"total\":"), 8, "\"total\":1");
+    expect(changed);
+    exp = exp_of();
+    EXPECT_EQ(exp->verdict, Verdict::Failed) << describe(exp);
+    EXPECT_NE(describe(exp).find("only in the replay"), std::string::npos) << describe(exp);
+    EXPECT_NE(exp->reason.find("whatever the epochs not compared would show"), std::string::npos)
+        << describe(exp);
+
+    auto more = rows;
+    more.push_back(R"({"total":5,"usr":"nobody","window_end":1000,"window_start":0})");
+    expect(more);
+    exp = exp_of();
+    EXPECT_EQ(exp->verdict, Verdict::Unavailable) << describe(exp);
+    o.epoch = 1;
+    exp = exp_of();
+    EXPECT_EQ(exp->verdict, Verdict::Failed) << describe(exp);
+    EXPECT_NE(describe(exp).find("only expected"), std::string::npos) << describe(exp);
 }
 
 }  // namespace

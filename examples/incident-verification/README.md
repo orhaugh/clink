@@ -17,11 +17,39 @@ CLINK_BIN_DIR=../../build ./run.sh
 ```
 
 It needs `clink_node` and `clink` built in `CLINK_BIN_DIR` with fault
-injection compiled in (a build with tests has it), `python3` and `curl`.
-Everything runs on 127.0.0.1: no containers and no other network. `WORK`
-names the directory it writes to (default a new temporary one). Its
-`results/` keeps every report, the logs and `summary.txt`. The script exits
-0 only when every step shows what it should.
+injection compiled in (a build with tests has it), `python3` and `curl`, and
+network isolation it can prove on this machine (below). Everything runs on
+127.0.0.1: no containers and no other network. `WORK` names the directory it
+writes to (default a new temporary one). Its `results/` keeps every report,
+the logs and `summary.txt`.
+
+The script exits 0 only when every step ran and showed what it should, with
+every verification isolated from the network. It exits 1 when a step does
+not show what it should, and 3 when the steps that ran passed but the run is
+not a qualification: `protocol.conformance` was unavailable, so the steps
+that need it did not run, or verification ran without isolation. Only exit 0
+is a qualification, and `scripts/incident-gate.sh` fails on anything else.
+
+## Network isolation
+
+Before the job starts, the script proves that it can deny verification the
+network (`scripts/network-isolation.sh`). The mechanism is `sandbox-exec` with
+a deny-network profile on macOS and `unshare -rn` on Linux. It must run a
+command, and a local control endpoint on 127.0.0.1 must answer a request made
+without it and not answer the same request made under it. The control is what
+tells isolation apart from an endpoint that was never reachable: if it does
+not answer even without isolation, the result is inconclusive, not enforced.
+
+Isolation that is unavailable (no mechanism, or a Linux host that does not
+allow unprivileged user namespaces), not enforced or inconclusive stops the
+script with the state and the reason. `ALLOW_UNISOLATED=1` runs the
+demonstration anyway, with every verification unisolated, for development on
+such a machine. It says so at the start and the end and exits 3: it is never
+a qualification. Nor is a run that sets one of the isolation library's
+test-only variables (`CLINK_ISOLATION`, `CLINK_ISOLATION_COMMAND`,
+`CLINK_ISOLATION_OS`, `CLINK_ISOLATION_PROBE_URL`). The gate refuses all of
+them. Every command that reads the bundle once it has moved runs isolated:
+the verifications, the regression freeze and the regression runs.
 
 ## The job
 
@@ -56,17 +84,22 @@ alone. It reads nothing the job wrote.
    A second, partial bundle leaves the snapshots out.
 4. **Portability.** Both bundles move to another directory, and the job's own
    directories move away, before anything is verified.
-5. **Offline verification.** `incident-verify --profile=full` runs under
-   `sandbox-exec` with the network denied (`unshare -rn` on Linux, where
-   permitted). Every check passes:
+5. **Offline verification.** `incident-verify --profile=full` runs with the
+   network denied, under the isolation proven before the job started. Every
+   check passes:
    - the restore rule, recomputed over the bundle's markers;
    - each participant's snapshot against its sidecar;
    - the traces' structure, and their conformance to the exactly-once
      specification through the TLC validator, when the pinned jars are cached
-     (otherwise that check is unavailable and the run exits 3);
+     (otherwise that check is unavailable, the verification exits 3, steps 6
+     and 7 do not run, and the script exits 3 at the end);
    - the window operator's every captured epoch, replayed twice from its own
      starting state, compared with what production handed the next operator,
-     and compared with the oracle.
+     and compared with the oracle. The selection is every captured epoch of
+     that operator, well under `--max-replays`, and a replay check passes only
+     when every selected epoch was checked whole and passed. A bound that
+     stops short of the selection leaves the check partial; it never passes
+     on the epochs it reached.
 
    The epoch the restore discarded is left out of the oracle comparison. The
    script prints its emission count beside the number of repeated rows in the
