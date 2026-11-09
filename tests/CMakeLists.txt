@@ -547,6 +547,12 @@ if(CLINK_INTEGRATION_TESTS)
         target_sources(clink_integration_tests PRIVATE integration/test_pulsar_sink_recovery.cpp)
         target_link_libraries(clink_integration_tests PRIVATE _clink_pulsar_external)
     endif()
+    # The Pub/Sub sink's recovery cells: as the Redis ones, into a topic on the
+    # emulator scripts/brokers-live.sh starts, with a verifier that pulls a
+    # subscription of its own over REST. They skip without it.
+    if(TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_pubsub_sink_recovery.cpp)
+    endif()
     # The MQTT sink's recovery cells: as the Redis ones, into a topic on the
     # broker scripts/brokers-live.sh starts, with a verifier that subscribes to
     # the topic through the impl's own MQTT client. They skip without it.
