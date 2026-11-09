@@ -4,6 +4,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -48,13 +49,96 @@ TEST(HttpConnectorFactoryRegistration, PubSubSinkAndSourceRegistered) {
     EXPECT_NE(rr.find_source("pubsub_source", "string"), nullptr);
 }
 
-std::string pubsub_thrown(const std::function<void()>& f) {
+std::string factory_thrown(const std::function<void()>& f) {
     try {
         f();
     } catch (const std::exception& e) {
         return e.what();
     }
     return "";
+}
+
+// The generic HTTP sink's factory: building connects to nothing, so a value is
+// refused here.
+TEST(HttpSinkFactory, TheFactoryReadsItsOptionsStrictly) {
+    const auto* f = clink::cluster::OperatorRegistry::default_instance().find_sink(
+        "http_sink", std::string{clink::cluster::kChannelString});
+    ASSERT_NE(f, nullptr);
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"url", "http://127.0.0.1:1"}};
+    EXPECT_NO_THROW((void)f->build(ctx));
+    auto every = ctx;
+    for (const auto& [k, v] :
+         std::vector<std::pair<std::string, std::string>>{{"path", "/ingest"},
+                                                          {"bulk_format", "ndjson"},
+                                                          {"content_type", "application/x-ndjson"},
+                                                          {"headers", "Authorization: Bearer x"},
+                                                          {"verify_tls", "false"},
+                                                          {"connect_timeout_ms", "600000"},
+                                                          {"request_timeout_ms", "3600000"},
+                                                          {"batch_records", "1000000"},
+                                                          {"batch_bytes", "1073741824"},
+                                                          {"max_retries", "20"},
+                                                          {"dlq", "drop"},
+                                                          {"linger_ms", "3600000"}}) {
+        every.params[k] = v;
+    }
+    EXPECT_NO_THROW((void)f->build(every));
+    for (const char* url : {"https://example.com", "http://[::1]:8080", "http://h:65535"}) {
+        auto c = ctx;
+        c.params["url"] = url;
+        EXPECT_NO_THROW((void)f->build(c)) << url;
+    }
+    // A path or a capital scheme made the client read the whole url as a host.
+    for (const char* url : {"http://127.0.0.1:8080/ingest",
+                            "HTTP://h",
+                            "ftp://h",
+                            "h:8080",
+                            "http://h?x=1",
+                            "http://"}) {
+        auto c = ctx;
+        c.params["url"] = url;
+        EXPECT_NE(factory_thrown([&] { (void)f->build(c); }).find("'url' must be http://"),
+                  std::string::npos)
+            << url;
+    }
+    for (const auto& [key, value] :
+         std::vector<std::pair<std::string, std::string>>{{"batch_records", "0"},
+                                                          {"batch_bytes", "-1"},
+                                                          {"max_retries", "21"},
+                                                          {"linger_ms", "soon"},
+                                                          {"connect_timeout_ms", "0"},
+                                                          {"request_timeout_ms", "-5"}}) {
+        auto c = ctx;
+        c.params[key] = value;
+        EXPECT_NE(
+            factory_thrown([&] { (void)f->build(c); }).find("'" + key + "' must be an integer"),
+            std::string::npos)
+            << key << "=" << value;
+    }
+    // 'nd-json' once read as json_array, verify_tls='FALSE' as true and
+    // dlq='DROP' as fail.
+    for (const auto& [key, value, why] :
+         std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"bulk_format", "nd-json", "'bulk_format' must be 'json_array' or 'ndjson'"},
+             {"verify_tls", "FALSE", "'verify_tls' must be 'true' or 'false'"},
+             {"dlq", "DROP", "'dlq' must be 'fail' or 'drop'"},
+             {"path", "ingest", "'path' must start with '/'"},
+             {"content_type", "", "'content_type' is empty"}}) {
+        auto c = ctx;
+        c.params[key] = value;
+        EXPECT_NE(factory_thrown([&] { (void)f->build(c); }).find(why), std::string::npos)
+            << key << "=" << value;
+    }
+}
+
+TEST(HttpSinkFactory, TheRecordNamesItsTimeoutsAndLimits) {
+    const auto* caps = clink::connectors::CapabilityRegistry::instance().find("http");
+    ASSERT_NE(caps, nullptr);
+    EXPECT_EQ(caps->version, "2");
+    EXPECT_EQ(caps->timeout_options,
+              (std::vector<std::string>{"connect_timeout_ms", "request_timeout_ms"}));
+    EXPECT_TRUE(caps->self_check().empty());
 }
 
 // Building a sink connects to nothing, so a value is refused here before any
@@ -92,7 +176,7 @@ TEST(PubSubFactory, TheSinkFactoryReadsItsOptionsStrictly) {
         auto c = ctx;
         c.params[key] = value;
         EXPECT_NE(
-            pubsub_thrown([&] { (void)f->build(c); }).find("'" + key + "' must be an integer"),
+            factory_thrown([&] { (void)f->build(c); }).find("'" + key + "' must be an integer"),
             std::string::npos)
             << key << "=" << value;
     }
@@ -100,19 +184,19 @@ TEST(PubSubFactory, TheSinkFactoryReadsItsOptionsStrictly) {
     auto tls = ctx;
     tls.params["verify_tls"] = "FALSE";
     EXPECT_NE(
-        pubsub_thrown([&] { (void)f->build(tls); }).find("'verify_tls' must be 'true' or 'false'"),
+        factory_thrown([&] { (void)f->build(tls); }).find("'verify_tls' must be 'true' or 'false'"),
         std::string::npos);
     auto dlq = ctx;
     dlq.params["dlq"] = "DROP";
-    EXPECT_NE(pubsub_thrown([&] { (void)f->build(dlq); }).find("'dlq' must be 'fail' or 'drop'"),
+    EXPECT_NE(factory_thrown([&] { (void)f->build(dlq); }).find("'dlq' must be 'fail' or 'drop'"),
               std::string::npos);
     auto both = ctx;
     both.params["auth_token"] = "t";
     both.params["auth_token_file"] = "/token";
-    EXPECT_NE(pubsub_thrown([&] { (void)f->build(both); }).find("not both"), std::string::npos);
+    EXPECT_NE(factory_thrown([&] { (void)f->build(both); }).find("not both"), std::string::npos);
     auto empty = ctx;
     empty.params["endpoint"] = "";
-    EXPECT_NE(pubsub_thrown([&] { (void)f->build(empty); }).find("'endpoint' is empty"),
+    EXPECT_NE(factory_thrown([&] { (void)f->build(empty); }).find("'endpoint' is empty"),
               std::string::npos);
 }
 

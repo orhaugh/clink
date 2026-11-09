@@ -8,12 +8,14 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
 
+#include "clink/config/json.hpp"
 #include "clink/connectors/capability.hpp"
 #include "clink/http_connector/batched_http_bulk_sink.hpp"
 #include "clink/http_connector/bulk_sink_builders.hpp"
@@ -40,9 +42,9 @@ DlqPolicy parse_dlq(const clink::plugin::BuildContext& ctx) {
     return ctx.param_or("dlq", "fail") == "drop" ? DlqPolicy::Drop : DlqPolicy::Fail;
 }
 
-// A Pub/Sub factory's integer option, refused unless it is a whole number from
-// min to max: a typo or a negative once read as the default or wrapped.
-std::int64_t pubsub_integer(const clink::plugin::BuildContext& ctx,
+// A factory's integer option, refused unless it is a whole number from min to
+// max: a typo or a negative once read as the default or wrapped.
+std::int64_t option_integer(const clink::plugin::BuildContext& ctx,
                             const std::string& who,
                             const char* key,
                             std::int64_t fallback,
@@ -63,8 +65,8 @@ std::int64_t pubsub_integer(const clink::plugin::BuildContext& ctx,
     return out;
 }
 
-// A Pub/Sub factory's boolean option: 'true' or 'false', nothing else.
-bool pubsub_boolean(const clink::plugin::BuildContext& ctx,
+// A factory's boolean option: 'true' or 'false', nothing else.
+bool option_boolean(const clink::plugin::BuildContext& ctx,
                     const std::string& who,
                     const char* key,
                     bool fallback) {
@@ -100,11 +102,11 @@ HttpRequest::Options pubsub_http_options(const clink::plugin::BuildContext& ctx,
         }
     }
     http.base_url = endpoint.empty() ? "https://pubsub.googleapis.com" : endpoint;
-    http.verify_tls = pubsub_boolean(ctx, who, "verify_tls", true);
+    http.verify_tls = option_boolean(ctx, who, "verify_tls", true);
     http.connect_timeout_ms =
-        static_cast<int>(pubsub_integer(ctx, who, "connect_timeout_ms", 5000, 1, 600000));
+        static_cast<int>(option_integer(ctx, who, "connect_timeout_ms", 5000, 1, 600000));
     http.rw_timeout_ms =
-        static_cast<int>(pubsub_integer(ctx, who, "request_timeout_ms", 30000, 1, 3600000));
+        static_cast<int>(option_integer(ctx, who, "request_timeout_ms", 30000, 1, 3600000));
     std::map<std::string, std::string> headers;
     const std::string token_file = ctx.param_or("auth_token_file", "");
     const std::string token = ctx.param_or("auth_token", "");
@@ -132,7 +134,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     // HTTP client, not semantics.
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "http",
-        .version = "1",
+        .version = "2",
         .is_source = false,
         .is_sink = true,
         .build_dependencies = {"cpp-httplib"},
@@ -151,9 +153,13 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {},
+        .timeout_options = {"connect_timeout_ms", "request_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"the sink must be the only sink on its chain: Dag::add_sink refuses "
+        .limitations = {"any 2xx counts as delivered: the reply's body is not read",
+                        "no idempotency key is sent: a replay posts its records again",
+                        "under bulk_format='json_array' a record that is not one JSON value, and "
+                        "under 'ndjson' one holding a newline, is refused before it is sent",
+                        "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
@@ -445,34 +451,104 @@ void install(clink::plugin::PluginRegistry& reg) {
     //     distinct key.
     //   content_type (default "application/json")
     //   headers             - "K1: V1; K2: V2" (e.g. "Authorization: Bearer xyz")
-    //   batch_records (default 500), batch_bytes (default 4194304)
-    //   max_retries (default 4; clamped to [0, 20])
+    //   batch_records (default 500; 1 to 1000000), batch_bytes (default 4194304)
+    //   max_retries (default 4; 0 to 20)
+    //   dlq ("fail" [default] | "drop") - a record refused, before sending or by
+    //                                     the endpoint
+    //   linger_ms (default 0)
     //   verify_tls ("true" [default] | "false")  - https server-cert verification
+    //   connect_timeout_ms (default 5000), request_timeout_ms (default 30000)
+    // Under json_array each record must be one JSON value, and under ndjson one
+    // line; any other is refused before it is sent.
     reg.register_sink<std::string>(
         "http_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            const std::string who = "http_sink";
+            const auto refuse = [&who](const std::string& why) {
+                throw std::runtime_error(who + ": " + why);
+            };
             BatchedHttpBulkSink<std::string>::Options opts;
             opts.http.base_url = ctx.param_or("url");
             if (opts.http.base_url.empty()) {
-                throw std::runtime_error("http_sink: 'url' is required");
+                refuse("'url' is required");
+            }
+            // The client reads the url as scheme://host[:port] and nothing more:
+            // a path, or a scheme in capitals, made it read the whole url as a
+            // host name and fail every post with an error about the connection.
+            static const std::regex kBase(
+                R"(https?://(\[[0-9A-Fa-f:.]+\]|[^:/?#\[\]@\s]+)(:[0-9]{1,5})?)");
+            if (!std::regex_match(opts.http.base_url, kBase)) {
+                refuse(
+                    "'url' must be http:// or https:// with a host and an optional port, and "
+                    "nothing after them; the path goes in 'path' (it is '" +
+                    opts.http.base_url + "')");
             }
             opts.http.headers = parse_headers(ctx.param_or("headers", ""));
-            opts.http.verify_tls = ctx.param_or("verify_tls", "true") != "false";
+            opts.http.verify_tls = option_boolean(ctx, who, "verify_tls", true);
+            opts.http.connect_timeout_ms =
+                static_cast<int>(option_integer(ctx, who, "connect_timeout_ms", 5000, 1, 600000));
+            opts.http.rw_timeout_ms =
+                static_cast<int>(option_integer(ctx, who, "request_timeout_ms", 30000, 1, 3600000));
             opts.path = ctx.param_or("path", "/");
+            if (opts.path.empty() || opts.path.front() != '/') {
+                refuse("'path' must start with '/' (it is '" + opts.path + "')");
+            }
             opts.content_type = ctx.param_or("content_type", "application/json");
+            if (opts.content_type.empty()) {
+                refuse("'content_type' is empty; leave it out for application/json");
+            }
             const auto fmt = ctx.param_or("bulk_format", "json_array");
-            opts.framing =
-                (fmt == "ndjson" || fmt == "NDJSON") ? BulkFraming::Ndjson : BulkFraming::JsonArray;
-            opts.max_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 500));
-            opts.max_bytes =
-                static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 4 * 1024 * 1024));
-            opts.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            if (fmt == "ndjson" || fmt == "NDJSON") {
+                opts.framing = BulkFraming::Ndjson;
+            } else if (fmt == "json_array") {
+                opts.framing = BulkFraming::JsonArray;
+            } else {
+                // Anything else was read as json_array.
+                refuse("'bulk_format' must be 'json_array' or 'ndjson' (it is '" + fmt + "')");
+            }
+            opts.max_records = static_cast<std::size_t>(
+                option_integer(ctx, who, "batch_records", 500, 1, 1000000));
+            opts.max_bytes = static_cast<std::size_t>(
+                option_integer(ctx, who, "batch_bytes", 4 * 1024 * 1024, 1, std::int64_t{1} << 30));
+            opts.max_retries = static_cast<int>(option_integer(ctx, who, "max_retries", 4, 0, 20));
+            if (const std::string dlq = ctx.param_or("dlq", "fail");
+                dlq != "fail" && dlq != "drop") {
+                refuse("'dlq' must be 'fail' or 'drop'; it is '" + dlq + "'");
+            }
             opts.dlq_policy = parse_dlq(ctx);
-            opts.max_age = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
-            opts.name = "http_sink";
+            opts.max_age =
+                std::chrono::milliseconds{option_integer(ctx, who, "linger_ms", 0, 0, 3600000)};
+            opts.name = who;
 
-            // The record is already a serialized JSON object string (SQL path)
-            // or whatever the upstream string channel carries; append verbatim.
-            auto render = [](std::string& out, const std::string& rec) { out += rec; };
+            // A record the body's framing cannot carry is refused before it is
+            // sent, and alone. Written verbatim, one record that is not JSON made
+            // a json_array body something other than JSON, and a record holding
+            // a newline went out as two NDJSON lines: an endpoint that refused
+            // the body refused every record of the request with it.
+            BatchedHttpBulkSink<std::string>::Renderer render;
+            if (opts.framing == BulkFraming::JsonArray) {
+                render = [who](std::string& out, const std::string& rec) {
+                    try {
+                        (void)clink::config::parse(rec);
+                    } catch (const std::exception& e) {
+                        throw UnrenderableRecord(
+                            who +
+                            ": under bulk_format='json_array' each record must be one JSON "
+                            "value, and this one is not (" +
+                            e.what() + "), so the request body would not be JSON");
+                    }
+                    out += rec;
+                };
+            } else {
+                render = [who](std::string& out, const std::string& rec) {
+                    if (rec.find('\n') != std::string::npos) {
+                        throw UnrenderableRecord(
+                            who +
+                            ": under bulk_format='ndjson' each record is one line, and this "
+                            "one holds a newline, so it would go out as two");
+                    }
+                    out += rec;
+                };
+            }
             return std::make_shared<BatchedHttpBulkSink<std::string>>(std::move(opts),
                                                                       std::move(render));
         });
@@ -954,10 +1030,10 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.project = ctx.param_or("project");
             o.topic = ctx.param_or("topic");
             o.batch_records =
-                static_cast<std::size_t>(pubsub_integer(ctx, who, "batch_records", 1000, 1, 1000));
+                static_cast<std::size_t>(option_integer(ctx, who, "batch_records", 1000, 1, 1000));
             o.batch_bytes = static_cast<std::size_t>(
-                pubsub_integer(ctx, who, "batch_bytes", 9 * 1024 * 1024, 1, std::int64_t{1} << 30));
-            o.max_retries = static_cast<int>(pubsub_integer(ctx, who, "max_retries", 4, 0, 20));
+                option_integer(ctx, who, "batch_bytes", 9 * 1024 * 1024, 1, std::int64_t{1} << 30));
+            o.max_retries = static_cast<int>(option_integer(ctx, who, "max_retries", 4, 0, 20));
             if (const std::string dlq = ctx.param_or("dlq", "fail");
                 dlq != "fail" && dlq != "drop") {
                 throw std::runtime_error(who + ": 'dlq' must be 'fail' or 'drop'; it is '" + dlq +
@@ -965,7 +1041,7 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             o.dlq_policy = parse_dlq(ctx);
             o.linger =
-                std::chrono::milliseconds{pubsub_integer(ctx, who, "linger_ms", 0, 0, 3600000)};
+                std::chrono::milliseconds{option_integer(ctx, who, "linger_ms", 0, 0, 3600000)};
             o.name = who;
             return make_pubsub_publish_sink(std::move(o));
         });

@@ -22,6 +22,7 @@ add_executable(clink_http_connector_tests
     test_pubsub.cpp
     test_pubsub_live.cpp
     test_pubsub_sink_live.cpp
+    test_http_sink_contract.cpp
 )
 target_link_libraries(clink_http_connector_tests PRIVATE
     clink::core
