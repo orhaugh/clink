@@ -24,6 +24,15 @@ name: http
 # each checked against the feed's dataset, with `clink run` reading the feed to
 # its end. It runs whenever the build succeeded, whatever the search gates did.
 #
+# The generic HTTP sink's gate (scripts/http-sink-live.sh), against endpoints the
+# tests serve: the sink as its factory builds it (each record as written in both
+# framings, a record its framing cannot carry refused alone before it is sent,
+# a 404 that dead-letters nothing, a 400 dead-lettered under dlq=drop, a passing
+# refusal retried, a cancel ending a post in flight), the factory's refusals,
+# the shared bulk sink's own suites, and the recovery cells, a worker killed
+# before a post and after the endpoint answered one, the latter also as a SQL
+# job, each checked against what the endpoint received.
+#
 # The InfluxDB sink's gate (scripts/influxdb-live.sh), against InfluxDB 2.7.12
 # pinned by digest in the script: the renderer (point identity, escaping,
 # refusals, timestamps, numbers), the reading of write responses, the sink
@@ -188,6 +197,17 @@ jobs:
             ${TOOLCHAIN}"
           REPORT_DIR="${RUNNER_TEMP}/http-poll-live-reports" \
             scripts/http-poll-live.sh build 2>&1 | tee "${RUNNER_TEMP}/http-poll-gate.log"
+      - name: Run the generic HTTP sink's gate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v /tmp:/tmp -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_HTTP_SINK_RECOVERY_LOG_DIR \
+            ${TOOLCHAIN}"
+          REPORT_DIR="${RUNNER_TEMP}/http-sink-live-reports" \
+            scripts/http-sink-live.sh build 2>&1 | tee "${RUNNER_TEMP}/http-sink-gate.log"
       - name: Run the InfluxDB sink's gate
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -285,6 +305,21 @@ jobs:
           path: |
             ${{ runner.temp }}/http-poll-live-reports/**
             ${{ runner.temp }}/http-poll-gate.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Keep the generic HTTP sink's reports and the cells' evidence
+        # The reports carry every case's result; the gate log and the recovery
+        # run's log carry the "[http-sink-recovery]" verdict lines and the fault
+        # framework's witness lines; recovery-logs/ holds every cell's
+        # coordinator and worker logs; provenance.txt names the commit and the
+        # build's configuration.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-sink-gate
+          path: |
+            ${{ runner.temp }}/http-sink-live-reports/**
+            ${{ runner.temp }}/http-sink-gate.log
           if-no-files-found: warn
           retention-days: 90
       - name: Keep the reports and the cells' evidence
