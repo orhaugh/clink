@@ -26,6 +26,14 @@ inline natsConnection* connect(const NatsConnParams& c, const std::string& ctx) 
     natsOptions* opts = nullptr;
     check(natsOptions_Create(&opts), ctx + ": natsOptions_Create");
     natsStatus s = natsOptions_SetURL(opts, c.url.c_str());
+    if (s == NATS_OK) {
+        s = natsOptions_SetTimeout(opts, static_cast<int64_t>(c.connect_timeout.count()));
+    }
+    if (s == NATS_OK) {
+        // Without it the socket blocks, and a write to a server that has
+        // stopped reading never returns.
+        s = natsOptions_SetWriteDeadline(opts, static_cast<int64_t>(c.write_timeout.count()));
+    }
     if (s == NATS_OK && !c.name.empty()) {
         s = natsOptions_SetName(opts, c.name.c_str());
     }

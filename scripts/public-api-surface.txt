@@ -281,6 +281,7 @@ impls/mysql/include/clink/mysql/mysql_snapshot.hpp
 impls/mysql/include/clink/mysql/mysql_source.hpp
 impls/mysql/include/clink/mysql/mysql_sql.hpp
 impls/nats/include/clink/nats/connection_params.hpp
+impls/nats/include/clink/nats/nats_publisher.hpp
 impls/nats/include/clink/nats/nats_sink.hpp
 impls/nats/include/clink/nats/nats_source.hpp
 impls/onnx/include/clink/onnx/onnx_model_provider.hpp

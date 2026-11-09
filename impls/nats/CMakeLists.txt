@@ -46,6 +46,7 @@ if(NOT _nats_found)
 endif()
 
 add_library(clink_nats STATIC
+    src/nats_publisher.cpp
     src/nats_source.cpp
     src/nats_sink.cpp
     src/register_factories.cpp

@@ -1,7 +1,9 @@
 // NATS JetStream connector factory registration (nats_source_string, nats_sink_string).
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -18,13 +20,47 @@ namespace clink::nats {
 
 namespace {
 
-NatsConnParams parse_conn(const clink::plugin::BuildContext& ctx) {
+std::int64_t int_option(const clink::plugin::BuildContext& ctx,
+                        const std::string& factory,
+                        const std::string& key,
+                        std::int64_t fallback,
+                        std::int64_t min,
+                        std::int64_t max = std::numeric_limits<std::int64_t>::max()) {
+    const auto it = ctx.params.find(key);
+    if (it == ctx.params.end()) {
+        return fallback;
+    }
+    std::size_t used = 0;
+    std::int64_t v = 0;
+    try {
+        v = std::stoll(it->second, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (used == 0 || used != it->second.size() || v < min || v > max) {
+        throw std::runtime_error(
+            factory + ": '" + key + "' must be an integer " +
+            (max == std::numeric_limits<std::int64_t>::max()
+                 ? "of at least " + std::to_string(min)
+                 : "from " + std::to_string(min) + " to " + std::to_string(max)) +
+            " (got '" + it->second + "')");
+    }
+    return v;
+}
+
+// The connection options the source and the sink share; the timeouts are read
+// strictly, so a mistyped one is refused rather than read as the default.
+NatsConnParams parse_conn(const clink::plugin::BuildContext& ctx, const std::string& who) {
     NatsConnParams c;
     c.url = ctx.param_or("url", "nats://localhost:4222");
     c.user = ctx.param_or("user", "");
     c.password = ctx.param_or("password", "");
     c.token = ctx.param_or("token", "");
     c.name = ctx.param_or("client_name", "clink");
+    c.connect_timeout =
+        std::chrono::milliseconds{int_option(ctx, who, "connect_timeout_ms", 2000, 1, 300000)};
+    c.write_timeout =
+        std::chrono::milliseconds{int_option(ctx, who, "write_timeout_ms", 5000, 1, 3600000)};
     return c;
 }
 
@@ -33,7 +69,7 @@ NatsConnParams parse_conn(const clink::plugin::BuildContext& ctx) {
 void install(clink::plugin::PluginRegistry& reg) {
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "nats",
-        .version = "1",
+        .version = "2",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"nats.c"},
@@ -53,9 +89,15 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = false,
-        .timeout_options = {},
+        .timeout_options = {"connect_timeout_ms", "write_timeout_ms", "publish_timeout_ms"},
         .available_in_sql = true,
         .limitations = {"publish has no producer dedup: a replayed tail is re-published",
+                        "a PubAck means the stream stored the message as it is configured; a "
+                        "single-replica stream can lose acknowledged messages if its host fails "
+                        "before they reach disk",
+                        "TLS is negotiated when the server requires it and verified against the "
+                        "system's trusted CAs; there is no option for a private CA, a client "
+                        "certificate or skipping verification",
                         "a consumer whose durable is deleted loses its redelivery state",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it"},
@@ -71,7 +113,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_source<std::string>(
         "nats_source_string", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             NatsSource::Options o;
-            o.conn = parse_conn(ctx);
+            o.conn = parse_conn(ctx, "nats_source_string");
             o.subject = ctx.param_or("subject");
             o.stream = ctx.param_or("stream", "");
             o.durable = ctx.param_or("durable", "clink");
@@ -104,16 +146,19 @@ void install(clink::plugin::PluginRegistry& reg) {
 
     // nats_sink_string: JetStream async publish to a subject, confirmed on each barrier.
     // At-least-once (publisher acks awaited at flush; no producer dedup key set).
-    // Params: url/user/password/token, subject (required), max_pending (4096),
-    //   publish_timeout_ms (30000).
+    // Params: url/user/password/token/client_name/connect_timeout_ms/write_timeout_ms, subject
+    //   (required), max_pending (4096), max_pending_bytes (64 MiB), publish_timeout_ms (30000).
     reg.register_sink<std::string>(
         "nats_sink_string", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            const std::string who = "nats_sink_string";
             NatsSink::Options o;
-            o.conn = parse_conn(ctx);
+            o.conn = parse_conn(ctx, who);
             o.subject = ctx.param_or("subject");
-            o.max_pending = static_cast<int>(ctx.param_int64_or("max_pending", 4096));
-            o.publish_timeout =
-                std::chrono::milliseconds{ctx.param_int64_or("publish_timeout_ms", 30000)};
+            o.max_pending = static_cast<int>(int_option(ctx, who, "max_pending", 4096, 1, 1000000));
+            o.max_pending_bytes = static_cast<std::size_t>(
+                int_option(ctx, who, "max_pending_bytes", 64LL << 20, 1, 4LL << 30));
+            o.publish_timeout = std::chrono::milliseconds{
+                int_option(ctx, who, "publish_timeout_ms", 30000, 1, 3600000)};
             o.name = "nats_sink";
             if (o.subject.empty()) {
                 throw std::runtime_error("nats_sink: 'subject' is required");
