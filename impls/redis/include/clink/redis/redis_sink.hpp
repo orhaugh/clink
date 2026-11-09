@@ -1,154 +1,71 @@
 #pragma once
 
-// Redis Streams sink: each input record is appended to a stream via XADD. On the
-// SQL path the record is a row_to_json_string JSON object; it is stored under a
-// single configurable field (default "v") so the redis_source round-trips it back
-// verbatim. Optional MAXLEN caps the stream length (approximate trim by default).
+// Redis Streams sink: each record is appended to a stream with XADD, as the
+// value of one field (default "v"), so redis_source reads it back as written.
+// On the SQL path a record is a row_to_json_string object; with
+// changelog='true' it keeps its __row_kind marker and the reader nets.
 //
-// Delivery is AT-LEAST-ONCE: XADD is append-only with no producer dedup key, so a
-// replay after a failed checkpoint re-appends the buffered batch (the source then
-// sees duplicates, which a downstream idempotent consumer or keyed dedup must
-// absorb). Records are flushed on a count / byte / linger threshold and on every
-// checkpoint barrier, so everything buffered is durable in the stream by the
-// barrier.
+// Delivery is AT-LEAST-ONCE. XADD has no producer key, so the records a
+// restored job writes again (those its last checkpoint did not cover) are
+// appended again. Records are written at the count, byte and linger thresholds
+// and at every checkpoint barrier, so a completed checkpoint covers only
+// records the stream holds. MAXLEN trims the oldest entries as the stream
+// grows, whether or not a consumer group has read them.
+//
+// Writes, failures and the command timeout are the shared core's
+// (clink/redis/redis_sink_core.hpp). A record longer than max_record_bytes
+// fails the sink before anything of its flush is sent.
 
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
-#include <memory>
-#include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
-#include "clink/metrics/connector_metrics.hpp"
 #include "clink/operators/operator_base.hpp"
 #include "clink/redis/redis_client.hpp"
+#include "clink/redis/redis_sink_core.hpp"
 
 namespace clink::redis {
 
 struct RedisSinkOptions {
-    ConnectOptions conn;
+    ConnectOptions conn;                   // a command_timeout of 0 means 30 s
     std::string stream;                    // target stream key (required)
     std::string field{"v"};                // field name holding each record's payload
     std::size_t maxlen{0};                 // XADD MAXLEN cap (0 = unbounded)
     bool approx_maxlen{true};              // MAXLEN ~ (approx, cheap) vs = (exact)
     std::size_t batch_records{1000};       // flush after this many buffered records
-    std::size_t max_bytes{0};              // flush after this many buffered payload bytes (0 = off)
+    std::size_t max_bytes{0};              // flush after this many buffered bytes (0 = 16 MiB)
+    std::size_t max_record_bytes{0};       // refuse a longer record (0 = 16 MiB)
     std::chrono::milliseconds max_age{0};  // linger: flush a partial batch this old (0 = off)
     std::string name{"redis_sink"};
+    RedisSinkServerFactory server_factory;  // unset: a real server
 };
 
 class RedisSink : public Sink<std::string> {
 public:
-    explicit RedisSink(RedisSinkOptions opts) : opts_(std::move(opts)) {
-        if (opts_.stream.empty()) {
-            throw std::runtime_error(opts_.name + ": 'stream' is required");
-        }
-        if (opts_.field.empty()) {
-            throw std::runtime_error(opts_.name + ": 'field' must not be empty");
-        }
-        if (opts_.batch_records == 0) {
-            opts_.batch_records = 1;
-        }
-    }
+    static constexpr std::size_t kDefaultMaxBytes = std::size_t{16} << 20;
+    static constexpr std::size_t kDefaultMaxRecordBytes = std::size_t{16} << 20;
 
-    void open() override { conn_ = std::make_unique<Connection>(opts_.conn); }
+    explicit RedisSink(RedisSinkOptions opts);
 
-    void on_data(const Batch<std::string>& batch) override {
-        for (const auto& rec : batch) {
-            if (pending_.empty()) {
-                first_buffered_at_ = std::chrono::steady_clock::now();  // linger clock
-            }
-            pending_bytes_ += rec.value().size();
-            pending_.push_back(rec.value());
-            if (pending_.size() >= opts_.batch_records ||
-                (opts_.max_bytes > 0 && pending_bytes_ >= opts_.max_bytes) || linger_elapsed_()) {
-                flush();
-            }
-        }
-    }
-
-    void on_barrier(CheckpointBarrier /*b*/) override { flush(); }
+    void open() override;
+    void on_data(const Batch<std::string>& batch) override;
+    void on_barrier(CheckpointBarrier b) override;
     // Its barrier hook writes out everything it received before the barrier,
     // which is its guarantee only while it owns its chain's checkpoint, so
     // Dag::add_sink refuses another sink beside it.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
-
-    void flush() override {
-        if (pending_.empty()) {
-            return;
-        }
-        if (conn_ == nullptr) {
-            throw std::runtime_error(opts_.name + ": flush() before open()");
-        }
-        const std::size_t n = pending_.size();
-        const std::size_t bytes = pending_bytes_;
-        const auto t0 = std::chrono::steady_clock::now();
-        try {
-            // Pipeline every XADD, then drain the replies in order: one network
-            // round-trip for the whole batch instead of one per record.
-            for (const auto& rec : pending_) {
-                conn_->append(xadd_args_(rec));
-            }
-            for (std::size_t i = 0; i < n; ++i) {
-                Reply r = conn_->get_reply();
-                if (r.is_error()) {
-                    throw std::runtime_error(opts_.name + ": XADD failed: " + r.error_text());
-                }
-            }
-        } catch (...) {
-            clink::metrics::connector::error_inc("redis", "sink");
-            pending_.clear();
-            pending_bytes_ = 0;
-            // Drop the connection: on a per-item error reply the remaining
-            // pipelined replies are still unread in hiredis' reader buffer, so a
-            // reused context would return stale replies. Forcing a reconnect on
-            // re-open avoids that desync (and a dead connection is gone anyway).
-            conn_.reset();
-            throw;  // job replays from the last checkpoint (at-least-once)
-        }
-        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t0)
-                            .count();
-        clink::metrics::connector::records_out_inc("redis", n);
-        clink::metrics::connector::bytes_out_inc("redis", bytes);
-        clink::metrics::connector::commit_latency_observe("redis", static_cast<std::uint64_t>(dt));
-        pending_.clear();
-        pending_bytes_ = 0;
-    }
-
-    void close() override {
-        flush();
-        conn_.reset();
-    }
-
+    void flush() override;
+    // Discards what is buffered and releases the connection; never throws.
+    void close() override;
     std::string name() const override { return opts_.name; }
 
 private:
-    std::vector<std::string> xadd_args_(const std::string& payload) const {
-        std::vector<std::string> args;
-        args.reserve(7);
-        args.emplace_back("XADD");
-        args.push_back(opts_.stream);
-        if (opts_.maxlen > 0) {
-            args.emplace_back("MAXLEN");
-            args.emplace_back(opts_.approx_maxlen ? "~" : "=");
-            args.push_back(std::to_string(opts_.maxlen));
-        }
-        args.emplace_back("*");  // server-assigned id
-        args.push_back(opts_.field);
-        args.push_back(payload);
-        return args;
-    }
-
-    bool linger_elapsed_() const {
-        return opts_.max_age.count() > 0 && !pending_.empty() &&
-               std::chrono::steady_clock::now() - first_buffered_at_ >= opts_.max_age;
-    }
+    [[nodiscard]] std::vector<std::string> xadd_args_(std::string payload) const;
+    [[nodiscard]] bool linger_elapsed_() const;
 
     RedisSinkOptions opts_;
-    std::unique_ptr<Connection> conn_;
+    RedisSinkCore core_;
     std::vector<std::string> pending_;
     std::size_t pending_bytes_{0};
     std::chrono::steady_clock::time_point first_buffered_at_{};

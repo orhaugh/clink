@@ -7,7 +7,10 @@
 add_executable(clink_redis_tests
     register.cpp
     test_factory_registration.cpp
+    test_redis_sink_contract_live.cpp
+    test_redis_sink_failures.cpp
     test_redis_sink_logic.cpp
+    test_redis_sink_rules.cpp
     test_redis_source_logic.cpp
     test_redis_live.cpp
     test_redis_tls.cpp

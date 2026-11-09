@@ -298,6 +298,8 @@ impls/rabbitmq/include/clink/rabbitmq/rabbitmq_sink.hpp
 impls/rabbitmq/include/clink/rabbitmq/rabbitmq_source.hpp
 impls/redis/include/clink/redis/redis_client.hpp
 impls/redis/include/clink/redis/redis_sink.hpp
+impls/redis/include/clink/redis/redis_sink_core.hpp
+impls/redis/include/clink/redis/redis_sink_rules.hpp
 impls/redis/include/clink/redis/redis_source.hpp
 impls/redis/include/clink/redis/redis_upsert_sink.hpp
 impls/rocksdb/include/clink/rocksdb/rocksdb_materialization_store.hpp

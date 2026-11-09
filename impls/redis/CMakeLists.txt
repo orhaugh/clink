@@ -62,6 +62,10 @@ if(_redis_ssl_lib AND OpenSSL_FOUND)
 endif()
 
 add_library(clink_redis STATIC
+    src/redis_sink.cpp
+    src/redis_sink_core.cpp
+    src/redis_sink_rules.cpp
+    src/redis_upsert_sink.cpp
     src/register_factories.cpp
 )
 add_library(clink::redis ALIAS clink_redis)

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <hiredis/hiredis.h>
+#include <sys/socket.h>
 
 #ifdef CLINK_REDIS_TLS
 #include <memory>
@@ -122,14 +123,21 @@ public:
         if (o.tls) {
             secure_(o);  // wrap in TLS before AUTH so credentials are encrypted
         }
-        if (!o.password.empty()) {
-            Reply r = o.username.empty() ? command({"AUTH", o.password})
-                                         : command({"AUTH", o.username, o.password});
-            require_ok_(r, "AUTH");
-        }
-        if (o.db != 0) {
-            Reply r = command({"SELECT", std::to_string(o.db)});
-            require_ok_(r, "SELECT");
+        // A constructor that throws runs no destructor, so the context is freed
+        // here, or every refused AUTH would leave its socket open.
+        try {
+            if (!o.password.empty()) {
+                Reply r = o.username.empty() ? command({"AUTH", o.password})
+                                             : command({"AUTH", o.username, o.password});
+                require_ok_(r, "AUTH");
+            }
+            if (o.db != 0) {
+                Reply r = command({"SELECT", std::to_string(o.db)});
+                require_ok_(r, "SELECT");
+            }
+        } catch (...) {
+            free_();
+            throw;
         }
     }
 
@@ -188,6 +196,15 @@ public:
     }
 
     bool ok() const noexcept { return ctx_ != nullptr && ctx_->err == 0; }
+
+    // Ends whatever the connection is waiting for: a blocked read or write fails
+    // at once, and the connection is unusable afterwards. Safe to call from
+    // another thread.
+    void shutdown_socket() noexcept {
+        if (ctx_ != nullptr && ctx_->fd >= 0) {
+            (void)::shutdown(ctx_->fd, SHUT_RDWR);
+        }
+    }
 
 private:
     static timeval to_timeval_(std::chrono::milliseconds ms) {
