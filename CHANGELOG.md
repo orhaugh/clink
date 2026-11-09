@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**The Delta sink commits a local version only if no writer has, and names
+each writer's data files apart.** It renamed its log entry into place, which
+replaced an existing version, and named its data file after the version, so
+two writers that read the same next version, a stale task beside its
+restarted one, left the table with only the second writer's rows. On a local
+disk the entry is now published by a hard link, which fails when the version
+exists, and the second writer stops with an error naming it; every data file
+carries an id of its writer. On an object store a commit is still an upload a
+second writer's replaces: there the table must have one writer.
+
 **The file source reads a file again from the start when it is restored over
 another file.** It resumed a restore at the byte offset its checkpoint held,
 without looking at the file: a shorter file, one rotated over or truncated,
