@@ -24,3 +24,4 @@ subsystems work today, and take precedence wherever detail has evolved.
 | [011](011-public-api-tiers.md) | The public API is tiered, and 1.x promises source compatibility on the Stable tier |
 | [012](012-machine-checked-exactly-once.md) | The exactly-once protocol is a machine-checked specification, and the engine's traces are validated against it |
 | [013](013-state-namespaced-by-job.md) | State is namespaced by job |
+| [014](014-incident-evidence-bundles.md) | Incident evidence bundles |
