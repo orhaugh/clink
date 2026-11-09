@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+**The RabbitMQ sink stays failed rather than wait on settled messages, says
+what became of each message, and can be cancelled while the broker stops
+reading.** After a nack or a returned message the sink stayed open: a later
+flush waited out its confirm timeout for a tag the broker had already settled,
+or failed again on the returned message's frames, left unread. `close()`
+waited for confirms, even when the task was cancelled, and could throw. A
+publish to a broker that stops reading (a memory or disk alarm) blocked with
+no limit, since librabbitmq writes with no deadline, and the task could not be
+cancelled; nor could a wait for confirms. The connect had no timeout,
+unconfirmed publishes had no bound between barriers, and a nack or a confirm
+timeout said nothing of what had been confirmed. Options were read leniently:
+`persistent='no'` published persistent messages, and a mistyped number read as
+the default. Now any failure fails the sink until it is opened again. A flush
+reads every confirm before it decides, since the broker confirms out of order,
+and says how many messages were confirmed, refused, returned or left
+unconfirmed; a closed channel carries the broker's reply. A watch shuts the
+socket when the task is cancelled during a publish or a wait.
+`connect_timeout_ms` (10 s) bounds the connect and the handshake, for the
+source too. `max_unconfirmed` (10,000) bounds the messages awaiting confirms,
+a record past `max_record_bytes` (16 MiB) fails the sink before it is
+published, and `close()` discards and never throws. Options are read strictly,
+and a SQL sink table takes only the options the sink reads. The brokers gate
+gains a RabbitMQ sinks phase: `RabbitMqSinkFailures` against a scripted
+broker, `RabbitMqSinkContractLive` against RabbitMQ 3.13, and recovery cells
+that kill a worker before and after a barrier's confirms.
+
 **The Redis sinks stay failed rather than forget a write, say what a flush
 left behind, and key and store each record exactly.** After a failed flush
 `redis_sink` and `redis_upsert_sink` cleared what they had buffered and dropped
