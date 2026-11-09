@@ -1,0 +1,27 @@
+-- The example job: a paced feed, a filter, and per-user totals over one-second
+-- event-time windows, written to a file. @FEED_URL@ and @OUT@ are filled in by
+-- run.sh. The source reads in cursor mode, so a restore asks the feed again
+-- from the checkpointed sequence number.
+CREATE TABLE events (seq BIGINT, usr TEXT, ts BIGINT, amount BIGINT) WITH (
+    connector        = 'http_poll',
+    format           = 'json',
+    url              = '@FEED_URL@',
+    path             = '/events',
+    cursor_param     = 'after',
+    cursor_field     = 'seq',
+    cursor_type      = 'integer',
+    poll_interval_ms = '20',
+    event_time_column = 'ts'
+);
+
+CREATE TABLE totals (usr TEXT, window_start BIGINT, total BIGINT, n BIGINT) WITH (
+    connector = 'file',
+    format    = 'json',
+    path      = '@OUT@'
+);
+
+INSERT INTO totals
+SELECT usr, window_start, SUM(amount) AS total, COUNT(*) AS n
+FROM events
+WHERE amount > 3
+GROUP BY TUMBLE(ts, INTERVAL '1' SECOND), usr;
