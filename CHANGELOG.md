@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**The object-store Parquet source resumes a restore only over the listing it
+was taken over, and the Parquet 2PC sink fails a commit that finds neither its
+staged nor its committed object.** The multi-object source behind the S3, GCS
+and Azure Parquet sources checkpointed only the count of batches it had
+emitted, so an object added or removed, or another parallelism, made a restore
+skip batches: after one of six objects was removed, a row was never emitted.
+The checkpoint now holds a hash of the whole listing, the subtask and the
+parallelism with the count, and a restore resumes by the count only when all
+of them match; otherwise, and from an earlier release's count, every assigned
+object is read again. The exactly-once Parquet sink took a missing staged
+object to mean its commit had run, so an interval whose staged object a
+lifecycle rule expired while the job was down vanished with the commit
+reported done; it now checks for the committed object, and with neither there
+it fails and keeps the handle. `scripts/s3-live.sh` gains a parquet phase with
+live cases for the source and the 2PC sink, and
+`scripts/object-store-parquet-live.sh` runs the GCS and Azure suites against
+their emulators, pinned by digest, in a new `object-stores` workflow.
+
 **The raw S3 source reads every page of a listing and restores by key, and the
 raw S3 sinks read their byte counts strictly.** The C++ `S3Source` listed a
 prefix once, and a listing answers at most 1000 keys a page, so the objects
