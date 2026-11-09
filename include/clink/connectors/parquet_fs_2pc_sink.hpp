@@ -38,8 +38,9 @@
 //   on_commit(id) - commit(handle) publishes staging -> committed by the route
 //                   the store publishes atomically (a streamed upload on S3, a
 //                   rename on a local disk or WebHDFS, a server-side copy on
-//                   GCS and Azure; see commit_one_) then
-//                   deletes staging. Idempotent: a missing staging object is a no-op.
+//                   GCS and Azure; see commit_one_) then deletes staging.
+//                   Idempotent: with the staging object gone, the commit stands
+//                   if the committed object is there, and fails if it is not.
 //   on_abort(id)  - abort(handle) DeleteFiles staging.
 //   flush/close   - drop an in-progress (non-barriered) interval; its bytes were
 //                   never staged or persisted, so there is nothing to commit.
@@ -235,7 +236,12 @@ private:
     }
 
     // Publish staging -> committed, then delete staging. Idempotent on replay: a
-    // missing staging object means the commit already ran. The committed object
+    // missing staging object with the committed object present means the commit
+    // already ran. With neither there, the interval's output is gone (a rule
+    // that expires staging objects ran while the job was down, say), and the
+    // commit fails rather than report a publication that did not happen, the
+    // handle staying persisted; it used to return as though committed. The
+    // committed object
     // must appear only whole, so the route is the one the store publishes
     // atomically by, as ParquetRollingSink chooses: S3 publishes a streamed
     // upload only when it completes; a local disk and WebHDFS rename; on the
@@ -248,6 +254,20 @@ private:
     void commit_one_(const std::string& staging_key, const std::string& committed_key) {
         auto info = fs_->GetFileInfo(staging_key);
         if (info.ok() && info->type() == arrow::fs::FileType::NotFound) {
+            auto committed = fs_->GetFileInfo(committed_key);
+            if (!committed.ok()) {
+                throw std::runtime_error("ParquetFsSink2PC: the staged object " + staging_key +
+                                         " is gone, and checking for the committed " +
+                                         committed_key +
+                                         " failed: " + committed.status().ToString());
+            }
+            if (committed->type() == arrow::fs::FileType::NotFound) {
+                throw std::runtime_error(
+                    "ParquetFsSink2PC: neither the staged object " + staging_key +
+                    " nor the committed " + committed_key +
+                    " exists, so this checkpoint's output is gone; a rule that expires "
+                    "staging objects must allow longer than a job can stay down");
+            }
             return;  // already committed and cleaned up
         }
         const auto type = fs_->type_name();

@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -197,6 +198,34 @@ TEST(ParquetFsSink2PC, FreshSinkCommitsPendingOnOpen) {
     EXPECT_EQ(count_parquet(base / "committed"), 1u);
     EXPECT_FALSE(state.get_operator_state(OperatorId{5}, "_xo_pending_sub0_5").has_value());
     EXPECT_EQ(read_committed(base), (std::vector<std::int64_t>{100, 200}));
+    std::filesystem::remove_all(base);
+}
+
+// A recovery that finds neither the staged nor the committed object has lost
+// the interval: a rule that expires staging objects removed it while the job
+// was down. The commit returned as though the object had been published, and
+// the handle was cleared with nothing committed; it now fails and keeps it.
+TEST(ParquetFsSink2PC, ARecoveryThatFindsNeitherTheStagedNorTheCommittedObjectFails) {
+    const auto base = make_temp_dir("gone");
+    InMemoryStateBackend state;
+    {
+        RuntimeContext rctx(OperatorId{5}, "fs2pc", &state, nullptr);
+        auto sink1 = make_sink(base, rctx, OperatorId{5});
+        sink1->open();
+        feed(*sink1, {100, 200});
+        sink1->on_barrier(CheckpointBarrier{CheckpointId{5}});
+    }
+    ASSERT_EQ(count_parquet(base / "staging"), 1u);
+    for (const auto& e : std::filesystem::directory_iterator(base / "staging")) {
+        std::filesystem::remove(e.path());
+    }
+    {
+        RuntimeContext rctx(OperatorId{5}, "fs2pc", &state, nullptr);
+        auto sink2 = make_sink(base, rctx, OperatorId{5});
+        EXPECT_THROW(sink2->open(), std::runtime_error);
+    }
+    EXPECT_EQ(count_parquet(base / "committed"), 0u);
+    EXPECT_TRUE(state.get_operator_state(OperatorId{5}, "_xo_pending_sub0_5").has_value());
     std::filesystem::remove_all(base);
 }
 
