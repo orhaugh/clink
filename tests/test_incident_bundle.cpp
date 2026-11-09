@@ -11,6 +11,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <unistd.h>
 #include <vector>
 
@@ -67,6 +68,19 @@ std::string reason_of(const std::vector<Check>& checks, const std::string& id) {
         }
     }
     return {};
+}
+
+// Whether the mode bits on `p` stop this process listing or reading it. They
+// do not stop root, which CI's containers run as, and a test that needs an
+// unreadable file cannot produce one there.
+bool mode_bits_deny(const fs::path& p) {
+    if (fs::is_directory(p)) {
+        std::error_code ec;
+        fs::directory_iterator it(p, ec);
+        return static_cast<bool>(ec);
+    }
+    std::ifstream in(p, std::ios::binary);
+    return !in.is_open();
 }
 
 class IncidentBundleTest : public ::testing::Test {
@@ -674,6 +688,11 @@ TEST_F(IncidentBundleTest, OnlyTheEvidenceDirectoriesAreScannedAndAListingErrorI
     fs::create_directories(hidden);
     spill(hidden / "epoch-1.cap", "unlisted");
     fs::permissions(hidden, fs::perms::none);
+    if (!mode_bits_deny(hidden)) {
+        fs::permissions(hidden, fs::perms::owner_all);
+        GTEST_SKIP() << "the mode bits do not stop this process listing a directory (it runs as "
+                        "root, as CI containers do), so no listing error can be made here";
+    }
     const auto checks = verify(r.bundle);
     fs::permissions(hidden, fs::perms::owner_all);
     EXPECT_EQ(verdict_of(checks, "bundle.artifacts"), Verdict::Failed);
@@ -687,6 +706,11 @@ TEST_F(IncidentBundleTest, AListedFileThatCannotBeReadFailsIntegrityInsteadOfEnd
     const auto marker =
         r.bundle / "checkpoint" / "_jobs" / std::to_string(kIncidentJob) / "COMPLETED-1";
     fs::permissions(marker, fs::perms::none);
+    if (!mode_bits_deny(marker)) {
+        fs::permissions(marker, fs::perms::owner_read | fs::perms::owner_write);
+        GTEST_SKIP() << "the mode bits do not stop this process reading a file (it runs as "
+                        "root, as CI containers do), so no unreadable artifact can be made here";
+    }
     std::vector<Check> checks;
     EXPECT_NO_THROW(checks = verify(r.bundle));
     fs::permissions(marker, fs::perms::owner_read | fs::perms::owner_write);
