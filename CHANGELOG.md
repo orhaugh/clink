@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**The NATS JetStream sink stays failed after a refusal, says what became of
+each message, and cannot be held by a server that stops reading.** After a
+refusal the sink stayed open, and a later flush found nothing pending and
+passed. `close()` waited for answers, even when the task was cancelled, and
+could throw, and a wait for answers could not be cancelled. nats.c writes with
+no deadline unless one is set, so a publish to a server that stops reading
+blocked for as long as it stopped. nats.c keeps every unanswered message in
+memory, and only a count bounded them. A timeout said nothing of what had been
+stored, and options were read leniently. Now any failure fails the sink until
+it is opened again. Every answer reaches a per-message handler, and a failure
+says how many messages were stored, refused or left unanswered. Waits look at
+the task's cancel every 100 ms. `write_timeout_ms` (5 s) ends a stalled write,
+for the source too, and `connect_timeout_ms` (2 s, nats.c's default) is now an
+option. `max_pending_bytes` (64 MiB) bounds the bytes awaiting answers beside
+`max_pending`, and `close()` discards and never throws. Options are read
+strictly, a SQL sink table takes only the options the sink reads, and the
+record says what TLS amounts to. The brokers gate gains a NATS sinks phase:
+`NatsSinkFailures` against a scripted server, `NatsSinkContractLive` against
+NATS 2.10, and recovery cells that kill a worker before and after a barrier's
+answers.
+
 **The RabbitMQ sink stays failed rather than wait on settled messages, says
 what became of each message, and can be cancelled while the broker stops
 reading.** After a nack or a returned message the sink stayed open: a later
