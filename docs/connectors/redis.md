@@ -1,6 +1,6 @@
 # Redis Streams
 
-> Connects to Redis Streams as both a source (`XREADGROUP` over a consumer group) and a sink (`XADD`).
+> Connects to Redis Streams as both a source (`XREADGROUP` over a consumer group) and a sink (`XADD`), and keeps a key-value view of a changelog with `mode='upsert'` (`SET` and `DEL`).
 
 ## Overview
 
@@ -31,23 +31,25 @@ cmake -S . -B build -DCLINK_WITH_REDIS=ON
 | --- | --- | --- |
 | `redis_source` | Source | `std::string` |
 | `redis_sink` | Sink | `std::string` |
-| `redis_upsert_sink` | Sink | `Row` (SET/DEL by the primary-key-derived key) |
+| `redis_upsert_sink` | Sink | `std::string`, a JSON object (`SET` or `DEL` by the key its primary key names) |
 
 (Registered in `impls/redis/src/register_factories.cpp`.)
 
 ## Configuration
 
-Options are parsed off the `BuildContext` in `register_factories.cpp`; the shared connection options come from the `ConnectOptions` struct in `redis_client.hpp`. The sink-only and source-only options come from `RedisSinkOptions` (`redis_sink.hpp`) and `RedisSourceOptions` (`redis_source.hpp`).
+Options are parsed off the `BuildContext` in `register_factories.cpp`; the shared connection options come from the `ConnectOptions` struct in `redis_client.hpp`. The sink-only and source-only options come from `RedisSinkOptions` (`redis_sink.hpp`), `RedisUpsertSinkOptions` (`redis_upsert_sink.hpp`) and `RedisSourceOptions` (`redis_source.hpp`).
+
+The connection options and the sinks' options are read strictly: a number outside its range, or a boolean other than `true` or `false`, fails the job's build rather than reading as the default.
 
 ### Connection (both source and sink)
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `host` | No | `localhost` | Redis host. |
-| `port` | No | `6379` | Redis port. |
+| `port` | No | `6379` | Redis port, 1 to 65535. |
 | `username` | No | (empty) | ACL username (Redis 6+). Empty means legacy `AUTH <password>`. |
 | `password` | No | (empty) | Password for `AUTH`. Empty means no authentication. |
-| `db` | No | `0` | Database index; `SELECT <db>` is issued only when non-zero. |
+| `db` | No | `0` | Database index, 0 or more; `SELECT <db>` is issued only when non-zero. |
 | `tls` | No | `false` | `true` wraps the connection in TLS before `AUTH`. Requires a TLS-enabled build (`CLINK_REDIS_TLS`); otherwise rejected at runtime. |
 | `tls_ca` | No | (empty) | Optional PEM path to a CA certificate for server verification. |
 | `tls_cert` | No | (empty) | Optional PEM path to a client certificate for mutual TLS. |
@@ -56,7 +58,7 @@ Options are parsed off the `BuildContext` in `register_factories.cpp`; the share
 | `tls_verify` | No | `true` | `false` skips server-certificate verification (self-signed development certs), the hostname check included. |
 | `tls_verify_hostname` | No | `true` | `false` keeps the certificate-chain check but accepts a certificate that names another host. |
 
-Authentication-related options are `username`, `password`, and the `tls_*` set. The TLS handshake runs before `AUTH`, so credentials are sent over the encrypted channel when `tls=true`.
+Authentication-related options are `username`, `password`, and the `tls_*` set. The TLS handshake runs before `AUTH`, so credentials are sent over the encrypted channel when `tls=true`. A `tls_ca`, `tls_cert`, `tls_key` or `tls_sni` given without `tls=true` is refused, since the connection would be made in the clear; so is a `tls` other than `true` or `false` (a `TRUE` once read as false).
 
 With `tls_verify` on, the handshake checks both that the server's certificate chains to a trusted CA (`tls_ca`, or the system store when it is empty) and that it names the host connected to (`tls_sni` when set, otherwise `host`). A name is matched against the certificate's DNS subjectAltNames, or its subject CN when it has none, with a wildcard covering one whole left-most label; an IP address is matched against its IP subjectAltNames only. A mismatch fails the connect with an error that names the host, what the certificate names, and `tls_verify_hostname=false`. hiredis itself checks only the chain, so the connector builds the TLS session and asks for the name before the handshake.
 
@@ -67,10 +69,23 @@ With `tls_verify` on, the handshake checks both that the server's certificate ch
 | `stream` | Yes | (none) | Target stream key. Construction fails if empty. |
 | `field` | No | `v` | Field name holding each record's payload. Must not be empty. |
 | `maxlen` | No | `0` | `XADD MAXLEN` cap on stream length; `0` means unbounded. |
-| `approx_maxlen` | No | `1` (true) | Non-zero uses approximate trim (`MAXLEN ~`); `0` uses exact (`MAXLEN =`). |
-| `batch_records` | No | `1000` | Flush the pipelined buffer after this many records. |
-| `max_bytes` | No | `0` | Flush after this many buffered payload bytes; `0` disables the byte threshold. |
-| `linger_ms` | No | `0` | Flush a partial batch once it is this old, in milliseconds; `0` disables linger. |
+| `approx_maxlen` | No | `1` | `1` or `true` uses approximate trim (`MAXLEN ~`); `0` or `false` exact (`MAXLEN =`). |
+| `batch_records` | No | `1000` | Flush the pipelined buffer after this many records, 1 to 1,000,000. |
+| `max_bytes` | No | `0` | Flush after this many buffered payload bytes, up to 1 GiB; `0` means 16 MiB. |
+| `max_record_bytes` | No | `16777216` | A longer record fails the sink before anything of its flush is sent; 1 byte to 512 MiB. |
+| `command_timeout_ms` | No | `30000` | The longest a command waits for its reply, 1 to 3,600,000 ms; past it the flush's outcome is unknown and the sink fails. |
+| `linger_ms` | No | `0` | Flush a partial batch once it is this old, 0 to 3,600,000 ms; `0` disables linger. |
+
+### Keyed sink (`redis_upsert_sink`)
+
+| Option | Required | Default | Description |
+| --- | --- | --- | --- |
+| `key_columns` | Yes | (none) | The primary key, comma-separated. On the SQL path the planner sets it from the table's `PRIMARY KEY`. |
+| `key_prefix` | No | (empty) | Prefix of every key the sink writes. |
+| `batch_records` | No | `1000` | Flush after this many buffered keys, 1 to 1,000,000; changes to one key are one key. |
+| `max_bytes` | No | `0` | Flush after this many buffered bytes of keys and values, up to 1 GiB; `0` means 16 MiB. |
+| `max_record_bytes` | No | `16777216` | A longer record fails the sink; 1 byte to 512 MiB. |
+| `command_timeout_ms` | No | `30000` | As for `redis_sink`. |
 
 ### Source (`redis_source`)
 
@@ -87,7 +102,9 @@ With `tls_verify` on, the handshake checks both that the server's certificate ch
 
 ## SQL usage
 
-Redis is mapped in `src/sql/physical_plan.cpp` to the `connector='redis'` string for both source (`redis_source`) and sink (`redis_sink`). On the SQL path the row is bridged to and from a JSON object string (`json_string_to_row` for the source, `row_to_json_string` for the sink). The default Streams sink is at-least-once; `mode='upsert'` with a PRIMARY KEY selects the changelog-aware key-value sink (`redis_upsert_sink`, see Delivery semantics) instead.
+Redis is mapped in `src/sql/physical_plan.cpp` to the `connector='redis'` string for both source (`redis_source`) and sink (`redis_sink`). On the SQL path the row is bridged to and from a JSON object string (`json_string_to_row` for the source, `row_to_json_string` for the sink). The default Streams sink is at-least-once; `mode='upsert'` with a PRIMARY KEY selects the changelog-aware key-value sink (`redis_upsert_sink`, see [the sinks](#the-sinks)) instead. A query that produces a changelog reaches the Streams sink only with `changelog='true'`, and its records then keep their `__row_kind` marker.
+
+A sink table's options are checked when the job is planned (`check_redis_sink_options`): one the sinks do not read is refused, naming those they read; `maxlen`, `approx_maxlen` and `linger_ms` are refused with `mode='upsert'`, and `key_prefix` without it; `key_columns` is refused, since the table's PRIMARY KEY supplies it. The source's options pass, so one table can serve as both.
 
 ```sql
 CREATE TABLE events_in (
@@ -110,6 +127,18 @@ CREATE TABLE events_out (
   host = 'localhost',
   port = '6379',
   stream = 'events_processed'
+);
+
+-- One key per customer, replaced as the totals change: customer:<id>.
+CREATE TABLE totals (
+  customer_id BIGINT,
+  total       DECIMAL(18, 2)
+) WITH (
+  connector = 'redis',
+  host = 'localhost',
+  mode = 'upsert',
+  primary_key = 'customer_id',
+  key_prefix = 'customer:'
 );
 ```
 
@@ -158,13 +187,53 @@ src.close();
 
 The factories can also be resolved through the runner registry by name (`redis_source` / `redis_sink` on the `string` channel), as in `impls/redis/tests/test_factory_registration.cpp`.
 
+## The sinks
+
+The Streams sink and the keyed sink share one core, `impls/redis/src/redis_sink_core.cpp`: the connection and its command timeout, the cancel watch, the failure state, and a pipelined write that reads every reply. The keyed sink's key rule is in `impls/redis/src/redis_sink_rules.cpp`; the JSON reader, the changelog marker and the removal of the marker from the stored value are the record rules the SQL sinks share (`include/clink/connectors/sink_record_rules.hpp`).
+
+### Modes
+
+| Mode | Selected by | Commands | Delivery |
+| --- | --- | --- | --- |
+| Append to a stream | `redis_sink`, or SQL `connector='redis'` | `XADD <stream> [MAXLEN ~\|= n] * <field> <record>` per record | At-least-once: a replay appends its records again. |
+| Key-value view of a changelog | `redis_upsert_sink`, or SQL `mode='upsert'` | `SET <key> <value>` for `insert`, `update_after` and a record with no `__row_kind`; `DEL <key>` for `delete` and `update_before` | Effectively-once on the keyspace, for a stable key and a deterministic query. |
+
+### Writes and failures
+
+Records are buffered and written at the count, byte and linger thresholds and at every checkpoint barrier, so a completed checkpoint covers only records Redis holds. A flush sends its commands pipelined and reads every reply.
+
+- A command Redis refuses (an error reply, such as `WRONGTYPE` on a key that is not a stream, or `OOM` under `maxmemory`) does not stop the others, which Redis runs regardless. The flush then fails, saying how many commands were refused, the first refusal, and how many were applied.
+- A reply that does not come, because the connection was lost, the command timeout passed or the task was cancelled, leaves the commands from there on unknown: each may or may not have run. A command that outlasts the timeout can still run afterwards; the live suite pauses the server's writes past the timeout and sees the server apply the flush once they resume. The error says how many were applied before the reply stopped and how many are unknown.
+- When the task's cancel is requested during a flush, a watch thread shuts the connection's socket, so the flush fails at once rather than waiting out the command timeout.
+
+Any failure fails the sink: every later record, barrier and flush is refused, an empty flush included, until the sink is opened again, which the job's restart does. The restart writes again what its last checkpoint did not cover. `close()` discards what is buffered, releases the connection and never throws; a clean end of input flushes before it. Errors never quote a record's contents.
+
+A reply means the server applied the command in memory. Persistence (`appendfsync`) and replication are the server's, and the sink waits for neither, so a primary that fails before persisting or replicating can lose acknowledged writes.
+
+### Bounds
+
+A flush holds at most `batch_records` records (or keys) and `max_bytes` bytes (16 MiB unless set). A record longer than `max_record_bytes` (16 MiB unless set) fails the sink before anything of its flush is sent, rather than reaching the server's own limit (`proto-max-bulk-len`, 512 MB by default), which would close the connection and leave the flush unknown. A command waits at most `command_timeout_ms` (30 s unless set) for its reply.
+
+### The Streams sink
+
+Each record is stored as written under one field (default `v`), byte for byte, so `redis_source` reads it back as written. `XADD` has no producer key, so the records a restored job writes again are appended again. `MAXLEN` trims the oldest entries as the stream grows, whether or not a consumer group has read them: the live suite writes twelve entries under `MAXLEN = 5` to a stream whose group has read nothing, and the group then reads five.
+
+### The keyed sink
+
+Each record is read strictly: one JSON object, UTF-8 throughout, no repeated member names, numbers kept as written. Its key is `key_prefix` and the primary key as text:
+
+- a string member is its characters;
+- a number is its exact plain decimal, so `1.50` names the key `1.5` and `1e3` the key `1000`, and `9007199254740993` and `9007199254740992` stay two keys;
+- `true` and `false` are themselves;
+- the members of a composite key are joined by the unit separator (U+001F), in `key_columns` order.
+
+A record whose key member is missing, null, an object or an array fails the sink, as does a number whose plain form passes 4,096 characters, and, in a composite key, a string holding U+001F, which would let two rows name one key. A `__row_kind` other than `insert`, `update_after`, `delete` or `update_before` fails the sink too.
+
+The stored value is the record as written without its `__row_kind` member: member order, number spellings and string escapes stay as they arrived. A flush nets the changelog by key, so a key's last change in the flush is the one written. The sink is not transactional: a reader can see a flush partly applied, and a key can show an earlier value while a restored job catches up to where it was.
+
 ## Delivery semantics
 
-Both ends are at-least-once.
-
-Sink (`redis_sink`): `XADD` is append-only with no producer dedup key. Records are buffered and pipelined, then flushed on the count / byte / linger threshold and on every checkpoint barrier, so everything buffered is durable in the stream by the barrier. On a flush error the connection is dropped and the exception is rethrown, so the job replays the buffered batch from the last checkpoint, which re-appends and produces duplicates downstream. There is no two-phase commit.
-
-Upsert sink (`redis_upsert_sink`, `mode='upsert'`): a separate key-value view (not Streams). Maintains one Redis key per PRIMARY KEY tuple - `SET <key_prefix><pk>` for insert/update_after, where a text key is its own characters, a number its digits, and the columns of a composite key are joined by the unit separator (0x1f), `DEL` for delete/update_before - netted by key within a flush and pipelined. Effectively-once on the keyspace for a stable PRIMARY KEY and a deterministic defining query (SET/DEL are keyed and idempotent, so a replay converges). The stored value is the row's JSON with the synthetic `__row_kind` removed. Lets a retracting query maintain a Redis key-value view.
+Both ends are at-least-once, and the keyed sink is effectively-once on the keyspace (see [the sinks](#the-sinks)). Neither sink uses two-phase commit.
 
 Source: the consumer group's per-consumer pending-entries list (PEL) is the durable cursor. On `open()` each consumer first re-drains its PEL (id `0`), re-delivering anything delivered but not acknowledged before a crash, then switches to new entries (`>`).
 
@@ -190,8 +259,13 @@ Same-parallelism restarts and scale-up are unaffected.
 ## Limitations
 
 - Each sink must be the only sink on its chain: at every checkpoint barrier it writes out what it received before the barrier, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
-- String channel only; record type is fixed to `std::string` for both factories.
+- String channel only; the record type is `std::string` for every factory.
 - The Streams sink is append-only at-least-once with no two-phase commit and no producer dedup; `mode='upsert'` selects the key-value sink instead.
+- `MAXLEN` trims entries a consumer group has not read.
+- A sink's write is acknowledged once the server applied it in memory; the sinks wait for neither persistence nor replication.
+- The keyed sink is not transactional: a reader can see a flush partly applied, and a key can show an earlier value while a restored job catches up.
+- A command that outlasts `command_timeout_ms` fails the sink with the flush's outcome unknown; the restart writes the flush again.
+- Redis Cluster is not supported: the connector holds one connection to one server and does not follow `MOVED` or `ASK` redirections.
 - A source entry round-trips verbatim only when it carries the single configured `field` (default `v`); any other entry is rendered as a JSON object of all field/value pairs, with all values string-typed (Redis bulk strings).
 - An `XDEL`-tombstoned entry that is still pending is paged past but not emitted, and acknowledged with its checkpoint.
 - The source acknowledges at checkpoint completion, so a crash between a completion and its `XACK` delivers that interval again (duplicates), and a restore from a checkpoint older than one it acknowledged does not see that checkpoint's entries again (see Delivery semantics).
@@ -201,16 +275,21 @@ Same-parallelism restarts and scale-up are unaffected.
 
 ## Testing
 
-The connector has in-process logic tests (`test_redis_sink_logic.cpp`, `test_redis_source_logic.cpp`, which include the rule for which consumers a lower parallelism strands), capability-record tests (`test_factory_registration.cpp`: the acknowledgement model, `AT_LEAST_ONCE_SOURCE`, `exactly_once` refused, the scale-down refusal), server-certificate tests (`test_redis_tls.cpp`), and env-gated live integration tests (`test_redis_live.cpp`). The acknowledgement ledger the source shares with the Pub/Sub source has its own tests (`tests/test_checkpoint_ack_ledger.cpp`), and `tests/test_source_ack_hooks.cpp` runs a source acknowledging through it in an in-process cluster, with and without par-1 fusion and across a checkpoint that never completes, judging every acknowledgement against the coordinator's `COMPLETED` markers.
+The connector has in-process logic tests (`test_redis_sink_logic.cpp`, `test_redis_source_logic.cpp`, which include the rule for which consumers a lower parallelism strands), capability-record and factory tests (`test_factory_registration.cpp`: the acknowledgement model, `AT_LEAST_ONCE_SOURCE`, `exactly_once` refused, the scale-down refusal, the sinks' records and their options read strictly), server-certificate tests (`test_redis_tls.cpp`), and env-gated live integration tests (`test_redis_live.cpp`).
+
+The sinks have their own suites. `RedisSinkRules` (`test_redis_sink_rules.cpp`) holds the key rule: strings, exact plain decimals, booleans, composite keys, and the keys refused. `RedisSinkFailures` and `RedisUpsertSinkFailures` (`test_redis_sink_failures.cpp`) drive both sinks against a scripted server: a refused command and a lost reply, each followed by a record, a barrier and a flush; reopening; a cancel during a flush and before one; a queueing failure; `close()`; the record, count, byte and linger bounds; the command timeout's default; and the keyed sink's netting, values as written, exact number keys and refusals. `RedisSinkContractLive` (`test_redis_sink_contract_live.cpp`) holds them to their contract against the server: entries exactly as written (a NUL byte, UTF-8, an empty record, 1 MiB), `MAXLEN` trimming entries a group has not read, a `WRONGTYPE` refusal and the reopen after it, a command that outlasts the timeout (the server's writes paused past it, and the flush applied once they resume), a cancel during a paused flush, a refused `AUTH` leaving no connection open, keyed values and keys exactly as written, netting and composite keys, a flush the server partly refuses under `maxmemory` (`SET` refused, `DEL` applied), and both factories writing to a selected database. `RedisUpsertSinkLive` and the shared upsert contract suite (`RedisUpsert/UpsertContractSuite`) run against the server too.
+
+The `RedisSinkRecovery` cells (`tests/integration/test_redis_sink_recovery.cpp`) run a coordinator and two `clink_node` workers polling a feed the test serves into each sink, with worker 0 killed at `redis.sink_before_flush` (a barrier's commands built and none sent) and at `redis.sink_after_flush` (the flush applied and the barrier not acknowledged), and a SQL job at parallelism 2 whose GROUP BY counts replace by key. They judge by what Redis holds, read over a RESP connection of their own: in the Streams cells every record is in the stream exactly as written, and the records appended twice are exactly those flushed after the checkpoint the job restored (none before the flush, the parked flush's after it); in the keyed cells every key holds its last record as written and every deleted key is absent. The acknowledgement ledger the source shares with the Pub/Sub source has its own tests (`tests/test_checkpoint_ack_ledger.cpp`), and `tests/test_source_ack_hooks.cpp` runs a source acknowledging through it in an in-process cluster, with and without par-1 fusion and across a checkpoint that never completes, judging every acknowledgement against the coordinator's `COMPLETED` markers.
 
 The certificate tests run in every TLS-enabled build without a Redis server: they connect to a local TLS listener (`tests/test_helpers/tls_handshake_server.hpp`), since the handshake completes before the client sends any command. They cover a certificate that names the address, one that names another host (refused, with the error), `tls_sni` as the name checked, wildcards, the hostname opt-out still checking the chain, and `tls_verify=false`.
 
 The live tests are skipped unless `CLINK_REDIS_TEST_URL` is set (for example `redis://localhost:6379`). The integration service is the `redis:7` Docker image defined in `docker/integration-services.yml`. `RedisLive` covers a sink-to-source round-trip, PEL replay of an un-acked consumer on restart, that acknowledged entries are not replayed, multi-field JSON-object rendering, and idempotent `XGROUP CREATE`. `RedisSourceAckLive` holds the source to its acknowledgement contract against the server, judged by `XPENDING` and by what a restarted consumer reads: an aborted checkpoint, a crash after the barrier, a crash after completion before the `XACK`, a killed connection at the `XACK`, an `XACK` whose reply is lost, intervals and notifications out of order, the `max_pending` bound, close after a cancel, and a scale-down beside stranded entries.
 
-`scripts/ack-sources-live.sh [build-dir]` is the required gate for every source that acknowledges at checkpoint completion (Redis Streams, Pub/Sub, RabbitMQ, NATS and Pulsar): it runs their live suites against one-off containers of the compose services, one service at a time on free loopback ports, and fails on a missing binary, a service that never answers, a failed or skipped case, or a suite that ran fewer cases than it should. The `ack-sources` CI workflow runs it.
+`scripts/brokers-live.sh [build-dir]` is the required gate for the broker connectors (Redis, Pub/Sub, RabbitMQ, NATS, Pulsar and MQTT): it runs each broker's phases against a one-off container of its compose service, one broker at a time on free loopback ports. The sources phase runs every acknowledging source's round trip and contract; for Redis the sinks phase runs the sinks' suites above and the `RedisSinkRecovery` cells. It fails on a missing binary, a service that never answers, a failed or skipped case, a suite that ran fewer cases than it should, or, with both phases run, a case of `clink_redis_tests` that neither phase ran (the TLS cases aside). The `brokers` CI workflow runs it.
 
 ```bash
-scripts/ack-sources-live.sh build
+scripts/brokers-live.sh build                                         # every broker, both phases
+BROKERS_LIVE_ONLY=redis BROKERS_LIVE_PHASES=sinks scripts/brokers-live.sh build
 ```
 
 The TLS round-trip test additionally requires `CLINK_REDIS_TLS_TEST_URL` (set to a TLS-enabled redis `host:port`) and a build with `CLINK_REDIS_TLS`. The `-L redis` label runs the connector's test executable.

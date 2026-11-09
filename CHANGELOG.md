@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+**The Redis sinks stay failed rather than forget a write, say what a flush
+left behind, and key and store each record exactly.** After a failed flush
+`redis_sink` and `redis_upsert_sink` cleared what they had buffered and dropped
+the connection, so a later empty flush, and with it the next checkpoint,
+succeeded. `close()` flushed even when the task was cancelled, a command could
+wait for its reply forever, the buffer had no byte bound unless one was set,
+and a flush that Redis refused in part reported only the first error. A
+refused `AUTH` or `SELECT` left its socket open on every attempt. The keyed
+sink took an unknown `__row_kind` as an insert and quoted records in its
+errors. It stored each value parsed and written again, so a decimal past a
+double's precision was stored altered, and it keyed numbers the same way, so
+two BIGINT keys past 2^53 could name one Redis key, as could a composite key
+whose text member held the separator. `tls='TRUE'` read as false and connected
+in the clear, and a mistyped number read as the default. Now any failure fails
+the sink until it is opened again. A flush reads every reply and says how many
+commands were applied, refused or left unknown, and a command waits at most
+`command_timeout_ms` (30 s unless set). A cancel shuts the socket, so the flush
+in flight ends at once. A flush holds at most 16 MiB unless `max_bytes` says
+otherwise, a record past `max_record_bytes` (16 MiB) fails the sink before it
+is sent, and `close()` discards. The keyed sink reads records strictly, keys
+numbers by their exact plain decimal, refuses a composite key member holding
+U+001F and unknown markers, and stores the record as written without its
+`__row_kind`. A key whose number was written with an exponent or past a
+double's precision is therefore spelt differently than before. Options are read
+strictly, a `tls_*` option without `tls='true'` is refused, and a SQL sink table
+takes only the options the sinks read. `scripts/ack-sources-live.sh` becomes
+`scripts/brokers-live.sh`, run by the `brokers` workflow, with a `sources` and
+a `sinks` phase per broker. The Redis sinks phase runs `RedisSinkFailures`
+against a scripted server, `RedisSinkContractLive` against Redis 7, and
+recovery cells that kill a worker before and after a flush.
+
 **The PostgreSQL sinks stay failed rather than forget a write, apply a
 changelog in the order its keys changed, and write each value exactly or refuse
 it.** After a failed flush `postgres_sink` and `postgres_upsert_sink` cleared

@@ -229,7 +229,13 @@ that the SELECT projects it.
   the key must be the table's whole primary key (see
   [Cassandra](../connectors/cassandra.md#delivery-ordering-and-the-final-state)).
 - **Redis upsert**: a key-value view (`SET`/`DEL` by the PK-derived key), distinct
-  from the append-only Streams sink.
+  from the append-only Streams sink. Redis compares keys byte for byte, so the
+  key's text is the row's identity: a number is keyed by its exact plain
+  decimal, and a composite key member holding the separator (U+001F) is
+  refused. A flush nets by that key and pipelines the survivors with no
+  transaction, so it can be seen partly applied; it reports how many commands
+  were applied, refused or left unknown (see
+  [Redis](../connectors/redis.md#the-sinks)).
 - **PostgreSQL upsert**: as the MySQL upsert, a flush is one transaction of
   runs of `INSERT ... ON CONFLICT (k) DO UPDATE` and `DELETE ... WHERE k IN
   (...)` in the order each key last changed. PostgreSQL refuses an upsert that
