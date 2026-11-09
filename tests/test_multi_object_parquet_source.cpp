@@ -9,6 +9,7 @@
 #include <fstream>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -239,6 +240,151 @@ TEST(MultiObjectParquetSource, ReplayResumesAcrossFilesWithoutLossOrDuplication)
     all.insert(all.end(), second.begin(), second.end());
     std::sort(all.begin(), all.end());
     EXPECT_EQ(all, (std::vector<std::int64_t>{0, 100, 200, 300, 400, 500}));
+}
+
+namespace {
+
+// One row per file, so each produce() call is one file: file i holds i * 100.
+std::filesystem::path six_files(const std::string& tag) {
+    auto dir = make_temp_dir(tag);
+    for (int i = 0; i < 6; ++i) {
+        write_int64_file(dir / ("p" + std::to_string(i) + ".parquet"), {i * 100});
+    }
+    return dir;
+}
+
+// The values `calls` produce() calls emit, in order.
+std::vector<std::int64_t> emit_calls(MultiObjectParquetSource<std::int64_t>& src, int calls) {
+    std::vector<std::int64_t> out;
+    Emitter<std::int64_t> em([&out](StreamElement<std::int64_t> e) {
+        if (e.is_data()) {
+            for (const auto& r : e.as_data()) {
+                out.push_back(r.value());
+            }
+        }
+        return true;
+    });
+    for (int i = 0; i < calls && src.produce(em); ++i) {
+    }
+    return out;
+}
+
+// Reads `calls` batches with a source over `dir` and checkpoints it.
+void read_and_checkpoint(const std::filesystem::path& dir,
+                         int subtask,
+                         int par,
+                         int calls,
+                         InMemoryStateBackend& backend,
+                         OperatorId op) {
+    MultiObjectParquetSource<std::int64_t> src(
+        local_fs_factory(), dir_opts(dir, subtask, par), int64_arrow_batcher());
+    src.open();
+    (void)emit_calls(src, calls);
+    src.snapshot_offset(backend, op, CheckpointId{1});
+    src.close();
+}
+
+// Everything a source over `dir` restored from `backend` emits, sorted.
+std::vector<std::int64_t> restore_and_drain(const std::filesystem::path& dir,
+                                            int subtask,
+                                            int par,
+                                            InMemoryStateBackend& backend,
+                                            OperatorId op) {
+    MultiObjectParquetSource<std::int64_t> src(
+        local_fs_factory(), dir_opts(dir, subtask, par), int64_arrow_batcher());
+    EXPECT_TRUE(src.restore_offset(backend, op));
+    src.open();
+    auto out = drain(src);
+    src.close();
+    return out;
+}
+
+}  // namespace
+
+// An object removed before the position moved the count: restored by the count
+// alone, the source skipped p3. The listing differs, so it reads every object
+// again.
+TEST(MultiObjectParquetSource, ARestoreAfterAnEarlierObjectWasRemovedReadsEveryObjectAgain) {
+    const auto dir = six_files("removed");
+    InMemoryStateBackend backend;
+    read_and_checkpoint(dir, 0, 1, 3, backend, OperatorId{7});
+    std::filesystem::remove(dir / "p0.parquet");
+    EXPECT_EQ(restore_and_drain(dir, 0, 1, backend, OperatorId{7}),
+              (std::vector<std::int64_t>{100, 200, 300, 400, 500}));
+}
+
+// An object added before the position moved the count the other way: restored
+// by the count alone, the source read p2 again and never read the new object.
+TEST(MultiObjectParquetSource, ARestoreAfterAnObjectWasAddedReadsEveryObjectAgain) {
+    const auto dir = six_files("added");
+    InMemoryStateBackend backend;
+    read_and_checkpoint(dir, 0, 1, 3, backend, OperatorId{7});
+    write_int64_file(dir / "a.parquet", {-1});
+    EXPECT_EQ(restore_and_drain(dir, 0, 1, backend, OperatorId{7}),
+              (std::vector<std::int64_t>{-1, 0, 100, 200, 300, 400, 500}));
+}
+
+// At another parallelism each subtask is assigned other objects, so a count
+// taken over the old assignment skipped some of the new one.
+TEST(MultiObjectParquetSource, ARestoreAtAnotherParallelismReadsEveryAssignedObjectAgain) {
+    const auto dir = six_files("rescaled");
+    InMemoryStateBackend backend;
+    read_and_checkpoint(dir, 0, 2, 2, backend, OperatorId{7});  // p0 and p2
+    // At parallelism 3, subtask 0 is assigned p0 and p3.
+    EXPECT_EQ(restore_and_drain(dir, 0, 3, backend, OperatorId{7}),
+              (std::vector<std::int64_t>{0, 300}));
+}
+
+// Over the same listing, by the same subtask, the restore resumes exactly.
+TEST(MultiObjectParquetSource, ARestoreOverTheSameListingResumesAfterTheCount) {
+    const auto dir = six_files("same");
+    InMemoryStateBackend backend;
+    read_and_checkpoint(dir, 1, 2, 2, backend, OperatorId{7});  // p1 and p3
+    EXPECT_EQ(restore_and_drain(dir, 1, 2, backend, OperatorId{7}),
+              (std::vector<std::int64_t>{500}));
+}
+
+// An earlier release's checkpoint holds the count alone, which names no
+// listing, so every object is read again rather than skipped on trust.
+TEST(MultiObjectParquetSource, AnEarlierReleasesCountReadsEveryObjectAgain) {
+    const auto dir = six_files("earlier");
+    InMemoryStateBackend backend;
+    const std::string key = "__multi_parquet_source_offset__";
+    std::string count(8, '\0');
+    count[0] = 3;
+    backend.put_operator_state(OperatorId{7},
+                               StateBackend::KeyView{key.data(), key.size()},
+                               StateBackend::ValueView{count.data(), count.size()});
+    EXPECT_EQ(restore_and_drain(dir, 0, 1, backend, OperatorId{7}),
+              (std::vector<std::int64_t>{0, 100, 200, 300, 400, 500}));
+}
+
+// The versioned form round-trips, a checkpoint taken before open() holds the
+// restored position again, and a form neither release wrote is refused.
+TEST(MultiObjectParquetSource, TheCheckpointsFormRoundTripsAndAnOddOneIsRefused) {
+    const auto dir = six_files("forms");
+    const std::string key = "__multi_parquet_source_offset__";
+    const StateBackend::KeyView k{key.data(), key.size()};
+    InMemoryStateBackend backend;
+    read_and_checkpoint(dir, 0, 1, 2, backend, OperatorId{7});
+    const auto written = backend.get_operator_state(OperatorId{7}, k);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(written->size(), 25U);
+    EXPECT_EQ(std::to_integer<int>((*written)[0]), 2);
+
+    MultiObjectParquetSource<std::int64_t> unopened(
+        local_fs_factory(), dir_opts(dir, 0, 1), int64_arrow_batcher());
+    ASSERT_TRUE(unopened.restore_offset(backend, OperatorId{7}));
+    InMemoryStateBackend again;
+    unopened.snapshot_offset(again, OperatorId{7}, CheckpointId{2});
+    EXPECT_EQ(again.get_operator_state(OperatorId{7}, k), written);
+
+    InMemoryStateBackend odd;
+    const std::string five = "abcde";
+    odd.put_operator_state(OperatorId{7}, k, StateBackend::ValueView{five.data(), five.size()});
+    MultiObjectParquetSource<std::int64_t> refused(
+        local_fs_factory(), dir_opts(dir, 0, 1), int64_arrow_batcher());
+    EXPECT_THROW((void)refused.restore_offset(odd, OperatorId{7}), std::runtime_error);
 }
 
 // A file another tool wrote has no event_time column. Its rows read in full,
