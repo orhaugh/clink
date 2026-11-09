@@ -153,6 +153,38 @@ TEST(MysqlFactoryRegistration, TheSinkFactoriesReadTheirOptionsStrictly) {
               std::string::npos);
 }
 
+// The cursor source's factory: a number outside its range, a jitter that is
+// not a fraction, a boolean that is not 'true' or 'false' and a mode it does not
+// know are refused when the job is built.
+TEST(MysqlFactoryRegistration, TheCursorSourceFactoryReadsItsOptionsStrictly) {
+    const auto* f = clink::cluster::OperatorRegistry::default_instance().find_source(
+        "mysql_source", std::string{clink::cluster::kChannelString});
+    ASSERT_NE(f, nullptr);
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"host", "nowhere"}, {"table", "t"}, {"cursor_column", "id"}};
+    EXPECT_NO_THROW((void)f->build(ctx));
+    auto every = ctx;
+    every.params.insert({{"batch_size", "1000000"},
+                         {"poll_ms", "3600000"},
+                         {"jitter_frac", "0.25"},
+                         {"bounded", "true"},
+                         {"mode", "upsert"}});
+    EXPECT_NO_THROW((void)f->build(every));
+    for (const auto& [key, value, why] :
+         std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"batch_size", "0", "'batch_size' must be a whole number"},
+             {"poll_ms", "-1", "'poll_ms' must be a whole number"},
+             {"jitter_frac", "0.5x", "'jitter_frac' must be a number from 0 to 1"},
+             {"jitter_frac", "2", "'jitter_frac' must be a number from 0 to 1"},
+             {"bounded", "TRUE", "'bounded' must be 'true' or 'false'"},
+             {"mode", "cursor", "'mode' must be 'snapshot'"}}) {
+        auto c = ctx;
+        c.params[key] = value;
+        EXPECT_NE(thrown([&] { (void)f->build(c); }).find(why), std::string::npos)
+            << key << "=" << value;
+    }
+}
+
 TEST(MysqlFactoryRegistration, TheSinkRecordsStateTheirContracts) {
     const auto* append = clink::connectors::CapabilityRegistry::instance().find("mysql");
     const auto* upsert = clink::connectors::CapabilityRegistry::instance().find("mysql_upsert");
@@ -160,7 +192,7 @@ TEST(MysqlFactoryRegistration, TheSinkRecordsStateTheirContracts) {
     ASSERT_NE(upsert, nullptr);
     EXPECT_TRUE(append->self_check().empty());
     EXPECT_TRUE(upsert->self_check().empty());
-    EXPECT_EQ(append->version, "2");
+    EXPECT_EQ(append->version, "3");
     EXPECT_EQ(upsert->version, "2");
     EXPECT_EQ(append->delivery, clink::connectors::DeliveryGuarantee::AtLeastOnce);
     EXPECT_EQ(upsert->delivery, clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent);

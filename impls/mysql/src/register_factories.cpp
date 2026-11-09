@@ -134,7 +134,7 @@ void read_sink_bounds(const clink::plugin::BuildContext& ctx, const char* who, O
 void install(clink::plugin::PluginRegistry& reg) {
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "mysql",
-        .version = "2",
+        .version = "3",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"libmariadb (mariadb-connector-c)"},
@@ -166,7 +166,10 @@ void install(clink::plugin::PluginRegistry& reg) {
              "a flush is one transaction only on a transactional engine; on another, a failed "
              "flush can leave its first statements applied",
              "tested against MySQL servers only, not MariaDB",
-             "query source re-reads from the start on restart",
+             "the cursor source reads rows above its cursor, so a row that becomes visible "
+             "after a later one was read (an auto-increment id or timestamp taken before the "
+             "later one's and committed after it was read) is skipped: at-least-once only "
+             "while rows become visible in cursor order",
              "the sink must be the only sink on its chain: Dag::add_sink refuses another sink "
              "beside it"},
     });
@@ -343,19 +346,48 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   poll_ms (default 1000), jitter_frac (default 0)
     reg.register_source<std::string>(
         "mysql_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
+            constexpr const char* who = "mysql_source";
             MysqlPollOptions o;
             o.conn = conn_options_from(ctx);
             o.table = ctx.param_or("table");
             o.cursor_column = ctx.param_or("cursor_column");
             o.id_column = ctx.param_or("id_column", "");
             o.initial_cursor = ctx.param_or("initial_cursor", "");
-            o.batch_size = static_cast<int>(ctx.param_int64_or("batch_size", 1000));
-            o.interval = std::chrono::milliseconds{ctx.param_int64_or("poll_ms", 1000)};
-            o.jitter_frac = std::stod(ctx.param_or("jitter_frac", "0"));
+            o.batch_size = static_cast<int>(int_option(ctx, who, "batch_size", 1000, 1, 1000000));
+            o.interval =
+                std::chrono::milliseconds{int_option(ctx, who, "poll_ms", 1000, 1, 3600000)};
+            // A fraction from 0 to 1. std::stod read '0.5x' as 0.5 and 'none' threw
+            // an error that named no option.
+            if (ctx.params.contains("jitter_frac")) {
+                const std::string v = ctx.param_or("jitter_frac");
+                std::size_t used = 0;
+                double j = -1;
+                try {
+                    j = std::stod(v, &used);
+                } catch (const std::exception&) {
+                    used = 0;
+                }
+                if (v.empty() || used != v.size() || !(j >= 0.0 && j <= 1.0)) {
+                    throw std::runtime_error(std::string{who} +
+                                             ": 'jitter_frac' must be a number from 0 to 1; it "
+                                             "is '" +
+                                             v + "'");
+                }
+                o.jitter_frac = j;
+            }
             // bounded='true' (or mode='snapshot') = one-shot: read the table once
             // then finish, instead of tailing it forever.
-            o.bounded =
-                ctx.param_or("bounded", "") == "true" || ctx.param_or("mode", "") == "snapshot";
+            // A SQL table carries one mode for both of its sides, so 'upsert', the
+            // sink's, reaches the source too, which reads the table as it is.
+            const bool bounded = bool_option(ctx, who, "bounded", false);
+            const std::string mode = ctx.param_or("mode", "");
+            if (!mode.empty() && mode != "snapshot" && mode != "upsert") {
+                throw std::runtime_error(std::string{who} +
+                                         ": 'mode' must be 'snapshot' (or the sink's 'upsert'); "
+                                         "it is '" +
+                                         mode + "'");
+            }
+            o.bounded = bounded || mode == "snapshot";
             o.name = "mysql_source";
             return clink::read_on_first_subtask<std::string>(ctx.subtask_idx,
                                                              make_mysql_poll_source(o));

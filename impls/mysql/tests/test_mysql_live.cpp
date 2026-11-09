@@ -297,6 +297,49 @@ TEST(MysqlLive, CursorSourceDoesNotReemitBoundaryRow) {
     EXPECT_EQ(ids.size(), static_cast<std::size_t>(kN));
 }
 
+// The cursor source reads the rows committed above its cursor. A row whose
+// cursor value was taken before a later row's, and committed after the later
+// one was read, sits below the cursor and is never read: here an
+// auto-increment id held by an open transaction while a later id commits. The
+// source is at-least-once only while rows become visible in cursor order. The
+// case holds that limitation, which the documentation states, and fails if it
+// ever stops holding.
+TEST(MysqlLive, ARowCommittedAfterALaterOneWasReadIsSkipped) {
+    if (!mysql_configured()) {
+        GTEST_SKIP() << "set CLINK_MYSQL_TEST_DSN";
+    }
+    const std::string tbl = unique_table();
+    {
+        Connection c{parse_dsn()};
+        c.exec("DROP TABLE IF EXISTS `" + tbl + "`");
+        c.exec("CREATE TABLE `" + tbl +
+               "` (id INT AUTO_INCREMENT PRIMARY KEY, val VARCHAR(64)) ENGINE=InnoDB");
+        c.exec("INSERT INTO `" + tbl + "` (val) VALUES ('a'), ('b')");
+    }
+    Connection slow{parse_dsn()};
+    slow.exec("START TRANSACTION");
+    slow.exec("INSERT INTO `" + tbl + "` (val) VALUES ('late')");  // id 3, not committed
+    {
+        Connection fast{parse_dsn()};
+        fast.exec("INSERT INTO `" + tbl + "` (val) VALUES ('early')");  // id 4, committed
+    }
+    auto source = clink::mysql::make_mysql_poll_source(source_opts(tbl, 100));
+    Captured first;
+    drain(*source, first, 3, 10000);
+    slow.exec("COMMIT");
+    Captured after;
+    drain(*source, after, 1, 2000);
+    source.reset();
+    drop_table(tbl);
+    std::set<int> ids;
+    for (const auto& v : first.values) {
+        ids.insert(id_of(v));
+    }
+    EXPECT_EQ(ids, (std::set<int>{1, 2, 4}));
+    EXPECT_TRUE(after.values.empty())
+        << "the row committed late was read: the documented limitation no longer holds";
+}
+
 // A TIMESTAMP arrives as epoch milliseconds. Named in timestamp_columns, it
 // lands in a DATETIME column as its UTC wall time and in a TIMESTAMP column as
 // the same instant: the sink runs its session in UTC, so MySQL reads the
