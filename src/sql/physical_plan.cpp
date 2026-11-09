@@ -200,6 +200,7 @@ void check_redis_sink_options(const TableDef& table, bool upsert);
 void check_rabbitmq_sink_options(const TableDef& table);
 void check_nats_sink_options(const TableDef& table);
 void check_pulsar_sink_options(const TableDef& table);
+void check_pubsub_sink_options(const TableDef& table);
 
 std::string string_sink_factory_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
@@ -694,6 +695,46 @@ void check_pulsar_sink_options(const TableDef& table) {
             }
         }
         unsupported("table '" + table.name + "': a connector='pulsar' sink does not read option '" +
+                    key + "'; it reads " + accepted);
+    }
+}
+
+void check_pubsub_sink_options(const TableDef& table) {
+    static const std::vector<std::string> kConnection = {"project",
+                                                         "endpoint",
+                                                         "auth_token",
+                                                         "auth_token_file",
+                                                         "headers",
+                                                         "verify_tls",
+                                                         "connect_timeout_ms",
+                                                         "request_timeout_ms"};
+    static const std::vector<std::string> kSink = {
+        "topic", "batch_records", "batch_bytes", "max_retries", "dlq", "linger_ms"};
+    static const std::vector<std::string> kSources = {"subscription",
+                                                      "max_messages",
+                                                      "return_immediately",
+                                                      "poll_interval_ms",
+                                                      "retry_base_backoff_ms",
+                                                      "ack_deadline_s",
+                                                      "max_lease_s",
+                                                      "max_outstanding",
+                                                      "on_decode_error"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        (void)value;
+        const auto listed = [&key](const std::vector<std::string>& v) {
+            return std::find(v.begin(), v.end(), key) != v.end();
+        };
+        if (listed(kConnection) || listed(kSink) || listed(kSources) || listed(interpreted)) {
+            continue;
+        }
+        std::string accepted;
+        for (const auto* list : {&kConnection, &kSink}) {
+            for (const auto& o : *list) {
+                accepted += (accepted.empty() ? "" : ", ") + o;
+            }
+        }
+        unsupported("table '" + table.name + "': a connector='pubsub' sink does not read option '" +
                     key + "'; it reads " + accepted);
     }
 }
@@ -1702,6 +1743,7 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         if (upsert) {
             unsupported("connector='pubsub' sink does not support mode='upsert'");
         }
+        check_pubsub_sink_options(table);
         return RowConnectorBinding{"pubsub_sink", kChannelString, "row_to_json_string"};
     }
     if (connector == "elasticsearch" || connector == "opensearch") {

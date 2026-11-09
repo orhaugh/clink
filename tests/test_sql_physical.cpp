@@ -3300,6 +3300,50 @@ TEST(SqlPhysical, PulsarSinkTablesTakeOnlyOptionsTheSinkReads) {
     EXPECT_NE(why.find("send_timeout_ms"), std::string::npos) << why;
 }
 
+namespace {
+
+std::string pubsub_sink_refusal(const std::string& with) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE ps_out (k BIGINT, v BIGINT) WITH (connector='pubsub', "
+        "project='p', topic='t'" +
+        with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO ps_out SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+// A connector='pubsub' sink table's options: one the sink does not read is
+// refused, naming the ones it reads; the source's options pass.
+TEST(SqlPhysical, PubSubSinkTablesTakeOnlyOptionsTheSinkReads) {
+    EXPECT_EQ(pubsub_sink_refusal(", endpoint='http://localhost:8085', auth_token='t', "
+                                  "headers='X-A: 1', verify_tls='false', "
+                                  "connect_timeout_ms='100', request_timeout_ms='200', "
+                                  "batch_records='10', batch_bytes='1024', max_retries='2', "
+                                  "dlq='drop', linger_ms='5'"),
+              "");
+    EXPECT_EQ(pubsub_sink_refusal(", subscription='s', max_messages='5', "
+                                  "return_immediately='false', poll_interval_ms='10', "
+                                  "retry_base_backoff_ms='20', ack_deadline_s='30', "
+                                  "max_lease_s='60', max_outstanding='5', "
+                                  "on_decode_error='drop'"),
+              "");
+    const auto why = pubsub_sink_refusal(", batch_record='10'");
+    EXPECT_NE(why.find("does not read option 'batch_record'"), std::string::npos) << why;
+    EXPECT_NE(why.find("batch_records"), std::string::npos) << why;
+}
+
 TEST(SqlPhysical, CassandraUpsertSinkSelected) {
     Catalog cat;
     auto s = parse(
