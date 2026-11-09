@@ -3219,6 +3219,46 @@ TEST(SqlPhysical, RabbitMqSinkTablesTakeOnlyOptionsTheSinkReads) {
     EXPECT_NE(why.find("confirm_timeout_ms"), std::string::npos) << why;
 }
 
+namespace {
+
+std::string nats_sink_refusal(const std::string& with) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE n_out (k BIGINT, v BIGINT) WITH (connector='nats', "
+        "url='nats://localhost:4222', subject='s'" +
+        with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO n_out SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+// A connector='nats' sink table's options: one the sink does not read is
+// refused, naming the ones it reads; the source's options pass.
+TEST(SqlPhysical, NatsSinkTablesTakeOnlyOptionsTheSinkReads) {
+    EXPECT_EQ(nats_sink_refusal(", user='u', password='p', client_name='c', "
+                                "connect_timeout_ms='500', write_timeout_ms='500', "
+                                "max_pending='10', max_pending_bytes='1024', "
+                                "publish_timeout_ms='5000'"),
+              "");
+    EXPECT_EQ(nats_sink_refusal(", stream='S', durable='d', batch='5', fetch_timeout_ms='10', "
+                                "ack_wait_s='2', max_lease_s='60', max_ack_pending='5'"),
+              "");
+    const auto why = nats_sink_refusal(", publish_timeout='5000'");
+    EXPECT_NE(why.find("does not read option 'publish_timeout'"), std::string::npos) << why;
+    EXPECT_NE(why.find("publish_timeout_ms"), std::string::npos) << why;
+}
+
 TEST(SqlPhysical, CassandraUpsertSinkSelected) {
     Catalog cat;
     auto s = parse(
