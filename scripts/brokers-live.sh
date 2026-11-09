@@ -16,29 +16,32 @@
 #     (<Connector>SourceAckLive): an aborted checkpoint, crashes before and
 #     after a completion, notifications out of order, close after a cancel, the
 #     bound on what is held, and per connector the leases, a failed
-#     acknowledgement and a scale-down. For Redis and MQTT also the source's
-#     offline suites (for MQTT the protocol codec and the acknowledgement
-#     tracker). The Redis and MQTT TLS round trips need a TLS server this gate
-#     does not start and are left out.
+#     acknowledgement and a scale-down. For Redis, Pub/Sub and MQTT also the
+#     source's offline suites (for MQTT the protocol codec and the
+#     acknowledgement tracker). The Redis and MQTT TLS round trips need a TLS
+#     server this gate does not start and are left out.
 #   sinks: the sinks' suites, offline and live, where a broker's sinks have
-#     them, today Redis, RabbitMQ, NATS, Pulsar and MQTT: the failure state
-#     against a scripted server (MQTT's against the live broker through a
-#     fault proxy), the contract against the server, the factories (and for
-#     Redis the key rules and the upsert contract suite); then the recovery
-#     cells in clink_integration_tests (RedisSinkRecovery,
-#     RabbitMqSinkRecovery, NatsSinkRecovery, PulsarSinkRecovery,
-#     MqttSinkRecovery): a coordinator and two workers polling a feed the test
-#     serves into each sink, one of them a SQL job at parallelism 2 (for MQTT,
-#     which has no SQL connector, the same kill at qos 2), with a worker killed
-#     before a flush (or its confirms) and after it, before its checkpoint
-#     completes. A broker without a sinks phase says so in provenance.txt.
+#     them, today Redis, Pub/Sub, RabbitMQ, NATS, Pulsar and MQTT: the failure
+#     state against a scripted server (MQTT's and Pub/Sub's against the live
+#     service through fault proxies), the contract against the server, the
+#     factories (and for Redis the key rules and the upsert contract suite);
+#     then the recovery cells in clink_integration_tests (RedisSinkRecovery,
+#     PubSubSinkRecovery, RabbitMqSinkRecovery, NatsSinkRecovery,
+#     PulsarSinkRecovery, MqttSinkRecovery): a coordinator and two workers
+#     polling a feed the test serves into each sink, one of them a SQL job at
+#     parallelism 2 (for MQTT, which has no SQL connector, the same kill at
+#     qos 2), with a worker killed before a flush (or its confirms) and after
+#     it, before its checkpoint completes. A broker without a sinks phase says
+#     so in provenance.txt.
 #
 # A live case skips when its service is not named and googletest counts that
 # as a pass, so scripts/check-gtest-reports.py fails the run on any skip and on
 # a suite that ran fewer cases than it should. When both phases run for a
 # broker that has both, the cases its binary ran between them must be every
 # case it lists apart from those left out on purpose (the Redis, Pulsar and
-# MQTT TLS cases), so a suite outside both phases fails the gate. A missing binary, a
+# MQTT TLS cases, and the other HTTP connectors' cases, which share Pub/Sub's
+# binary and run in the http workflow), so a suite outside both phases fails
+# the gate. A missing binary, a
 # service that never answers and a failed case fail it too.
 #
 # REPORT_DIR keeps each broker's reports and output under <broker>/<phase>,
@@ -63,6 +66,7 @@
 #
 # What the tests read, all set here: CLINK_REDIS_TEST_URL,
 # CLINK_REDIS_RECOVERY_LOG_DIR, CLINK_PUBSUB_EMULATOR_HOST,
+# CLINK_PUBSUB_RECOVERY_LOG_DIR,
 # CLINK_RABBITMQ_TEST_ENDPOINT, CLINK_RABBITMQ_TEST_PORT,
 # CLINK_RABBITMQ_TEST_USER, CLINK_RABBITMQ_TEST_PASSWORD,
 # CLINK_RABBITMQ_TEST_MANAGEMENT_PORT, CLINK_RABBITMQ_RECOVERY_LOG_DIR,
@@ -121,7 +125,8 @@ filter_of() {  # <broker> <phase>
     case "$1/$2" in
         redis/sources) echo 'RedisLive.*:RedisSourceAckLive.*:RedisSourceLogic.*:SourceCapabilityRecord.*:-RedisLive.TlsConnectionRoundTrip' ;;
         redis/sinks) echo 'RedisSink*:RedisUpsert*:RedisFactoryRegistration.*' ;;
-        pubsub/sources) echo 'PubSubLive.*:PubSubSourceAckLive.*' ;;
+        pubsub/sources) echo 'PubSubLive.*:PubSubSourceAckLive.*:PubSubSourceAck.*:PubSubBase64.*:PubSubPaths.*:PubSubIds.*:PubSubBodies.*:PubSubParse.*:PubSubOptionValidation.*:PubSubRoundTrip.*:SourceCapabilityRecord.*' ;;
+        pubsub/sinks) echo 'PubSubSink*:PubSubPublishResult.*:PubSubFactory.*' ;;
         rabbitmq/sources) echo 'RabbitMqLive.*:RabbitMqSourceAckLive.*:RabbitMqSource.*' ;;
         rabbitmq/sinks) echo 'RabbitMqSink*:RabbitMqFactoryRegistration.*' ;;
         nats/sources) echo 'NatsLive.*:NatsSourceAckLive.*:NatsSource.*' ;;
@@ -154,6 +159,20 @@ expectations_of() {  # <broker> <phase>
         pubsub/sources)
             echo 'PubSubLive.*=1'
             echo 'PubSubSourceAckLive.*=3'
+            echo 'PubSubSourceAck.*=13'
+            echo 'PubSubBase64.*=2'
+            echo 'PubSubPaths.*=1'
+            echo 'PubSubIds.*=1'
+            echo 'PubSubBodies.*=1'
+            echo 'PubSubParse.*=2'
+            echo 'PubSubOptionValidation.*=1'
+            echo 'PubSubRoundTrip.*=1'
+            echo 'SourceCapabilityRecord.*=2'
+            ;;
+        pubsub/sinks)
+            echo 'PubSubSinkContractLive.*=10'
+            echo 'PubSubPublishResult.*=2'
+            echo 'PubSubFactory.*=2'
             ;;
         rabbitmq/sources)
             echo 'RabbitMqLive.*=3'
@@ -206,6 +225,7 @@ expectations_of() {  # <broker> <phase>
 recovery_filter_of() {  # <broker> <phase>
     case "$1/$2" in
         redis/sinks) echo 'RedisSinkRecovery.*' ;;
+        pubsub/sinks) echo 'PubSubSinkRecovery.*' ;;
         rabbitmq/sinks) echo 'RabbitMqSinkRecovery.*' ;;
         nats/sinks) echo 'NatsSinkRecovery.*' ;;
         pulsar/sinks) echo 'PulsarSinkRecovery.*' ;;
@@ -215,6 +235,7 @@ recovery_filter_of() {  # <broker> <phase>
 recovery_expectations_of() {  # <broker> <phase>
     case "$1/$2" in
         redis/sinks) echo 'RedisSinkRecovery.*=5' ;;
+        pubsub/sinks) echo 'PubSubSinkRecovery.*=3' ;;
         rabbitmq/sinks) echo 'RabbitMqSinkRecovery.*=3' ;;
         nats/sinks) echo 'NatsSinkRecovery.*=3' ;;
         pulsar/sinks) echo 'PulsarSinkRecovery.*=3' ;;
@@ -225,6 +246,7 @@ recovery_expectations_of() {  # <broker> <phase>
 recovery_log_var_of() {  # <broker>
     case "$1" in
         redis) echo CLINK_REDIS_RECOVERY_LOG_DIR ;;
+        pubsub) echo CLINK_PUBSUB_RECOVERY_LOG_DIR ;;
         rabbitmq) echo CLINK_RABBITMQ_RECOVERY_LOG_DIR ;;
         nats) echo CLINK_NATS_RECOVERY_LOG_DIR ;;
         pulsar) echo CLINK_PULSAR_RECOVERY_LOG_DIR ;;
@@ -233,10 +255,12 @@ recovery_log_var_of() {  # <broker>
 }
 # The cases the phases leave out on purpose, which the coverage check allows:
 # the TLS cases, which need a TLS-enabled build, the openssl CLI or a TLS
-# server (ctest runs the certificate cases wherever they can run).
+# server (ctest runs the certificate cases wherever they can run), and in
+# Pub/Sub's binary every other HTTP connector's cases.
 excluded_of() {  # <broker>
     case "$1" in
         redis) echo 'RedisTls.*:RedisLive.TlsConnectionRoundTrip' ;;
+        pubsub) echo '*-PubSub*:SourceCapabilityRecord.*' ;;
         pulsar) echo 'PulsarTls.*' ;;
         mqtt) echo 'MqttLive.TlsConnectionRoundTrip' ;;
     esac
@@ -254,7 +278,7 @@ if [ "${#missing[@]}" -gt 0 ]; then
     exit 1
 fi
 if [ "${BROKERS_LIVE_RECOVERY}" = 1 ] && phase_runs sinks &&
-    { runs redis || runs rabbitmq || runs nats || runs pulsar || runs mqtt; } &&
+    { runs redis || runs pubsub || runs rabbitmq || runs nats || runs pulsar || runs mqtt; } &&
     [ -z "${IT_BIN}" ]; then
     echo "brokers-live: the recovery cells need clink_integration_tests (and clink_node and" \
         "clink_submit_sql) under ${BUILD_DIR}; BROKERS_LIVE_RECOVERY=0 leaves them out" >&2

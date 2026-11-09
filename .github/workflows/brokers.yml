@@ -7,10 +7,10 @@ name: brokers
 # aborted checkpoint, crashes before and after a completion, notifications out
 # of order, close after a cancel, the bound on what is held, and per connector
 # the leases, a failed acknowledgement and a scale-down. The sinks phase, where
-# a broker's sinks have one (Redis, RabbitMQ, NATS, Pulsar, MQTT): the sinks'
-# suites against the server and their recovery cells, a coordinator and two
-# workers with a worker killed before and after a flush. The live cases skip
-# in the ci workflow, which starts no brokers, and gtest counts a skip as a
+# a broker's sinks have one (Redis, Pub/Sub, RabbitMQ, NATS, Pulsar, MQTT): the
+# sinks' suites against the server and their recovery cells, a coordinator and
+# two workers with a worker killed before and after a flush. The live cases
+# skip in the ci workflow, which starts no brokers, and gtest counts a skip as a
 # pass; this gate fails on any skip and on a suite that ran fewer cases than it
 # has.
 #
@@ -105,6 +105,7 @@ jobs:
             -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
             -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
             -e CLINK_REDIS_TEST_URL -e CLINK_REDIS_RECOVERY_LOG_DIR -e CLINK_PUBSUB_EMULATOR_HOST \
+            -e CLINK_PUBSUB_RECOVERY_LOG_DIR \
             -e CLINK_RABBITMQ_TEST_ENDPOINT -e CLINK_RABBITMQ_TEST_PORT \
             -e CLINK_RABBITMQ_TEST_USER -e CLINK_RABBITMQ_TEST_PASSWORD \
             -e CLINK_RABBITMQ_TEST_MANAGEMENT_PORT -e CLINK_RABBITMQ_RECOVERY_LOG_DIR \
