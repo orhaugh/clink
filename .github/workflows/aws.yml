@@ -48,7 +48,8 @@ name: aws
 # abort and contract suite; that sink's cluster-level suite runs in
 # docker-suites. Its parquet phase: the rolling sink's parts across a restore and
 # a kill, and through the factories the multi-object source's restores and the
-# exactly-once Parquet sink's commit and recovery.
+# exactly-once Parquet sink's commit and recovery. Its iceberg phase: the Iceberg
+# connector's suites, with a table whose data and metadata live on the store.
 #
 # A live test skips when its endpoint or binary is missing and gtest counts that
 # as a pass, so each gate fails on any skip and on any required suite that did
@@ -99,10 +100,11 @@ jobs:
           restore-keys: |
             ccache-aws-
             ccache-kinesis-
-      # CLINK_WITH_AWS=ON and CLINK_WITH_AWS_S3=ON, not AUTO: an SDK missing from
-      # the image fails the configure rather than leaving a gate without its
-      # binaries. Debug without DWARF and stripped, as the build job builds.
-      - name: Build the AWS and S3 tests, the recovery cells, the node binary and the SQL submitter
+      # CLINK_WITH_AWS=ON, CLINK_WITH_AWS_S3=ON and CLINK_WITH_ICEBERG=ON, not
+      # AUTO: an SDK or iceberg-cpp missing from the image fails the configure
+      # rather than leaving a gate without its binaries. Debug without DWARF and
+      # stripped, as the build job builds.
+      - name: Build the AWS, S3 and Iceberg tests, the recovery cells, the node binary and the SQL submitter
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ccache"
@@ -117,9 +119,11 @@ jobs:
               apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
               cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
                 -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_AWS=ON -DCLINK_WITH_AWS_S3=ON \
+                -DCLINK_WITH_ICEBERG=ON \
                 -DCMAKE_C_FLAGS_DEBUG=-g0 -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s \
                 -DCMAKE_SHARED_LINKER_FLAGS=-s
-              cmake --build build --target clink_aws_tests clink_s3_tests clink_integration_tests \
+              cmake --build build --target clink_aws_tests clink_s3_tests clink_iceberg_tests \
+                clink_integration_tests \
                 clink_node clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
               ccache -s | tail -3'
       - name: Save compiler cache

@@ -2,8 +2,8 @@
 # The S3 connector's live gate, against SILO, a maintained fork of the MinIO
 # server, pinned by digest as tests/integration/docker_minio.hpp pins it: the raw
 # object modes (the text sink, the multipart two-phase commit sink and the C++
-# source), then the Parquet modes; each phase followed by a check that nothing
-# was skipped and that every suite ran in full.
+# source), the Parquet modes, and Iceberg tables on an S3 warehouse; each phase
+# followed by a check that nothing was skipped and that every suite ran in full.
 #
 #   scripts/s3-live.sh [build-dir]
 #   S3_LIVE_PHASES=parquet scripts/s3-live.sh   # one phase
@@ -27,6 +27,11 @@
 # the same objects and after one was removed, and the exactly-once sink's
 # commit, its recovery of a prepared handle, and a recovery that finds neither
 # the staged nor the committed object.
+# The iceberg phase: clink_iceberg_tests in full but for the REST catalog case,
+# which needs a catalog server: the sink's appends, two-phase commits,
+# recoveries, partitions and upserts and the source's scans on a local
+# warehouse, and IcebergS3Live, a table whose data and metadata live on the
+# store, written and opened again.
 # The cluster-level exactly-once suite for the 2PC sink, S3ExactlyOnceTest, runs
 # in scripts/docker-suites-live.sh. The container goes, with its volume, when the
 # gate ends.
@@ -44,7 +49,7 @@
 # Knobs:
 #   BUILD_DIR    the build to take the binary from (argument or default build/)
 #   REPORT_DIR   where the reports go (default <build-dir>/s3-live-reports)
-#   S3_LIVE_PHASES  the phases to run, default "raw parquet"
+#   S3_LIVE_PHASES  the phases to run, default "raw parquet iceberg"
 #   PIN_RUNNER   a prefix for every test command (CI runs the binary inside the
 #                toolchain image with `docker run --network host ... -e <each
 #                variable below>`)
@@ -57,7 +62,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${1:-${BUILD_DIR:-${ROOT}/build}}"
 REPORT_DIR="${REPORT_DIR:-${BUILD_DIR}/s3-live-reports}"
-S3_LIVE_PHASES="${S3_LIVE_PHASES:-raw parquet}"
+S3_LIVE_PHASES="${S3_LIVE_PHASES:-raw parquet iceberg}"
 IMAGE="pgsty/silo:RELEASE.2026-10-18T00-00-00Z@sha256:2636fc4155d9a7e41ff58cdb65ddd13ba9304e67184e13c25bc5cb34016269d7"
 
 S3_BIN="$(find "${BUILD_DIR}" -name clink_s3_tests -type f -perm -u+x 2>/dev/null | head -1)"
@@ -149,10 +154,10 @@ fi
     echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"${REPORT_DIR}/provenance.txt"
 
-run() {  # <phase> <gtest filter>
+run() {  # <phase> <gtest filter> [binary, default clink_s3_tests]
     echo "==> $1"
     # shellcheck disable=SC2086 # PIN_RUNNER is a command prefix, split on purpose
-    ${PIN_RUNNER:-} "${S3_BIN}" --gtest_output="json:${REPORT_DIR}/$1.json" \
+    ${PIN_RUNNER:-} "${3:-${S3_BIN}}" --gtest_output="json:${REPORT_DIR}/$1.json" \
         --gtest_filter="$2" 2>&1 | tee "${REPORT_DIR}/$1.log" || status=1
 }
 
@@ -183,8 +188,28 @@ for phase in ${S3_LIVE_PHASES}; do
             --expect 'ParquetS3Live.*=4' \
             "${REPORT_DIR}/parquet.json" || status=1
         ;;
+    iceberg)
+        ice_bin="$(find "${BUILD_DIR}" -name clink_iceberg_tests -type f -perm -u+x 2>/dev/null | head -1)"
+        if [ -z "${ice_bin}" ]; then
+            echo "s3-live: clink_iceberg_tests must be built under ${BUILD_DIR}" >&2
+            status=1
+            continue
+        fi
+        run iceberg '-IcebergRestLive.*' "${ice_bin}"
+        python3 "${ROOT}/scripts/check-gtest-reports.py" \
+            --expect 'IcebergSink.*=3' \
+            --expect 'IcebergSink2PC.*=8' \
+            --expect 'IcebergSinkEndOfInput.*=3' \
+            --expect 'IcebergSinkPartitioned.*=2' \
+            --expect 'IcebergUpsert.*=4' \
+            --expect 'IcebergSource.*=4' \
+            --expect 'IcebergFactoryRegistration.*=2' \
+            --expect 'IcebergStateExport.*=1' \
+            --expect 'IcebergS3Live.*=1' \
+            "${REPORT_DIR}/iceberg.json" || status=1
+        ;;
     *)
-        echo "s3-live: no phase '${phase}' (raw, parquet)" >&2
+        echo "s3-live: no phase '${phase}' (raw, parquet, iceberg)" >&2
         status=1
         ;;
     esac
