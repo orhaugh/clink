@@ -56,6 +56,16 @@ the source holds its whole result in memory and that a query once sent runs
 to the end before a cancel is seen. `PostgresSourceLive` holds the restore
 cases against the server, in a new `select` phase of `scripts/postgres-live.sh`.
 
+**The MySQL polling source states the condition its at-least-once rests on,
+and reads its options strictly.** It reads the rows committed above its
+cursor, so a row whose cursor value was taken before a later row's, and which
+committed after the later one was read, is skipped, as concurrent writers to
+an `AUTO_INCREMENT` or time-stamped table produce. The page claimed
+at-least-once without that condition, and the record described a query source
+that re-reads from the start. Both now state it, and a live case holds it
+against the server. `batch_size`, `poll_ms`, `jitter_frac` (`0.5x` once read
+as 0.5), `bounded` and `mode` are read strictly.
+
 **The generic HTTP sink refuses a record its framing cannot carry, alone and
 before it is sent, and reads its options strictly.** Every record was written
 into the body as it was, so one record that was not JSON made a `json_array`
