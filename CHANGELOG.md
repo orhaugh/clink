@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+**Incident evidence bundles: collect a job's evidence, verify it offline, and
+freeze a reproduced epoch as a regression test.** `clink incident-collect`
+gathers what one incident needs from a job's own directories - the checkpoint
+markers, the participants' snapshot sidecars and, by choice, their snapshots,
+the flight recorder's epochs, a run of protocol traces and the coordinator's
+job manifest with credential-like parameters redacted - into a bundle whose
+versioned manifest lists every file's SHA-256 and every absence. It chooses
+the checkpoint with the restore rule a coordinator takeover uses, refuses when
+a marker set or a file changes while it copies, and publishes by one rename.
+`clink incident-verify` checks a bundle anywhere, with no cluster and no
+network: integrity, the restore point, each participant's state, the traces'
+structure and, where the TLC jars are present, their conformance to the
+exactly-once specification, then replays the captured epochs, comparing each
+with itself, with what production handed the next operator, and with an
+independent expectation. Every check reports passed, failed, unavailable or
+unsupported with its evidence and next action, and a partial result exits 3.
+`clink incident-regress` writes the regression bundle `--emit-test` writes,
+and `clink replay --run-test` runs one as its generated test does. The
+coordinator's on-disk restore rule moved into
+`include/clink/cluster/in_doubt_resolution.hpp` unchanged, so collection and
+verification call it rather than restate it. Design record 014; the example
+`examples/incident-verification/` kills a Worker at an asserted point and is
+the workflow's gate.
+
 **The RabbitMQ, NATS, Pulsar and MQTT sources read their options strictly.**
 Each broker's sink round made the sink's and the connection's options strict
 and left the sources' own options lenient: a value that did not parse fell back

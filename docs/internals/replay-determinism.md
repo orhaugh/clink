@@ -38,7 +38,7 @@ Determinism is what makes version comparison meaningful: if replay were noisy, a
 
 ## Incident to regression test
 
-`clink replay --emit-test=<dir>` freezes an epoch into a self-contained bundle (capture + starting state + golden emissions + manifest) with a generated gtest whose body is one call to `clink::sql::run_replay_regression` - determinism is what makes the golden meaningful: the bundle passes forever on a correct build and locates the first divergence on a regressing one.
+`clink replay --emit-test=<dir>` freezes an epoch into a self-contained bundle (capture + starting state + golden emissions + manifest) with a generated gtest whose body is one call to `clink::sql::run_replay_regression` - determinism is what makes the golden meaningful: the bundle passes forever on a correct build and locates the first divergence on a regressing one. `clink replay --run-test=<dir>` runs a bundle as its generated test does, and `clink incident-regress` writes one from an incident bundle ([incident verification](incident-verification.md)).
 
 ## The executable form
 

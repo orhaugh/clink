@@ -45,11 +45,11 @@ place:
 | Path | Role | Present when |
 | --- | --- | --- |
 | `manifest.json` | the index: format, provenance, selection, every artifact's path, size and SHA-256, every absence and truncation | always |
-| `job/manifest.json` | the coordinator's persisted job manifest (graph, checkpoint config, confirmation flag, capture settings, the graph before a rescale), credentials redacted | `--ha-dir` names a directory holding it |
+| `job/manifest.json` | the coordinator's persisted job manifest (graph, checkpoint config, confirmation flag, capture settings), credentials redacted and the graph before a rescale left out | `--ha-dir` names a directory holding it |
 | `checkpoint/_jobs/<job>/` | the job's `COMPLETED-<id>`, `CONFIRMED-<id>` and `RESTORED` records, byte for byte | always |
 | `checkpoint/_state/<job>/v<gen>/<subtask>/checkpoint-<id>.snap.meta` | each participant's integrity sidecar | always |
-| `checkpoint/_state/<job>/v<gen>/<subtask>/checkpoint-<id>.snap` | each participant's snapshot | `--include-state` |
-| `capture/op-<id>/op.json`, `capture/op-<id>/subtask-<s>/epoch-<n>.cap` | the flight recorder's epochs and operator specs | `--include-captures` |
+| `checkpoint/_state/<job>/v<gen>/<subtask>/checkpoint-<id>.snap` | each participant's snapshot, and each captured epoch's starting snapshot | `--include-state` |
+| `capture/op-<id>/subtask-<s>/op.json`, `capture/op-<id>/subtask-<s>/epoch-<n>.cap` | the flight recorder's epochs and operator specs | `--include-captures` |
 | `traces/<process>.ndjson` | one run directory of protocol traces | `--trace-dir` |
 
 The checkpoint and capture subtrees keep the engine's own layout, so the
@@ -83,13 +83,13 @@ stable identifier, the evidence it used, the reason, and the next action.
 | `protocol.conformance` | the existing TLC trace validator accepts the run | `scripts/formal-check.sh --trace` |
 | `replay.determinism` | two replays of an epoch produce identical emissions | `EpochReplay` |
 | `replay.recorded_output` | the replay's emissions equal the records its single downstream operator captured for the same epoch | `EpochReplay`, the capture reader |
-| `replay.expected_output` | the replay's emissions equal an independent oracle's, given with `--expected` | `EpochReplay` |
-| `destination.reconciliation` | (unsupported in this release: offline verification reads no destination) | - |
+| `replay.expected_output` | the selected epochs of one operator, each replayed from its starting state, emit an independent expectation's rows, given with `--expected`, compared as multisets | `EpochReplay` |
+| `destination.reconciliation` | (reported unsupported in every `full` report and required by no profile: offline verification reads no destination) | - |
 
 Profiles name the checks a run requires: `integrity` (the `bundle.*` checks),
 `consistency` (adds `checkpoint.*` and `state.decode`), `replay` (adds
-`replay.determinism` and `replay.recorded_output`) and `full` (adds the
-protocol checks and, with `--expected`, `replay.expected_output`).
+`replay.determinism` and `replay.recorded_output`, and with `--expected`
+`replay.expected_output`) and `full` (adds the protocol checks).
 
 Exit codes: `0` every check the profile requires passed; `1` a check failed;
 `3` none failed but at least one required check is unavailable or
@@ -100,6 +100,15 @@ only `replay.recorded_output` compares with what production did, and only
 where production's output was captured. A truncated capture can establish
 neither for the whole epoch: the replay check reports it truncated and the
 recorded-output check unavailable.
+
+An epoch replays from the checkpoint its events were processed from: the one
+before it, except for a restored run's first epoch, which starts from the
+checkpoint that run restored (the `RESTORED` record's `restore`, for epoch
+`next`). An epoch the `RESTORED` record passes over was processed by a run
+the restore discarded, so `replay.expected_output` leaves it out of the union
+it compares. `replay.recorded_output` places a capture in the job graph by
+its uid or, for an operator without one, by its type and parameters, which
+the Worker copies from the graph into `op.json`.
 
 ## Trust
 
@@ -112,8 +121,10 @@ A bundle is untrusted input. The reader refuses absolute paths, `..`
 components and symbolic links; bounds the number of files, each file's size,
 the manifest's size and JSON depth; refuses an unknown format or version;
 and never runs a command or loads a plugin a manifest names. Replay rebuilds
-operators from the binary's own registry; a plugin operator replays only
-with `--plugin`, which the user supplies.
+operators from the binary's own registry and loads no plugin, so a plugin
+operator reports unsupported (`clink replay --plugin` replays it). Operators
+that call an external system for each record, lookups and model inference,
+report unsupported without being built: verification contacts no service.
 
 ## Collection
 
@@ -135,14 +146,22 @@ retention lock, and adding one is a distributed service this record does not
 want. A checkpoint that disappears during collection fails the collection
 with the reason, and the user collects again or stops the job first.
 
+A coordinator removes a job's manifest from its HA directory when the job
+ends. Collecting while the job runs keeps the graph and the restore rule in
+the bundle; after it has ended, `--commit-confirmation` supplies the rule and
+the recorded-output check has no graph.
+
 Bounds: `--max-bytes` (default 1 GiB), `--max-files` (default 10,000) and
 `--timeout-s` (default 600) stop collection with an error; `--op` and
 `--epochs` narrow the captures, and what selection leaves out is listed as
 excluded in the manifest.
 
 Sensitive data: graph parameters whose names suggest a credential
-(`password`, `secret`, `token`, `key`, `credential`, `auth`) are replaced by
-`<redacted>` in `job/manifest.json`. Snapshots and captures hold the job's
+(`password`, `passwd`, `secret`, `token`, `credential`, `api_key`, `apikey`,
+`access_key`, `private_key`, `sasl`, `auth`, `conninfo`) are replaced by
+`<redacted>` in `job/manifest.json`, and the graph before a rescale is left
+out. A bare `key` is not on the list: it names key columns far more often
+than secrets. Snapshots and captures hold the job's
 records and keyed state, which no redaction can make safe, so they are
 collected only with `--include-state` and `--include-captures`, and the
 manifest records whether they were.
@@ -150,9 +169,10 @@ manifest records whether they were.
 ## Unsupported in this release
 
 Coordination stores other than the local filesystem (an `s3://` checkpoint
-directory), RocksDB SST checkpoints for `state.decode`, replay of multi-input
-operators and non-Row channels (as `clink replay`), a live per-subtask view
-of a running job, destination reconciliation, signing.
+directory), RocksDB SST checkpoints for `state.decode`, state outside the
+checkpoint directory, replay of multi-input operators, non-Row channels and
+plugin operators, a live per-subtask view of a running job, destination
+reconciliation, signing.
 
 ## Implementation and tests
 
@@ -162,7 +182,8 @@ of a running job, destination reconciliation, signing.
   reader's bounds, collection and the checks that need no SQL runtime.
 - `include/clink/sql/incident_replay.hpp`, `src/sql/incident_replay.cpp`: the
   replay checks and regression bundles, on `EpochReplay`.
-- `tools/clink_incident.cpp`: the three commands.
+- `tools/clink_incident.cpp`: the three commands; `clink replay --run-test`
+  runs a regression bundle as its generated test does.
 - Tests: every check's positive case and its mutations (a missing, modified or
   unlisted artifact; a truncated snapshot or capture; a wrong job, checkpoint
   or generation; mismatched participants; a restore rule that chooses another
