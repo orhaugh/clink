@@ -8,6 +8,8 @@
 // the earlier recovery suite already covers, a job that crashes
 // between checkpoints can now restart and not double-count records.
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -15,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -228,6 +231,110 @@ TEST(SourceReplay, FileSourceFullyConsumedDoesNotReEmit) {
     EXPECT_TRUE(drain_ints(*ch2).empty())
         << "a fully-consumed FileSource must not re-emit on restart";
 
+    std::filesystem::remove(path);
+}
+
+namespace {
+
+// Lines `values`, one per line, into the file at `path`, replacing it.
+void rewrite_lines(const std::filesystem::path& path, const std::vector<int>& values) {
+    std::ofstream o(path, std::ios::trunc);
+    for (const int v : values) {
+        o << v << "\n";
+    }
+}
+
+// The first batch a FileSource restored from `backend` emits over `path`.
+std::vector<int> first_batch_after_restore(const std::filesystem::path& path,
+                                           InMemoryStateBackend& backend,
+                                           OperatorId op_id) {
+    FileSource<int> src(path, int_lines(), 3, "fsrc");
+    EXPECT_TRUE(src.restore_offset(backend, op_id));
+    src.open();
+    auto ch = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> em(ch.get());
+    src.produce(em);
+    return drain_ints(*ch);
+}
+
+// Reads three lines of a file of ten, and checkpoints there.
+void checkpoint_after_three(const std::filesystem::path& path,
+                            InMemoryStateBackend& backend,
+                            OperatorId op_id) {
+    FileSource<int> first(path, int_lines(), /*batch_size=*/3, "fsrc");
+    first.open();
+    auto ch = std::make_shared<BoundedChannel<StreamElement<int>>>(64);
+    Emitter<int> em(ch.get());
+    first.produce(em);
+    EXPECT_EQ(drain_ints(*ch), (std::vector<int>{0, 1, 2}));
+    first.snapshot_offset(backend, op_id, CheckpointId{1});
+}
+
+}  // namespace
+
+// A file shorter than the checkpoint's position is not the file it read:
+// resumed there, the source seeked past the end and read nothing. It reads
+// the file from the start.
+TEST(SourceReplay, FileSourceRestoreOverAShorterFileReadsItFromTheStart) {
+    InMemoryStateBackend backend;
+    const OperatorId op_id{211};
+    const auto path = write_int_lines("shorter", 10);
+    checkpoint_after_three(path, backend, op_id);
+    rewrite_lines(path, {7});
+    EXPECT_EQ(first_batch_after_restore(path, backend, op_id), (std::vector<int>{7}));
+    std::filesystem::remove(path);
+}
+
+// A file whose bytes before the position differ is not the file it read
+// either: resumed at the offset, the source skipped its first lines. It reads
+// the file from the start.
+TEST(SourceReplay, FileSourceRestoreOverAReplacedFileReadsItFromTheStart) {
+    InMemoryStateBackend backend;
+    const OperatorId op_id{212};
+    const auto path = write_int_lines("replaced", 10);
+    checkpoint_after_three(path, backend, op_id);
+    rewrite_lines(path, {10, 11, 12, 13, 14});
+    EXPECT_EQ(first_batch_after_restore(path, backend, op_id), (std::vector<int>{10, 11, 12}));
+    std::filesystem::remove(path);
+}
+
+// Lines appended after the position leave the bytes before it as they were:
+// the source resumes there and reads on.
+TEST(SourceReplay, FileSourceRestoreAfterLinesWereAppendedResumes) {
+    InMemoryStateBackend backend;
+    const OperatorId op_id{213};
+    const auto path = write_int_lines("appended", 10);
+    checkpoint_after_three(path, backend, op_id);
+    {
+        std::ofstream o(path, std::ios::app);
+        o << 10 << "\n";
+    }
+    EXPECT_EQ(first_batch_after_restore(path, backend, op_id), (std::vector<int>{3, 4, 5}));
+    std::filesystem::remove(path);
+}
+
+// An earlier release wrote the offset alone; it restores, checked against the
+// file's length only, and a form neither release wrote is refused.
+TEST(SourceReplay, FileSourceRestoreFromAnEarlierReleasesPosition) {
+    InMemoryStateBackend backend;
+    const OperatorId op_id{214};
+    const auto path = write_int_lines("legacy", 10);
+    std::array<std::byte, 8> legacy{};
+    legacy[0] = std::byte{6};  // after "0\n1\n2\n"
+    backend.put_operator_state(
+        op_id,
+        StateBackend::KeyView{"__file_source_offset__", 22},
+        StateBackend::ValueView{reinterpret_cast<const char*>(legacy.data()), legacy.size()});
+    EXPECT_EQ(first_batch_after_restore(path, backend, op_id), (std::vector<int>{3, 4, 5}));
+    rewrite_lines(path, {9});
+    EXPECT_EQ(first_batch_after_restore(path, backend, op_id), (std::vector<int>{9}));
+
+    const std::string odd = "abc";
+    backend.put_operator_state(op_id,
+                               StateBackend::KeyView{"__file_source_offset__", 22},
+                               StateBackend::ValueView{odd.data(), odd.size()});
+    FileSource<int> src(path, int_lines(), 3, "fsrc");
+    EXPECT_THROW((void)src.restore_offset(backend, op_id), std::runtime_error);
     std::filesystem::remove(path);
 }
 

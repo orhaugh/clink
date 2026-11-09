@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -8,14 +9,17 @@
 #include <fstream>
 #include <ios>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include "clink/connectors/text_format.hpp"
 #include "clink/operators/operator_base.hpp"
+#include "clink/runtime/log_buffer.hpp"
 #include "clink/time/watermark.hpp"
 
 namespace clink {
@@ -69,9 +73,20 @@ public:
             if (restored_offset_ == kConsumed_) {
                 stream_.seekg(0, std::ios::end);
                 stream_eof_ = true;
-            } else {
+            } else if (same_file_before_(restored_offset_)) {
                 stream_.seekg(static_cast<std::streamoff>(restored_offset_));
                 logical_offset_ = restored_offset_;
+            } else {
+                // A file shorter than the position, or whose bytes before it
+                // are not those the checkpoint read, is another file: resumed
+                // at the offset it lost every line (a shorter file read as
+                // empty) or began mid-line. Read from the start: lines
+                // repeated, which at-least-once allows, never skipped.
+                clink::log::warn("source.file",
+                                 name_ + ": " + path_.string() +
+                                     " is not the file the checkpoint read up to byte " +
+                                     std::to_string(restored_offset_) +
+                                     ", so it is read again from the start");
             }
         }
     }
@@ -127,6 +142,10 @@ public:
     // -1. Operator-state slot: fixed key, stored via put_operator_state so
     // the rescale restore filter never narrows it (source state is not keyed
     // state - every subtask restores its offset whole).
+    // The checkpoint holds, after a version byte, the offset and a fingerprint
+    // of the bytes just before it: their count (up to kWindow_) and an FNV-1a
+    // hash, read again from the file, so a restore can tell the file it reads
+    // from the one the checkpoint read.
     void snapshot_offset(StateBackend& backend,
                          OperatorId op_id,
                          CheckpointId /*ckpt_id*/) override {
@@ -134,9 +153,27 @@ public:
         if (stream_.is_open() && !exhausted_()) {
             off = logical_offset_;
         }
-        std::array<std::byte, 8> bytes{};
+        std::uint32_t window = 0;
+        std::uint64_t hash = 0;
+        if (off != kConsumed_) {
+            window = static_cast<std::uint32_t>(std::min<std::uint64_t>(kWindow_, off));
+            if (const auto h = window_hash_(off, window)) {
+                hash = *h;
+            } else {
+                window = 0;  // unreadable now: a restore checks the length alone
+            }
+        }
+        std::array<std::byte, kStateBytes_> bytes{};
+        bytes[0] = static_cast<std::byte>(kStateVersion_);
         for (int i = 0; i < 8; ++i) {
-            bytes[static_cast<std::size_t>(i)] = static_cast<std::byte>((off >> (i * 8)) & 0xFF);
+            bytes[static_cast<std::size_t>(1 + i)] =
+                static_cast<std::byte>((off >> (i * 8)) & 0xFF);
+            bytes[static_cast<std::size_t>(13 + i)] =
+                static_cast<std::byte>((hash >> (i * 8)) & 0xFF);
+        }
+        for (int i = 0; i < 4; ++i) {
+            bytes[static_cast<std::size_t>(9 + i)] =
+                static_cast<std::byte>((window >> (i * 8)) & 0xFF);
         }
         backend.put_operator_state(
             op_id,
@@ -144,15 +181,38 @@ public:
             StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
     }
 
+    // An earlier release wrote the offset alone, in 8 bytes; it restores with
+    // only the file's length to check it against.
     bool restore_offset(StateBackend& backend, OperatorId op_id) override {
         auto v = backend.get_operator_state(
             op_id, StateBackend::KeyView{kOffsetKey_, std::strlen(kOffsetKey_)});
-        if (!v.has_value() || v->size() < 8) {
+        if (!v.has_value()) {
             return false;
         }
+        const auto byte_at = [&v](std::size_t i) {
+            return static_cast<std::uint64_t>(std::to_integer<std::uint8_t>((*v)[i]));
+        };
         std::uint64_t restored = 0;
-        for (int i = 0; i < 8; ++i) {
-            restored |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
+        restored_window_ = 0;
+        restored_hash_ = 0;
+        if (v->size() == kStateBytes_ && byte_at(0) == kStateVersion_) {
+            for (int i = 0; i < 8; ++i) {
+                restored |= byte_at(static_cast<std::size_t>(1 + i)) << (i * 8);
+                restored_hash_ |= byte_at(static_cast<std::size_t>(13 + i)) << (i * 8);
+            }
+            for (int i = 0; i < 4; ++i) {
+                restored_window_ |=
+                    static_cast<std::uint32_t>(byte_at(static_cast<std::size_t>(9 + i)) << (i * 8));
+            }
+        } else if (v->size() == 8) {
+            for (int i = 0; i < 8; ++i) {
+                restored |= byte_at(static_cast<std::size_t>(i)) << (i * 8);
+            }
+        } else {
+            throw std::runtime_error(name_ +
+                                     ": the checkpoint's position is in a form this "
+                                     "release does not read (" +
+                                     std::to_string(v->size()) + " bytes)");
         }
         restored_offset_ = restored;
         has_restored_offset_ = true;
@@ -165,6 +225,46 @@ private:
     static constexpr const char* kOffsetKey_ = "__file_source_offset__";
     // Sentinel for "the whole file was read before the checkpoint".
     static constexpr std::uint64_t kConsumed_ = std::numeric_limits<std::uint64_t>::max();
+    static constexpr std::uint64_t kStateVersion_ = 2;
+    static constexpr std::size_t kStateBytes_ = 21;  // version, offset, window, hash
+    static constexpr std::uint64_t kWindow_ = 64 * 1024;
+
+    // FNV-1a over the `window` bytes of the file before `offset`, read through
+    // a stream of its own; nothing when they cannot be read.
+    [[nodiscard]] std::optional<std::uint64_t> window_hash_(std::uint64_t offset,
+                                                            std::uint32_t window) const {
+        std::ifstream in(path_, std::ios::binary);
+        if (!in) {
+            return std::nullopt;
+        }
+        in.seekg(static_cast<std::streamoff>(offset - window));
+        std::vector<char> bytes(window);
+        in.read(bytes.data(), static_cast<std::streamsize>(window));
+        if (static_cast<std::uint64_t>(in.gcount()) != window) {
+            return std::nullopt;
+        }
+        std::uint64_t h = 14695981039346656037ULL;
+        for (const char c : bytes) {
+            h ^= static_cast<std::uint8_t>(c);
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    // Whether the file holds at least `offset` bytes and, when the checkpoint
+    // recorded them, the same bytes before it.
+    [[nodiscard]] bool same_file_before_(std::uint64_t offset) const {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(path_, ec);
+        if (ec || size < offset) {
+            return false;
+        }
+        if (restored_window_ == 0) {
+            return true;
+        }
+        const auto h = window_hash_(offset, restored_window_);
+        return h.has_value() && *h == restored_hash_;
+    }
 
     // Buffered line scanning over block reads. The istream getline path
     // read the file a character at a time through the streambuf virtual
@@ -245,6 +345,8 @@ private:
     bool stream_eof_{false};
     bool eos_watermark_emitted_{false};
     std::uint64_t restored_offset_{0};
+    std::uint32_t restored_window_{0};
+    std::uint64_t restored_hash_{0};
     bool has_restored_offset_{false};
 };
 
