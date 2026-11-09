@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# The PostgreSQL connector's live gate: two phases, the change stream and the
-# sinks, against the server CLINK_POSTGRES_CDC_TEST_DSN names, then a check that
-# nothing was skipped and that every required suite ran in full.
+# The PostgreSQL connector's live gate: three phases, the change stream, the
+# sinks and the SELECT source, against the server CLINK_POSTGRES_CDC_TEST_DSN
+# names, then a check that nothing was skipped and that every required suite
+# ran in full.
 #
 #   CLINK_POSTGRES_CDC_TEST_DSN="host=localhost port=5432 user=postgres password=postgres dbname=postgres" \
 #     scripts/postgres-live.sh [build-dir]
 #
 # The phases POSTGRES_LIVE_PHASES names run one after the other:
 #
-#   cdc: clink_postgres_tests' change-stream, decoder, row-codec and SELECT
-#     source suites, the SQL CDC round trip (clink_postgres_sql_tests), and
+#   cdc: clink_postgres_tests' change-stream and decoder suites and the
+#     factories, the SQL CDC round trip (clink_postgres_sql_tests), and
 #     clink_integration_tests' change-stream cells: a coordinator and workers
 #     into ClickHouse with faults at the source's phase boundaries, and a column
 #     added and backfilled into ClickHouse.
@@ -20,6 +21,12 @@
 #     coordinator and two workers polling a feed the test serves into each
 #     sink, one of them a SQL job at parallelism 2, with a worker killed before
 #     a flush's COMMIT and after it, before its checkpoint completes.
+#   select: the SELECT source's suites: its position round-tripping through a
+#     checkpoint, its row codec, and PostgresSourceLive against the server
+#     (values and NULLs as read, and a restore over the same rows, after an
+#     earlier row was deleted or changed, after rows were added at the end, and
+#     from an earlier release's position). It has no cells and needs no
+#     Docker.
 #
 # Needs the server the DSN names, started with wal_level=logical and
 # max_prepared_transactions above zero (the postgres-cdc service of
@@ -31,23 +38,23 @@
 #
 # A live case skips when its server is not named and googletest counts that as
 # a pass, so scripts/check-gtest-reports.py fails the run on any skip and on a
-# suite that ran fewer cases than it should. When both phases run, the cases
+# suite that ran fewer cases than it should. When every phase runs, the cases
 # clink_postgres_tests ran between them must be every case it lists, so a suite
-# outside both phases fails the gate. Reports land in REPORT_DIR/<phase>/
+# outside every phase fails the gate. Reports land in REPORT_DIR/<phase>/
 # (default <build-dir>/postgres-live-reports), with provenance.txt (the commit,
 # whether the tree was clean, the build's configuration, the client library,
 # the server's version and each phase's result), without credentials. This is
 # what the postgres-cdc CI workflow runs.
 #
 # Knobs:
-#   POSTGRES_LIVE_PHASES     the phases to run, of "cdc sink" (default both)
+#   POSTGRES_LIVE_PHASES     the phases to run, of "cdc sink select" (default all)
 #   POSTGRES_LIVE_RECOVERY   1 (default) or 0, which leaves the recovery cells out
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BUILD_DIR="${1:-build}"
 REPORT_DIR="${REPORT_DIR:-${BUILD_DIR}/postgres-live-reports}"
-POSTGRES_LIVE_PHASES="${POSTGRES_LIVE_PHASES:-cdc sink}"
+POSTGRES_LIVE_PHASES="${POSTGRES_LIVE_PHASES:-cdc sink select}"
 POSTGRES_LIVE_RECOVERY="${POSTGRES_LIVE_RECOVERY:-1}"
 if [ -z "${CLINK_POSTGRES_CDC_TEST_DSN:-}" ]; then
     echo "postgres-live: set CLINK_POSTGRES_CDC_TEST_DSN; without it every live case skips" >&2
@@ -61,8 +68,9 @@ IT_BIN="${BUILD_DIR}/tests/clink_integration_tests"
 # passing cases it must count, suite by suite.
 filter_of() {
     case "$1" in
-        cdc) echo 'CdcRowEncoder.*:CdcCursor.*:CdcJson.*:CdcEventCodec.*:PostgresCdc*:PostgresDecoder.*:PostgresRowCodec.*:PostgresSourceReplay.*:PostgresTypedCdcSource.*:PostgresFactoryRegistration.*' ;;
+        cdc) echo 'CdcRowEncoder.*:CdcCursor.*:CdcJson.*:CdcEventCodec.*:PostgresCdc*:PostgresDecoder.*:PostgresTypedCdcSource.*:PostgresFactoryRegistration.*' ;;
         sink) echo 'PgSink*:PostgresJsonSink*:PostgresUpsert*:PostgresSink*' ;;
+        select) echo 'PostgresSourceReplay.*:PostgresSourceLive.*:PostgresRowCodec.*' ;;
         *) return 1 ;;
     esac
 }
@@ -75,7 +83,7 @@ expectations_of() {
             echo 'PostgresCdcDecodeStrict.*=14'
             echo 'PostgresCdcLive.*=3'
             echo 'PostgresCdcContractLive.*=28'
-            echo 'PostgresFactoryRegistration.*=10'
+            echo 'PostgresFactoryRegistration.*=11'
             echo 'PostgresCdcSql.*=4'
             ;;
         sink)
@@ -94,6 +102,11 @@ expectations_of() {
             echo 'PostgresSink2PC.*=3'
             echo 'PostgresSink2PCLive.*=8'
             echo 'PostgresSink2PC/SinkContractSuite/0.*=8'
+            ;;
+        select)
+            echo 'PostgresSourceReplay.*=2'
+            echo 'PostgresSourceLive.*=6'
+            echo 'PostgresRowCodec.*=4'
             ;;
     esac
 }
@@ -118,12 +131,13 @@ recovery_expectations_of() {
 
 for phase in ${POSTGRES_LIVE_PHASES}; do
     if ! filter_of "${phase}" >/dev/null; then
-        echo "postgres-live: no phase '${phase}' (choose from cdc sink)" >&2
+        echo "postgres-live: no phase '${phase}' (choose from cdc sink select)" >&2
         exit 1
     fi
 done
 mkdir -p "${REPORT_DIR}"
-rm -rf "${REPORT_DIR:?}/cdc" "${REPORT_DIR:?}/sink" "${REPORT_DIR:?}/provenance.txt"
+rm -rf "${REPORT_DIR:?}/cdc" "${REPORT_DIR:?}/sink" "${REPORT_DIR:?}/select" \
+    "${REPORT_DIR:?}/provenance.txt"
 
 rc=0
 {
@@ -183,7 +197,8 @@ for phase in ${POSTGRES_LIVE_PHASES}; do
         run "${dir}" postgres-sql "${SQL_BIN}"
         reports+=("${dir}/postgres-sql.json")
     fi
-    if [ "${POSTGRES_LIVE_RECOVERY}" = "1" ]; then
+    # A phase with no cells runs none: an empty filter would run every case.
+    if [ "${POSTGRES_LIVE_RECOVERY}" = "1" ] && [ -n "$(recovery_filter_of "${phase}")" ]; then
         run "${dir}" recovery "${IT_BIN}" --gtest_filter="$(recovery_filter_of "${phase}")"
         reports+=("${dir}/recovery.json")
         while read -r e; do
@@ -198,15 +213,17 @@ for phase in ${POSTGRES_LIVE_PHASES}; do
 done
 
 # Between them the phases ran every case the binary has.
-if [[ " ${POSTGRES_LIVE_PHASES} " == *" cdc "* && " ${POSTGRES_LIVE_PHASES} " == *" sink "* ]]; then
+if [[ " ${POSTGRES_LIVE_PHASES} " == *" cdc "* && " ${POSTGRES_LIVE_PHASES} " == *" sink "* &&
+    " ${POSTGRES_LIVE_PHASES} " == *" select "* ]]; then
     listed="$("${UNIT_BIN}" --gtest_list_tests | grep -c '^  ' || true)"
     ran=$(( $(cases_in "${REPORT_DIR}/cdc/postgres.json" || echo 0) + \
-            $(cases_in "${REPORT_DIR}/sink/postgres.json" || echo 0) ))
+            $(cases_in "${REPORT_DIR}/sink/postgres.json" || echo 0) + \
+            $(cases_in "${REPORT_DIR}/select/postgres.json" || echo 0) ))
     echo "  clink_postgres_tests cases: ${listed} listed, ${ran} run by the phases" \
         >>"${REPORT_DIR}/provenance.txt"
     if [ "${listed}" != "${ran}" ]; then
         echo "postgres-live: clink_postgres_tests lists ${listed} cases and the phases ran ${ran}:" \
-            "a suite is outside both phases' filters" >&2
+            "a suite is outside every phase's filter" >&2
         rc=1
     fi
 fi

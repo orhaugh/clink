@@ -1,6 +1,6 @@
 name: postgres-cdc
 
-# The PostgreSQL connector's gate (scripts/postgres-live.sh), in two phases
+# The PostgreSQL connector's gate (scripts/postgres-live.sh), in three phases
 # against a real server, PostgreSQL 16.15 pinned by digest in
 # docker/integration-services.yml.
 #
@@ -21,9 +21,13 @@ name: postgres-cdc
 # SQL job at parallelism 2, with a worker killed before a flush's COMMIT and
 # after it.
 #
+# The SELECT source (select): its position through a checkpoint, its row codec,
+# and its live suite, which restores it over the same rows and over rows that
+# changed, and requires that a restore repeat rows rather than skip them.
+#
 # A live test skips when its server or binary is missing and gtest counts that
 # as a pass, so the gate fails on any skip, on any required suite that did not
-# run in full, and on a case outside both phases.
+# run in full, and on a case outside every phase.
 #
 # Plain runner steps that `docker run` the toolchain image, as the ClickHouse
 # recovery workflow does: the tests reach the servers on the runner's

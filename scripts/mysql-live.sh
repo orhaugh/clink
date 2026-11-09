@@ -27,8 +27,9 @@
 #     treats as one, the tables the sinks refuse, exact values, refused values,
 #     the session's mode, transactions, packet limits, lock waits, a cancel, a
 #     lost COMMIT reply, the factories); and the round trips between the sinks
-#     and the polling source (MysqlLive); then the MysqlSinkRecovery cells: a
-#     coordinator and two workers polling a feed the test serves into each
+#     and the polling source (MysqlLive, with the row the polling source skips
+#     when it commits after a later one was read); then the MysqlSinkRecovery
+#     cells: a coordinator and two workers polling a feed the test serves into each
 #     sink, one of them a SQL job at parallelism 2, with a worker killed before
 #     a flush's COMMIT and after it, before its checkpoint completes.
 #
@@ -102,7 +103,7 @@ cells_of() {
 expectations_of() {
     case "$1" in
         cdc)
-            echo 'MysqlFactoryRegistration.*=8'
+            echo 'MysqlFactoryRegistration.*=9'
             echo 'MysqlSourceLogic.*=9'
             echo 'MysqlRowDecode.*=6'
             echo 'MysqlJsonb.*=1'
@@ -126,7 +127,7 @@ expectations_of() {
             echo 'MysqlUpsertSink.*=1'
             echo 'MysqlUpsertSinkLive.*=4'
             echo 'MysqlUpsert/UpsertContractSuite/0.*=5'
-            echo 'MysqlLive.*=6'
+            echo 'MysqlLive.*=7'
             echo 'MysqlSinkContractLive.*=15'
             ;;
     esac
