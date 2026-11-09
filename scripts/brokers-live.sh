@@ -20,20 +20,22 @@
 #     suites. The Redis and MQTT TLS round trips need a TLS server this gate
 #     does not start and are left out.
 #   sinks: the sinks' suites, offline and live, where a broker's sinks have
-#     them, today Redis: the key rules, the failure state against a scripted
-#     server, the contract against the server, the factories and the upsert
-#     contract suite; then the RedisSinkRecovery cells in
-#     clink_integration_tests: a coordinator and two workers polling a feed the
-#     test serves into each sink, one of them a SQL job at parallelism 2, with
-#     a worker killed before a flush and after it, before its checkpoint
-#     completes. A broker without a sinks phase says so in provenance.txt.
+#     them, today Redis and RabbitMQ: the failure state against a scripted
+#     server, the contract against the server, the factories (and for Redis
+#     the key rules and the upsert contract suite); then the recovery cells in
+#     clink_integration_tests (RedisSinkRecovery, RabbitMqSinkRecovery): a
+#     coordinator and two workers polling a feed the test serves into each
+#     sink, one of them a SQL job at parallelism 2, with a worker killed before
+#     a flush (or its confirms) and after it, before its checkpoint completes.
+#     A broker without a sinks phase says so in provenance.txt.
 #
 # A live case skips when its service is not named and googletest counts that
 # as a pass, so scripts/check-gtest-reports.py fails the run on any skip and on
-# a suite that ran fewer cases than it should. When both phases run for Redis,
-# the cases clink_redis_tests ran between them must be every case it lists
-# apart from the TLS cases, so a suite outside both phases fails the gate. A
-# missing binary, a service that never answers and a failed case fail it too.
+# a suite that ran fewer cases than it should. When both phases run for a
+# broker that has both, the cases its binary ran between them must be every
+# case it lists apart from those left out on purpose (the Redis TLS cases), so
+# a suite outside both phases fails the gate. A missing binary, a service that
+# never answers and a failed case fail it too.
 #
 # REPORT_DIR keeps each broker's reports and output under <broker>/<phase>,
 # provenance.txt (the commit, whether the tree was clean, the build's
@@ -59,6 +61,7 @@
 # CLINK_REDIS_RECOVERY_LOG_DIR, CLINK_PUBSUB_EMULATOR_HOST,
 # CLINK_RABBITMQ_TEST_ENDPOINT, CLINK_RABBITMQ_TEST_PORT,
 # CLINK_RABBITMQ_TEST_USER, CLINK_RABBITMQ_TEST_PASSWORD,
+# CLINK_RABBITMQ_TEST_MANAGEMENT_PORT, CLINK_RABBITMQ_RECOVERY_LOG_DIR,
 # CLINK_NATS_TEST_ENDPOINT, CLINK_PULSAR_TEST_ENDPOINT, CLINK_MQTT_TEST_URL.
 set -euo pipefail
 
@@ -113,7 +116,8 @@ filter_of() {  # <broker> <phase>
         redis/sources) echo 'RedisLive.*:RedisSourceAckLive.*:RedisSourceLogic.*:SourceCapabilityRecord.*:-RedisLive.TlsConnectionRoundTrip' ;;
         redis/sinks) echo 'RedisSink*:RedisUpsert*:RedisFactoryRegistration.*' ;;
         pubsub/sources) echo 'PubSubLive.*:PubSubSourceAckLive.*' ;;
-        rabbitmq/sources) echo 'RabbitMqLive.*:RabbitMqSourceAckLive.*' ;;
+        rabbitmq/sources) echo 'RabbitMqLive.*:RabbitMqSourceAckLive.*:RabbitMqSource.*' ;;
+        rabbitmq/sinks) echo 'RabbitMqSink*:RabbitMqFactoryRegistration.*' ;;
         nats/sources) echo 'NatsLive.*:NatsSourceAckLive.*' ;;
         pulsar/sources) echo 'PulsarLive.*:PulsarSourceAckLive.*' ;;
         mqtt/sources) echo 'MqttLive.*:MqttSourceAckLive.*:-MqttLive.TlsConnectionRoundTrip' ;;
@@ -145,6 +149,13 @@ expectations_of() {  # <broker> <phase>
         rabbitmq/sources)
             echo 'RabbitMqLive.*=3'
             echo 'RabbitMqSourceAckLive.*=7'
+            echo 'RabbitMqSource.*=2'
+            ;;
+        rabbitmq/sinks)
+            echo 'RabbitMqSink.*=2'
+            echo 'RabbitMqSinkFailures.*=13'
+            echo 'RabbitMqSinkContractLive.*=11'
+            echo 'RabbitMqFactoryRegistration.*=3'
             ;;
         nats/sources)
             echo 'NatsLive.*=2'
@@ -163,11 +174,20 @@ expectations_of() {  # <broker> <phase>
 recovery_filter_of() {  # <broker> <phase>
     case "$1/$2" in
         redis/sinks) echo 'RedisSinkRecovery.*' ;;
+        rabbitmq/sinks) echo 'RabbitMqSinkRecovery.*' ;;
     esac
 }
 recovery_expectations_of() {  # <broker> <phase>
     case "$1/$2" in
         redis/sinks) echo 'RedisSinkRecovery.*=5' ;;
+        rabbitmq/sinks) echo 'RabbitMqSinkRecovery.*=3' ;;
+    esac
+}
+# Where each broker's recovery cells keep the cluster's logs.
+recovery_log_var_of() {  # <broker>
+    case "$1" in
+        redis) echo CLINK_REDIS_RECOVERY_LOG_DIR ;;
+        rabbitmq) echo CLINK_RABBITMQ_RECOVERY_LOG_DIR ;;
     esac
 }
 # The cases the phases leave out on purpose, which the coverage check allows:
@@ -190,7 +210,8 @@ if [ "${#missing[@]}" -gt 0 ]; then
     echo "brokers-live: the test binaries of ${missing[*]} are not built under ${BUILD_DIR}" >&2
     exit 1
 fi
-if [ "${BROKERS_LIVE_RECOVERY}" = 1 ] && phase_runs sinks && runs redis && [ -z "${IT_BIN}" ]; then
+if [ "${BROKERS_LIVE_RECOVERY}" = 1 ] && phase_runs sinks && { runs redis || runs rabbitmq; } &&
+    [ -z "${IT_BIN}" ]; then
     echo "brokers-live: the recovery cells need clink_integration_tests (and clink_node and" \
         "clink_submit_sql) under ${BUILD_DIR}; BROKERS_LIVE_RECOVERY=0 leaves them out" >&2
     exit 1
@@ -321,9 +342,10 @@ phases() {  # <broker>
         local cells
         cells="$(recovery_filter_of "${broker}" "${phase}")"
         if [ -n "${cells}" ] && [ "${BROKERS_LIVE_RECOVERY}" = 1 ]; then
-            export CLINK_REDIS_RECOVERY_LOG_DIR="${dir}/recovery-logs"
-            mkdir -p "${CLINK_REDIS_RECOVERY_LOG_DIR}"
-            chmod a+rwx "${CLINK_REDIS_RECOVERY_LOG_DIR}"
+            local logs="${dir}/recovery-logs"
+            mkdir -p "${logs}"
+            chmod a+rwx "${logs}"
+            export "$(recovery_log_var_of "${broker}")=${logs}"
             run "${dir}" recovery "${IT_BIN}" --gtest_filter="${cells}"
             reports+=("${dir}/recovery.json")
             while read -r e; do
@@ -339,15 +361,17 @@ phases() {  # <broker>
     done
     # Between them the phases ran every case the binary has, bar the
     # exclusions.
-    local excluded
-    excluded="$(excluded_of "${broker}")"
-    if [ -n "${excluded}" ] && phase_runs sources && phase_runs sinks; then
-        local listed left ran
+    if [ -n "$(filter_of "${broker}" sources)" ] && [ -n "$(filter_of "${broker}" sinks)" ] &&
+        phase_runs sources && phase_runs sinks; then
+        local excluded listed left=0 ran
+        excluded="$(excluded_of "${broker}")"
         # shellcheck disable=SC2086 # PIN_RUNNER is a command prefix, split on purpose
         listed="$(${PIN_RUNNER:-} "${bin}" --gtest_list_tests | grep -c '^  ' || true)"
-        # shellcheck disable=SC2086
-        left="$(${PIN_RUNNER:-} "${bin}" --gtest_list_tests --gtest_filter="${excluded}" |
-            grep -c '^  ' || true)"
+        if [ -n "${excluded}" ]; then
+            # shellcheck disable=SC2086
+            left="$(${PIN_RUNNER:-} "${bin}" --gtest_list_tests --gtest_filter="${excluded}" |
+                grep -c '^  ' || true)"
+        fi
         ran=$(( $(cases_in "${REPORT_DIR}/${broker}/sources/tests.json" || echo 0) + \
                 $(cases_in "${REPORT_DIR}/${broker}/sinks/tests.json" || echo 0) ))
         echo "  ${broker} cases: ${listed} listed, ${left} left out on purpose, ${ran} run by" \
@@ -379,7 +403,7 @@ if runs pubsub; then
 fi
 
 if runs rabbitmq; then
-    start rabbitmq 5672
+    start rabbitmq 5672 15672
     # Asked only once the server has written its Erlang cookie: a CLI that finds
     # none writes one as root, which the server cannot read, and it stops. The
     # listener opens after the node answers a ping, so its port is asked too.
@@ -388,6 +412,8 @@ if runs rabbitmq; then
     port="$(port_of 5672)"
     export CLINK_RABBITMQ_TEST_ENDPOINT=127.0.0.1 CLINK_RABBITMQ_TEST_PORT="${port}"
     export CLINK_RABBITMQ_TEST_USER=clink CLINK_RABBITMQ_TEST_PASSWORD=clink
+    port="$(port_of 15672)"
+    export CLINK_RABBITMQ_TEST_MANAGEMENT_PORT="${port}"
     phases rabbitmq
     stop
 fi
