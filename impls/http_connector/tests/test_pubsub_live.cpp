@@ -1,6 +1,6 @@
 // Pub/Sub LIVE integration test. SKIPPED unless CLINK_PUBSUB_EMULATOR_HOST is set
 // (e.g. "localhost:8085" from docker/integration-services.yml); the live gate,
-// scripts/ack-sources-live.sh, sets it and fails on any skip. Runs against a
+// scripts/brokers-live.sh, sets it and fails on any skip. Runs against a
 // real Pub/Sub emulator over the REST API: creates a topic + subscription, then
 // proves the publish sink and the pull source round-trip every record, that the
 // acknowledgement once the checkpoint completes removes the messages

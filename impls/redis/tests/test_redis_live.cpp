@@ -1,6 +1,6 @@
 // Redis Streams LIVE integration test. SKIPPED unless CLINK_REDIS_TEST_URL is set
 // (e.g. redis://localhost:6379 from docker/integration-services.yml); the live
-// gate, scripts/ack-sources-live.sh, sets it and fails on any skip. Proves
+// gate, scripts/brokers-live.sh, sets it and fails on any skip. Proves
 // against a real redis-server: a sink->source round-trip delivers every record
 // verbatim; an un-acked consumer re-delivers its PEL on restart (at-least-once);
 // XGROUP CREATE is idempotent across re-opens; and the source's acknowledgement

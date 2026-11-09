@@ -8,7 +8,7 @@
 // message is acknowledged only once a completed checkpoint covers it, so a
 // crash, an aborted checkpoint or a close delivers again exactly what no
 // completed checkpoint covers, and one checkpoint interval reads at most the
-// session's in-flight window. scripts/ack-sources-live.sh runs it and fails on a
+// session's in-flight window. scripts/brokers-live.sh runs it and fails on a
 // skip.
 
 #include <algorithm>

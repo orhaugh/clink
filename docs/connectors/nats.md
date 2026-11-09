@@ -166,9 +166,9 @@ Offline tests in `impls/nats/tests/test_nats.cpp` cover required-parameter valid
 
 The live tests in `impls/nats/tests/test_nats_live.cpp` are skipped unless `CLINK_NATS_TEST_ENDPOINT` is set to a JetStream-enabled NATS URL (for example `nats://localhost:4222`); each creates its stream up front. `NatsLive` covers the round trip and the sink's refusal. `NatsSourceAckLive` holds the source to its acknowledgement contract, judged by what another subscriber of the same durable receives once the source has gone, with a 2 s AckWait: an aborted checkpoint, a crash after a completion and before its ack, notifications out of order, close after a cancel, the `max_ack_pending` bound, and a checkpoint three times as slow as AckWait. The close and slow-checkpoint cases failed against the source before this contract, and pass.
 
-`scripts/ack-sources-live.sh` runs both suites against the `nats` service of `docker/integration-services.yml` (`nats:2.10` with JetStream), as a one-off container on free loopback ports, and fails on a skipped case or a short suite; the `ack-sources` CI workflow runs it.
+`scripts/brokers-live.sh` runs both suites, in its sources phase, against the `nats` service of `docker/integration-services.yml` (`nats:2.10` with JetStream), as a one-off container on free loopback ports, and fails on a skipped case or a short suite; the `brokers` CI workflow runs it.
 
 ```bash
 ctest --test-dir build -L nats          # offline cases; the live ones skip
-scripts/ack-sources-live.sh build       # every acknowledging source, live
+scripts/brokers-live.sh build           # every broker connector, live
 ```

@@ -1,5 +1,5 @@
 // RabbitMQ LIVE integration test. SKIPPED unless CLINK_RABBITMQ_TEST_ENDPOINT is set (the
-// broker host, e.g. localhost); the live gate, scripts/ack-sources-live.sh, sets it and fails on
+// broker host, e.g. localhost); the live gate, scripts/brokers-live.sh, sets it and fails on
 // any skip. Port/user/password come from CLINK_RABBITMQ_TEST_{PORT,USER,PASSWORD} (defaults
 // 5672 / guest / guest). Proves against a real broker: the sink publishes (with publisher
 // confirms) and the source consumes the same messages back; and the source's acknowledgement

@@ -179,9 +179,9 @@ Offline tests in `impls/rabbitmq/tests/test_rabbitmq.cpp` cover required-paramet
 
 The live tests in `impls/rabbitmq/tests/test_rabbitmq_live.cpp` are skipped unless `CLINK_RABBITMQ_TEST_ENDPOINT` is set (the broker host). Port, user and password come from `CLINK_RABBITMQ_TEST_PORT`, `CLINK_RABBITMQ_TEST_USER` and `CLINK_RABBITMQ_TEST_PASSWORD` (defaults `5672` / `guest` / `guest`). `RabbitMqLive` covers the round trip and the sink's refusals. `RabbitMqSourceAckLive` holds the source to its acknowledgement contract, judged by what a fresh consumer of the queue receives once the source has gone: an aborted checkpoint, a crash after a completion and before its ack, intervals and notifications out of order, an aborted interval below a completed one, close after a cancel, the prefetch bound, and the default prefetch measured. The aborted-interval and close cases failed against the source before this contract, and pass.
 
-`scripts/ack-sources-live.sh` runs both suites against the `rabbitmq` service of `docker/integration-services.yml` (`rabbitmq:3-management-alpine`, user and password `clink`), as a one-off container on a free loopback port, and fails on a skipped case or a short suite; the `ack-sources` CI workflow runs it.
+`scripts/brokers-live.sh` runs both suites, in its sources phase, against the `rabbitmq` service of `docker/integration-services.yml` (`rabbitmq:3-management-alpine`, user and password `clink`), as a one-off container on a free loopback port, and fails on a skipped case or a short suite; the `brokers` CI workflow runs it.
 
 ```bash
 ctest --test-dir build -L rabbitmq          # offline cases; the live ones skip
-scripts/ack-sources-live.sh build           # every acknowledging source, live
+scripts/brokers-live.sh build               # every broker connector, live
 ```

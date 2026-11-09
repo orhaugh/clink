@@ -158,11 +158,11 @@ The factory test also holds the exclusive subscription to parallelism 1, and the
 
 Live integration tests (`impls/pulsar/tests/test_pulsar_live.cpp`) drive the sink and source against a real broker: `PulsarLive.PublishThenConsumeRoundTrip`, and `PulsarLive.AnExclusiveSubscriptionReplaysInOrderFromItsCheckpointedPosition` (see "Replay after a restart"). They are skipped unless the environment variable `CLINK_PULSAR_TEST_ENDPOINT` is set to a Pulsar service URL, for example:
 
-`PulsarSourceAckLive` holds the source to its acknowledgement contract, judged by what another consumer of the same Shared subscription receives once the source has gone: an aborted checkpoint, a crash after a completion and before its ack, notifications out of order, and close after a cancel. The close case failed against the source before this contract, and passes. `scripts/ack-sources-live.sh` runs both live suites against the `pulsar` service of `docker/integration-services.yml` (`apachepulsar/pulsar:3.3.1` standalone), as a one-off container on free loopback ports, and fails on a skipped case or a short suite; the `ack-sources` CI workflow runs it.
+`PulsarSourceAckLive` holds the source to its acknowledgement contract, judged by what another consumer of the same Shared subscription receives once the source has gone: an aborted checkpoint, a crash after a completion and before its ack, notifications out of order, and close after a cancel. The close case failed against the source before this contract, and passes. `scripts/brokers-live.sh` runs both live suites, in its sources phase, against the `pulsar` service of `docker/integration-services.yml` (`apachepulsar/pulsar:3.3.1` standalone), as a one-off container on free loopback ports, and fails on a skipped case or a short suite; the `brokers` CI workflow runs it.
 
 ```bash
 CLINK_PULSAR_TEST_ENDPOINT=pulsar://localhost:6650 ctest --test-dir build -L pulsar
-scripts/ack-sources-live.sh build       # every acknowledging source, live
+scripts/brokers-live.sh build           # every broker connector, live
 ```
 
 The broker auto-creates the topic (`allowAutoTopicCreation`), so no provisioning is needed. The tests do not pin a specific broker container image; point `CLINK_PULSAR_TEST_ENDPOINT` at any reachable Pulsar broker (for example a standard `apachepulsar/pulsar` standalone instance).
