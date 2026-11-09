@@ -564,10 +564,13 @@ Shared Pub/Sub options:
 | --- | --- | --- | --- |
 | `endpoint` | No | (env / real service) | Override base URL (e.g. an emulator). |
 | `auth_token` | No | (empty) | Static bearer token; sets `Authorization: Bearer <token>`. Valid only for its lifetime (no refresh). |
-| `auth_token_file` | No | (empty) | Path to a file holding the bearer token, re-read per request when the file changes. An external refresher (Workload Identity / sidecar / Vault agent) rotating the file is picked up without restarting the job. Takes precedence over `auth_token`. |
+| `auth_token_file` | No | (empty) | Path to a file holding the bearer token, re-read per request when the file changes. An external refresher (Workload Identity / sidecar / Vault agent) rotating the file is picked up without restarting the job. Setting it and `auth_token` both is refused. |
 | `headers` | No | (empty) | Extra headers, merged after the token (an explicit `Authorization` header wins). |
-| `verify_tls` | No | `true` | HTTPS certificate verification. |
-| `max_retries` | No | `4` | Retry attempts; clamped to `[0, 20]`. |
+| `verify_tls` | No | `true` | HTTPS certificate verification, `true` or `false`. |
+| `connect_timeout_ms` | No | `5000` | The longest a connection may take, 1 to 600,000. |
+| `request_timeout_ms` | No | `30000` | The longest a request may wait to send or read, 1 to 3,600,000. |
+
+An empty `endpoint` is refused, and `verify_tls` takes only `true` or `false`: `verify_tls='FALSE'` once read as `true`.
 
 `pubsub_sink` additional options:
 
@@ -575,10 +578,25 @@ Shared Pub/Sub options:
 | --- | --- | --- | --- |
 | `project` | Yes | (none) | GCP project id. |
 | `topic` | Yes | (none) | Topic id. |
-| `batch_records` | No | `1000` | Messages per publish; capped at the 1000-message Pub/Sub limit. |
-| `batch_bytes` | No | `9437184` | Flush threshold in bytes; stays under the request size limit. |
-| `dlq` | No | `fail` | Permanent-failure policy (`fail` / `drop`). |
-| `linger_ms` | No | `0` | Partial-batch linger. |
+| `batch_records` | No | `1000` | Messages per publish, 1 to 1000, Pub/Sub's limit. |
+| `batch_bytes` | No | `9437184` | Flush threshold in rendered (base64) bytes, 1 to 1 GiB; see [size](#size). |
+| `max_retries` | No | `4` | Attempts after the first for a publish that fails transiently, 0 to 20. |
+| `dlq` | No | `fail` | A record the service refuses, or an empty one: `fail` fails the sink, `drop` dead-letters it. |
+| `linger_ms` | No | `0` | Flush a partial batch once it is this many milliseconds old, 0 to 3,600,000; 0 disables linger. |
+
+Every number is checked against its range and refused outside it, so a typo fails the build of the job rather than reading as the default: `batch_records='5000'` was quietly cut to 1000, and a negative `batch_bytes` wrapped.
+
+#### When a publish counts
+
+A publish is all or nothing. A 2xx counts only when it carries one message id per message sent; any other 2xx, a proxy's page, another service's answer or a truncated reply, confirms nothing, and the request is sent again, so a reply lost after the service published means the messages twice. Before, any 2xx counted: the live suite's proxy answering 200 with a page and forwarding nothing lost every message. A 400 refuses the records, which `dlq='drop'` dead-letters. 401, 403 and 404 are the endpoint's state, and 408, 429, 5xx and transport errors are passing: all are retried with backoff, then the flush fails and keeps its batch, so no barrier passes over it, and nothing is dead-lettered.
+
+#### Empty records
+
+Pub/Sub refuses a message with neither data nor attributes, and with it the whole request: against the emulator, one empty message among good ones failed the request with "Some messages are empty". The sink refuses an empty record before it is sent. Under `dlq='drop'` it alone is dead-lettered and the rest are published; under `dlq='fail'` the sink fails and refuses every later record and barrier until it opens again. Before, the empty record went into its batch: under `drop` the whole batch went to the dead-letter queue, and under `fail` the job failed again on every replay. The SQL path never sends one, since each row is a JSON object.
+
+#### Size
+
+Pub/Sub documents a limit of 10 MB per publish request, which the emulator does not enforce: the emulator of Cloud SDK 592.0.0 took a 12 MB request and a 10.1 MB message, so no test here shows what the service does past the limit. `batch_bytes` (9 MiB of base64 by default) is checked after each record is added, so a request can pass it by one record.
 
 `pubsub_source` additional options:
 
@@ -692,7 +710,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - `influxdb_sink` is at-least-once. With `timestamp_field` a rewritten point lands on its own series and time, where InfluxDB merges it into the point already there; without it every write is a new point, so a replay duplicates. [Its section](#influxdb_sink) has the contract.
 - `splunk_hec_sink` is at-least-once with no dedup key: an event HEC accepted is indexed again when it is sent again, after a lost reply, a busy server's partial acceptance, a refused event's neighbours or a replay. With `ack='none'` a barrier waits for HEC's acceptance, with `ack='indexer'` for indexer acknowledgement. [Its section](#splunk_hec_sink) has the contract.
 - `prometheus_sink` is at-least-once into a store of latest values: each push replaces the group's series of the metric, so a replay ends at each series' latest value, and `push_series` decides which series each push carries. [Its section](#prometheus_sink) has the contract.
-- `pubsub_sink` is at-least-once with no producer dedup; a replay re-publishes.
+- `pubsub_sink` is at-least-once with no producer dedup: a replay re-publishes, and so does a retry after a reply that did not confirm every message (see [when a publish counts](#when-a-publish-counts)).
 - `http_poll_source` in cursor mode replays from its checkpointed cursor: at-least-once into the job, and exactly-once into a two-phase-commit sink, while the endpoint answers the records strictly after the cursor, ascending and each value unique, and keeps what it served. Every page is checked against what the source can see of that before anything is emitted, and one that fails fails the poll (see [the source's section](#http_poll_source)). Its capability record, `http_poll`, declares replay only with `cursor_field` and `cursor_param`, so the delivery analyser reports a job over a source in resource mode as `AT_MOST_ONCE_SOURCE` and refuses `at_least_once` and above for it, naming the options that would make it replay. Before, the source shared the `http` record, which claimed replay however the source was set up.
 - `pubsub_source` is at-least-once. It pulls, leases what it holds, and acknowledges once the checkpoint that covers a message completes; the server delivers again whatever was not acknowledged, which is also the crash-recovery mechanism. The contract, in detail:
     - `snapshot_offset()` seals the messages pulled since the last barrier as that checkpoint's; `notify_checkpoint_complete()` makes every interval at or below the completed id ready, and the next `produce()` turn, or `close()`, posts `:acknowledge` for them. Every request stays on the source thread; the notification only moves ackIds between lists (`include/clink/connectors/checkpoint_ack_ledger.hpp`), and a repeated, late or out-of-order one moves nothing twice and nothing sealed above the id it names.
@@ -716,6 +734,7 @@ auto factory = rr.find_sink("elasticsearch_sink", "string");
 - `prometheus_sink` targets a Pushgateway, a store of each series' latest value for a modest number of series, not a time-series database: Prometheus sees only the values present when it scrapes. The sink must be its group's only writer of its metric and runs on one subtask. With `push_series='batch'` a series not named since the previous push disappears; with `'all'` a series stays until the group is deleted. Label names outside the label grammar and integer values past 2^53 are refused. Remote-write is not implemented.
 - `http_poll_source` replays only in cursor mode, and only from an endpoint that answers strictly after the cursor, ascending by a unique `cursor_field`, and keeps what it served; it refuses a page that breaks what it can check of that, including a value shared by two records. Page tokens, offsets and cursors of several fields are not supported. One subtask polls. A bounded run ends only on an empty page (cursor mode) or after one response (resource mode). Records with an integer past 64 bits or a number past a double's range are refused, since clink's JSON reader cannot decode them.
 - `pubsub_source` holds at most `max_outstanding` unacknowledged messages per subtask, and a job that completes no checkpoint stops pulling there. A message held past `max_lease_s` is delivered again (a duplicate). Subscriptions with exactly-once delivery enabled are not handled specially.
+- `pubsub_sink` sets no attributes and no ordering key, refuses an empty record, and does not check Pub/Sub's documented 10 MB request limit, which the emulator does not enforce (see [size](#size)).
 - Pub/Sub uses the synchronous REST `Pull` with `returnImmediately`; gRPC StreamingPull is not used. The build does not mint OAuth2 tokens itself; a static `auth_token` expires after its lifetime, but `auth_token_file` lets an external refresher rotate the token without a restart. Multiple subtasks pull the same subscription and Pub/Sub load-balances across them (no client-side sharding).
 - The bulk sinks buffer rendered records in memory until a flush trigger; `batch_records` / `batch_bytes` / `linger_ms` bound that buffer.
 - `linger_ms` is evaluated only when a record arrives (no timer thread), so a fully idle buffer waits for the next checkpoint barrier.
@@ -741,7 +760,11 @@ The live integration tests are skipped unless their endpoint environment variabl
 
 `splunk_hec_sink` has a simulated gate against a protocol stub and a live suite that needs a server someone supplies; see [Splunk HEC](#splunk-hec). `http_poll_source` has a gate of its own against local servers, below, and also feeds the search recovery cells, from a feed the test serves.
 
-`pubsub_source`'s acknowledgement contract is tested in process by `PubSubSourceAck` (`test_pubsub.cpp`), against a stub of the REST endpoints that leases each delivery under a new ackId, honours `modifyAckDeadline`, acknowledges only through a current ackId and can fail acknowledges: an aborted checkpoint, crashes after the barrier and after completion, failed and retried acknowledges, notifications out of order, leases held across a delayed checkpoint and given up past `max_lease`, the `max_outstanding` bound, close after a cancel, and both `on_decode_error` policies. `PubSubSourceAckLive` (`test_pubsub_live.cpp`) repeats the abort, the crash after completion and the delayed checkpoint against the emulator. `test_factory_registration.cpp` pins the capability record and the analyser's verdict. `scripts/brokers-live.sh [build-dir]` is the required gate: its sources phase runs `PubSubLive` and `PubSubSourceAckLive` against a one-off emulator container, with the other acknowledging sources' suites, and fails on a missing binary, an emulator that never answers, a failed or skipped case, or a short suite (see the [Redis page](redis.md#testing)). The `brokers` CI workflow runs it.
+`pubsub_source`'s acknowledgement contract is tested in process by `PubSubSourceAck` (`test_pubsub.cpp`), against a stub of the REST endpoints that leases each delivery under a new ackId, honours `modifyAckDeadline`, acknowledges only through a current ackId and can fail acknowledges: an aborted checkpoint, crashes after the barrier and after completion, failed and retried acknowledges, notifications out of order, leases held across a delayed checkpoint and given up past `max_lease`, the `max_outstanding` bound, close after a cancel, and both `on_decode_error` policies. `PubSubSourceAckLive` (`test_pubsub_live.cpp`) repeats the abort, the crash after completion and the delayed checkpoint against the emulator. `test_factory_registration.cpp` pins the capability record and the analyser's verdict.
+
+`pubsub_sink` is tested in process by `PubSubPublishResult` (the reply verdict) and `PubSubFactory` (the factory's refusals and the record), and live by `PubSubSinkContractLive` (`test_pubsub_sink_live.cpp`), judged by what a subscription of the test's own receives over REST: every message exactly as written past one publish's 1000, an empty record dead-lettered alone under `drop` and failing the sink with nothing sent under `fail`, a missing topic failing the sink with nothing dead-lettered, and, through `BulkFaultProxy`, a 200 that published nothing sent again, replies that never confirm failing the flush and keeping the batch, a 503 retried, and a reply lost after the publish sending the messages twice, then, through `TcpFaultProxy`, a cancel ending a publish in flight, and the factory. The recovery cells `PubSubSinkRecovery` (`tests/integration/test_pubsub_sink_recovery.cpp`) run a coordinator and two workers polling a feed the test serves into the sink, and SIGKILL the worker parked at `pubsub_sink.before_write` (the publish built and not sent) or at `pubsub_sink.after_write` (the service having confirmed it, the barrier not), the latter also as a SQL job at parallelism 2; a subscription made before the job finds every record, at most twice, and twice exactly those published after the restored checkpoint and before the kill.
+
+`scripts/brokers-live.sh [build-dir]` is the required gate: its sources phase runs the source's live and in-process suites, and its sinks phase the sink's suites and the recovery cells, against a one-off emulator container, and it fails on a missing binary, an emulator that never answers, a failed or skipped case, a short suite, or a Pub/Sub case outside both phases (see the [Redis page](redis.md#testing)). The `brokers` CI workflow runs it.
 
 ### InfluxDB
 

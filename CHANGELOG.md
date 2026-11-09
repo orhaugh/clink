@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**The Pub/Sub sink counts a publish only when the reply confirms every
+message, refuses an empty record alone, and reads its options strictly.** Any
+2xx counted as a publish, so a proxy or another service answering 200 lost
+every message of the request, and a reply confirming fewer messages than were
+sent counted for all of them. Pub/Sub refuses a message with neither data nor
+attributes, and the whole request with it, so one empty record failed its
+batch: under `dlq='drop'` every record of it went to the dead-letter queue,
+and under `dlq='fail'` the job failed again on every replay. Options were read
+leniently: `verify_tls='FALSE'` read as `true`, `batch_records='5000'` was cut
+to 1000 without a word, and a negative `batch_bytes` wrapped. Now a 2xx counts
+only with one message id per message, and any other is sent again, never
+dead-lettered; an empty record is refused before it is sent, dead-lettered
+alone under `drop` and failing the sink under `fail`. Options are read
+strictly, the shared connection options for the source too, which gain
+`connect_timeout_ms` and `request_timeout_ms`, and a SQL sink table takes only
+the options the sink reads. The brokers gate gains a Pub/Sub sinks phase:
+`PubSubSinkContractLive` against the emulator through fault proxies, and
+recovery cells that kill a worker before a publish and after the service
+confirmed one.
+
 **The MQTT sink stays failed after a failed flush, fails a flush the broker
 refused, says what became of each message, and gives each sink a client id of
 its own.** After a failed flush the sink cleared what it had buffered and
