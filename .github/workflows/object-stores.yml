@@ -1,0 +1,107 @@
+name: object-stores
+
+# The Parquet modes' gate on Google Cloud Storage and Azure Blob Storage
+# (scripts/object-store-parquet-live.sh), each against an emulator pinned by
+# digest: fake-gcs-server and Azurite. Each phase runs the store's test binary
+# in full: the factories, the sink and source cases that need no store, and the
+# live ones (a write and read back, the rolling sink never publishing an
+# unfinished part, the Row channel's typed columns). S3's Parquet phase runs in
+# the aws workflow, against SILO. Nothing here runs against Google Cloud or
+# Azure.
+#
+# A live test skips when its endpoint or binary is missing and gtest counts that
+# as a pass, so the gate fails on any skip and on any suite that ran fewer cases
+# than it has.
+#
+# The script runs on the runner, where it starts and removes the emulators with
+# Docker; the test binaries run inside the toolchain image through PIN_RUNNER,
+# on the runner's network.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: object-stores-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: The Parquet modes hold their contracts on the GCS and Azure emulators
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TOOLCHAIN: ghcr.io/${{ github.repository_owner }}/clink-build:main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report what is under test
+        run: |
+          echo "commit under test: $(git rev-parse HEAD)"
+          docker pull -q "${TOOLCHAIN}"
+          df -h /
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-object-stores-${{ github.run_id }}
+          restore-keys: |
+            ccache-object-stores-
+      # CLINK_WITH_GCS=ON and CLINK_WITH_AZURE=ON, not AUTO: an Arrow without
+      # the store fails the configure rather than leaving the gate without its
+      # binaries. Debug without DWARF and stripped, as the build job builds.
+      - name: Build the GCS and Azure tests
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ccache"
+          docker run --rm --user root \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
+            -v "${RUNNER_TEMP}/ccache:/root/.ccache" \
+            -e CLINK_DEPS_PREFIX=/usr/local -e CCACHE_DIR=/root/.ccache -e CCACHE_MAXSIZE=1500M \
+            -e CMAKE_C_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "${TOOLCHAIN}" bash -c '
+              set -euo pipefail
+              git config --global --add safe.directory "*"
+              apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
+                -DCLINK_WITH_GCS=ON -DCLINK_WITH_AZURE=ON -DCMAKE_C_FLAGS_DEBUG=-g0 \
+                -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
+              cmake --build build --target clink_gcs_tests clink_azure_tests \
+                -j "$(( $(nproc) / 2 + 1 ))"
+              ccache -s | tail -3'
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-object-stores-${{ github.run_id }}
+      - name: Run the GCS and Azure gate
+        run: |
+          set -euo pipefail
+          export REPORT_DIR="${RUNNER_TEMP}/object-store-parquet-live-reports"
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_GCS_TEST_ENDPOINT -e CLINK_AZURE_TEST_ENDPOINT \
+            ${TOOLCHAIN}"
+          scripts/object-store-parquet-live.sh build 2>&1 | tee "${RUNNER_TEMP}/object-store-gate.log"
+      - name: Keep the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: object-store-parquet-gate
+          path: |
+            ${{ runner.temp }}/object-store-parquet-live-reports/**
+            ${{ runner.temp }}/object-store-gate.log
+          if-no-files-found: warn
+          retention-days: 90

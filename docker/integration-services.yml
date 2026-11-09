@@ -330,7 +330,7 @@ services:
   # scheme=http). The test creates its own bucket. -public-host must match the
   # in-container authority so upload redirects resolve. CLINK_GCS_TEST_ENDPOINT: "gcs:4443"
   gcs:
-    image: fsouza/fake-gcs-server
+    image: fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef
     command: ["-scheme", "http", "-host", "0.0.0.0", "-port", "4443", "-public-host", "gcs:4443"]
     ports:
       - "4443:4443"
@@ -339,7 +339,7 @@ services:
   # service on 0.0.0.0 so a networked client reaches it; the test uses Azurite's
   # well-known devstoreaccount1 account + key. CLINK_AZURE_TEST_ENDPOINT: "azurite:10000"
   azurite:
-    image: mcr.microsoft.com/azure-storage/azurite
+    image: mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5
     command: ["azurite", "--blobHost", "0.0.0.0", "--blobPort", "10000"]
     ports:
       - "10000:10000"
