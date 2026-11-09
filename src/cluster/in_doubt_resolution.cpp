@@ -153,6 +153,72 @@ std::uint64_t latest_triggered_id_on_disk(const std::string& checkpoint_dir, Job
     return body.has_value() ? triggered_id_of(*body) : 0;
 }
 
+std::uint64_t latest_marker_id_on_disk(const std::string& checkpoint_dir,
+                                       JobId job_id,
+                                       const std::string& prefix,
+                                       const std::optional<RestoredRecord>& restored) {
+    if (checkpoint_dir.empty())
+        return 0;
+    std::uint64_t latest = 0;
+    for (const auto& key :
+         make_coordination_store(checkpoint_dir)->list("_jobs/" + std::to_string(job_id))) {
+        const auto name = std::filesystem::path(key).filename().string();
+        if (name.rfind(prefix, 0) != 0)
+            continue;
+        // Only a whole marker counts: the prefix, then the id, then nothing.
+        // A marker is published by renaming its temp file
+        // (<marker>.tmp.<pid>.<n>, write_string_fsync_rename) into place, and
+        // a writer killed between the temp's fsync and the rename leaves the
+        // temp behind. std::stoull reads "2.tmp.74715.0" as 2, so a takeover
+        // counted a checkpoint whose completion was never recorded, restored
+        // from it, found no marker for it, and read state from a directory
+        // that holds none: the job failed with every record since the last
+        // real marker unpublished.
+        const auto digits = std::string_view{name}.substr(prefix.size());
+        if (digits.empty() || digits.size() > 20 ||
+            digits.find_first_not_of("0123456789") != std::string_view::npos)
+            continue;
+        try {
+            const auto id = std::stoull(std::string{digits});
+            if (restored.has_value() && restored->passes_over(id))
+                continue;
+            if (id > latest)
+                latest = id;
+        } catch (...) {
+        }
+    }
+    return latest;
+}
+
+// The newest COMPLETED marker. With the job's RESTORED record, the newest a
+// restore may choose: a marker the record passes over was still being put
+// when the job restored from below it, and its transactions are gone.
+std::uint64_t latest_completed_id_on_disk(const std::string& checkpoint_dir,
+                                          JobId job_id,
+                                          const std::optional<RestoredRecord>& restored) {
+    return latest_marker_id_on_disk(checkpoint_dir, job_id, "COMPLETED-", restored);
+}
+
+// Commit-confirmed restore protocol: the newest checkpoint whose external
+// commits provably executed (CONFIRMED-N written by handle_commit_confirmed_).
+std::uint64_t latest_confirmed_id_on_disk(const std::string& checkpoint_dir, JobId job_id) {
+    return latest_marker_id_on_disk(checkpoint_dir, job_id, "CONFIRMED-");
+}
+
+RestorePointOnDisk restore_point_on_disk(const std::string& checkpoint_dir,
+                                         JobId job_id,
+                                         bool needs_confirmation) {
+    RestorePointOnDisk out;
+    out.needs_confirmation = needs_confirmation;
+    out.confirmed = latest_confirmed_id_on_disk(checkpoint_dir, job_id);
+    if (!needs_confirmation) {
+        out.restored = read_restore_point(checkpoint_dir, job_id);
+    }
+    out.completed = latest_completed_id_on_disk(checkpoint_dir, job_id, out.restored);
+    out.chosen = needs_confirmation ? out.confirmed : out.completed;
+    return out;
+}
+
 std::string restored_record_key(JobId job_id) {
     return "_jobs/" + std::to_string(job_id) + "/RESTORED";
 }

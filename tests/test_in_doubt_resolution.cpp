@@ -683,6 +683,38 @@ TEST_F(ResolutionFixture, AnUnreadableRestoreRecordIsAnErrorNotAnEmptyRange) {
     EXPECT_EQ(read_restore_point(dir, kJob)->next, 2u);
 }
 
+// The restore point on disk, as a takeover reads it before the in-doubt walk:
+// the newest COMPLETED marker the RESTORED record does not pass over, or, for
+// the confirmation family, the newest CONFIRMED marker. A marker's temp file
+// is not a marker.
+TEST_F(ResolutionFixture, TheRestorePointOnDiskFollowsTheTakeoversRule) {
+    using clink::cluster::record_restore_point;
+    using clink::cluster::restore_point_on_disk;
+    const auto job_dir = completed_marker_dir_for(dir, kJob);
+    std::filesystem::create_directories(job_dir);
+    for (const char* name :
+         {"COMPLETED-3", "COMPLETED-5", "COMPLETED-6", "CONFIRMED-3", "COMPLETED-9.tmp.1.0"}) {
+        std::ofstream(job_dir / name) << "job=7\n";
+    }
+    auto plain = restore_point_on_disk(dir, kJob, /*needs_confirmation=*/false);
+    EXPECT_EQ(plain.chosen, 6u);
+    EXPECT_EQ(plain.completed, 6u);
+    EXPECT_EQ(plain.confirmed, 3u);
+    EXPECT_FALSE(plain.restored.has_value());
+    // A deploy restored from 3 and numbered from 6: 5 was still being put.
+    ASSERT_TRUE(record_restore_point(dir, kJob, 1, {.restore = 3, .next = 6}));
+    plain = restore_point_on_disk(dir, kJob, false);
+    EXPECT_EQ(plain.chosen, 6u) << "6 is the restored run's own id";
+    ASSERT_TRUE(record_restore_point(dir, kJob, 1, {.restore = 3, .next = 7}));
+    plain = restore_point_on_disk(dir, kJob, false);
+    EXPECT_EQ(plain.chosen, 3u) << "5 and 6 were passed over";
+    ASSERT_TRUE(plain.restored.has_value());
+    const auto confirmed = restore_point_on_disk(dir, kJob, /*needs_confirmation=*/true);
+    EXPECT_EQ(confirmed.chosen, 3u);
+    EXPECT_FALSE(confirmed.restored.has_value()) << "the confirmation family reads no record";
+    EXPECT_EQ(restore_point_on_disk(dir, kJob + 1, false).chosen, 0u);
+}
+
 // -- cancellation (the rig-night composite's zombie walk) ------------------
 //
 // The coordinator's watchdog cancels a walk that outruns its deadline. A

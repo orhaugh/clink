@@ -105,7 +105,7 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 // transaction its restore does not hold), so a restore that chose it would
 // re-commit transactions that are gone and resume the source past their
 // interval. A job that restores from its newest completed checkpoint passes
-// such a marker over (latest_completed_id_on_disk in coordinator.cpp). Records
+// such a marker over (latest_completed_id_on_disk below). Records
 // only rise: a later deploy restores from at least what an earlier one could
 // choose and numbers above every id ever allocated, so the newest record
 // excludes all an older one did that a restore could still reach.
@@ -134,6 +134,44 @@ struct RestoredRecord {
 // transactions are gone, and guessing is not safer.
 [[nodiscard]] std::optional<RestoredRecord> read_restore_point(const std::string& checkpoint_dir,
                                                                JobId job_id);
+
+// The newest marker under <checkpoint_dir>/_jobs/<job_id>/ named `prefix`
+// followed by a checkpoint id and nothing else (a marker's temp file is not
+// one); with `restored`, passing over the ids the record passes over. 0 when
+// there is none or `checkpoint_dir` is empty. Throws when the store cannot be
+// listed. latest_completed_id_on_disk and latest_confirmed_id_on_disk are the
+// COMPLETED- and CONFIRMED- forms. A coordinator takeover and a resumed
+// submission restore with these, and `clink incident-collect` selects its
+// checkpoint with them.
+[[nodiscard]] std::uint64_t latest_marker_id_on_disk(
+    const std::string& checkpoint_dir,
+    JobId job_id,
+    const std::string& prefix,
+    const std::optional<RestoredRecord>& restored = std::nullopt);
+[[nodiscard]] std::uint64_t latest_completed_id_on_disk(
+    const std::string& checkpoint_dir,
+    JobId job_id,
+    const std::optional<RestoredRecord>& restored = std::nullopt);
+[[nodiscard]] std::uint64_t latest_confirmed_id_on_disk(const std::string& checkpoint_dir,
+                                                        JobId job_id);
+
+// The checkpoint a coordinator takeover restores a job from, as the disk
+// records it before the in-doubt walk: the newest COMPLETED marker the job's
+// RESTORED record does not pass over, or, for a job whose sinks need commit
+// confirmation, the newest CONFIRMED one. The walk that follows for that
+// family asks the sinks' external systems and can advance the point; nothing
+// read from disk alone can say how far. Throws as the scans and
+// read_restore_point do.
+struct RestorePointOnDisk {
+    bool needs_confirmation{false};
+    std::uint64_t completed{0};              // newest COMPLETED a restore may choose
+    std::uint64_t confirmed{0};              // newest CONFIRMED; 0 when there is none
+    std::optional<RestoredRecord> restored;  // read only without confirmation
+    std::uint64_t chosen{0};                 // 0: nothing to restore from
+};
+[[nodiscard]] RestorePointOnDisk restore_point_on_disk(const std::string& checkpoint_dir,
+                                                       JobId job_id,
+                                                       bool needs_confirmation);
 
 // The checkpoint-id floor of a new run of the job (DeployMsg::run_checkpoint_floor):
 // a 2PC sink reads receipts and unresolved markers above the larger of its
