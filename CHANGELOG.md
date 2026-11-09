@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**The raw S3 source reads every page of a listing and restores by key, and the
+raw S3 sinks read their byte counts strictly.** The C++ `S3Source` listed a
+prefix once, and a listing answers at most 1000 keys a page, so the objects
+after the first 1000 were never read. It restored by an index into the sorted
+listing, so an object removed before the position skipped the next one and an
+object added before it read one twice; and it addressed a custom endpoint by
+virtual host, so a store named by host could not be listed. It now reads every
+page, the checkpoint holds the key of the last object emitted, a restore
+resumes after that key, and a custom endpoint is addressed by path; an earlier
+release's index names no object, so a restore from it reads every object
+again. `rollover_bytes` and `part_size` are read strictly:
+`rollover_bytes='0'` put an object for every record, and a typo fell back to
+the default. The `s3` record drops the Parquet modes' format, schema evolution
+and partition discovery, which their own records carry, and states what the
+text sink loses and repeats and how the source restores. `scripts/s3-live.sh`
+runs the raw object suites against SILO, in the `aws` workflow.
+
 **The ClickHouse SELECT source repeats rows after a restore rather than skip
 them, and reads its options strictly.** It resumed a restore at the row index
 its checkpoint held, after running its query again: without `ORDER BY`,
