@@ -519,6 +519,14 @@ if(CLINK_INTEGRATION_TESTS)
     if(TARGET clink::postgres AND TARGET clink::http_connector)
         target_sources(clink_integration_tests PRIVATE integration/test_postgres_sink_recovery.cpp)
     endif()
+    # The Redis sinks' recovery cells: a coordinator and two workers polling a
+    # feed the test serves into the Streams and keyed sinks, against the server
+    # scripts/brokers-live.sh starts, with faults at the sinks' own points and a
+    # verifier that reads Redis over a RESP connection of its own. They skip
+    # without it.
+    if(TARGET clink::redis AND TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_redis_sink_recovery.cpp)
+    endif()
     # The Cassandra and ScyllaDB sinks' recovery cells: a coordinator and two
     # workers polling a feed the test serves into the sinks, against the server
     # scripts/cassandra-live.sh starts, with faults at the sinks' own points and
