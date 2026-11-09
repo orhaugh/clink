@@ -23,7 +23,10 @@ acknowledgement, nothing to rewind to. Delivery is therefore
 **at-most-once across restarts** - messages that arrive while the job is
 down, or between a crash and its last checkpoint, are gone, and the source
 persists no cursor because there is none. Within one connection, delivery
-is in-order and complete.
+is in-order and complete: a frame the client cannot read ends the connection,
+and the messages that arrived whole before it are emitted first. Before, the
+error was raised at once and took with it the messages decoded in the same
+read, two in the test that holds it.
 
 The two honest patterns when stronger guarantees are needed:
 
@@ -74,17 +77,24 @@ after it with a keyed shuffle.
 | --- | --- | --- |
 | `url` | required | `ws://host[:port]/path` or `wss://...` |
 | `subscribe` | empty | text frame sent after every (re)connect - the venue's subscribe message |
-| `read_block_ms` | `500` | how long one `produce()` call waits for data |
-| `ping_interval_ms` | `30000` | client keepalive pings; `0` disables |
-| `open_timeout_ms` | `10000` | connect + TLS + handshake deadline |
+| `read_block_ms` | `500` | how long one `produce()` call waits for data, 1 to 60,000 |
+| `ping_interval_ms` | `30000` | client keepalive pings, up to an hour; `0` disables |
+| `open_timeout_ms` | `10000` | connect + TLS + handshake deadline, 1 to 600,000 |
 | `max_messages` | `0` | stop after N messages (`0` = unbounded); a capped source is bounded, for demos and tests |
-| `reconnect` | `true` | re-dial dropped connections; `false` ends the stream at the first drop or server close |
-| `reconnect_backoff_max_ms` | `30000` | exponential backoff cap |
+| `reconnect` | `true` | re-dial dropped connections; `false` ends the stream at the first drop or server close, and fails it at a frame the client cannot read |
+| `reconnect_backoff_max_ms` | `30000` | exponential backoff cap, 1 to 3,600,000 |
 | `tls_verify` | `true` | `wss://` certificate + hostname verification (disable only for self-signed development endpoints) |
+
+Every option is read strictly: a number outside its range, or a boolean other
+than `true` or `false`, is refused when the job is built, naming it.
+`reconnect='FALSE'` once read as `true`. The client sends no handshake headers
+of the caller's, so credentials go in the URL or in the subscription message.
 
 Binary messages are counted
 (`clink_connector_errors_total{connector="websocket",direction="binary_skipped"}`)
-and not emitted: the string channel carries text.
+and not emitted: the string channel carries text. Text is passed on without
+a UTF-8 check; on the SQL path the JSON decoding refuses text that is not
+UTF-8.
 
 ## SQL usage
 
@@ -150,7 +160,11 @@ auto source = std::make_shared<clink::websocket::WebSocketSource>(std::move(o));
 RFC 6455's own worked examples - the section 1.3 nonce/accept pair and the
 section 5.7 masked "Hello" frame, byte for byte - and drives the source
 against an in-process WebSocket server: ordered delivery, subscribe-on-
-reconnect, ping/pong, fragmented reassembly, server close, binary skip. The
+reconnect, ping/pong, fragmented reassembly, server close, binary skip, and
+messages that arrived before a bad frame emitted before the error is raised.
+`test_factory_registration.cpp` holds the factory's refusals, the record, and
+the delivery analyser's refusal of an at-least-once sink over the source. The
 live test is env-gated: set `CLINK_WS_LIVE_URL` (and optionally
 `CLINK_WS_LIVE_SUBSCRIBE`) to run one real receive against a feed of your
-choosing.
+choosing; no gate runs it, since no feed is pinned, and the in-process server
+is the source's evidence.

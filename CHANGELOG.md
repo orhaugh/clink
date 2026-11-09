@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**The WebSocket source emits the messages that arrived before a frame it
+cannot read, reads its options strictly, and its record claims no header
+authentication.** A protocol error was raised at once, taking with it the
+whole messages decoded in the same read; they are now emitted first, and the
+error then fails the stream with reconnect off, or ends the connection with
+it on. Options were read leniently: `reconnect='FALSE'` and
+`tls_verify='FALSE'` read as `true`, and numbers were taken as given. The
+record listed header authentication, which the client does not offer, and
+named the reconnect backoff alone among its waits; it now names the open
+timeout and states what the source loses: messages sent while it is down,
+binary messages, and text passed on without a UTF-8 check.
+
 **The PostgreSQL SELECT source repeats rows after a restore rather than skip
 them.** It resumed a restore at the row index its checkpoint held, after
 running its query again, so rows that had moved were skipped: a query without
