@@ -51,6 +51,10 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// `text`, one object read_json_object accepted, without its top-level member
+// `name`, everything else as written; unchanged when it has no such member.
+[[nodiscard]] std::string remove_member(std::string_view text, std::string_view name);
+
 // ---- keys ----------------------------------------------------------------------------
 
 // A text that identifies the record's key exactly as the stream holds it: the

@@ -520,6 +520,130 @@ std::string plain_decimal(std::string_view token, std::size_t max_chars) {
     return out;
 }
 
+namespace {
+
+// The end of the JSON string that starts at `i` (its opening quote), and its
+// decoded text in `out`. The text has passed read_json_object, so it is well
+// formed.
+std::size_t scan_string(std::string_view s, std::size_t i, std::string* out) {
+    ++i;
+    while (i < s.size() && s[i] != '"') {
+        if (s[i] != '\\') {
+            if (out != nullptr) {
+                out->push_back(s[i]);
+            }
+            ++i;
+            continue;
+        }
+        const char e = s[i + 1];
+        if (e != 'u') {
+            if (out != nullptr) {
+                static constexpr std::string_view kFrom = "\"\\/bfnrt";
+                static constexpr std::string_view kTo = "\"\\/\b\f\n\r\t";
+                out->push_back(kTo[kFrom.find(e)]);
+            }
+            i += 2;
+            continue;
+        }
+        const auto hex = [&](std::size_t at) {
+            std::uint32_t v = 0;
+            for (std::size_t k = 0; k < 4; ++k) {
+                v = (v << 4U) | static_cast<std::uint32_t>(hex_value(s[at + k]));
+            }
+            return v;
+        };
+        std::uint32_t cp = hex(i + 2);
+        i += 6;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10U) + (hex(i + 2) - 0xDC00);
+            i += 6;
+        }
+        if (out != nullptr) {
+            put_utf8(*out, cp);
+        }
+    }
+    return i + 1;
+}
+
+// The end of the value that starts at `i`.
+std::size_t scan_value(std::string_view s, std::size_t i) {
+    if (s[i] == '"') {
+        return scan_string(s, i, nullptr);
+    }
+    if (s[i] != '{' && s[i] != '[') {
+        while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' && s[i] != ' ' &&
+               s[i] != '\t' && s[i] != '\n' && s[i] != '\r') {
+            ++i;
+        }
+        return i;
+    }
+    int depth = 0;
+    while (i < s.size()) {
+        const char c = s[i];
+        if (c == '"') {
+            i = scan_string(s, i, nullptr);
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (--depth == 0) {
+                return i + 1;
+            }
+        }
+        ++i;
+    }
+    return i;
+}
+
+std::size_t skip_space(std::string_view s, std::size_t i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) {
+        ++i;
+    }
+    return i;
+}
+
+}  // namespace
+
+std::string remove_member(std::string_view text, std::string_view name) {
+    std::size_t i = skip_space(text, 0) + 1;  // past '{'
+    std::size_t previous_end = i;             // where the previous member ended
+    bool first = true;
+    while (true) {
+        i = skip_space(text, i);
+        if (i >= text.size() || text[i] == '}') {
+            return std::string{text};
+        }
+        const std::size_t member_begin = i;
+        std::string key;
+        i = scan_string(text, i, &key);
+        i = skip_space(text, i) + 1;  // past ':'
+        i = scan_value(text, skip_space(text, i));
+        const std::size_t member_end = i;
+        i = skip_space(text, i);
+        const bool comma = i < text.size() && text[i] == ',';
+        if (key == name) {
+            std::string out{text};
+            if (comma) {
+                // This member and the comma after it.
+                out.erase(member_begin, skip_space(text, i + 1) - member_begin);
+            } else if (!first) {
+                // The last member, and the comma before it.
+                out.erase(previous_end, member_end - previous_end);
+            } else {
+                out.erase(member_begin, member_end - member_begin);
+            }
+            return out;
+        }
+        first = false;
+        previous_end = member_end;
+        if (!comma) {
+            return std::string{text};
+        }
+        ++i;
+    }
+}
+
 // ---- keys ----------------------------------------------------------------------------
 
 std::string stream_key(const JsonMembers& m, const std::vector<std::string>& key_columns) {

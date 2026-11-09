@@ -166,3 +166,20 @@ TEST(SinkChangelogBuffer, KeysTheTableEquatesMeetItInOrder) {
     EXPECT_EQ(runs[0].first, ChangeKind::Delete);
     EXPECT_EQ(runs[1].first, ChangeKind::Upsert);
 }
+
+// The record as written, less one top-level member: wherever it stands, with
+// escaped names, and nested members of the same name left alone.
+TEST(SinkRecordRules, RemoveMemberKeepsTheRestAsWritten) {
+    using clink::sinkrules::remove_member;
+    EXPECT_EQ(remove_member(R"({"k":1,"__row_kind":"delete","v":"x"})", "__row_kind"),
+              R"({"k":1,"v":"x"})");
+    EXPECT_EQ(remove_member(R"({"__row_kind":"insert","k":1})", "__row_kind"), R"({"k":1})");
+    EXPECT_EQ(remove_member(R"({"k":1.50e1, "v":[1,{"__row_kind":2}], "__row_kind" : "x" })",
+                            "__row_kind"),
+              R"({"k":1.50e1, "v":[1,{"__row_kind":2}] })");
+    EXPECT_EQ(remove_member(R"({"__row_kind":"x"})", "__row_kind"), "{}");
+    EXPECT_EQ(remove_member(R"({"\u005f_row_kind":"x","k":"a\"b"})", "__row_kind"),
+              R"({"k":"a\"b"})");
+    EXPECT_EQ(remove_member(R"({"k":1})", "__row_kind"), R"({"k":1})");
+    EXPECT_EQ(remove_member("{}", "__row_kind"), "{}");
+}
