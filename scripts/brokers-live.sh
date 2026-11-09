@@ -20,11 +20,11 @@
 #     suites. The Redis and MQTT TLS round trips need a TLS server this gate
 #     does not start and are left out.
 #   sinks: the sinks' suites, offline and live, where a broker's sinks have
-#     them, today Redis, RabbitMQ and NATS: the failure state against a
-#     scripted server, the contract against the server, the factories (and for
-#     Redis the key rules and the upsert contract suite); then the recovery
-#     cells in clink_integration_tests (RedisSinkRecovery,
-#     RabbitMqSinkRecovery, NatsSinkRecovery): a
+#     them, today Redis, RabbitMQ, NATS and Pulsar: the failure state against
+#     a scripted server, the contract against the server, the factories (and
+#     for Redis the key rules and the upsert contract suite); then the
+#     recovery cells in clink_integration_tests (RedisSinkRecovery,
+#     RabbitMqSinkRecovery, NatsSinkRecovery, PulsarSinkRecovery): a
 #     coordinator and two workers polling a feed the test serves into each
 #     sink, one of them a SQL job at parallelism 2, with a worker killed before
 #     a flush (or its confirms) and after it, before its checkpoint completes.
@@ -34,9 +34,9 @@
 # as a pass, so scripts/check-gtest-reports.py fails the run on any skip and on
 # a suite that ran fewer cases than it should. When both phases run for a
 # broker that has both, the cases its binary ran between them must be every
-# case it lists apart from those left out on purpose (the Redis TLS cases), so
-# a suite outside both phases fails the gate. A missing binary, a service that
-# never answers and a failed case fail it too.
+# case it lists apart from those left out on purpose (the Redis and Pulsar TLS
+# cases), so a suite outside both phases fails the gate. A missing binary, a
+# service that never answers and a failed case fail it too.
 #
 # REPORT_DIR keeps each broker's reports and output under <broker>/<phase>,
 # provenance.txt (the commit, whether the tree was clean, the build's
@@ -64,7 +64,7 @@
 # CLINK_RABBITMQ_TEST_USER, CLINK_RABBITMQ_TEST_PASSWORD,
 # CLINK_RABBITMQ_TEST_MANAGEMENT_PORT, CLINK_RABBITMQ_RECOVERY_LOG_DIR,
 # CLINK_NATS_TEST_ENDPOINT, CLINK_NATS_RECOVERY_LOG_DIR,
-# CLINK_PULSAR_TEST_ENDPOINT, CLINK_MQTT_TEST_URL.
+# CLINK_PULSAR_TEST_ENDPOINT, CLINK_PULSAR_RECOVERY_LOG_DIR, CLINK_MQTT_TEST_URL.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -122,7 +122,8 @@ filter_of() {  # <broker> <phase>
         rabbitmq/sinks) echo 'RabbitMqSink*:RabbitMqFactoryRegistration.*' ;;
         nats/sources) echo 'NatsLive.*:NatsSourceAckLive.*:NatsSource.*' ;;
         nats/sinks) echo 'NatsSink*:NatsFactoryRegistration.*' ;;
-        pulsar/sources) echo 'PulsarLive.*:PulsarSourceAckLive.*' ;;
+        pulsar/sources) echo 'PulsarLive.*:PulsarSourceAckLive.*:PulsarSource.*' ;;
+        pulsar/sinks) echo 'PulsarSink*:PulsarFactoryRegistration.*' ;;
         mqtt/sources) echo 'MqttLive.*:MqttSourceAckLive.*:-MqttLive.TlsConnectionRoundTrip' ;;
     esac
 }
@@ -174,6 +175,13 @@ expectations_of() {  # <broker> <phase>
         pulsar/sources)
             echo 'PulsarLive.*=2'
             echo 'PulsarSourceAckLive.*=4'
+            echo 'PulsarSource.*=2'
+            ;;
+        pulsar/sinks)
+            echo 'PulsarSink.*=2'
+            echo 'PulsarSinkFailures.*=11'
+            echo 'PulsarSinkContractLive.*=6'
+            echo 'PulsarFactoryRegistration.*=5'
             ;;
         mqtt/sources)
             echo 'MqttLive.*=5'
@@ -186,6 +194,7 @@ recovery_filter_of() {  # <broker> <phase>
         redis/sinks) echo 'RedisSinkRecovery.*' ;;
         rabbitmq/sinks) echo 'RabbitMqSinkRecovery.*' ;;
         nats/sinks) echo 'NatsSinkRecovery.*' ;;
+        pulsar/sinks) echo 'PulsarSinkRecovery.*' ;;
     esac
 }
 recovery_expectations_of() {  # <broker> <phase>
@@ -193,6 +202,7 @@ recovery_expectations_of() {  # <broker> <phase>
         redis/sinks) echo 'RedisSinkRecovery.*=5' ;;
         rabbitmq/sinks) echo 'RabbitMqSinkRecovery.*=3' ;;
         nats/sinks) echo 'NatsSinkRecovery.*=3' ;;
+        pulsar/sinks) echo 'PulsarSinkRecovery.*=3' ;;
     esac
 }
 # Where each broker's recovery cells keep the cluster's logs.
@@ -201,14 +211,16 @@ recovery_log_var_of() {  # <broker>
         redis) echo CLINK_REDIS_RECOVERY_LOG_DIR ;;
         rabbitmq) echo CLINK_RABBITMQ_RECOVERY_LOG_DIR ;;
         nats) echo CLINK_NATS_RECOVERY_LOG_DIR ;;
+        pulsar) echo CLINK_PULSAR_RECOVERY_LOG_DIR ;;
     esac
 }
 # The cases the phases leave out on purpose, which the coverage check allows:
-# the TLS cases, which need a TLS-enabled build and server (ctest runs the
-# certificate cases in every TLS-enabled build).
+# the TLS cases, which need a TLS-enabled build, the openssl CLI or a TLS
+# server (ctest runs the certificate cases wherever they can run).
 excluded_of() {  # <broker>
     case "$1" in
         redis) echo 'RedisTls.*:RedisLive.TlsConnectionRoundTrip' ;;
+        pulsar) echo 'PulsarTls.*' ;;
     esac
 }
 
@@ -223,7 +235,8 @@ if [ "${#missing[@]}" -gt 0 ]; then
     echo "brokers-live: the test binaries of ${missing[*]} are not built under ${BUILD_DIR}" >&2
     exit 1
 fi
-if [ "${BROKERS_LIVE_RECOVERY}" = 1 ] && phase_runs sinks && { runs redis || runs rabbitmq || runs nats; } &&
+if [ "${BROKERS_LIVE_RECOVERY}" = 1 ] && phase_runs sinks &&
+    { runs redis || runs rabbitmq || runs nats || runs pulsar; } &&
     [ -z "${IT_BIN}" ]; then
     echo "brokers-live: the recovery cells need clink_integration_tests (and clink_node and" \
         "clink_submit_sql) under ${BUILD_DIR}; BROKERS_LIVE_RECOVERY=0 leaves them out" >&2
@@ -307,6 +320,22 @@ await() {  # <what> <seconds> <command...>
 # shellcheck disable=SC2329 # called through await
 http_ok() {  # <url>
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$1" || true)" = "200" ]
+}
+
+# Pulsar answers its health check before it owns the bundles of public/default,
+# and the first client operation on a cold bundle can outlast the client's
+# timeout (a subscribe that timed out at 30 s while the broker took 50 s to load
+# its namespace). A lookup makes the broker load the topic's bundle, so looking
+# up 32 topics, which land on every one of the namespace's four bundles but with
+# a chance near 1 in 10,000, readies them all before the first case.
+# shellcheck disable=SC2329 # called through await
+pulsar_warm() {  # <admin port>
+    local i
+    for i in $(seq 1 32); do
+        [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
+            "http://127.0.0.1:$1/lookup/v2/topic/persistent/public/default/clink-warm-${i}" ||
+            true)" = "200" ] || return 1
+    done
 }
 
 # shellcheck disable=SC2329 # called through await
@@ -443,6 +472,7 @@ fi
 if runs pulsar; then
     start pulsar 6650 8080
     await pulsar 240 http_ok "http://127.0.0.1:$(port_of 8080)/admin/v2/brokers/health"
+    await "pulsar's namespace bundles" 240 pulsar_warm "$(port_of 8080)"
     port="$(port_of 6650)"
     export CLINK_PULSAR_TEST_ENDPOINT="pulsar://127.0.0.1:${port}"
     phases pulsar
