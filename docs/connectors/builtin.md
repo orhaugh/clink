@@ -30,7 +30,11 @@ CREATE TABLE sink (bidder BIGINT, bid_count BIGINT) WITH (connector='blackhole')
 Nets a changelog stream (insert / delete / update_before / update_after) into
 its final relation by full-row multiplicity - no primary key needed - and
 writes the survivors on flush. For keyless changelog outputs, e.g. a
-retracting aggregate joined to another stream. A NaN or infinite double is
+retracting aggregate joined to another stream. Each row's multiplicity is kept
+in keyed state, written through as records arrive, on every state backend, so
+a restore brings it back; on a backend that defers reads (`remote-read://`,
+`forst://...?defer_reads=1`) the sink used to keep none, and a restore lost
+every row counted before the checkpoint. A NaN or infinite double is
 written as `null`, or as `"NaN"`, `"Infinity"` or `"-Infinity"` with
 `json_non_finite='string'`; see
 [NaN and infinity in JSON output](README.md#nan-and-infinity-in-json-output).

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**The file source reads a file again from the start when it is restored over
+another file.** It resumed a restore at the byte offset its checkpoint held,
+without looking at the file: a shorter file, one rotated over or truncated,
+was read as empty, and a replaced one lost its first lines. The checkpoint now
+holds a hash of the up to 64 KiB before the offset, and a restore resumes only
+over a file at least that long whose bytes there are the same; otherwise it
+reads the file from the start, lines repeated rather than skipped, and says so
+in its log. A file that grew after the offset still resumes. A checkpoint from
+an earlier release is checked against the file's length only.
+
+**The upsert and changelog file sinks keep their state on a backend that
+defers reads.** `file_json_upsert_sink` and `changelog_net_sink` write their
+netted view through to keyed state as records arrive, but left out every
+backend that defers reads (`remote-read://`, `forst://...?defer_reads=1`),
+where they kept nothing: a restore lost every row whose last change came
+before the checkpoint. Those backends answer the calls the sinks make, and
+both now keep their state on every backend.
+
 **The WebSocket source emits the messages that arrived before a frame it
 cannot read, reads its options strictly, and its record claims no header
 authentication.** A protocol error was raised at once, taking with it the
