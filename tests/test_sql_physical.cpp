@@ -3259,6 +3259,47 @@ TEST(SqlPhysical, NatsSinkTablesTakeOnlyOptionsTheSinkReads) {
     EXPECT_NE(why.find("publish_timeout_ms"), std::string::npos) << why;
 }
 
+namespace {
+
+std::string pulsar_sink_refusal(const std::string& with) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE p_out (k BIGINT, v BIGINT) WITH (connector='pulsar', "
+        "service_url='pulsar://localhost:6650', topic='t'" +
+        with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO p_out SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+// A connector='pulsar' sink table's options: one the sink does not read is
+// refused, naming the ones it reads; the source's options pass.
+TEST(SqlPhysical, PulsarSinkTablesTakeOnlyOptionsTheSinkReads) {
+    EXPECT_EQ(pulsar_sink_refusal(", token='env://T', operation_timeout_s='5', tls_ca='/ca.pem', "
+                                  "tls_verify_hostname='false', batching='false', "
+                                  "send_timeout_ms='5000', max_pending='10', "
+                                  "max_pending_bytes='1024'"),
+              "");
+    EXPECT_EQ(pulsar_sink_refusal(", subscription='s', subscription_type='exclusive', "
+                                  "receiver_queue_size='5', receive_timeout_ms='10', "
+                                  "batch_size='3', subscribe_timeout_ms='100'"),
+              "");
+    const auto why = pulsar_sink_refusal(", send_timeout='5000'");
+    EXPECT_NE(why.find("does not read option 'send_timeout'"), std::string::npos) << why;
+    EXPECT_NE(why.find("send_timeout_ms"), std::string::npos) << why;
+}
+
 TEST(SqlPhysical, CassandraUpsertSinkSelected) {
     Catalog cat;
     auto s = parse(

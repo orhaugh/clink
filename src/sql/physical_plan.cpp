@@ -199,6 +199,7 @@ void check_postgres_sink_options(const TableDef& table, bool upsert);
 void check_redis_sink_options(const TableDef& table, bool upsert);
 void check_rabbitmq_sink_options(const TableDef& table);
 void check_nats_sink_options(const TableDef& table);
+void check_pulsar_sink_options(const TableDef& table);
 
 std::string string_sink_factory_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
@@ -662,6 +663,37 @@ void check_nats_sink_options(const TableDef& table) {
             }
         }
         unsupported("table '" + table.name + "': a connector='nats' sink does not read option '" +
+                    key + "'; it reads " + accepted);
+    }
+}
+
+void check_pulsar_sink_options(const TableDef& table) {
+    static const std::vector<std::string> kConnection = {
+        "service_url", "token", "operation_timeout_s", "tls_ca", "tls_verify_hostname"};
+    static const std::vector<std::string> kSink = {
+        "topic", "batching", "send_timeout_ms", "max_pending", "max_pending_bytes"};
+    static const std::vector<std::string> kSources = {"subscription",
+                                                      "subscription_type",
+                                                      "receiver_queue_size",
+                                                      "receive_timeout_ms",
+                                                      "batch_size",
+                                                      "subscribe_timeout_ms"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        (void)value;
+        const auto listed = [&key](const std::vector<std::string>& v) {
+            return std::find(v.begin(), v.end(), key) != v.end();
+        };
+        if (listed(kConnection) || listed(kSink) || listed(kSources) || listed(interpreted)) {
+            continue;
+        }
+        std::string accepted;
+        for (const auto* list : {&kConnection, &kSink}) {
+            for (const auto& o : *list) {
+                accepted += (accepted.empty() ? "" : ", ") + o;
+            }
+        }
+        unsupported("table '" + table.name + "': a connector='pulsar' sink does not read option '" +
                     key + "'; it reads " + accepted);
     }
 }
@@ -1459,6 +1491,7 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         if (upsert) {
             unsupported("connector='pulsar' sink does not support mode='upsert'");
         }
+        check_pulsar_sink_options(table);
         return RowConnectorBinding{"pulsar_sink_string", kChannelString, "row_to_json_string"};
     }
     if (connector == "cassandra") {
