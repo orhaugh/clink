@@ -540,6 +540,13 @@ if(CLINK_INTEGRATION_TESTS)
         target_sources(clink_integration_tests PRIVATE integration/test_nats_sink_recovery.cpp)
         target_link_libraries(clink_integration_tests PRIVATE ${CLINK_NATS_LIBS_EXPORT})
     endif()
+    # The Pulsar sink's recovery cells: as the Redis ones, into a topic on the
+    # broker scripts/brokers-live.sh starts, with a verifier that reads the
+    # topic through a consumer of its own. They skip without it.
+    if(TARGET clink::pulsar AND TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_pulsar_sink_recovery.cpp)
+        target_link_libraries(clink_integration_tests PRIVATE _clink_pulsar_external)
+    endif()
     # The Cassandra and ScyllaDB sinks' recovery cells: a coordinator and two
     # workers polling a feed the test serves into the sinks, against the server
     # scripts/cassandra-live.sh starts, with faults at the sinks' own points and
