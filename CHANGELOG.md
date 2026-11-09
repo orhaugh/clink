@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**The Iceberg sink matches a commit by its own run, so a later run of a job
+into the same table no longer loses its rows.** The commit is idempotent by a
+tag on each snapshot, and the check looked for the checkpoint id anywhere in
+the table's history. A later run starts from empty state and repeats an
+earlier run's checkpoint ids, so it found the earlier run's snapshot for its
+checkpoint, skipped its own commit, and its rows were lost without an error.
+Each open is now a run: the staged handle records it, each snapshot carries it
+as `clink.run` beside `clink.checkpoint-id`, and the check matches both. A
+handle an earlier release recorded names no run and recovers as before. The
+Iceberg page no longer says the connector has no source, and the S3 gate gains
+an iceberg phase that runs the Iceberg suites and a table on the store.
+
 **The object-store Parquet source resumes a restore only over the listing it
 was taken over, and the Parquet 2PC sink fails a commit that finds neither its
 staged nor its committed object.** The multi-object source behind the S3, GCS

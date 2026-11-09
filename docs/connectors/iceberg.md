@@ -1,6 +1,6 @@
 # Apache Iceberg
 
-> Sink only. Writes a stream of SQL `Row` records as a real Apache Iceberg table (typed Parquet data files plus Iceberg snapshots) via the native `iceberg-cpp` library and a SQLite or REST catalog.
+> Writes a stream of SQL `Row` records as a real Apache Iceberg table (typed Parquet data files plus Iceberg snapshots), and reads a table's snapshot back as Rows, via the native `iceberg-cpp` library and a SQLite or REST catalog.
 
 ## Overview
 
@@ -143,7 +143,7 @@ To resolve the sink through the plugin registry instead, look up the `iceberg_ro
 
 ## Delivery semantics
 
-The sink stages data on the checkpoint barrier and commits the snapshot only on `on_commit`, after the checkpoint is globally durable. The commit is idempotent: each snapshot is tagged with a `clink.checkpoint-id` summary property, so a redelivered commit or a recovery replay never double-commits.
+The sink stages data on the checkpoint barrier and commits the snapshot only on `on_commit`, after the checkpoint is globally durable. The commit is idempotent: each snapshot carries two summary properties, `clink.checkpoint-id` and `clink.run`, the run that staged its files, and the staged handle records the run beside the files, so a redelivered commit or a recovery replay finds its snapshot and never double-commits. Each open of the sink is a new run, because a later run of a job into the same table starts from empty state and its checkpoint ids repeat an earlier run's. Releases up to and including v0.15.0 matched a snapshot by checkpoint id alone, so a later run found the earlier run's snapshot for its checkpoint, skipped its own commit, and lost its rows without an error. A handle such a release recorded names no run; recovery commits it as that release did and matches it against a snapshot that carries no run.
 
 - Wired into the engine's two-phase commit (with a state backend and coordinator), delivery is exactly-once. `on_barrier` stages the Parquet data file without creating a snapshot; `on_commit` creates the snapshot; `on_abort` deletes the staged, unreferenced data file and creates no snapshot. A sink that staged a checkpoint and then crashed before `on_commit` commits the pending staged data when a replacement sink re-opens against the same state backend and operator id. At a clean end of input the sink reports its staged checkpoints, so its runner holds it open (up to 30 seconds, then the subtask fails and restore-time recovery commits them) until the last checkpoint's commit or abort arrives; a bounded job's final interval is committed directly rather than left for a restore. The staged-files handle lives in operator state, so it survives a rescale: subtask 0 is the only writer and succeeds the old subtask 0 at every parallelism change, and any copy restored into another subtask is erased.
 - In standalone use (no state backend, no coordinator), it falls back to at-least-once: the barrier commits immediately.
@@ -153,7 +153,7 @@ A data file staged before a crash whose checkpoint never completed is an orphan 
 ## Limitations
 
 - The sink must be the only sink on its chain: at every checkpoint barrier it prepares the interval's transaction and stages its handle in the checkpoint, which holds only while it owns its chain's checkpoint, so `Dag::add_sink` refuses another sink beside it, whichever is added first. SQL and job graphs plan every sink as a subtask of its own; with the Dag API, put the other sink in a separate Dag (see [checkpointing](../internals/checkpointing.md#guarantees-and-caveats)).
-- Sink only; there is no Iceberg source.
+- The source reads a pinned snapshot only: no delete files (a snapshot holding positional or equality deletes is refused), no incremental or changelog scan, no filter pushdown. A snapshot expired between a checkpoint and its restore cannot be read again, and the restore fails.
 - Single-writer: only one subtask writes. SQL plans the sink on one subtask whatever the job's parallelism, with the operators in front fanning in to it, and the factory refuses a parallelism above 1. Up to and including v0.11.0 SQL fanned the sink out with the job, and every subtask beside subtask 0, which alone writes, dropped its share of the rows. The `clink.checkpoint-id` idempotency marker protects against this writer's own redelivery or replay only. It is a precondition, not enforced, that no other job writes the same table concurrently; a foreign concurrent writer could defeat the idempotency scan.
 - Partitioning is identity only, on INT/LONG/BOOL/STRING columns; bucket, truncate and temporal transforms are not supported, nor are float/double partition columns. Partition values must be present and non-null. A high-cardinality partition column produces many open writers and small files per interval, so prefer bounded-cardinality keys and run Iceberg compaction.
 - Upsert mode is unpartitioned (it cannot be combined with `partition_by`, which is rejected at `open()`), and keys must be present and non-null on every record.
@@ -165,9 +165,11 @@ A data file staged before a crash whose checkpoint never completed is an orphan 
 
 The in-process tests live in `impls/iceberg/tests/test_iceberg_sink.cpp` (ctest label `iceberg`) and run by default once the connector is built. They drive `make_iceberg_row_sink` end to end against a local SQLite-catalog warehouse and assert the on-disk structure (catalog DB, `.metadata.json`, `.avro` manifests, Parquet data files, `snap-` snapshot lists), covering append, 2PC stage/commit/abort, recovery, the end-of-input commit (driven through the sink's own runner), identity partitioning and upsert.
 
-Three tests are environment-gated and skip unless their variables are set:
+Two tests are environment-gated and skip unless their variables are set:
 
 - S3 round-trip (`IcebergS3Live.WritesToS3AndReopens`): set `CLINK_S3_TEST_ENDPOINT` (and optionally `CLINK_S3_TEST_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). Writes a table whose data and metadata live on S3 (MinIO/LocalStack) with a local SQLite catalog, then re-opens it. Skips in CI.
 - REST catalog round-trip (`IcebergRestLive.WritesViaRestCatalog`): set `CLINK_ICEBERG_REST_URI` (and optionally `CLINK_ICEBERG_REST_WAREHOUSE`, `CLINK_ICEBERG_REST_TOKEN`, the S3 environment). Writes via a REST catalog server (Polaris/Nessie/iceberg-rest-fixture) and re-opens via `LoadTable`.
+
+`scripts/s3-live.sh` runs the whole binary but for the REST catalog case in its iceberg phase, against SILO, a fork of the MinIO server pinned by digest, so the S3 round trip runs there: 28 cases, failing on any skip. The `aws` workflow runs it. The REST catalog case runs only under `scripts/run-all-live.sh`, which starts a catalog server.
 
 Set `CLINK_ICEBERG_KEEP_DIR` to retain the local warehouse so an external reader (PyIceberg, Spark) can verify the table. PyIceberg cannot read equality deletes, so the upsert merge-on-read result is verified with an external `iceberg-cpp` reader.
