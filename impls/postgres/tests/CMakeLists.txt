@@ -7,6 +7,7 @@ add_executable(clink_postgres_tests
     test_postgres_decoder.cpp
     test_postgres_sink.cpp
     test_postgres_source_replay.cpp
+    test_postgres_source_live.cpp
     test_typed_cdc_source.cpp
     test_postgres_cdc_decode.cpp
     test_postgres_cdc_live.cpp

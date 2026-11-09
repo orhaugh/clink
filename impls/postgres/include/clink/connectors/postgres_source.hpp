@@ -54,11 +54,13 @@ public:
     // A SELECT materialises a finite result set (BATCH-1).
     [[nodiscard]] bool is_bounded() const noexcept override { return true; }
 
-    // #60: source replay. The cursor is the row index into the result set the
-    // SELECT materialises in open(); persisting it lets a restart resume mid
-    // result-set. Exactly-once at the source boundary holds only for a
-    // deterministically-ordered query (ORDER BY) over data unchanged between
-    // runs. open() clamps a restored cursor to the re-materialised row count.
+    // Source replay. The checkpoint holds how many rows were emitted and a hash
+    // of them. open() runs the query again and resumes after those rows only
+    // when its first rows hash the same, which holds for a deterministically
+    // ordered query (ORDER BY on a unique key) over rows unchanged up to there;
+    // otherwise, or from an earlier release's checkpoint, which holds no hash,
+    // it emits every row again. Rows are repeated rather than skipped: at least
+    // once, and exactly once at the source when the rows are the same.
     void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt) override;
     bool restore_offset(StateBackend& backend, OperatorId op_id) override;
 

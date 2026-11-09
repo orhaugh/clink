@@ -712,7 +712,7 @@ CdcConfig cdc_config(const clink::plugin::BuildContext& ctx,
 void install(clink::plugin::PluginRegistry& reg) {
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "postgres",
-        .version = "2",
+        .version = "3",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"libpq"},
@@ -750,7 +750,12 @@ void install(clink::plugin::PluginRegistry& reg) {
                         "a failed write fails the sink until it is opened again; a COMMIT whose "
                         "reply is lost leaves its flush's outcome unknown",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
-                        "another sink beside it"},
+                        "another sink beside it",
+                        "the SELECT source holds its whole result in memory, and its query, "
+                        "once sent, runs to the end before a cancel is seen",
+                        "the SELECT source resumes a restore after the rows its checkpoint "
+                        "covered only when the query returns them again in the same order; "
+                        "otherwise it emits every row again"},
     });
 
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
@@ -848,7 +853,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             PostgresSource::Options opts;
             opts.conninfo = ctx.param_or("conninfo");
             opts.query = ctx.param_or("query");
-            opts.batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
+            opts.batch_size = static_cast<std::size_t>(
+                int_option(ctx, "postgres_row_source", "batch_size", 256, 1, 1000000));
             if (opts.conninfo.empty()) {
                 throw std::runtime_error("postgres_row_source: 'conninfo' is required");
             }
@@ -925,7 +931,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             PostgresSource::Options opts;
             opts.conninfo = ctx.param_or("conninfo");
             opts.query = ctx.param_or("query");
-            opts.batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
+            opts.batch_size = static_cast<std::size_t>(
+                int_option(ctx, "postgres_text_source", "batch_size", 256, 1, 1000000));
             if (opts.conninfo.empty()) {
                 throw std::runtime_error("postgres_text_source: 'conninfo' is required");
             }
@@ -947,7 +954,8 @@ void install(clink::plugin::PluginRegistry& reg) {
             PostgresSource::Options opts;
             opts.conninfo = ctx.param_or("conninfo");
             opts.query = ctx.param_or("query");
-            opts.batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
+            opts.batch_size = static_cast<std::size_t>(
+                int_option(ctx, "postgres_source", "batch_size", 256, 1, 1000000));
             if (opts.conninfo.empty()) {
                 throw std::runtime_error("postgres_source: 'conninfo' is required");
             }

@@ -286,13 +286,33 @@ TEST(PostgresFactoryRegistration, TheSinkRecordsStateTheirContracts) {
     ASSERT_NE(upsert, nullptr);
     EXPECT_TRUE(plain->self_check().empty());
     EXPECT_TRUE(upsert->self_check().empty());
-    EXPECT_EQ(plain->version, "2");
+    EXPECT_EQ(plain->version, "3");
     EXPECT_EQ(upsert->version, "2");
     EXPECT_EQ(plain->delivery, clink::connectors::DeliveryGuarantee::AtLeastOnce);
     EXPECT_EQ(upsert->delivery, clink::connectors::DeliveryGuarantee::EffectivelyOnceIdempotent);
     EXPECT_EQ(upsert->idempotency_key_option, "key_columns");
     EXPECT_EQ(upsert->timeout_options,
               (std::vector<std::string>{"connect_timeout", "lock_wait_timeout_s"}));
+}
+
+// The SELECT sources' factories: a batch size that is not a whole number from
+// 1 to 1000000 is refused when the job is built.
+TEST(PostgresFactoryRegistration, TheSelectSourceFactoriesReadTheirBatchSizeStrictly) {
+    for (const char* name : {"postgres_source", "postgres_text_source"}) {
+        const auto* f = clink::cluster::OperatorRegistry::default_instance().find_source(
+            name, std::string{clink::cluster::kChannelString});
+        ASSERT_NE(f, nullptr) << name;
+        clink::cluster::OperatorBuildContext ctx;
+        ctx.params = {{"conninfo", "host=nowhere"}, {"query", "SELECT 1"}};
+        EXPECT_NO_THROW((void)f->build(ctx)) << name;
+        for (const char* bad : {"0", "-1", "1000001", "many"}) {
+            ctx.params["batch_size"] = bad;
+            EXPECT_NE(
+                pg_thrown([&] { (void)f->build(ctx); }).find("'batch_size' must be an integer"),
+                std::string::npos)
+                << name << " " << bad;
+        }
+    }
 }
 
 }  // namespace

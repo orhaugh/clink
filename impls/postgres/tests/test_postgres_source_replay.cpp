@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -47,7 +48,9 @@ void seed(InMemoryStateBackend& backend,
 }
 }  // namespace
 
-TEST(PostgresSourceReplay, JdbcRowOffsetRoundTrips) {
+// The position round-trips through a checkpoint in its versioned form: a
+// version byte, the index and the hash of the rows before it.
+TEST(PostgresSourceReplay, ThePositionAndItsHashRoundTrip) {
     if (!PostgresSource::is_real_implementation()) {
         GTEST_SKIP() << "Built without libpq";
     }
@@ -55,15 +58,22 @@ TEST(PostgresSourceReplay, JdbcRowOffsetRoundTrips) {
     constexpr const char* kKey = "__postgres_source_row__";
     const StateBackend::KeyView key{kKey, std::strlen(kKey)};
 
+    std::array<char, 17> form{};
+    form[0] = 2;
+    const auto index = le8(99);
+    const auto hash = le8(0x0123456789abcdefULL);
+    for (std::size_t i = 0; i < 8; ++i) {
+        form[1 + i] = static_cast<char>(index[i]);
+        form[9 + i] = static_cast<char>(hash[i]);
+    }
     InMemoryStateBackend seeded;
-    seed(seeded, op, key, 99);
+    seeded.put_operator_state(op, key, StateBackend::ValueView{form.data(), form.size()});
 
     PostgresSource::Options opts;
     opts.conninfo = "host=127.0.0.1 port=1";
     opts.query = "SELECT 1";
     PostgresSource src(std::move(opts));
     ASSERT_TRUE(src.restore_offset(seeded, op));
-
     InMemoryStateBackend out;
     src.snapshot_offset(out, op, CheckpointId{1});
     EXPECT_EQ(out.get_operator_state(op, key), seeded.get_operator_state(op, key));
@@ -74,6 +84,42 @@ TEST(PostgresSourceReplay, JdbcRowOffsetRoundTrips) {
     o2.query = "SELECT 1";
     PostgresSource src2(std::move(o2));
     EXPECT_FALSE(src2.restore_offset(empty, op));
+}
+
+// An earlier release wrote the index alone, in 8 bytes. It restores, holding no
+// hash, so open() emits every row again rather than trust the position; the
+// next checkpoint is in the versioned form. A form neither release wrote is
+// refused.
+TEST(PostgresSourceReplay, AnEarlierReleasesPositionRestoresAndAnUnknownFormIsRefused) {
+    if (!PostgresSource::is_real_implementation()) {
+        GTEST_SKIP() << "Built without libpq";
+    }
+    const OperatorId op{11};
+    constexpr const char* kKey = "__postgres_source_row__";
+    const StateBackend::KeyView key{kKey, std::strlen(kKey)};
+    InMemoryStateBackend seeded;
+    seed(seeded, op, key, 99);
+    PostgresSource::Options opts;
+    opts.conninfo = "host=127.0.0.1 port=1";
+    opts.query = "SELECT 1";
+    PostgresSource src(std::move(opts));
+    ASSERT_TRUE(src.restore_offset(seeded, op));
+    InMemoryStateBackend out;
+    src.snapshot_offset(out, op, CheckpointId{1});
+    const auto written = out.get_operator_state(op, key);
+    ASSERT_TRUE(written.has_value());
+    ASSERT_EQ(written->size(), 17U);
+    EXPECT_EQ(static_cast<int>((*written)[0]), 2);
+    EXPECT_EQ(static_cast<std::uint8_t>((*written)[1]), 99);
+
+    InMemoryStateBackend odd;
+    const std::string five = "abcde";
+    odd.put_operator_state(op, key, StateBackend::ValueView{five.data(), five.size()});
+    PostgresSource::Options o3;
+    o3.conninfo = "host=127.0.0.1 port=1";
+    o3.query = "SELECT 1";
+    PostgresSource src3(std::move(o3));
+    EXPECT_THROW((void)src3.restore_offset(odd, op), std::runtime_error);
 }
 
 // A checkpoint from a release that recorded the received LSN alone restores
