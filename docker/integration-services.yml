@@ -313,9 +313,15 @@ services:
   # auto-created on subscribe, so no admin setup is needed; -nfw/-nss drop the
   # functions worker + stream storage to speed startup. Admin REST on 8080 gives a
   # readiness probe. CLINK_PULSAR_TEST_ENDPOINT: "pulsar://pulsar:6650"
+  # CLINK_PULSAR_MEM sets the broker's JVM memory, by default the image's own (a
+  # 2 GiB heap, touched in full at start, and up to 4 GiB of direct memory): on a
+  # machine whose Docker has less free, a smaller one keeps the broker from
+  # starving every other container.
   pulsar:
     image: apachepulsar/pulsar:3.3.1
     command: ["bin/pulsar", "standalone", "-nfw", "-nss"]
+    environment:
+      - PULSAR_MEM=${CLINK_PULSAR_MEM:--Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g}
     ports:
       - "6650:6650"
       - "8080:8080"

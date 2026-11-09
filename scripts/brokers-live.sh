@@ -60,6 +60,11 @@
 #                          pulsar mqtt" (default all)
 #   BROKERS_LIVE_PHASES    the phases to run, of "sources sinks" (default both)
 #   BROKERS_LIVE_RECOVERY  1 (default) or 0, which leaves the recovery cells out
+#   CLINK_PULSAR_MEM       the Pulsar broker's JVM memory (PULSAR_MEM), by default
+#                          the image's own 2 GiB heap and 4 GiB of direct
+#                          memory; a smaller one, such as "-Xms512m -Xmx768m
+#                          -XX:MaxDirectMemorySize=512m", on a machine whose
+#                          Docker has less than that free
 #   PIN_RUNNER             a prefix for every test command (CI runs the
 #                          binaries inside the toolchain image with `docker run
 #                          --network host ... -e <each variable below>`)
@@ -306,6 +311,9 @@ chmod a+rwx "${REPORT_DIR}"
     echo "brokers: ${BROKERS_LIVE_ONLY}"
     echo "phases: ${BROKERS_LIVE_PHASES}"
     echo "recovery cells: $( [ "${BROKERS_LIVE_RECOVERY}" = 1 ] && echo run || echo left out)"
+    if runs pulsar; then
+        echo "pulsar memory: ${CLINK_PULSAR_MEM:-the image default}"
+    fi
     echo "started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"${REPORT_DIR}/provenance.txt"
 
