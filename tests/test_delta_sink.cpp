@@ -182,6 +182,65 @@ TEST(DeltaSink, ATornLogEntryIsNeverAVersion) {
 #endif
 }
 
+// Two writers that read the same next version, as a stale task beside its
+// restarted one can, must not overwrite each other. The second one's data file
+// took the first one's name and its log entry was renamed over the first one's,
+// so the table's version 0 held only the second writer's rows. The commit is
+// now put-if-absent: the second writer stops, and the first one's version and
+// data stand.
+TEST(DeltaSink, ASecondWriterOfOneVersionStopsRatherThanOverwrite) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_delta_two_" + std::to_string(static_cast<long>(::getpid())));
+    std::filesystem::remove_all(root);
+    const auto make_sink = [&] {
+        DeltaRowSinkOptions o;
+        o.table_root = root.string();
+        o.batcher = make_row_columnar_arrow_batcher(schema());
+        return std::make_unique<DeltaRowSink>(std::move(o));
+    };
+    auto first = make_sink();
+    auto second = make_sink();
+    first->open();
+    second->open();
+    Batch<Row> a;
+    a.emplace(make_row(1, "first"));
+    first->on_data(a);
+    Batch<Row> b;
+    b.emplace(make_row(2, "second"));
+    second->on_data(b);
+    first->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    std::string why;
+    try {
+        second->on_barrier(CheckpointBarrier{CheckpointId{1}});
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    EXPECT_NE(why.find("version 0"), std::string::npos) << why;
+    // Version 0 is the first writer's, and its data file holds its row.
+    const auto log0 = root / "_delta_log" / "00000000000000000000.json";
+    const auto lines = read_lines(log0);
+    ASSERT_FALSE(lines.empty());
+    const std::string add_path =
+        cfg::parse(lines.back()).as_object().at("add").as_object().at("path").as_string();
+    ParquetSource<Row> src(
+        (root / add_path).string(), make_row_columnar_arrow_batcher(schema()), "rb");
+    src.open();
+    std::vector<std::string> names;
+    auto em = Emitter<Row>{[&](StreamElement<Row> e) {
+        if (e.is_data()) {
+            for (const auto& r : e.as_data()) {
+                names.push_back(r.value().values.at("name").as_string());
+            }
+        }
+        return true;
+    }};
+    while (src.produce(em)) {
+    }
+    src.close();
+    EXPECT_EQ(names, (std::vector<std::string>{"first"}));
+    std::filesystem::remove_all(root);
+}
+
 TEST(DeltaSink, WritesValidDeltaTableWithTwoCommits) {
     // CLINK_DELTA_KEEP_DIR lets an external reader (delta-rs / DuckDB) validate the
     // produced table: point it at a dir, run this test, then read that dir.

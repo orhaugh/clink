@@ -19,7 +19,12 @@
 //
 // DELIVERY = AT-LEAST-ONCE, append-only, SINGLE-WRITER. The commit writes
 // _delta_log/<N>.json with N = (max existing version)+1; correct because the sink
-// is the sole writer of the table (only subtask 0 is active, others dormant). A
+// is the sole writer of the table (only subtask 0 is active, others dormant). On
+// a local disk the commit is put-if-absent, so a second writer that read the
+// same N, a stale task beside its restarted one, stops rather than replace the
+// version, and each writer's data files carry an id of its own, so neither
+// overwrites the other's. On an object store the commit is an upload, which a
+// second writer's replaces: one writer only. A
 // crash between the data-file write and the global checkpoint replays the interval
 // (the rows are re-written as a new version - duplicate rows, absorbed by a
 // downstream dedup or a later compaction). NOT supported in v1: UPDATE / DELETE /
@@ -35,6 +40,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -87,6 +93,7 @@ public:
         create_dir_(log_dir_(), "create _delta_log");
         version_ = next_version_();
         table_id_ = make_uuid_();
+        writer_id_ = make_uuid_().substr(0, 16);
     }
 
     void on_data(const Batch<Row>& batch) override {
@@ -205,8 +212,11 @@ private:
     void open_data_file_() {
         std::string fn = "part-" + clink::delta::version_filename(version_);
         fn = fn.substr(0, fn.size() - 5);  // strip ".json" -> "part-<20digits>"
+        // The writer's own id: a second writer that read the same version, a
+        // stale task beside its restarted one, used to take this file's name and
+        // overwrite the data a committed version references.
         fn += "-" + std::to_string(opts_.subtask_idx) + "-" + std::to_string(file_counter_++) +
-              ".parquet";
+              "-" + writer_id_ + ".parquet";
         cur_data_rel_ = fn;
         const std::string full = base_path_ + "/" + fn;
         out_ = value_or_throw_(fs_->OpenOutputStream(full), "open data file");
@@ -266,12 +276,40 @@ private:
         }
         ensure_ok_(log_out->Close(), "close log");
         if (local) {
-            ensure_ok_(fs_->Move(write_path, log_path), "publish log");
+            publish_local_(write_path, log_path);
         }
 
         ++version_;
         cur_data_rel_.clear();
         cur_records_ = 0;
+    }
+
+    // Publishes the local entry only if no version N exists: a hard link fails
+    // when its name is taken, where a rename replaced it, so a second writer
+    // that read the same N, a stale task beside its restarted one, replaced a
+    // committed version and the rows it held. A filesystem that refuses hard
+    // links falls back to the rename after a look for the entry, which narrows
+    // the race without closing it.
+    void publish_local_(const std::string& tmp, const std::string& entry) const {
+        std::error_code ec;
+        std::filesystem::create_hard_link(tmp, entry, ec);
+        if (!ec) {
+            std::error_code ignore;
+            std::filesystem::remove(tmp, ignore);
+            return;
+        }
+        const bool taken = ec == std::errc::file_exists || std::filesystem::exists(entry);
+        if (!taken) {
+            ensure_ok_(fs_->Move(tmp, entry), "publish log");
+            return;
+        }
+        std::error_code ignore;
+        std::filesystem::remove(tmp, ignore);
+        throw std::runtime_error(
+            opts_.name + ": version " + std::to_string(version_) + " of the table at " +
+            base_path_ +
+            " was committed by another writer; the sink is the table's only "
+            "writer by contract, so it stops rather than replace that version");
     }
 
     static std::string make_uuid_() {
@@ -301,6 +339,7 @@ private:
     std::string base_path_;  // table root path within fs_
     std::int64_t version_{0};
     std::string table_id_;
+    std::string writer_id_;  // in every data file's name: this writer's alone
     int file_counter_{0};
 
     std::shared_ptr<arrow::io::OutputStream> out_;
