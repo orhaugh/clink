@@ -68,9 +68,21 @@ These keys are read by every connector unless noted otherwise (defaults and the 
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `path` | No | `/` | Request path. |
+| `path` | No | `/` | Request path; must start with `/`. |
 | `bulk_format` | No | `json_array` | Request body framing: `json_array` (`[rec0,rec1,...]`) or `ndjson` (newline-delimited). Named `bulk_format`, not `format`, because `format` is the SQL channel selector. |
 | `content_type` | No | `application/json` | Request `Content-Type`. |
+| `connect_timeout_ms` | No | `5000` | The longest a connection may take, 1 to 600,000. |
+| `request_timeout_ms` | No | `30000` | The longest a request may wait to send or read, 1 to 3,600,000. |
+
+The sink reads every option strictly. `url` must be `http://` or `https://` with a host and an optional port and nothing after them, the path going in `path`: a url with a path, or a scheme in capitals, made the client read the whole url as a host name and fail every post with an error about the connection. `bulk_format` must be one of its two values (anything else was read as `json_array`), numbers are checked against their ranges (`batch_records` 1 to 1,000,000, `batch_bytes` up to 1 GiB, `max_retries` 0 to 20, `linger_ms` up to an hour) rather than clamped, and `verify_tls` and `dlq` take only their two values.
+
+#### Records
+
+Each record is written into the body as it is. Under `json_array` a record must be one JSON value, and under `ndjson` one line; a record the framing cannot carry is refused before it is sent. Under `dlq='drop'` it alone is dead-lettered; under `dlq='fail'` the sink fails and refuses every later record and barrier until it opens again. Before, one record that was not JSON made a `json_array` body something other than JSON, and a record holding a newline went out as two NDJSON lines, so an endpoint that refused the body refused every record of the request with it, and under `drop` all of them went to the dead-letter queue. The SQL path renders each row as a JSON object, which both framings carry.
+
+#### When a post counts
+
+Any 2xx counts as delivered: a generic endpoint's reply has no form the sink could check, so its body is not read. A 400, 409 or 422 refuses the request's records, which `dlq='drop'` dead-letters; any other refusal is retried with backoff, then the flush fails and keeps its batch, so no barrier passes over it. No idempotency key is sent, so a replay posts its records again; an endpoint that must not take a record twice needs a key in the record itself.
 
 ### `elasticsearch_sink` / `opensearch_sink`
 
@@ -836,6 +848,10 @@ Where a case needs a fault the server will not produce on demand, it writes thro
 The search CI workflow passed the gates for Elasticsearch 8.13.4 and OpenSearch 2.17.1 on commit `bf6cae33` (run 42184675107), 43 of 43 each, before the throttled, secured and cluster phases and the newer servers were added.
 
 All four gates passed in local runs on 2026-11-06, 55 of 55 each. Elasticsearch 8.13.4 and OpenSearch 3.3.0 ran on commit `52bfc6f9`. Elasticsearch 9.2.0 and OpenSearch 2.17.1 ran on `a3ecff67`, which adds only the gate's retry of a port Docker refused; on `52bfc6f9`, Docker had refused one port in each of those two gates. In every case the fault landed with records in flight or not yet covered by a checkpoint, and the throttled servers' own 429s ran from 2,999 to 6,940 items. The cluster absorbed a non-sink node's kill without failing a write, so that case shows nothing is lost; the case that kills the sink's own node shows the flush failing and recovering. These reports are not published. The `search` CI workflow then ran all four gates on commit `9102113f` (run 42199665079): 55 of 55 for each server.
+
+### The generic sink
+
+`HttpSinkContract` (`test_http_sink_contract.cpp`) builds the sink through its factory, as a job does, against an endpoint the test serves that, as most JSON APIs do, refuses a body it cannot read: each record as written in both framings, a record that is not JSON (or is empty) dead-lettered alone under `drop` and failing the sink with nothing of it sent under `fail`, a record holding a newline refused under `ndjson`, a 404 retried and failing the flush with nothing dead-lettered, a 400 dead-lettered under `drop`, a 503 retried, and, through `TcpFaultProxy`, a cancel ending a post in flight. `HttpSinkFactory` holds the factory's refusals and the record. The recovery cells `HttpSinkRecovery` (`tests/integration/test_http_sink_recovery.cpp`) run a coordinator and two workers polling a feed the test serves into the sink, posting to an endpoint the test also serves, and SIGKILL the worker parked at `http_sink.before_write` (the request built and not sent) or at `http_sink.after_write` (the endpoint having answered, the barrier not), the latter also as a SQL job at parallelism 2; the endpoint, which keeps each record as it arrived, finds every record at most twice, and twice exactly those posted after the restored checkpoint and before the kill. `scripts/http-sink-live.sh [build-dir]` is the gate: it runs those suites with the shared bulk sink's own, bar its refusal of https in a build without TLS, which a build with TLS skips, and fails on a missing binary, a failed or skipped case, or a short suite. The `http` workflow runs it.
 
 ### The polling source
 

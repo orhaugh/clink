@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**The generic HTTP sink refuses a record its framing cannot carry, alone and
+before it is sent, and reads its options strictly.** Every record was written
+into the body as it was, so one record that was not JSON made a `json_array`
+body something other than JSON, and one holding a newline went out as two
+NDJSON lines: an endpoint that refused the body refused every record of the
+request, under `dlq='drop'` all of them went to the dead-letter queue, and
+under `dlq='fail'` the job failed again on every replay. A `url` with a path,
+or a scheme in capitals, made the client read the whole url as a host name
+and fail every post with an error about the connection, a `bulk_format` other
+than the two framings read as `json_array`, `verify_tls='FALSE'` read as
+`true`, and numbers were read leniently. Now under `json_array` a record must
+be one JSON value and under `ndjson` one line, and any other is refused
+before it is sent: dead-lettered alone under `drop`, failing the sink under
+`fail`. Options are read strictly, `connect_timeout_ms` and
+`request_timeout_ms` are new, and a SQL sink table takes only the options the
+sink reads. A new gate, `scripts/http-sink-live.sh`, which the `http`
+workflow runs, holds the sink's contract against endpoints the tests serve
+and recovery cells that kill a worker before a post and after the endpoint
+answered one.
+
 **The Pub/Sub sink counts a publish only when the reply confirms every
 message, refuses an empty record alone, and reads its options strictly.** Any
 2xx counted as a publish, so a proxy or another service answering 200 lost
