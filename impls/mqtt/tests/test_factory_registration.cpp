@@ -10,6 +10,7 @@
 
 #include "clink/cluster/guarantee_gate.hpp"
 #include "clink/cluster/job_graph.hpp"
+#include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/runner_registry.hpp"
 #include "clink/connectors/capability.hpp"
 #include "clink/connectors/delivery_guarantee.hpp"
@@ -108,6 +109,107 @@ TEST(MqttCapabilityRecords, AJobFromTheSourceIsAtLeastOnceAndExactlyOnceIsRefuse
     into_mqtt.ops.push_back(gate_op(
         "mqtt_sink", "snk", {"src"}, {{"topic", "t"}, {"delivery_guarantee", "at_least_once"}}));
     EXPECT_EQ(clink::cluster::check_delivery_guarantee(into_mqtt, ckpt, &report), "");
+}
+
+template <typename F>
+std::string mqtt_thrown(F&& f) {
+    try {
+        std::forward<F>(f)();
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// Building a sink connects to nothing, so a value is refused here before any
+// broker is involved.
+TEST(MqttFactoryRegistration, TheSinkFactoryReadsItsOptionsStrictly) {
+    const auto* f = clink::cluster::OperatorRegistry::default_instance().find_sink(
+        "mqtt_sink", std::string{clink::cluster::kChannelString});
+    ASSERT_NE(f, nullptr);
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"topic", "t"}};
+    EXPECT_NO_THROW((void)f->build(ctx));
+    auto every = ctx;
+    every.params.insert({{"port", "65535"},
+                         {"keepalive", "5"},
+                         {"tls", "true"},
+                         {"tls_ca", "/ca.pem"},
+                         {"tls_verify", "false"},
+                         {"client_id", "clink-test"},
+                         {"clean_session", "false"},
+                         {"qos", "2"},
+                         {"retain", "true"},
+                         {"batch_records", "1000000"},
+                         {"max_bytes", "0"},
+                         {"max_record_bytes", "268435455"},
+                         {"linger_ms", "3600000"},
+                         {"ack_timeout_ms", "3600000"},
+                         {"protocol_version", "3.1.1"}});
+    EXPECT_NO_THROW((void)f->build(every));
+    for (const auto& [key, value] :
+         std::vector<std::pair<std::string, std::string>>{{"port", "0"},
+                                                          {"keepalive", "4"},
+                                                          {"qos", "3"},
+                                                          {"qos", "one"},
+                                                          {"batch_records", "0"},
+                                                          {"max_bytes", "-1"},
+                                                          {"max_record_bytes", "268435456"},
+                                                          {"linger_ms", "-1"},
+                                                          {"ack_timeout_ms", "0"}}) {
+        auto c = ctx;
+        c.params[key] = value;
+        EXPECT_NE(mqtt_thrown([&] { (void)f->build(c); }).find("'" + key + "' must be an integer"),
+                  std::string::npos)
+            << key << "=" << value;
+    }
+    // tls='TRUE' once read as false and connected in the clear, and retain='TRUE'
+    // as no retain.
+    for (const char* key : {"tls", "tls_verify", "clean_session", "retain"}) {
+        auto c = ctx;
+        c.params[key] = "TRUE";
+        EXPECT_NE(mqtt_thrown([&] {
+                      (void)f->build(c);
+                  }).find("'" + std::string{key} + "' must be 'true' or 'false'"),
+                  std::string::npos)
+            << key;
+    }
+    auto clear = ctx;
+    clear.params["tls_cert"] = "/cert.pem";
+    EXPECT_NE(mqtt_thrown([&] { (void)f->build(clear); }).find("would not use TLS"),
+              std::string::npos);
+    // Unset, the client id is the sink's own, which a persistent session cannot
+    // be kept under.
+    auto kept = ctx;
+    kept.params["clean_session"] = "false";
+    EXPECT_NE(mqtt_thrown([&] { (void)f->build(kept); }).find("needs a 'client_id'"),
+              std::string::npos);
+    auto empty = ctx;
+    empty.params["client_id"] = "";
+    EXPECT_NE(mqtt_thrown([&] { (void)f->build(empty); }).find("'client_id' is empty"),
+              std::string::npos);
+    for (const char* version : {"5", "3.1.1"}) {
+        auto c = ctx;
+        c.params["protocol_version"] = version;
+        EXPECT_NO_THROW((void)f->build(c)) << version;
+    }
+    for (const char* version : {"4", "3.1", "mqtt5", ""}) {
+        auto c = ctx;
+        c.params["protocol_version"] = version;
+        EXPECT_NE(mqtt_thrown([&] {
+                      (void)f->build(c);
+                  }).find("'protocol_version' must be '5' or '3.1.1'"),
+                  std::string::npos)
+            << version;
+    }
+}
+
+TEST(MqttCapabilityRecords, TheSinkRecordNamesItsTimeout) {
+    const auto* sink = clink::connectors::CapabilityRegistry::instance().find("mqtt");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->version, "2");
+    EXPECT_FALSE(sink->retries);
+    EXPECT_EQ(sink->timeout_options, (std::vector<std::string>{"ack_timeout_ms"}));
 }
 
 }  // namespace

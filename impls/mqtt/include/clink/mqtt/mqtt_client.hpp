@@ -1,7 +1,8 @@
 #pragma once
 
-// Minimal RAII wrapper over libmosquitto's synchronous client API, shared by the
-// MQTT source and sink. Three concerns it centralises:
+// Minimal RAII wrapper over libmosquitto's synchronous client API, which the
+// MQTT sink publishes through (the source has its own client,
+// mqtt_subscriber.hpp). Three concerns it centralises:
 //   1. library lifecycle - mosquitto_lib_init() is called exactly once per
 //      process (call_once); mosquitto_lib_cleanup() is deliberately NOT called
 //      (running it at static-destruction time races with live connection
@@ -14,6 +15,13 @@
 //      The library uses the SYNCHRONOUS mosquitto_loop(), so callbacks fire
 //      inline on the caller's thread - no cross-thread locking is needed for the
 //      buffers the source/sink fill from them.
+//
+// MQTT 5 or 3.1.1. Under MQTT 5 an acknowledgement carries a reason code, which
+// the publish callback receives, so a message the broker refused (one its ACL
+// denies, say) is told apart from one it took; MQTT 3.1.1 has no such code, and
+// a broker that drops a message acknowledges it all the same. A DISCONNECT the
+// broker sends under MQTT 5 carries a reason too, which disconnect_reason()
+// keeps.
 //
 // TLS is built into libmosquitto (OpenSSL); there is no separate SSL library to
 // find (unlike hiredis). If the installed libmosquitto was compiled without TLS,
@@ -42,10 +50,17 @@ namespace clink::mqtt {
 class MqttConnection {
 public:
     using MessageCb = std::function<void(const char* topic, const void* payload, std::size_t len)>;
-    using PublishCb = std::function<void(int mid)>;
+    // The message id and, under MQTT 5, the acknowledgement's reason code: 0x80
+    // and above is a refusal. Always 0 under MQTT 3.1.1.
+    using PublishCb = std::function<void(int mid, int reason_code)>;
 
-    explicit MqttConnection(const ConnectOptions& o) {
+    // protocol_version: MQTT_PROTOCOL_V5 or MQTT_PROTOCOL_V311.
+    explicit MqttConnection(const ConnectOptions& o, int protocol_version = MQTT_PROTOCOL_V311)
+        : protocol_version_(protocol_version) {
         global_init_();
+        if (protocol_version != MQTT_PROTOCOL_V5 && protocol_version != MQTT_PROTOCOL_V311) {
+            throw std::runtime_error("mqtt: the protocol version must be MQTT 5 or 3.1.1");
+        }
         op_timeout_ = o.connack_timeout;  // reused to bound the SUBACK wait
         int keepalive = o.keepalive < 5 ? 5 : o.keepalive;
         const char* id = o.client_id.empty() ? nullptr : o.client_id.c_str();
@@ -58,10 +73,12 @@ public:
             throw std::runtime_error("mqtt: mosquitto_new failed (out of memory or invalid id)");
         }
         mosquitto_connect_callback_set(mosq_, &MqttConnection::on_connect_trampoline);
-        mosquitto_disconnect_callback_set(mosq_, &MqttConnection::on_disconnect_trampoline);
+        mosquitto_disconnect_v5_callback_set(mosq_, &MqttConnection::on_disconnect_trampoline);
         mosquitto_message_callback_set(mosq_, &MqttConnection::on_message_trampoline);
-        mosquitto_publish_callback_set(mosq_, &MqttConnection::on_publish_trampoline);
+        mosquitto_publish_v5_callback_set(mosq_, &MqttConnection::on_publish_trampoline);
         mosquitto_subscribe_callback_set(mosq_, &MqttConnection::on_subscribe_trampoline);
+        check_(mosquitto_int_option(mosq_, MOSQ_OPT_PROTOCOL_VERSION, protocol_version),
+               "protocol version");
 
         if (!o.username.empty() || !o.password.empty()) {
             check_(mosquitto_username_pw_set(mosq_,
@@ -92,7 +109,9 @@ public:
                                      std::to_string(o.port));
         }
         if (connack_rc_ != 0) {
-            const std::string reason = mosquitto_connack_string(connack_rc_);
+            const std::string reason = protocol_version_ == MQTT_PROTOCOL_V5
+                                           ? mosquitto_reason_string(connack_rc_)
+                                           : mosquitto_connack_string(connack_rc_);
             destroy_();
             throw std::runtime_error("mqtt: broker refused connection: " + reason);
         }
@@ -201,6 +220,13 @@ public:
     [[nodiscard]] bool connected() const noexcept { return connected_; }
     struct mosquitto* native() const noexcept { return mosq_; }
 
+    // The reason the broker gave in the DISCONNECT that ended the connection
+    // (MQTT 5 only), or empty: a connection that just closed gives none.
+    [[nodiscard]] std::string disconnect_reason() const {
+        return disconnect_rc_ >= 0x80 ? std::string{mosquitto_reason_string(disconnect_rc_)}
+                                      : std::string{};
+    }
+
 private:
     // OpenSSL SSL_VERIFY_* values, passed to mosquitto_tls_opts_set as ints so we
     // do not pull OpenSSL headers into this client.
@@ -241,6 +267,8 @@ private:
         on_message_ = std::move(o.on_message_);
         on_publish_ = std::move(o.on_publish_);
         op_timeout_ = o.op_timeout_;
+        protocol_version_ = o.protocol_version_;
+        disconnect_rc_ = o.disconnect_rc_;
         connected_ = o.connected_;
         got_connack_ = o.got_connack_;
         got_suback_ = o.got_suback_;
@@ -285,9 +313,21 @@ private:
         c->got_connack_ = true;
         c->connack_rc_ = rc;
         c->connected_ = (rc == 0);
+        c->disconnect_rc_ = 0;
     }
-    static void on_disconnect_trampoline(struct mosquitto*, void* obj, int /*rc*/) noexcept {
-        self_(obj)->connected_ = false;
+    // rc is the broker's reason code when it sent a DISCONNECT under MQTT 5, and
+    // otherwise libmosquitto's own error number, all below 0x80. libmosquitto
+    // calls this again, with 0, when its next loop finds the socket the
+    // DISCONNECT closed, so a broker's reason is kept until the next connect.
+    static void on_disconnect_trampoline(struct mosquitto*,
+                                         void* obj,
+                                         int rc,
+                                         const mosquitto_property* /*props*/) noexcept {
+        MqttConnection* c = self_(obj);
+        c->connected_ = false;
+        if (rc >= 0x80) {
+            c->disconnect_rc_ = rc;
+        }
     }
     static void on_subscribe_trampoline(struct mosquitto*,
                                         void* obj,
@@ -315,13 +355,17 @@ private:
             c->record_cb_error_("unknown exception in message callback");
         }
     }
-    static void on_publish_trampoline(struct mosquitto*, void* obj, int mid) noexcept {
+    static void on_publish_trampoline(struct mosquitto*,
+                                      void* obj,
+                                      int mid,
+                                      int reason_code,
+                                      const mosquitto_property* /*props*/) noexcept {
         MqttConnection* c = self_(obj);
         if (!c->on_publish_) {
             return;
         }
         try {
-            c->on_publish_(mid);
+            c->on_publish_(mid, reason_code);
         } catch (const std::exception& e) {
             c->record_cb_error_(e.what());
         } catch (...) {
@@ -333,10 +377,12 @@ private:
     MessageCb on_message_;
     PublishCb on_publish_;
     std::chrono::milliseconds op_timeout_{5000};
+    int protocol_version_{MQTT_PROTOCOL_V311};
     bool connected_{false};
     bool got_connack_{false};
     bool got_suback_{false};
     int connack_rc_{0};
+    int disconnect_rc_{0};
     bool cb_error_{false};
     std::string cb_error_msg_;
 };

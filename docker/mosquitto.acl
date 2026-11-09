@@ -1,0 +1,6 @@
+# Mosquitto ACL for the MQTT connector live IT (docker/mosquitto.conf), test-only
+# and never a production config. The lines apply to anonymous clients: every
+# topic may be read and written except those under clink/denied/, where the
+# sink's live suite publishes so that the broker refuses.
+topic deny clink/denied/#
+topic readwrite #

@@ -8,6 +8,7 @@ add_executable(clink_mqtt_tests
     register.cpp
     test_factory_registration.cpp
     test_mqtt_protocol.cpp
+    test_mqtt_sink_contract_live.cpp
     test_mqtt_sink_logic.cpp
     test_mqtt_source_ack.cpp
     test_mqtt_source_logic.cpp
@@ -19,6 +20,8 @@ target_link_libraries(clink_mqtt_tests PRIVATE
     GTest::gtest_main
     ${_mqtt_target}
 )
+# The sink's live contract suite takes the TCP fault proxy from tests/integration/.
+target_include_directories(clink_mqtt_tests PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_definitions(clink_mqtt_tests PRIVATE CLINK_HAS_MQTT)
 clink_set_warnings(clink_mqtt_tests)
 gtest_discover_tests(clink_mqtt_tests

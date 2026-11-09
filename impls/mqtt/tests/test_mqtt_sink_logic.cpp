@@ -46,12 +46,20 @@ TEST(MqttSinkLogic, EmptyFlushIsNoop) {
     EXPECT_NO_THROW(s.flush());  // nothing buffered, no connection needed
 }
 
-TEST(MqttSinkLogic, FlushWithBufferedRecordsBeforeOpenThrows) {
+// A record before open() is refused rather than buffered for a connection that
+// does not exist; it once sat in the buffer until a flush threw.
+TEST(MqttSinkLogic, ARecordBeforeOpenIsRefused) {
     MqttSink s(opts("t"));
     Batch<std::string> b;
     b.emplace("x");
-    s.on_data(b);  // one record buffered, below the default flush threshold
-    EXPECT_THROW(s.flush(), std::runtime_error);
+    try {
+        s.on_data(b);
+        ADD_FAILURE() << "a record before open() was accepted";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string{e.what()}.find("before open()"), std::string::npos) << e.what();
+    }
+    EXPECT_NO_THROW(s.flush()) << "nothing was buffered, so there is nothing to flush";
+    EXPECT_NO_THROW(s.close());
 }
 
 #endif  // CLINK_HAS_MQTT

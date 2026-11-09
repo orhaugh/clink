@@ -64,6 +64,7 @@ find_path(_mqtt_cjson_inc NAMES cjson/cJSON.h
 
 add_library(clink_mqtt STATIC
     src/register_factories.cpp
+    src/mqtt_sink.cpp
     src/mqtt_source.cpp
     src/mqtt_subscriber.cpp
 )
