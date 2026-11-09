@@ -3344,6 +3344,44 @@ TEST(SqlPhysical, PubSubSinkTablesTakeOnlyOptionsTheSinkReads) {
     EXPECT_NE(why.find("batch_records"), std::string::npos) << why;
 }
 
+namespace {
+
+std::string http_sink_refusal(const std::string& with) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE h_out (k BIGINT, v BIGINT) WITH (connector='http', format='json', "
+        "url='http://localhost:8080'" +
+        with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO h_out SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+// A connector='http' sink table's options: one the sink does not read is
+// refused, naming the ones it reads.
+TEST(SqlPhysical, HttpSinkTablesTakeOnlyOptionsTheSinkReads) {
+    EXPECT_EQ(http_sink_refusal(", path='/ingest', bulk_format='ndjson', "
+                                "content_type='application/x-ndjson', headers='X-A: 1', "
+                                "verify_tls='false', connect_timeout_ms='100', "
+                                "request_timeout_ms='200', batch_records='10', "
+                                "batch_bytes='1024', max_retries='2', dlq='drop', linger_ms='5'"),
+              "");
+    const auto why = http_sink_refusal(", batch_size='10'");
+    EXPECT_NE(why.find("does not read option 'batch_size'"), std::string::npos) << why;
+    EXPECT_NE(why.find("batch_records"), std::string::npos) << why;
+}
+
 TEST(SqlPhysical, CassandraUpsertSinkSelected) {
     Catalog cat;
     auto s = parse(

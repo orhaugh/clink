@@ -201,6 +201,7 @@ void check_rabbitmq_sink_options(const TableDef& table);
 void check_nats_sink_options(const TableDef& table);
 void check_pulsar_sink_options(const TableDef& table);
 void check_pubsub_sink_options(const TableDef& table);
+void check_http_sink_options(const TableDef& table);
 
 std::string string_sink_factory_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
@@ -735,6 +736,38 @@ void check_pubsub_sink_options(const TableDef& table) {
             }
         }
         unsupported("table '" + table.name + "': a connector='pubsub' sink does not read option '" +
+                    key + "'; it reads " + accepted);
+    }
+}
+
+void check_http_sink_options(const TableDef& table) {
+    static const std::vector<std::string> kSink = {"url",
+                                                   "path",
+                                                   "bulk_format",
+                                                   "content_type",
+                                                   "headers",
+                                                   "verify_tls",
+                                                   "connect_timeout_ms",
+                                                   "request_timeout_ms",
+                                                   "batch_records",
+                                                   "batch_bytes",
+                                                   "max_retries",
+                                                   "dlq",
+                                                   "linger_ms"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        (void)value;
+        const auto listed = [&key](const std::vector<std::string>& v) {
+            return std::find(v.begin(), v.end(), key) != v.end();
+        };
+        if (listed(kSink) || listed(interpreted)) {
+            continue;
+        }
+        std::string accepted;
+        for (const auto& o : kSink) {
+            accepted += (accepted.empty() ? "" : ", ") + o;
+        }
+        unsupported("table '" + table.name + "': a connector='http' sink does not read option '" +
                     key + "'; it reads " + accepted);
     }
 }
@@ -1729,6 +1762,7 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         if (upsert) {
             unsupported("connector='http' sink does not support mode='upsert'");
         }
+        check_http_sink_options(table);
         return RowConnectorBinding{"http_sink", kChannelString, "row_to_json_string"};
     }
     if (connector == "pubsub") {
