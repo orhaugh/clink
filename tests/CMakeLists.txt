@@ -547,6 +547,13 @@ if(CLINK_INTEGRATION_TESTS)
         target_sources(clink_integration_tests PRIVATE integration/test_pulsar_sink_recovery.cpp)
         target_link_libraries(clink_integration_tests PRIVATE _clink_pulsar_external)
     endif()
+    # The MQTT sink's recovery cells: as the Redis ones, into a topic on the
+    # broker scripts/brokers-live.sh starts, with a verifier that subscribes to
+    # the topic through the impl's own MQTT client. They skip without it.
+    if(TARGET clink::mqtt AND TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_mqtt_sink_recovery.cpp)
+        target_link_libraries(clink_integration_tests PRIVATE clink::mqtt)
+    endif()
     # The Cassandra and ScyllaDB sinks' recovery cells: a coordinator and two
     # workers polling a feed the test serves into the sinks, against the server
     # scripts/cassandra-live.sh starts, with faults at the sinks' own points and
