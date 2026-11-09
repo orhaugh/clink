@@ -101,8 +101,11 @@ void usage() {
         << "                    generated gtest source (one call into\n"
         << "                    clink::sql::run_replay_regression). Add the .cpp\n"
         << "                    to a test target linking clink::sql.\n"
+        << "  --run-test=<dir>  run such a bundle as its generated test does, and\n"
+        << "                    exit 1 with the first divergence when it fails.\n"
         << "\n"
-        << "Exit codes: 0 = ok, 1 = --verify found a divergence, 2 = error.\n";
+        << "Exit codes: 0 = ok, 1 = --verify found a divergence or --run-test\n"
+        << "failed, 2 = error.\n";
 }
 
 struct Options {
@@ -272,6 +275,20 @@ int replay_whole_job(const Options& o) {
 int clink_cmd_replay(int argc, char** argv) {
     if (has_flag(argc, argv, "help")) {
         usage();
+        return 0;
+    }
+    if (const auto bundle = get_arg(argc, argv, "run-test"); !bundle.empty()) {
+        // The body of every generated regression test, from the command line.
+        {
+            clink::plugin::PluginRegistry impl_reg;
+            clink::plugin::install_defaults(impl_reg);
+        }
+        const auto failure = clink::sql::run_replay_regression(bundle);
+        if (!failure.empty()) {
+            std::cerr << "regression bundle " << bundle << " fails: " << failure << "\n";
+            return 1;
+        }
+        std::cout << "regression bundle " << bundle << " passes\n";
         return 0;
     }
     Options o;

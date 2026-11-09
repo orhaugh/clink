@@ -854,6 +854,7 @@ if(CLINK_BUILD_SQL)
         test_embedded_engine.cpp
         test_replay_cli.cpp
         test_replay_plugin_types.cpp
+        test_incident_replay.cpp
         test_sql_conformance.cpp
         test_sql_catalog_fixtures.cpp
     )

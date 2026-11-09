@@ -44,9 +44,29 @@ int clink_cmd_rescale(int argc, char** argv);
 int clink_cmd_rescale_op(int argc, char** argv);
 int clink_cmd_list(int argc, char** argv);
 int clink_cmd_checkpoint_verify(int argc, char** argv);
+int clink_cmd_incident_collect(int argc, char** argv);
+int clink_cmd_incident_verify(int argc, char** argv);
+int clink_cmd_incident_regress(int argc, char** argv);
 int clink_cmd_lint(int argc, char** argv);
 
 namespace {
+
+// The impls declare their capability records inside their install() hooks, and
+// nothing calls them on a path that does not run a job. Install the linked
+// connectors into a scratch registry, exactly as `clink run` does before a
+// script, so what reads the records sees the binary rather than the subset
+// that self-registers.
+void declare_linked_capabilities() {
+    clink::cluster::ensure_built_ins_registered();
+    clink::plugin::PluginRegistry linked;
+    clink::plugin::install_defaults(linked);
+#ifdef CLINK_CLI_HAS_SQL
+    // The SQL frontend declares the records of the connectors it registers
+    // itself (delta, print, collect, changelog, queryable_state), and
+    // announces itself, from its install().
+    clink::sql::install(linked);
+#endif
+}
 
 void usage() {
     std::cerr
@@ -79,6 +99,11 @@ void usage() {
         << "  list              List active and recently-completed jobs (alias of  list).\n"
         << "  checkpoint-verify Verify a checkpoint directory's integrity; --repair mints\n"
         << "                    sidecars for a directory written before they existed.\n"
+        << "  incident-collect  Gather one job's incident evidence into a portable bundle.\n"
+        << "  incident-verify   Check an incident bundle offline: integrity, the restore\n"
+        << "                    point, state, protocol traces and replay. Exits 3 on a\n"
+        << "                    partial result.\n"
+        << "  incident-regress  Freeze a bundle's captured epoch as a replay regression test.\n"
         << "  lint              Check a job/cluster configuration for settings that will be\n"
         << "                    ignored or that contradict each other. No cluster needed;\n"
         << "                    exits 1 on anything submission would refuse.\n"
@@ -111,24 +136,10 @@ int main(int argc, char** argv) {
         // answer - the JSON form is meant to be piped into a parser.
         // Only defaulted, so an explicit CLINK_LOG_LEVEL still wins.
         ::setenv("CLINK_LOG_LEVEL", "off", /*overwrite=*/0);
-        clink::cluster::ensure_built_ins_registered();
-        // The impls declare their capability records inside their install()
-        // hooks, and nothing on this path called them: the manifest listed
-        // the six built-ins and told the reader that Kafka, ClickHouse and
-        // every other connector compiled into the binary were absent.
-        // Install the linked connectors into a scratch registry first,
-        // exactly as `clink run` does before a script, so the manifest
-        // describes the binary rather than the subset that self-registers.
-        {
-            clink::plugin::PluginRegistry linked;
-            clink::plugin::install_defaults(linked);
-#ifdef CLINK_CLI_HAS_SQL
-            // The SQL frontend declares the records of the connectors it
-            // registers itself (delta, print, collect, changelog,
-            // queryable_state), and announces itself, from its install().
-            clink::sql::install(linked);
-#endif
-        }
+        // Without the linked connectors' records the manifest listed the six
+        // built-ins and told the reader that Kafka, ClickHouse and every other
+        // connector compiled into the binary were absent.
+        declare_linked_capabilities();
         const auto facts = clink::connectors::current_build_facts();
         const auto caps = clink::connectors::CapabilityRegistry::instance().all();
         std::cout << (cmd == "--capabilities-json"
@@ -156,7 +167,8 @@ int main(int argc, char** argv) {
     // rule --capabilities applies above.
     if (cmd == "state-cat" || cmd == "state-diff" || cmd == "state-export" ||
         cmd == "state-query" || cmd == "check-savepoint" || cmd == "capture-cat" ||
-        cmd == "replay-diff") {
+        cmd == "replay-diff" || cmd == "incident-collect" || cmd == "incident-verify" ||
+        cmd == "incident-regress") {
         ::setenv("CLINK_LOG_LEVEL", "off", /*overwrite=*/0);
     }
 
@@ -225,6 +237,18 @@ int main(int argc, char** argv) {
     }
     if (cmd == "checkpoint-verify") {
         return clink_cmd_checkpoint_verify(sub_argc, sub_argv);
+    }
+    if (cmd == "incident-collect") {
+        // The bundle's delivery report is the analysis the coordinator runs at
+        // submission, over the same capability records.
+        declare_linked_capabilities();
+        return clink_cmd_incident_collect(sub_argc, sub_argv);
+    }
+    if (cmd == "incident-verify") {
+        return clink_cmd_incident_verify(sub_argc, sub_argv);
+    }
+    if (cmd == "incident-regress") {
+        return clink_cmd_incident_regress(sub_argc, sub_argv);
     }
 
     std::cerr << "clink: unknown command '" << cmd << "'\n\n";

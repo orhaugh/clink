@@ -481,6 +481,7 @@ include/clink/sql/cdc_keep_rows.hpp
 include/clink/sql/column_lineage.hpp
 include/clink/sql/delta_row_sink.hpp
 include/clink/sql/expr_lowering.hpp
+include/clink/sql/incident_replay.hpp
 include/clink/sql/install.hpp
 include/clink/sql/join_reorder.hpp
 include/clink/sql/json_string_to_row_columnar.hpp
