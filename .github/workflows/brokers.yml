@@ -7,7 +7,7 @@ name: brokers
 # aborted checkpoint, crashes before and after a completion, notifications out
 # of order, close after a cancel, the bound on what is held, and per connector
 # the leases, a failed acknowledgement and a scale-down. The sinks phase, where
-# a broker's sinks have one (Redis, RabbitMQ): the sinks' suites against the server and
+# a broker's sinks have one (Redis, RabbitMQ, NATS): the sinks' suites against the server and
 # their recovery cells, a coordinator and two workers with a worker killed
 # before and after a flush. The live cases skip in the ci workflow, which
 # starts no brokers, and gtest counts a skip as a pass; this gate fails on any
@@ -107,7 +107,8 @@ jobs:
             -e CLINK_RABBITMQ_TEST_ENDPOINT -e CLINK_RABBITMQ_TEST_PORT \
             -e CLINK_RABBITMQ_TEST_USER -e CLINK_RABBITMQ_TEST_PASSWORD \
             -e CLINK_RABBITMQ_TEST_MANAGEMENT_PORT -e CLINK_RABBITMQ_RECOVERY_LOG_DIR \
-            -e CLINK_NATS_TEST_ENDPOINT -e CLINK_PULSAR_TEST_ENDPOINT -e CLINK_MQTT_TEST_URL \
+            -e CLINK_NATS_TEST_ENDPOINT -e CLINK_NATS_RECOVERY_LOG_DIR \
+            -e CLINK_PULSAR_TEST_ENDPOINT -e CLINK_MQTT_TEST_URL \
             ${TOOLCHAIN}"
           scripts/brokers-live.sh build 2>&1 | tee "${RUNNER_TEMP}/brokers-gate.log"
 
@@ -116,8 +117,8 @@ jobs:
         # cluster logs, provenance.txt (the commit, the build's configuration,
         # each broker's image and each phase's result) and, on failure, the
         # brokers' logs. The gate log carries each cell's
-        # "[redis-sink-recovery]" and "[rabbitmq-sink-recovery]" line and the
-        # fault framework's witness lines.
+        # "[redis-sink-recovery]", "[rabbitmq-sink-recovery]" and
+        # "[nats-sink-recovery]" line and the fault framework's witness lines.
         if: always()
         uses: actions/upload-artifact@v4
         with:

@@ -20,10 +20,11 @@
 #     suites. The Redis and MQTT TLS round trips need a TLS server this gate
 #     does not start and are left out.
 #   sinks: the sinks' suites, offline and live, where a broker's sinks have
-#     them, today Redis and RabbitMQ: the failure state against a scripted
-#     server, the contract against the server, the factories (and for Redis
-#     the key rules and the upsert contract suite); then the recovery cells in
-#     clink_integration_tests (RedisSinkRecovery, RabbitMqSinkRecovery): a
+#     them, today Redis, RabbitMQ and NATS: the failure state against a
+#     scripted server, the contract against the server, the factories (and for
+#     Redis the key rules and the upsert contract suite); then the recovery
+#     cells in clink_integration_tests (RedisSinkRecovery,
+#     RabbitMqSinkRecovery, NatsSinkRecovery): a
 #     coordinator and two workers polling a feed the test serves into each
 #     sink, one of them a SQL job at parallelism 2, with a worker killed before
 #     a flush (or its confirms) and after it, before its checkpoint completes.
@@ -62,7 +63,8 @@
 # CLINK_RABBITMQ_TEST_ENDPOINT, CLINK_RABBITMQ_TEST_PORT,
 # CLINK_RABBITMQ_TEST_USER, CLINK_RABBITMQ_TEST_PASSWORD,
 # CLINK_RABBITMQ_TEST_MANAGEMENT_PORT, CLINK_RABBITMQ_RECOVERY_LOG_DIR,
-# CLINK_NATS_TEST_ENDPOINT, CLINK_PULSAR_TEST_ENDPOINT, CLINK_MQTT_TEST_URL.
+# CLINK_NATS_TEST_ENDPOINT, CLINK_NATS_RECOVERY_LOG_DIR,
+# CLINK_PULSAR_TEST_ENDPOINT, CLINK_MQTT_TEST_URL.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -118,7 +120,8 @@ filter_of() {  # <broker> <phase>
         pubsub/sources) echo 'PubSubLive.*:PubSubSourceAckLive.*' ;;
         rabbitmq/sources) echo 'RabbitMqLive.*:RabbitMqSourceAckLive.*:RabbitMqSource.*' ;;
         rabbitmq/sinks) echo 'RabbitMqSink*:RabbitMqFactoryRegistration.*' ;;
-        nats/sources) echo 'NatsLive.*:NatsSourceAckLive.*' ;;
+        nats/sources) echo 'NatsLive.*:NatsSourceAckLive.*:NatsSource.*' ;;
+        nats/sinks) echo 'NatsSink*:NatsFactoryRegistration.*' ;;
         pulsar/sources) echo 'PulsarLive.*:PulsarSourceAckLive.*' ;;
         mqtt/sources) echo 'MqttLive.*:MqttSourceAckLive.*:-MqttLive.TlsConnectionRoundTrip' ;;
     esac
@@ -160,6 +163,13 @@ expectations_of() {  # <broker> <phase>
         nats/sources)
             echo 'NatsLive.*=2'
             echo 'NatsSourceAckLive.*=6'
+            echo 'NatsSource.*=2'
+            ;;
+        nats/sinks)
+            echo 'NatsSink.*=2'
+            echo 'NatsSinkFailures.*=11'
+            echo 'NatsSinkContractLive.*=9'
+            echo 'NatsFactoryRegistration.*=3'
             ;;
         pulsar/sources)
             echo 'PulsarLive.*=2'
@@ -175,12 +185,14 @@ recovery_filter_of() {  # <broker> <phase>
     case "$1/$2" in
         redis/sinks) echo 'RedisSinkRecovery.*' ;;
         rabbitmq/sinks) echo 'RabbitMqSinkRecovery.*' ;;
+        nats/sinks) echo 'NatsSinkRecovery.*' ;;
     esac
 }
 recovery_expectations_of() {  # <broker> <phase>
     case "$1/$2" in
         redis/sinks) echo 'RedisSinkRecovery.*=5' ;;
         rabbitmq/sinks) echo 'RabbitMqSinkRecovery.*=3' ;;
+        nats/sinks) echo 'NatsSinkRecovery.*=3' ;;
     esac
 }
 # Where each broker's recovery cells keep the cluster's logs.
@@ -188,6 +200,7 @@ recovery_log_var_of() {  # <broker>
     case "$1" in
         redis) echo CLINK_REDIS_RECOVERY_LOG_DIR ;;
         rabbitmq) echo CLINK_RABBITMQ_RECOVERY_LOG_DIR ;;
+        nats) echo CLINK_NATS_RECOVERY_LOG_DIR ;;
     esac
 }
 # The cases the phases leave out on purpose, which the coverage check allows:
@@ -210,7 +223,7 @@ if [ "${#missing[@]}" -gt 0 ]; then
     echo "brokers-live: the test binaries of ${missing[*]} are not built under ${BUILD_DIR}" >&2
     exit 1
 fi
-if [ "${BROKERS_LIVE_RECOVERY}" = 1 ] && phase_runs sinks && { runs redis || runs rabbitmq; } &&
+if [ "${BROKERS_LIVE_RECOVERY}" = 1 ] && phase_runs sinks && { runs redis || runs rabbitmq || runs nats; } &&
     [ -z "${IT_BIN}" ]; then
     echo "brokers-live: the recovery cells need clink_integration_tests (and clink_node and" \
         "clink_submit_sql) under ${BUILD_DIR}; BROKERS_LIVE_RECOVERY=0 leaves them out" >&2
