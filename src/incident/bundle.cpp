@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <set>
@@ -12,6 +14,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <unistd.h>
 
 #include "clink/cluster/in_doubt_resolution.hpp"
@@ -298,9 +301,219 @@ const Artifact* Bundle::find(const std::string& path) const {
     return nullptr;
 }
 
+namespace {
+
+// The manifest's own form, checked once so that no check has to: every field a
+// check reads is present with its type, or the bundle is refused.
+const config::JsonValue& member(const config::JsonValue& obj,
+                                std::string_view key,
+                                const std::string& what) {
+    if (!obj.contains(key)) {
+        throw BundleRefused("manifest field '" + what + "' is missing");
+    }
+    return obj.at(key);
+}
+
+// Presence alone, for a field the caller then reads with at(): the reference
+// at() returns refers to the manifest, never to a temporary.
+void require(const config::JsonValue& obj, std::string_view key, const std::string& what) {
+    if (!obj.contains(key)) {
+        throw BundleRefused("manifest field '" + what + "' is missing");
+    }
+}
+
+void expect(bool ok, const std::string& what, const char* type) {
+    if (!ok) {
+        throw BundleRefused("manifest field '" + what + "' is not " + type);
+    }
+}
+
+std::uint64_t expect_uint(const config::JsonValue& v, const std::string& what) {
+    expect(v.is_integral_number() && v.as_int() >= 0, what, "a non-negative integer");
+    return static_cast<std::uint64_t>(v.as_int());
+}
+
+// An operator id: 64 bits, written as decimal text (JSON integers stop at
+// 2^63), or as a non-negative integer.
+std::uint64_t expect_u64(const config::JsonValue& v, const std::string& what) {
+    if (v.is_string()) {
+        const auto& t = v.as_string();
+        std::uint64_t out = 0;
+        const auto [end, ec] = std::from_chars(t.data(), t.data() + t.size(), out);
+        expect(!t.empty() && ec == std::errc{} && end == t.data() + t.size(),
+               what,
+               "a 64-bit decimal");
+        return out;
+    }
+    return expect_uint(v, what);
+}
+
+void expect_optional(const config::JsonValue& obj,
+                     std::string_view key,
+                     const std::string& what,
+                     bool (config::JsonValue::*is)() const noexcept,
+                     const char* type) {
+    if (obj.contains(key)) {
+        expect((obj.at(key).*is)(), what, type);
+    }
+}
+
+void validate_manifest(const config::JsonValue& m) {
+    if (m.contains("collector")) {
+        const auto& col = m.at("collector");
+        expect(col.is_object(), "collector", "an object");
+        for (const char* key : {"collected_at", "clink_version", "git_sha"}) {
+            expect_optional(col,
+                            key,
+                            std::string{"collector."} + key,
+                            &config::JsonValue::is_string,
+                            "a string");
+        }
+        expect_optional(
+            col, "git_clean", "collector.git_clean", &config::JsonValue::is_bool, "a boolean");
+    }
+    require(m, "job", "job");
+    const auto& job = m.at("job");
+    expect(job.is_object(), "job", "an object");
+    expect(expect_uint(member(job, "id", "job.id"), "job.id") > 0, "job.id", "a job id");
+    if (job.contains("commit_confirmation") && !job.at("commit_confirmation").is_null()) {
+        expect(job.at("commit_confirmation").is_bool(),
+               "job.commit_confirmation",
+               "a boolean or null");
+    }
+    expect_optional(job,
+                    "commit_confirmation_source",
+                    "job.commit_confirmation_source",
+                    &config::JsonValue::is_string,
+                    "a string");
+    expect_optional(job, "rescaled", "job.rescaled", &config::JsonValue::is_bool, "a boolean");
+    if (job.contains("prior_graph_through")) {
+        (void)expect_uint(job.at("prior_graph_through"), "job.prior_graph_through");
+    }
+    require(m, "selection", "selection");
+    const auto& sel = m.at("selection");
+    expect(sel.is_object(), "selection", "an object");
+    expect(
+        expect_uint(member(sel, "checkpoint", "selection.checkpoint"), "selection.checkpoint") > 0,
+        "selection.checkpoint",
+        "a checkpoint id");
+    for (const char* key : {"engine_choice", "completed", "confirmed", "generation"}) {
+        (void)expect_uint(member(sel, key, std::string{"selection."} + key),
+                          std::string{"selection."} + key);
+    }
+    expect(member(sel, "overridden", "selection.overridden").is_bool(),
+           "selection.overridden",
+           "a boolean");
+    expect(member(sel, "state_root", "selection.state_root").is_string(),
+           "selection.state_root",
+           "a string");
+    require(sel, "participants", "selection.participants");
+    const auto& parts = sel.at("participants");
+    expect(parts.is_array(), "selection.participants", "an array");
+    for (const auto& p : parts.as_array()) {
+        expect(expect_uint(p, "selection.participants[]") <= 0xFFFFFFFFULL,
+               "selection.participants[]",
+               "a subtask index");
+    }
+    if (sel.contains("restored")) {
+        const auto& r = sel.at("restored");
+        expect(r.is_object(), "selection.restored", "an object");
+        (void)expect_uint(member(r, "restore", "selection.restored.restore"),
+                          "selection.restored.restore");
+        (void)expect_uint(member(r, "next", "selection.restored.next"), "selection.restored.next");
+    }
+    require(m, "contents", "contents");
+    const auto& contents = m.at("contents");
+    expect(contents.is_object(), "contents", "an object");
+    for (const char* key : {"state", "captures", "traces", "job_manifest"}) {
+        expect_optional(contents,
+                        key,
+                        std::string{"contents."} + key,
+                        &config::JsonValue::is_bool,
+                        "a boolean");
+    }
+    if (m.contains("delivery")) {
+        expect(m.at("delivery").is_object() || m.at("delivery").is_null(),
+               "delivery",
+               "an object or null");
+    }
+    if (m.contains("absent")) {
+        expect(m.at("absent").is_array(), "absent", "an array");
+        for (const auto& a : m.at("absent").as_array()) {
+            expect(a.is_object(), "absent[]", "an object");
+            for (const char* key : {"role", "path", "reason"}) {
+                expect_optional(a,
+                                key,
+                                std::string{"absent[]."} + key,
+                                &config::JsonValue::is_string,
+                                "a string");
+            }
+        }
+    }
+    for (const char* key : {"excluded", "notes"}) {
+        if (m.contains(key)) {
+            expect(m.at(key).is_array(), key, "an array");
+            for (const auto& e : m.at(key).as_array()) {
+                expect(e.is_string(), std::string{key} + "[]", "a string");
+            }
+        }
+    }
+}
+
+bool in_evidence_dir(const std::string& path) {
+    return std::any_of(kEvidenceDirs.begin(), kEvidenceDirs.end(), [&](const char* dir) {
+        return path.size() > std::strlen(dir) + 1 && path.starts_with(dir) &&
+               path[std::strlen(dir)] == '/';
+    });
+}
+
+std::string capture_path_of(std::uint64_t op, std::uint64_t subtask, std::uint64_t epoch) {
+    return "capture/op-" + std::to_string(op) + "/subtask-" + std::to_string(subtask) + "/epoch-" +
+           std::to_string(epoch) + ".cap";
+}
+
+}  // namespace
+
+std::optional<std::string> Bundle::inside(const std::string& path) const {
+    std::string_view p = path;
+    if (p.starts_with("file://")) {
+        p.remove_prefix(7);
+    } else if (p.find("://") != std::string_view::npos) {
+        return std::nullopt;
+    }
+    const fs::path candidate{std::string{p}};
+    if (!candidate.is_absolute()) {
+        return std::nullopt;
+    }
+    const auto under = [](const fs::path& where,
+                          const fs::path& base) -> std::optional<std::string> {
+        const auto text = where.lexically_relative(base).generic_string();
+        if (text.empty() || text == "." || text == ".." || text.starts_with("../")) {
+            return std::nullopt;
+        }
+        return text;
+    };
+    if (auto rel = under(candidate.lexically_normal(), root)) {
+        return rel;
+    }
+    // The same place reached through a link above the bundle (macOS keeps its
+    // temporary directories behind /var -> /private/var). Both paths are
+    // absolute, so the working directory still plays no part.
+    std::error_code ec;
+    const auto canon_path = fs::weakly_canonical(candidate, ec);
+    const auto canon_root = fs::weakly_canonical(root, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return under(canon_path, canon_root);
+}
+
 Bundle read_bundle(const fs::path& root_in, const ReadLimits& limits) {
     std::error_code ec;
-    const auto root = fs::absolute(root_in, ec);
+    auto root = fs::absolute(root_in, ec).lexically_normal();
+    if (!root.has_filename()) {
+        root = root.parent_path();  // a trailing separator
+    }
     if (ec || !fs::is_directory(fs::symlink_status(root, ec))) {
         throw BundleRefused(root_in.string() + " is not a directory");
     }
@@ -335,11 +548,7 @@ Bundle read_bundle(const fs::path& root_in, const ReadLimits& limits) {
                                 " is not one this reader knows (it reads up to " +
                                 std::to_string(kVersion) + ")");
         }
-        (void)b.job();
-        (void)b.checkpoint();
-        if (!b.manifest.at("contents").is_object()) {
-            throw BundleRefused("manifest field 'contents' is not an object");
-        }
+        validate_manifest(b.manifest);
         const auto& arts = b.manifest.at("artifacts");
         if (!arts.is_array()) {
             throw BundleRefused("manifest field 'artifacts' is not an array");
@@ -362,9 +571,10 @@ Bundle read_bundle(const fs::path& root_in, const ReadLimits& limits) {
             art.role = a.at("role").as_string();
             art.sha256 = a.at("sha256").as_string();
             art.bytes = uint_at(a, "bytes");
-            if (!safe_relative_path(art.path) || art.path == "manifest.json") {
+            if (!safe_relative_path(art.path) || !in_evidence_dir(art.path)) {
                 throw BundleRefused("artifact path '" + art.path +
-                                    "' is not a plain relative path inside the bundle");
+                                    "' is not a plain relative path inside one of the bundle's "
+                                    "evidence directories");
             }
             if (!is_hex64(art.sha256)) {
                 throw BundleRefused("artifact '" + art.path + "' has no SHA-256 in lowercase hex");
@@ -383,6 +593,53 @@ Bundle read_bundle(const fs::path& root_in, const ReadLimits& limits) {
                 throw BundleRefused("artifact '" + art.path + "' is listed twice");
             }
             b.artifacts.push_back(std::move(art));
+        }
+        if (b.manifest.contains("captures")) {
+            const auto& caps = b.manifest.at("captures");
+            expect(caps.is_array(), "captures", "an array");
+            std::set<std::string> taken;
+            for (const auto& c : caps.as_array()) {
+                expect(c.is_object(), "captures[]", "an object");
+                CapturedEpoch e;
+                e.op = expect_u64(member(c, "op", "captures[].op"), "captures[].op");
+                e.subtask =
+                    expect_uint(member(c, "subtask", "captures[].subtask"), "captures[].subtask");
+                e.epoch = expect_uint(member(c, "epoch", "captures[].epoch"), "captures[].epoch");
+                expect(e.epoch > 0, "captures[].epoch", "an epoch (from 1)");
+                expect(member(c, "path", "captures[].path").is_string(),
+                       "captures[].path",
+                       "a string");
+                e.path = c.at("path").as_string();
+                // The replay engine reads the epoch by its op, subtask and epoch,
+                // so a path that names another file would vouch for one file
+                // while another is replayed.
+                const auto expected = capture_path_of(e.op, e.subtask, e.epoch);
+                if (e.path != expected) {
+                    throw BundleRefused("captured epoch " + e.path + " is listed as op " +
+                                        std::to_string(e.op) + " subtask " +
+                                        std::to_string(e.subtask) + " epoch " +
+                                        std::to_string(e.epoch) + ", whose file is " + expected);
+                }
+                if (b.find(e.path) == nullptr) {
+                    throw BundleRefused("captured epoch " + e.path + " is not a listed artifact");
+                }
+                if (!taken.insert(e.path).second) {
+                    throw BundleRefused("captured epoch " + e.path + " is listed twice");
+                }
+                expect_optional(c,
+                                "truncated",
+                                "captures[].truncated",
+                                &config::JsonValue::is_bool,
+                                "a boolean");
+                e.truncated = c.bool_or("truncated", false);
+                b.captures.push_back(std::move(e));
+            }
+            std::sort(b.captures.begin(),
+                      b.captures.end(),
+                      [](const CapturedEpoch& x, const CapturedEpoch& y) {
+                          return std::tie(x.op, x.subtask, x.epoch) <
+                                 std::tie(y.op, y.subtask, y.epoch);
+                      });
         }
     } catch (const BundleRefused&) {
         throw;
@@ -438,6 +695,119 @@ std::uint64_t epoch_starting_checkpoint(std::uint64_t epoch,
         return *restored_from;
     }
     return epoch > 0 ? epoch - 1 : 0;
+}
+
+std::vector<cluster::RestoredRecord> recorded_restores(const Bundle& b) {
+    std::vector<cluster::RestoredRecord> out;
+    if (const auto r = cluster::read_restore_point(b.checkpoint_dir().string(), b.job())) {
+        out.push_back(*r);
+    }
+    // Every restore in the traced period, of this job: the coordinator traces
+    // each redeploy with the checkpoint it restored and the id it numbers from.
+    for (const auto& a : b.artifacts) {
+        if (a.role != "trace") {
+            continue;
+        }
+        std::ifstream in(b.root / a.path);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.find("\"Redeploy\"") == std::string::npos) {
+                continue;
+            }
+            try {
+                const auto v = config::parse(line);
+                if (!v.is_object() || v.string_or("event", "") != "Redeploy" ||
+                    !v.contains("job") || !v.at("job").is_integral_number() ||
+                    static_cast<std::uint64_t>(v.at("job").as_int()) != b.job() ||
+                    !v.contains("restore") || !v.at("restore").is_integral_number() ||
+                    !v.contains("next") || !v.at("next").is_integral_number()) {
+                    continue;
+                }
+                out.push_back(cluster::RestoredRecord{
+                    .restore = static_cast<std::uint64_t>(v.at("restore").as_int()),
+                    .next = static_cast<std::uint64_t>(v.at("next").as_int())});
+            } catch (const std::exception&) {
+                // protocol.trace_structure reports a line that does not parse.
+            }
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const auto& x, const auto& y) {
+        return std::tie(x.next, x.restore) < std::tie(y.next, y.restore);
+    });
+    out.erase(std::unique(out.begin(),
+                          out.end(),
+                          [](const auto& x, const auto& y) {
+                              return x.next == y.next && x.restore == y.restore;
+                          }),
+              out.end());
+    return out;
+}
+
+bool epoch_discarded(const std::vector<cluster::RestoredRecord>& restores,
+                     std::uint64_t epoch) noexcept {
+    return std::any_of(
+        restores.begin(), restores.end(), [&](const auto& r) { return r.passes_over(epoch); });
+}
+
+EpochStart epoch_start(const Bundle& b,
+                       const std::vector<cluster::RestoredRecord>& restores,
+                       std::uint64_t epoch) {
+    EpochStart s;
+    std::optional<std::uint64_t> start;
+    std::uint64_t newest_next = 0;
+    for (const auto& r : restores) {
+        newest_next = std::max(newest_next, r.next);
+        if (r.next == epoch) {
+            start = r.restore;
+        }
+    }
+    if (!start.has_value()) {
+        const auto& job = b.manifest.at("job");
+        const bool plain = job.contains("commit_confirmation") &&
+                           job.at("commit_confirmation").is_bool() &&
+                           !job.at("commit_confirmation").as_bool();
+        // A run of a job outside the confirmation family restores from the
+        // newest checkpoint it completed, so whichever run processed this epoch
+        // started from the checkpoint before it, or that checkpoint is torn and
+        // there is nothing to restore. A run in the family restores from a
+        // confirmed checkpoint: before the newest recorded restore, the
+        // checkpoint before the epoch is its start whatever run processed it
+        // only if it was confirmed.
+        if (epoch <= 1) {
+            start = 0;
+        } else if (epoch > newest_next || plain ||
+                   b.find("checkpoint/_jobs/" + std::to_string(b.job()) + "/CONFIRMED-" +
+                          std::to_string(epoch - 1)) != nullptr) {
+            start = epoch - 1;
+        } else {
+            s.reason = "epoch " + std::to_string(epoch) +
+                       " comes before the job's newest restore, and checkpoint " +
+                       std::to_string(epoch - 1) +
+                       " was never confirmed: a run of a job whose sinks need commit "
+                       "confirmation restores from a confirmed checkpoint, so a restore the "
+                       "bundle does not record may have started a run at this epoch from "
+                       "an older one";
+            return s;
+        }
+    }
+    // A rescale's first epoch starts from the old layout's checkpoint, whose
+    // state the restore re-divides across the new subtasks.
+    const auto& job = b.manifest.at("job");
+    const auto through = job.contains("prior_graph_through")
+                             ? static_cast<std::uint64_t>(job.at("prior_graph_through").as_int())
+                             : 0;
+    if (job.bool_or("rescaled", false) && *start > 0 && *start <= through && epoch > through) {
+        s.unsupported = true;
+        s.reason = "epoch " + std::to_string(epoch) + " starts from checkpoint " +
+                   std::to_string(*start) + ", written before the job was rescaled (through " +
+                   std::to_string(through) +
+                   "): its restore re-divided several subtasks' state, and replay restores "
+                   "one subtask's snapshot";
+        return s;
+    }
+    s.known = true;
+    s.checkpoint = *start;
+    return s;
 }
 
 Check refused_check(const std::string& reason) {
@@ -525,39 +895,68 @@ Check bundle_artifacts_check(const Bundle& b) {
                                " bytes, listed as " + std::to_string(a.bytes));
             continue;
         }
-        if (sha256_file(full) != a.sha256) {
-            problems.push_back(a.path + ": SHA-256 differs from the manifest's");
+        try {
+            if (sha256_file(full) != a.sha256) {
+                problems.push_back(a.path + ": SHA-256 differs from the manifest's");
+            }
+        } catch (const std::exception& e) {
+            problems.push_back(a.path + ": " + e.what());
         }
     }
-    // Nothing unlisted: an evidence file the manifest does not vouch for is
-    // not evidence, and a link could stand in for one.
-    for (auto it = fs::recursive_directory_iterator(b.root, fs::directory_options::none, ec);
-         !ec && it != fs::recursive_directory_iterator();
-         it.increment(ec)) {
-        const auto rel = fs::relative(it->path(), b.root, ec).generic_string();
-        const auto st = it->symlink_status(ec);
-        if (fs::is_symlink(st)) {
-            problems.push_back(rel + ": a symbolic link in the bundle");
-            it.disable_recursion_pending();
+    // Nothing unlisted in an evidence directory: a file the manifest does not
+    // vouch for is not evidence, and a link could stand in for one. A
+    // directory that cannot be listed is a problem, not a pass. The root may
+    // hold other files (a report written beside the manifest), and the
+    // metadata macOS leaves in any directory it shows (.DS_Store, ._*) is
+    // neither evidence nor read by any check.
+    for (const char* dir : kEvidenceDirs) {
+        const auto top = b.root / dir;
+        const auto top_st = fs::symlink_status(top, ec);
+        if (ec || !fs::exists(top_st)) {
+            ec.clear();
             continue;
         }
-        if (fs::is_directory(st)) {
+        if (!fs::is_directory(top_st)) {
+            problems.push_back(std::string{dir} + ": not a plain directory");
             continue;
         }
-        if (rel == "manifest.json") {
-            continue;
+        fs::recursive_directory_iterator it(top, fs::directory_options::none, ec);
+        for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            const auto rel = it->path().lexically_relative(b.root).generic_string();
+            const auto name = it->path().filename().string();
+            std::error_code st_ec;
+            const auto st = it->symlink_status(st_ec);
+            if (st_ec) {
+                problems.push_back(rel + ": " + st_ec.message());
+                continue;
+            }
+            if (fs::is_symlink(st)) {
+                problems.push_back(rel + ": a symbolic link in the bundle");
+                it.disable_recursion_pending();
+                continue;
+            }
+            if (fs::is_directory(st)) {
+                continue;
+            }
+            if (name == ".DS_Store" || name.starts_with("._")) {
+                continue;
+            }
+            if (!fs::is_regular_file(st)) {
+                problems.push_back(rel + ": not a regular file");
+            } else if (listed.count(rel) == 0) {
+                problems.push_back(rel + ": present but not in the manifest");
+            }
         }
-        if (!fs::is_regular_file(st)) {
-            problems.push_back(rel + ": not a regular file");
-        } else if (listed.count(rel) == 0) {
-            problems.push_back(rel + ": present but not in the manifest");
+        if (ec) {
+            problems.push_back(std::string{dir} + " cannot be listed in full: " + ec.message());
+            ec.clear();
         }
     }
     if (problems.empty()) {
         c.reason = "every one of the " + std::to_string(b.artifacts.size()) +
                    " listed artifacts exists with its listed size and SHA-256, and nothing "
-                   "unlisted is present. This shows the bundle is as collected, not who "
-                   "collected it.";
+                   "unlisted is in an evidence directory. This shows the bundle is as "
+                   "collected, not who collected it.";
         return c;
     }
     c.verdict = Verdict::Failed;
@@ -788,9 +1187,10 @@ Check checkpoint_restore_rule_check(const Bundle& b) {
                                    "confirmation)"
                                  : "the newest COMPLETED checkpoint the RESTORED record does not "
                                    "pass over"));
-    c.details.push_back(
-        "newest COMPLETED a restore may choose: " + std::to_string(point.completed) +
-        ", newest CONFIRMED: " + std::to_string(point.confirmed));
+    c.details.push_back(confirm ? "newest CONFIRMED: " + std::to_string(point.confirmed) +
+                                      "; newest COMPLETED: " + std::to_string(point.completed)
+                                : "newest COMPLETED a restore may choose: " +
+                                      std::to_string(point.completed));
     if (point.restored.has_value()) {
         c.details.push_back("RESTORED record: restored from " +
                             std::to_string(point.restored->restore) + ", numbering from " +
@@ -849,9 +1249,7 @@ Check checkpoint_participants_check(const Bundle& b) {
         return c;
     }
     std::error_code ec;
-    const auto canon_root = fs::weakly_canonical(b.root, ec).string() + "/";
-    const auto canon_state = fs::weakly_canonical(src.state_root, ec).string();
-    if (canon_state.rfind(canon_root, 0) != 0) {
+    if (!b.inside(src.state_root).has_value()) {
         c.verdict = Verdict::Unsupported;
         c.reason = "the checkpoint's state was written to " + src.state_root +
                    ", outside the checkpoint directory, which a bundle does not carry in this "
@@ -864,8 +1262,7 @@ Check checkpoint_participants_check(const Bundle& b) {
     std::size_t verified = 0;
     for (const auto sub : *src.participants) {
         const fs::path dir = state_dir_for(src.state_root, src.generation, sub);
-        const auto snap = dir / name;
-        const auto rel = fs::relative(snap, b.root, ec).generic_string();
+        const auto rel = b.inside((dir / name).string()).value_or((dir / name).string());
         c.evidence.push_back(rel + ".meta");
         if (b.find(rel + ".meta") == nullptr) {
             problems.push_back("participant " + std::to_string(sub) + ": no " + rel + ".meta");
@@ -878,7 +1275,7 @@ Check checkpoint_participants_check(const Bundle& b) {
             problems.push_back("participant " + std::to_string(sub) + ": no " + rel);
             continue;
         }
-        const auto verdict = state::verify_checkpoint(snap);
+        const auto verdict = state::verify_checkpoint(b.root / rel);
         if (!verdict.ok()) {
             problems.push_back("participant " + std::to_string(sub) + ": " + rel + " is " +
                                std::string{state::to_string(verdict.status)} + ": " +
@@ -1142,65 +1539,137 @@ Check protocol_conformance_check(const Bundle& b, const VerifyOptions& o, const 
             return c;
         }
     }
-    // The validator reads a run directory; give it a copy of the traces so the
-    // bundle is never written to.
+    if (std::system("command -v python3 >/dev/null 2>&1") != 0) {
+        c.reason = "the trace validator needs python3, and none is on PATH";
+        c.next_action = "install python3";
+        return c;
+    }
+    // A copy of the traces in a directory of this run's own, so the bundle is
+    // never written to; then this job's events alone, merged as the validator
+    // merges a run, so another job's events in the same traces neither pass
+    // nor fail this bundle.
+    std::string pattern = (fs::temp_directory_path() / "clink-incident-traces.XXXXXX").string();
+    if (::mkdtemp(pattern.data()) == nullptr) {
+        c.reason = "no temporary directory for the validator's input could be made";
+        c.next_action = "check TMPDIR";
+        return c;
+    }
+    const fs::path tmp{pattern};
     std::error_code ec;
-    const auto tmp = fs::temp_directory_path() /
-                     ("clink-incident-traces-" + std::to_string(static_cast<long>(::getpid())));
-    fs::remove_all(tmp, ec);
-    fs::create_directories(tmp / "run");
+    fs::create_directories(tmp / "run", ec);
     for (const auto& a : b.artifacts) {
-        if (a.role == "trace") {
+        if (a.role == "trace" && !ec) {
             fs::copy_file(b.root / a.path,
                           tmp / "run" / fs::path{a.path}.filename(),
                           fs::copy_options::overwrite_existing,
                           ec);
         }
     }
+    const auto scripts = formal.parent_path() / "scripts";
+    const auto merged = tmp / ("job-" + std::to_string(b.job()) + ".ndjson");
     const auto out_file = tmp / "validator.log";
+    int rc = 1;
+    if (!ec) {
+        const std::string merge = "python3 '" + (scripts / "protocol-trace-merge.py").string() +
+                                  "' --job " + std::to_string(b.job()) + " --out '" +
+                                  merged.string() + "' '" + (tmp / "run").string() + "' > '" +
+                                  out_file.string() + "' 2>&1";
+        rc = std::system(merge.c_str());
+    }
+    if (ec || rc != 0) {
+        const auto log = read_text(out_file);
+        fs::remove_all(tmp, ec);
+        c.verdict = Verdict::Failed;
+        c.reason = "the traces do not merge into one run of job " + std::to_string(b.job());
+        c.details.push_back(log.substr(0, 400));
+        c.next_action = "read the merge's message; protocol.trace_structure checks each file";
+        return c;
+    }
     const std::string cmd = "CLINK_FORMAL_TOOLS_DIR='" + tools + "' bash '" +
-                            (formal.parent_path() / "scripts" / "formal-check.sh").string() +
-                            "' --trace '" + (tmp / "run").string() + "' > '" + out_file.string() +
-                            "' 2>&1";
-    const int rc = std::system(cmd.c_str());
+                            (scripts / "formal-check.sh").string() + "' --trace '" +
+                            merged.string() + "' > '" + out_file.string() + "' 2>&1";
+    rc = std::system(cmd.c_str());
     const auto log = read_text(out_file);
     fs::remove_all(tmp, ec);
-    std::vector<std::string> tail;
+    std::vector<std::string> all;
     {
         std::istringstream lines(log);
         std::string line;
-        std::vector<std::string> all;
         while (std::getline(lines, line)) {
             all.push_back(line);
         }
-        for (std::size_t i = all.size() > 12 ? all.size() - 12 : 0; i < all.size(); ++i) {
-            tail.push_back(all[i]);
-        }
     }
-    c.details = tail;
-    if (rc == 0) {
-        c.verdict = Verdict::Passed;
-        c.reason =
-            "the formal trace validator accepts the run: its events are a behaviour of "
-            "the exactly-once specification. This concerns the protocol's steps, not the "
-            "records' contents.";
+    for (std::size_t i = all.size() > 12 ? all.size() - 12 : 0; i < all.size(); ++i) {
+        c.details.push_back(all[i]);
+    }
+    if (rc != 0) {
+        c.verdict = Verdict::Failed;
+        c.reason = "the formal trace validator rejects the run";
+        c.next_action =
+            "read the validator's output above; see docs/internals/"
+            "exactly-once-specification.md, What a divergence means";
         return c;
     }
-    c.verdict = Verdict::Failed;
-    c.reason = "the formal trace validator rejects the run";
-    c.next_action =
-        "read the validator's output above; see docs/internals/"
-        "exactly-once-specification.md, What a divergence means";
+    // The validator exits 0 when it skips every run it was given as outside
+    // the specification: nothing was validated, which is not acceptance.
+    std::size_t validated = 0;
+    std::string skipped;
+    for (const auto& line : all) {
+        if (const auto at = line.find("all ");
+            line.starts_with("formal-check: all ") && at != std::string::npos) {
+            validated = static_cast<std::size_t>(std::strtoull(line.c_str() + at + 4, nullptr, 10));
+        }
+        if (line.find("SKIPPED") != std::string::npos) {
+            skipped = line;
+        }
+    }
+    if (validated == 0) {
+        c.verdict = Verdict::Unsupported;
+        c.reason =
+            "the run is outside what the exactly-once specification models, so the "
+            "validator checked nothing";
+        if (!skipped.empty()) {
+            c.reason += ": " + skipped.substr(skipped.find("SKIPPED, ") == std::string::npos
+                                                  ? 0
+                                                  : skipped.find("SKIPPED, ") + 9);
+        }
+        c.next_action = "see formal/trace/events.txt for what the specification covers";
+        return c;
+    }
+    c.verdict = Verdict::Passed;
+    c.reason =
+        "the formal trace validator accepts the run: its events are a behaviour of the "
+        "exactly-once specification. This concerns the protocol's steps, not the records' "
+        "contents.";
     return c;
+}
+
+}  // namespace
+
+namespace {
+
+// A check that throws reports the failure rather than ending verification.
+template <typename Run>
+Check guarded(const char* id, Run&& run) {
+    try {
+        return run();
+    } catch (const std::exception& e) {
+        return Check{.id = id,
+                     .verdict = Verdict::Failed,
+                     .evidence = {},
+                     .reason = std::string{"the check could not read its evidence: "} + e.what(),
+                     .next_action = "collect the bundle again",
+                     .details = {}};
+    }
 }
 
 }  // namespace
 
 std::vector<Check> verify_core(const Bundle& b, const VerifyOptions& o) {
     std::vector<Check> out;
-    out.push_back(bundle_manifest_check(b));
-    out.push_back(bundle_artifacts_check(b));
-    out.push_back(bundle_completeness_check(b));
+    out.push_back(guarded("bundle.manifest", [&] { return bundle_manifest_check(b); }));
+    out.push_back(guarded("bundle.artifacts", [&] { return bundle_artifacts_check(b); }));
+    out.push_back(guarded("bundle.completeness", [&] { return bundle_completeness_check(b); }));
     if (o.profile == "integrity") {
         return out;
     }
@@ -1228,13 +1697,17 @@ std::vector<Check> verify_core(const Bundle& b, const VerifyOptions& o) {
         }
         return out;
     }
-    out.push_back(checkpoint_marker_check(b));
-    out.push_back(checkpoint_restore_rule_check(b));
-    out.push_back(checkpoint_participants_check(b));
-    out.push_back(state_decode_check(b));
+    out.push_back(guarded("checkpoint.marker", [&] { return checkpoint_marker_check(b); }));
+    out.push_back(
+        guarded("checkpoint.restore_rule", [&] { return checkpoint_restore_rule_check(b); }));
+    out.push_back(
+        guarded("checkpoint.participants", [&] { return checkpoint_participants_check(b); }));
+    out.push_back(guarded("state.decode", [&] { return state_decode_check(b); }));
     if (o.profile == "full") {
-        auto structure = trace_structure_check(b);
-        auto conformance = protocol_conformance_check(b, o, structure);
+        auto structure =
+            guarded("protocol.trace_structure", [&] { return trace_structure_check(b); });
+        auto conformance = guarded("protocol.conformance",
+                                   [&] { return protocol_conformance_check(b, o, structure); });
         out.push_back(std::move(structure));
         out.push_back(std::move(conformance));
         // Said in every full report, so that passing is never read as saying

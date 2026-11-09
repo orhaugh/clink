@@ -75,15 +75,19 @@ alone. It reads nothing the job wrote.
 6. **A forbidden trace.** The same bundle, with the Coordinator's redeploy
    rewritten to restore from the checkpoint that never completed, fails
    `protocol.conformance`, and the run exits 1.
-7. **A regression test.** The restored run's first epoch becomes the
+7. **A run the specification does not model.** The same bundle with a rescale
+   traced is outside what the specification models. The validator skips the
+   run, so `protocol.conformance` is unsupported rather than passed, and the
+   run exits 3.
+8. **A regression test.** The restored run's first epoch becomes the
    regression bundle `clink replay --emit-test` writes. `clink replay
    --run-test` passes on it, then fails once its golden output is doctored,
    naming the first divergence.
-8. **A partial and a failed result.** The bundle without snapshots exits 3,
+9. **A partial and a failed result.** The bundle without snapshots exits 3,
    with `state.decode` and the replays unavailable. A copy with one byte of a
    capture flipped exits 1 on `bundle.artifacts`, and nothing behind it runs.
-9. **Cost.** `measure.py` runs the same query over 200,000 events from a file,
-   unpaced, with the flight recorder off and on.
+10. **Cost.** `measure.py` runs the same query over 200,000 events from a file,
+    unpaced, with the flight recorder off and on.
 
 ## What passing does not show
 

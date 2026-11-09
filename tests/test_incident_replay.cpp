@@ -291,6 +291,28 @@ protected:
         });
     }
 
+    // The window operator's epoch 1 copied as its epoch 2, which starts from
+    // checkpoint 1, as a longer run would have captured it. Returns the op.
+    std::uint64_t add_second_epoch() const {
+        const auto window = op_of(work_, "tumbling_window_row");
+        const auto first = epoch_file(work_, window, 1);
+        const auto second = first.parent_path() / "epoch-2.cap";
+        fs::copy_file(first, second);
+        relist(second, "capture_epoch");
+        const auto rel = fs::relative(second, work_).generic_string();
+        edit_manifest([&](JsonValue& m) {
+            clink::config::JsonObject cap;
+            cap["op"] = JsonValue{std::to_string(window)};
+            cap["subtask"] = JsonValue{static_cast<std::int64_t>(
+                std::stoull(first.parent_path().filename().string().substr(8)))};
+            cap["epoch"] = JsonValue{static_cast<std::int64_t>(2)};
+            cap["path"] = JsonValue{rel};
+            cap["truncated"] = JsonValue{false};
+            m.as_object()["captures"].as_array().emplace_back(std::move(cap));
+        });
+        return window;
+    }
+
     // Rewrite a capture's records through `change`, keeping its header.
     static void rewrite_capture(const fs::path& file,
                                 const std::function<void(clink::sql::Row&)>& change) {
@@ -322,6 +344,8 @@ TEST_F(IncidentReplayTest, ARealRunReplaysDeterministicallyAndAgreesWithProducti
     EXPECT_EQ(det->verdict, Verdict::Passed) << describe(det);
     EXPECT_EQ(rec->verdict, Verdict::Passed) << describe(rec);
     EXPECT_EQ(find_check(checks, "replay.expected_output"), nullptr) << "no expectation was given";
+    EXPECT_NE(describe(rec).find("is a sink"), std::string::npos)
+        << "the operator before the sink cannot be compared, by its topology: " << describe(rec);
     // The window operator's own epoch is among those compared with what
     // production handed its consumer.
     clink::sql::IncidentReplayOptions o;
@@ -493,22 +517,7 @@ TEST_F(IncidentReplayTest, AnEpochWithoutItsStartingStateIsUnavailable) {
     // A second epoch of the window operator, starting from checkpoint 1, as a
     // longer run would have captured. With checkpoint 1's state it replays;
     // without it, it is unavailable, not failed.
-    const auto window = op_of(work_, "tumbling_window_row");
-    const auto first = epoch_file(work_, window, 1);
-    const auto second = first.parent_path() / "epoch-2.cap";
-    fs::copy_file(first, second);
-    relist(second, "capture_epoch");
-    const auto rel = fs::relative(second, work_).generic_string();
-    edit_manifest([&](JsonValue& m) {
-        clink::config::JsonObject cap;
-        cap["op"] = JsonValue{static_cast<std::int64_t>(window)};
-        cap["subtask"] = JsonValue{static_cast<std::int64_t>(
-            std::stoull(first.parent_path().filename().string().substr(8)))};
-        cap["epoch"] = JsonValue{static_cast<std::int64_t>(2)};
-        cap["path"] = JsonValue{rel};
-        cap["truncated"] = JsonValue{false};
-        m.as_object()["captures"].as_array().emplace_back(std::move(cap));
-    });
+    const auto window = add_second_epoch();
     clink::sql::IncidentReplayOptions o;
     o.op = window;
     o.epoch = 2;
@@ -584,6 +593,114 @@ TEST_F(IncidentReplayTest, AReplayedEpochBecomesARegressionBundleThatPasses) {
         run_command(std::string{CLINK_CLI_BINARY} + " replay --run-test=" + out.string(), &output),
         1)
         << output;
+}
+
+TEST_F(IncidentReplayTest, ACaptureCutShortIsUnavailableRatherThanReplayedAsTheEpoch) {
+    const auto window = op_of(work_, "tumbling_window_row");
+    const auto file = epoch_file(work_, window, 1);
+    const auto bytes = slurp_file(file);
+    spill_file(file, bytes.substr(0, bytes.size() * 2 / 3));
+    relist(file, "capture_epoch");
+    clink::sql::IncidentReplayOptions o;
+    o.op = window;
+    o.expected_path = (work_ / "expected.ndjson").string();
+    {
+        std::ofstream out(o.expected_path);
+        for (const auto& row : expected_window_rows()) {
+            out << row << "\n";
+        }
+    }
+    const auto checks = clink::sql::incident_replay_checks(bundle(), o);
+    const auto* det = find_check(checks, "replay.determinism");
+    EXPECT_EQ(det->verdict, Verdict::Unavailable) << describe(det);
+    EXPECT_NE(describe(det).find("cut short"), std::string::npos) << describe(det);
+    EXPECT_EQ(find_check(checks, "replay.recorded_output")->verdict, Verdict::Unavailable);
+    EXPECT_EQ(find_check(checks, "replay.expected_output")->verdict, Verdict::Unavailable)
+        << describe(find_check(checks, "replay.expected_output"));
+}
+
+TEST_F(IncidentReplayTest, AnExpectationOverATruncatedEpochIsUnavailable) {
+    fs::remove_all(work_);
+    fs::copy(truncated_, work_, fs::copy_options::recursive);
+    clink::sql::IncidentReplayOptions o;
+    o.op = op_of(work_, "tumbling_window_row");
+    o.expected_path = (work_ / "expected.ndjson").string();
+    {
+        std::ofstream out(o.expected_path);
+        for (const auto& row : expected_window_rows()) {
+            out << row << "\n";
+        }
+    }
+    const auto exp_checks = clink::sql::incident_replay_checks(bundle(), o);
+    const auto* exp = find_check(exp_checks, "replay.expected_output");
+    ASSERT_NE(exp, nullptr);
+    EXPECT_EQ(exp->verdict, Verdict::Unavailable) << describe(exp);
+    // Nor is a part of an epoch frozen as a regression test of it, and nothing
+    // is left behind.
+    const auto out = work_ / "regression";
+    EXPECT_THROW((void)clink::sql::incident_regress(bundle(), *o.op, 1, std::nullopt, out.string()),
+                 std::runtime_error);
+    EXPECT_FALSE(fs::exists(out));
+}
+
+TEST_F(IncidentReplayTest, AStartingSnapshotOutsideTheBundleIsNeverRead) {
+    const auto window = add_second_epoch();
+    // A copy of the state outside the bundle, which checkpoint 1's marker now
+    // names, as a marker would name state the bundle did not collect.
+    const auto outside = root_ / (std::string{"outside-"} +
+                                  ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    fs::remove_all(outside);
+    fs::copy(work_ / "checkpoint" / "_state", outside, fs::copy_options::recursive);
+    const auto marker = work_ / "checkpoint" / "_jobs" / "1" / "COMPLETED-1";
+    auto body = slurp_file(marker);
+    const auto at = body.find("state=");
+    ASSERT_NE(at, std::string::npos) << body;
+    body = body.substr(0, at) + "state=" + (outside / "1").string() + "\n";
+    spill_file(marker, body);
+    relist(marker, "completed_marker");
+    clink::sql::IncidentReplayOptions o;
+    o.op = window;
+    o.epoch = 2;
+    const auto det_checks = clink::sql::incident_replay_checks(bundle(), o);
+    const auto* det = find_check(det_checks, "replay.determinism");
+    EXPECT_EQ(det->verdict, Verdict::Unavailable) << describe(det);
+    EXPECT_NE(describe(det).find("not in the bundle"), std::string::npos) << describe(det);
+}
+
+TEST_F(IncidentReplayTest, AnEpochThatBeginsOnARescaleIsUnsupported) {
+    const auto window = add_second_epoch();
+    // The graph was rescaled after checkpoint 1: epoch 2 starts from the old
+    // layout's state, which the restore re-divided across the new subtasks.
+    edit_manifest([](JsonValue& m) {
+        m.as_object()["job"].as_object()["rescaled"] = JsonValue{true};
+        m.as_object()["job"].as_object()["prior_graph_through"] =
+            JsonValue{static_cast<std::int64_t>(1)};
+    });
+    clink::sql::IncidentReplayOptions o;
+    o.op = window;
+    o.epoch = 2;
+    const auto det_checks = clink::sql::incident_replay_checks(bundle(), o);
+    const auto* det = find_check(det_checks, "replay.determinism");
+    EXPECT_EQ(det->verdict, Verdict::Unsupported) << describe(det);
+    EXPECT_NE(describe(det).find("rescaled"), std::string::npos) << describe(det);
+}
+
+TEST_F(IncidentReplayTest, TheCommandTakesEvery64BitOperatorIdAndRefusesAMalformedBundleCleanly) {
+    const std::string cli = CLINK_CLI_BINARY;
+    const auto verify = cli + " incident-verify " + work_.string() + " --profile=replay";
+    std::string output;
+    // The largest id parses; it selects nothing, so the replays are partial.
+    EXPECT_EQ(run_command(verify + " --op=18446744073709551615 --max-replays=5", &output), 3)
+        << output;
+    EXPECT_EQ(run_command(verify + " --op=18446744073709551616", &output), 2) << output;
+    EXPECT_EQ(run_command(verify + " --max-replays=0", &output), 2) << output;
+    // A manifest field of the wrong type refuses the bundle: exit 2, a report,
+    // and no abort.
+    edit_manifest([](JsonValue& m) {
+        m.as_object()["collector"].as_object()["collected_at"] = JsonValue{7};
+    });
+    EXPECT_EQ(run_command(verify + " --json", &output), 2) << output;
+    EXPECT_NE(output.find("collector.collected_at"), std::string::npos) << output;
 }
 
 }  // namespace

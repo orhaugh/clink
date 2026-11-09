@@ -26,8 +26,8 @@ echo "==> The replay suite"
     --gtest_output="json:${out}/sql.json" >"${out}/sql.log" 2>&1
 set -e
 python3 "${here}/scripts/check-gtest-reports.py" \
-    --expect 'IncidentBundleTest.*=27' --expect 'IncidentEpochs.*=1' \
-    --expect 'ResolutionFixture.TheRestorePointOnDisk*=1' --expect 'IncidentReplayTest.*=9' \
+    --expect 'IncidentBundleTest.*=35' --expect 'IncidentEpochs.*=1' \
+    --expect 'ResolutionFixture.TheRestorePointOnDisk*=1' --expect 'IncidentReplayTest.*=14' \
     "${out}/core.json" "${out}/sql.json"
 
 echo "==> The example, end to end"

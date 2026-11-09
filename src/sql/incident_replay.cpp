@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -32,14 +33,9 @@ using incident::Bundle;
 using incident::Check;
 using incident::Verdict;
 
-// One captured epoch the manifest lists.
-struct Entry {
-    std::uint64_t op{0};
-    std::uint64_t subtask{0};
-    std::uint64_t epoch{0};
-    std::string path;  // bundle-relative epoch file
-    bool truncated{false};
-};
+// One captured epoch, as the reader checked it against the file the replay
+// engine reads.
+using Entry = incident::CapturedEpoch;
 
 std::string entry_name(const Entry& e) {
     return "op " + std::to_string(e.op) + " subtask " + std::to_string(e.subtask) + " epoch " +
@@ -49,32 +45,6 @@ std::string entry_name(const Entry& e) {
 bool selected(const Entry& e, const IncidentReplayOptions& o) {
     return (!o.op || *o.op == e.op) && (!o.subtask || *o.subtask == e.subtask) &&
            (!o.epoch || *o.epoch == e.epoch);
-}
-
-// Every captured epoch the manifest lists whose file the bundle holds.
-std::vector<Entry> captured_entries(const Bundle& b) {
-    std::vector<Entry> out;
-    if (!b.manifest.contains("captures") || !b.manifest.at("captures").is_array()) {
-        return out;
-    }
-    for (const auto& c : b.manifest.at("captures").as_array()) {
-        if (!c.is_object()) {
-            continue;
-        }
-        Entry e;
-        e.op = static_cast<std::uint64_t>(c.int_or("op", 0));
-        e.subtask = static_cast<std::uint64_t>(c.int_or("subtask", 0));
-        e.epoch = static_cast<std::uint64_t>(c.int_or("epoch", 0));
-        e.path = c.string_or("path", "");
-        e.truncated = c.bool_or("truncated", false);
-        if (e.epoch > 0 && !e.path.empty() && b.find(e.path) != nullptr) {
-            out.push_back(std::move(e));
-        }
-    }
-    std::sort(out.begin(), out.end(), [](const Entry& x, const Entry& y) {
-        return std::tie(x.op, x.subtask, x.epoch) < std::tie(y.op, y.subtask, y.epoch);
-    });
-    return out;
 }
 
 std::string read_text(const fs::path& path) {
@@ -91,8 +61,10 @@ struct CapturedSpec {
     std::map<std::string, std::string> params;
 };
 
+// The op.json the replay engine reads for the entry's operator and subtask.
 CapturedSpec captured_spec(const Bundle& b, const Entry& e) {
-    const auto rel = (fs::path{e.path}.parent_path() / "op.json").generic_string();
+    const auto rel =
+        "capture/op-" + std::to_string(e.op) + "/subtask-" + std::to_string(e.subtask) + "/op.json";
     if (b.find(rel) == nullptr) {
         return {};
     }
@@ -120,53 +92,87 @@ bool calls_external_systems(const std::string& op_type) {
            op_type.find("predict") != std::string::npos;
 }
 
-// Where a replay of `epoch` starts: the checkpoint the epoch's events were
-// processed from (epoch_starting_checkpoint, over the bundle's RESTORED
-// record), and that checkpoint's generation directory, resolved over the
-// bundle's own markers as a restore would. Checkpoint 0 is fresh state, with
-// no directory.
-struct StartingState {
-    std::uint64_t checkpoint{0};
-    std::string dir;
+std::string external_note(const std::string& op_type) {
+    return "op type '" + op_type +
+           "' calls an external system for each record (a lookup or model inference), and "
+           "verification contacts no service";
+}
+
+// The restores the bundle records, read once for all the replays.
+struct Restores {
+    std::vector<cluster::RestoredRecord> known;
+    std::string error;  // the RESTORED record does not read
 };
 
-std::optional<StartingState> starting_state(const Bundle& b,
-                                            std::uint64_t epoch,
-                                            std::uint64_t subtask,
-                                            std::string& why) {
-    std::optional<cluster::RestoredRecord> restored;
+Restores read_restores(const Bundle& b) {
+    Restores r;
     try {
-        restored = cluster::read_restore_point(b.checkpoint_dir().string(), b.job());
+        r.known = incident::recorded_restores(b);
     } catch (const std::exception& e) {
-        why = std::string{"the bundle's RESTORED record does not read: "} + e.what();
-        return std::nullopt;
+        r.error = std::string{"the bundle's RESTORED record does not read: "} + e.what();
     }
+    return r;
+}
+
+// Where a replay of `epoch` starts (incident::epoch_start), and that
+// checkpoint's generation directory, resolved over the bundle's own markers as
+// a restore would. Checkpoint 0 is fresh state, with no directory. The
+// snapshot must be one the bundle lists: a marker's state root can name the
+// live directory the bundle was collected from.
+struct StartingState {
+    Verdict verdict{Verdict::Passed};  // Passed: replayable
+    std::uint64_t checkpoint{0};
+    std::string dir;
+    std::string why;
+};
+
+StartingState starting_state(const Bundle& b,
+                             const Restores& restores,
+                             std::uint64_t epoch,
+                             std::uint64_t subtask) {
     StartingState s;
-    s.checkpoint = incident::epoch_starting_checkpoint(
-        epoch,
-        restored.has_value() ? std::optional{restored->restore} : std::nullopt,
-        restored.has_value() ? std::optional{restored->next} : std::nullopt);
+    s.verdict = Verdict::Unavailable;
+    if (!restores.error.empty()) {
+        s.why = restores.error;
+        return s;
+    }
+    const auto start = incident::epoch_start(b, restores.known, epoch);
+    if (!start.known) {
+        s.verdict = start.unsupported ? Verdict::Unsupported : Verdict::Unavailable;
+        s.why = start.reason;
+        return s;
+    }
+    s.checkpoint = start.checkpoint;
     if (s.checkpoint == 0) {
+        s.verdict = Verdict::Passed;
         return s;
     }
     if (b.find("checkpoint/_jobs/" + std::to_string(b.job()) + "/COMPLETED-" +
                std::to_string(s.checkpoint)) == nullptr) {
-        why = "the bundle holds no COMPLETED marker for checkpoint " +
-              std::to_string(s.checkpoint) + ", the epoch's starting state";
-        return std::nullopt;
+        s.why = "the bundle holds no COMPLETED marker for checkpoint " +
+                std::to_string(s.checkpoint) + ", the epoch's starting state";
+        return s;
     }
     try {
         const auto src = cluster::resolve_restore_source(
             cluster::completed_marker_dir_for(b.checkpoint_dir().string(), b.job()).string(),
             s.checkpoint);
-        s.dir = fs::path{state_dir_for(
-                             src.state_root, src.generation, static_cast<std::uint32_t>(subtask))}
-                    .parent_path()
-                    .string();
+        const fs::path dir =
+            state_dir_for(src.state_root, src.generation, static_cast<std::uint32_t>(subtask));
+        const auto snap =
+            b.inside((dir / ("checkpoint-" + std::to_string(s.checkpoint) + ".snap")).string());
+        if (!snap.has_value() || b.find(*snap) == nullptr) {
+            s.why = "the epoch's starting snapshot (checkpoint " + std::to_string(s.checkpoint) +
+                    ", subtask " + std::to_string(subtask) +
+                    ") is not in the bundle; collect with --include-state";
+            return s;
+        }
+        s.dir = dir.parent_path().string();
     } catch (const std::exception& e) {
-        why = "checkpoint " + std::to_string(s.checkpoint) + " cannot be resolved: " + e.what();
-        return std::nullopt;
+        s.why = "checkpoint " + std::to_string(s.checkpoint) + " cannot be resolved: " + e.what();
+        return s;
     }
+    s.verdict = Verdict::Passed;
     return s;
 }
 
@@ -189,19 +195,24 @@ struct Replayed {
     Verdict verdict{Verdict::Unavailable};
     std::string note;
     std::vector<std::string> rows;  // the first run's emissions
+    bool partial{false};            // the capture held only part of the epoch
 };
 
 // EpochReplay names what it could not do; sort that into the verdicts. An
-// operator this build cannot rebuild is unsupported, evidence the bundle lacks
-// is unavailable, and anything else - an unreadable capture, an operator that
-// throws on its captured events - is a failure.
+// operator this build cannot rebuild is unsupported; evidence the bundle lacks
+// or holds unreadable is unavailable; an operator that throws on its captured
+// events is a failure.
 Verdict classify_replay_error(const std::string& what) {
     for (const char* unsupported : {"no registered factory", "replay driver", "not registered"}) {
         if (what.find(unsupported) != std::string::npos) {
             return Verdict::Unsupported;
         }
     }
-    for (const char* unavailable : {".snap under", "cannot open", "requires checkpoint_dir"}) {
+    for (const char* unavailable : {".snap under",
+                                    "cannot open",
+                                    "requires checkpoint_dir",
+                                    "not a capture file",
+                                    "malformed op.json"}) {
         if (what.find(unavailable) != std::string::npos) {
             return Verdict::Unavailable;
         }
@@ -217,22 +228,35 @@ std::size_t first_difference(const std::vector<std::string>& a, const std::vecto
     return at;
 }
 
-Replayed replay_twice(const Bundle& b, const Entry& e) {
+Replayed replay_twice(const Bundle& b, const Restores& restores, const Entry& e) {
     Replayed r;
-    if (const auto spec = captured_spec(b, e); calls_external_systems(spec.op_type)) {
-        r.verdict = Verdict::Unsupported;
-        r.note = "op type '" + spec.op_type +
-                 "' calls an external system for each record (a lookup or model inference), "
-                 "and verification contacts no service";
-        return r;
-    }
-    const auto state = starting_state(b, e.epoch, e.subtask, r.note);
-    if (!state.has_value()) {
-        r.verdict = Verdict::Unavailable;
+    const auto state = starting_state(b, restores, e.epoch, e.subtask);
+    if (state.verdict != Verdict::Passed) {
+        r.verdict = state.verdict;
+        r.note = state.why;
         return r;
     }
     try {
-        const auto replay = EpochReplay::load(replay_request(b, e.op, e.epoch, e.subtask, *state));
+        const auto replay = EpochReplay::load(replay_request(b, e.op, e.epoch, e.subtask, state));
+        const auto& info = replay.info();
+        // The operator the engine is about to build, whatever the manifest says.
+        if (calls_external_systems(info.spec.op_type)) {
+            r.verdict = Verdict::Unsupported;
+            r.note = external_note(info.spec.op_type);
+            return r;
+        }
+        // A capture whose header does not say it was truncated holds every
+        // record the header counts, unless the file was cut short.
+        if (!info.truncated && info.format_version >= 2 && info.data_count != info.records_seen) {
+            r.verdict = Verdict::Unavailable;
+            r.partial = true;
+            r.note = "the capture holds " + std::to_string(info.data_count) + " of the " +
+                     std::to_string(info.records_seen) +
+                     " records its header counts: it was cut short when it was written or "
+                     "copied, so it cannot stand for the epoch";
+            return r;
+        }
+        r.partial = info.truncated;
         r.rows = replay.run();
         const auto again = replay.run();
         if (again != r.rows) {
@@ -245,10 +269,10 @@ Replayed replay_twice(const Bundle& b, const Entry& e) {
         }
         r.verdict = Verdict::Passed;
         r.note = std::to_string(r.rows.size()) + " emissions from " +
-                 (state->checkpoint == 0 ? std::string{"fresh state"}
-                                         : "checkpoint " + std::to_string(state->checkpoint)) +
+                 (state.checkpoint == 0 ? std::string{"fresh state"}
+                                        : "checkpoint " + std::to_string(state.checkpoint)) +
                  ", identical twice";
-        if (replay.info().truncated) {
+        if (info.truncated) {
             r.note += "; the capture was truncated, so this covers its stored prefix only";
         }
     } catch (const std::exception& ex) {
@@ -323,32 +347,38 @@ const cluster::OperatorSpec* sole_consumer(const cluster::JobGraphSpec& graph,
     return consumers.front();
 }
 
-// The rows production handed the operator's sole consumer in the same epoch,
-// read from that consumer's own capture and rendered as the replay renders
-// its emissions. Sets `why` and returns nullopt when the bundle and the
-// topology do not make that the same stream.
-std::optional<std::vector<std::string>> recorded_downstream(
-    const Bundle& b,
-    const Entry& e,
-    const std::vector<Entry>& all,
-    const std::optional<cluster::JobGraphSpec>& graph,
-    std::string& why) {
+// What production handed the operator's sole consumer in the same epoch, read
+// from that consumer's own capture and rendered as the replay renders its
+// emissions. Without rows, `verdict` says why: unsupported where the topology
+// does not make the two one stream, unavailable where evidence is missing.
+struct Recorded {
+    std::optional<std::vector<std::string>> rows;
+    Verdict verdict{Verdict::Unavailable};
+    std::string why;
+};
+
+Recorded recorded_downstream(const Bundle& b,
+                             const Entry& e,
+                             const std::vector<Entry>& all,
+                             const std::optional<cluster::JobGraphSpec>& graph) {
+    Recorded r;
     if (e.truncated) {
-        why = "the operator's capture was truncated, so it cannot stand for the whole epoch";
-        return std::nullopt;
+        r.why = "the operator's capture was truncated, so it cannot stand for the whole epoch";
+        return r;
     }
     if (!graph.has_value()) {
-        why = "the bundle holds no job graph to find the operator's downstream operator";
-        return std::nullopt;
+        r.why = "the bundle holds no job graph to find the operator's downstream operator";
+        return r;
     }
     const auto* self = graph_op_of(*graph, captured_spec(b, e));
     if (self == nullptr) {
-        why = "the capture's op.json does not name exactly one operator of the job graph";
-        return std::nullopt;
+        r.why = "the capture's op.json does not name exactly one operator of the job graph";
+        return r;
     }
-    const auto* down = sole_consumer(*graph, *self, why);
+    const auto* down = sole_consumer(*graph, *self, r.why);
     if (down == nullptr) {
-        return std::nullopt;
+        r.verdict = Verdict::Unsupported;
+        return r;
     }
     std::vector<const Entry*> found;
     for (const auto& c : all) {
@@ -356,22 +386,31 @@ std::optional<std::vector<std::string>> recorded_downstream(
             found.push_back(&c);
         }
     }
+    const bool terminal = std::none_of(graph->ops.begin(), graph->ops.end(), [&](const auto& op) {
+        return std::find(op.inputs.begin(), op.inputs.end(), down->id) != op.inputs.end();
+    });
+    if (found.empty() && terminal) {
+        r.verdict = Verdict::Unsupported;
+        r.why = "its consumer ('" + down->id +
+                "') is a sink, whose input the flight recorder does not capture";
+        return r;
+    }
     if (found.size() != 1) {
-        why = "the downstream operator ('" + down->id + "') has " +
-              (found.empty() ? std::string{"no capture"} : std::string{"several captures"}) +
-              " of this epoch in the bundle";
-        return std::nullopt;
+        r.why = "the downstream operator ('" + down->id + "') has " +
+                (found.empty() ? std::string{"no capture"} : std::string{"several captures"}) +
+                " of this epoch in the bundle";
+        return r;
     }
     if (found.front()->truncated) {
-        why = "the downstream operator's capture was truncated";
-        return std::nullopt;
+        r.why = "the downstream operator's capture was truncated";
+        return r;
     }
     const auto bytes = read_text(b.root / found.front()->path);
     const auto parsed =
         capture::read_capture_events(std::as_bytes(std::span{bytes}), row_json_codec());
     if (!parsed.has_value()) {
-        why = "the downstream operator's capture does not read";
-        return std::nullopt;
+        r.why = "the downstream operator's capture does not read";
+        return r;
     }
     std::vector<std::string> rows;
     for (const auto& ev : parsed->second) {
@@ -379,7 +418,14 @@ std::optional<std::vector<std::string>> recorded_downstream(
             rows.push_back(format_replay_row(rec->value()));
         }
     }
-    return rows;
+    if (parsed->first.version >= 2 && rows.size() != parsed->first.records_seen) {
+        r.why = "the downstream operator's capture holds " + std::to_string(rows.size()) +
+                " of the " + std::to_string(parsed->first.records_seen) +
+                " records its header counts: it was cut short";
+        return r;
+    }
+    r.rows = std::move(rows);
+    return r;
 }
 
 // A row as format_replay_row renders it, or an oracle's JSON object, in one
@@ -475,28 +521,38 @@ void conclude_recorded(Check& c, const Tally& t, std::size_t reordered) {
             "the replay does not reproduce production for these epochs: compare with "
             "clink replay --out and clink replay-diff, and check the build is the "
             "job's";
-    } else if (t.passed == 0) {
+        return;
+    }
+    if (t.unavailable > 0) {
         c.verdict = Verdict::Unavailable;
-        c.reason =
-            "no replayed epoch had its production output captured in a form that can be "
-            "compared";
+        c.reason = std::to_string(t.unavailable) +
+                   " selected epoch(s) could not be compared for want of evidence (listed); " +
+                   std::to_string(t.passed) + " equal what production did";
         c.next_action =
-            "collect the downstream operator's capture too (no --ops filter), from a "
-            "job whose compared operators run at parallelism 1, with untruncated "
-            "epochs";
-    } else {
-        c.verdict = Verdict::Passed;
-        c.reason = std::to_string(t.passed) +
-                   " replayed epoch(s) equal, row for row, what production handed the "
-                   "downstream operator";
-        if (reordered > 0) {
-            c.reason += "; in " + std::to_string(reordered) +
-                        " of them rows of different keys came in another order, which the "
-                        "engine does not fix, and each key's own rows in the same order";
-        }
-        if (t.unavailable > 0) {
-            c.reason += "; " + std::to_string(t.unavailable) + " were not compared (listed)";
-        }
+            "collect the downstream operators' captures too (no --op filter), untruncated, "
+            "with the job manifest (--ha-dir) and each epoch's starting state";
+        return;
+    }
+    if (t.passed == 0) {
+        c.verdict = Verdict::Unsupported;
+        c.reason =
+            "no selected epoch's operator feeds a captured operator as one stream, so "
+            "nothing could be compared with production";
+        c.next_action = "select an operator whose sole consumer is captured, at parallelism 1";
+        return;
+    }
+    c.verdict = Verdict::Passed;
+    c.reason = std::to_string(t.passed) +
+               " replayed epoch(s) equal, row for row, what production handed the "
+               "downstream operator";
+    if (reordered > 0) {
+        c.reason += "; in " + std::to_string(reordered) +
+                    " of them rows of different keys came in another order, which the "
+                    "engine does not fix, and each key's own rows in the same order";
+    }
+    if (t.unsupported > 0) {
+        c.reason +=
+            "; " + std::to_string(t.unsupported) + " cannot be compared by their topology (listed)";
     }
 }
 
@@ -565,13 +621,13 @@ void compare_with_recorded(Check& c,
                            const Entry& e,
                            const CapturedSpec& spec,
                            const std::vector<std::string>& replayed,
-                           const std::optional<std::vector<std::string>>& recorded,
-                           const std::string& why) {
-    if (!recorded.has_value()) {
-        t.add(Verdict::Unavailable);
-        c.details.push_back(entry_name(e) + ": not compared - " + why);
+                           const Recorded& found) {
+    if (!found.rows.has_value()) {
+        t.add(found.verdict);
+        c.details.push_back(entry_name(e) + ": not compared - " + found.why);
         return;
     }
+    const auto& recorded = found.rows;
     c.evidence.push_back(e.path);
     if (*recorded == replayed) {
         t.add(Verdict::Passed);
@@ -630,7 +686,7 @@ void compare_with_recorded(Check& c,
 // starting state, against an independent expectation of their emissions. An
 // expectation need not know which epoch a row fell in, nor the order within
 // one, so the comparison is of multisets.
-Check expected_check(const Bundle& b,
+Check expected_check(const Restores& restores,
                      const std::string& path,
                      const std::vector<std::pair<Entry, Replayed>>& runs) {
     Check c{.id = "replay.expected_output",
@@ -644,18 +700,15 @@ Check expected_check(const Bundle& b,
         c.next_action = "select an operator with --op, and its epochs with --epoch or none";
         return c;
     }
-    // An epoch the RESTORED record passes over belongs to a run whose work the
+    // An epoch a recorded restore passes over belongs to a run whose work the
     // restore discarded: its events were processed again in the restored run's
     // first epoch, so counting both would count them twice.
-    std::optional<cluster::RestoredRecord> restored;
-    try {
-        restored = cluster::read_restore_point(b.checkpoint_dir().string(), b.job());
-    } catch (const std::exception& e) {
-        c.reason = std::string{"the bundle's RESTORED record does not read: "} + e.what();
+    if (!restores.error.empty()) {
+        c.reason = restores.error;
         return c;
     }
     const auto discarded = [&](const Entry& e) {
-        return restored.has_value() && restored->passes_over(e.epoch);
+        return incident::epoch_discarded(restores.known, e.epoch);
     };
     for (const auto& [entry, run] : runs) {
         if (entry.op != runs.front().first.op || entry.subtask != runs.front().first.subtask) {
@@ -675,6 +728,17 @@ Check expected_check(const Bundle& b,
         if (run.verdict != Verdict::Passed) {
             c.reason = entry_name(entry) + " did not replay: " + run.note;
             c.next_action = "see replay.determinism";
+            return c;
+        }
+        // A union with part of an epoch missing is not what an expectation
+        // of the whole describes.
+        if (run.partial) {
+            c.reason = entry_name(entry) +
+                       "'s capture holds only part of the epoch, so the selection's rows "
+                       "cannot be compared with an expectation of all of them";
+            c.next_action =
+                "run the job with a --capture-records past the epoch's records, or "
+                "compare an expectation of the part";
             return c;
         }
     }
@@ -748,7 +812,8 @@ Check replay_check(const char* id) {
 std::vector<Check> incident_replay_checks(const Bundle& b, const IncidentReplayOptions& o) {
     auto det = replay_check("replay.determinism");
     auto rec = replay_check("replay.recorded_output");
-    const auto all = captured_entries(b);
+    const auto& all = b.captures;
+    const auto restores = read_restores(b);
     std::vector<Entry> chosen;
     std::copy_if(all.begin(), all.end(), std::back_inserter(chosen), [&](const Entry& e) {
         return selected(e, o);
@@ -772,7 +837,7 @@ std::vector<Check> incident_replay_checks(const Bundle& b, const IncidentReplayO
         rec.next_action = det.next_action;
         std::vector<Check> out{det, rec};
         if (!o.expected_path.empty()) {
-            out.push_back(expected_check(b, o.expected_path, {}));
+            out.push_back(expected_check(restores, o.expected_path, {}));
         }
         return out;
     }
@@ -784,18 +849,30 @@ std::vector<Check> incident_replay_checks(const Bundle& b, const IncidentReplayO
     std::vector<std::pair<Entry, Replayed>> runs;
     for (const auto& e : chosen) {
         det.evidence.push_back(e.path);
-        auto r = replay_twice(b, e);
+        auto r = replay_twice(b, restores, e);
         det_tally.add(r.verdict);
         det.details.push_back(entry_name(e) + ": " + incident::to_string(r.verdict) + " - " +
                               r.note);
-        if (r.verdict == Verdict::Passed) {
-            std::string why;
-            const auto recorded = recorded_downstream(b, e, all, graph, why);
-            compare_with_recorded(
-                rec, rec_tally, reordered, e, captured_spec(b, e), r.rows, recorded, why);
+        if (r.verdict == Verdict::Passed && !r.partial) {
+            compare_with_recorded(rec,
+                                  rec_tally,
+                                  reordered,
+                                  e,
+                                  captured_spec(b, e),
+                                  r.rows,
+                                  recorded_downstream(b, e, all, graph));
         } else {
-            rec_tally.add(Verdict::Unavailable);
-            rec.details.push_back(entry_name(e) + ": not compared - the replay did not pass");
+            // What kept the replay from passing keeps the comparison from
+            // being made: an operator this build cannot replay cannot be
+            // compared either, and a replay without its evidence, or with part
+            // of it, has nothing to compare.
+            rec_tally.add(r.verdict == Verdict::Unsupported ? Verdict::Unsupported
+                                                            : Verdict::Unavailable);
+            rec.details.push_back(entry_name(e) + ": not compared - " +
+                                  (r.verdict == Verdict::Passed
+                                       ? std::string{"the capture was truncated, so it holds "
+                                                     "only part of the epoch"}
+                                       : "the replay did not pass"));
         }
         runs.emplace_back(e, std::move(r));
     }
@@ -812,11 +889,10 @@ std::vector<Check> incident_replay_checks(const Bundle& b, const IncidentReplayO
                          " epochs, more than the " + std::to_string(runs.size()) +
                          " one run replays, so their union cannot be compared";
             exp.next_action =
-                "narrow the selection with --epoch, or compare part of it with an "
-                "expectation of that part";
+                "narrow the selection with --epoch, or raise --max-replays to cover it";
             out.push_back(exp);
         } else {
-            out.push_back(expected_check(b, o.expected_path, runs));
+            out.push_back(expected_check(restores, o.expected_path, runs));
         }
     }
     return out;
@@ -827,27 +903,61 @@ std::size_t incident_regress(const Bundle& b,
                              std::uint64_t epoch,
                              std::optional<std::uint64_t> subtask,
                              const std::string& out_dir) {
-    for (const auto& e : captured_entries(b)) {
-        if (e.op == op && e.epoch == epoch && (!subtask || *subtask == e.subtask)) {
-            if (const auto spec = captured_spec(b, e); calls_external_systems(spec.op_type)) {
-                throw std::runtime_error("op type '" + spec.op_type +
-                                         "' calls an external system for each record, so its "
-                                         "replay is not a self-contained regression test");
+    // The subtask, from the bundle's captures when it is not named: its
+    // starting snapshot is that subtask's.
+    if (!subtask.has_value()) {
+        std::set<std::uint64_t> subtasks;
+        for (const auto& e : b.captures) {
+            if (e.op == op && e.epoch == epoch) {
+                subtasks.insert(e.subtask);
             }
         }
+        if (subtasks.size() != 1) {
+            throw std::runtime_error(
+                subtasks.empty()
+                    ? "the bundle holds no capture of op " + std::to_string(op) + " epoch " +
+                          std::to_string(epoch)
+                    : "op " + std::to_string(op) + " epoch " + std::to_string(epoch) +
+                          " was captured on several subtasks; name one with --subtask");
+        }
+        subtask = *subtasks.begin();
     }
-    std::string why;
-    const auto state = starting_state(b, epoch, subtask.value_or(0), why);
-    if (!state.has_value()) {
-        throw std::runtime_error(why);
+    const auto restores = read_restores(b);
+    const auto state = starting_state(b, restores, epoch, *subtask);
+    if (state.verdict != Verdict::Passed) {
+        throw std::runtime_error(state.why);
     }
-    const auto req = replay_request(b, op, epoch, subtask, *state);
-    const auto n = emit_replay_regression(req, out_dir);
-    if (const auto failure = run_replay_regression(out_dir); !failure.empty()) {
-        throw std::runtime_error("the emitted regression bundle does not pass on this build: " +
-                                 failure);
+    const auto req = replay_request(b, op, epoch, subtask, state);
+    {
+        // The operator the engine would build, before anything is built.
+        const auto replay = EpochReplay::load(req);
+        if (calls_external_systems(replay.info().spec.op_type)) {
+            throw std::runtime_error(external_note(replay.info().spec.op_type) +
+                                     ", so its replay is not a self-contained regression test");
+        }
+        const auto& info = replay.info();
+        if (info.truncated || (info.format_version >= 2 && info.data_count != info.records_seen)) {
+            throw std::runtime_error(
+                "the epoch's capture holds only part of the epoch, so a "
+                "regression test of it would freeze a part");
+        }
     }
-    return n;
+    std::error_code ec;
+    const bool existed = std::filesystem::exists(out_dir, ec);
+    try {
+        const auto n = emit_replay_regression(req, out_dir);
+        if (const auto failure = run_replay_regression(out_dir); !failure.empty()) {
+            throw std::runtime_error("the emitted regression bundle does not pass on this build: " +
+                                     failure);
+        }
+        return n;
+    } catch (...) {
+        // Nothing that would not pass is left behind.
+        if (!existed) {
+            std::filesystem::remove_all(out_dir, ec);
+        }
+        throw;
+    }
 }
 
 }  // namespace clink::sql

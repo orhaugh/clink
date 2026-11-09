@@ -301,6 +301,38 @@ PY
     note "exit 1: $(grep -m1 'DIVERGES' "${R}/verify-bad-trace.txt" | sed 's/^ *- formal-check: *//' | cut -c1-160)"
 fi
 
+if [ "${conformance}" = passed ]; then
+    say "A run the specification does not model is unsupported, not passed"
+    # The same bundle with a rescale traced, which the specification does not
+    # model: the validator skips the run, and a skip is not acceptance.
+    cp -R "${B}" "${WORK}/elsewhere/incident-1-rescaled"
+    python3 - "${WORK}/elsewhere/incident-1-rescaled" <<'PY'
+import glob, hashlib, json, os, sys
+b = sys.argv[1]
+f = glob.glob(os.path.join(b, "traces", "coordinator-*.ndjson"))[0]
+lines = open(f).read().splitlines()
+last = json.loads(lines[-1])
+lines.append(json.dumps({"seq": last["seq"] + 1, "ts": last["ts"] + 1, "proc": last["proc"],
+                         "event": "Rescale", "job": 1}, separators=(",", ":")))
+open(f, "w").write("\n".join(lines) + "\n")
+m = json.load(open(os.path.join(b, "manifest.json")))
+for a in m["artifacts"]:
+    if a["path"] == os.path.relpath(f, b):
+        data = open(f, "rb").read()
+        a["bytes"], a["sha256"] = len(data), hashlib.sha256(data).hexdigest()
+json.dump(m, open(os.path.join(b, "manifest.json"), "w"), indent=2)
+PY
+    set +e
+    offline "${BIN}/clink" incident-verify "${WORK}/elsewhere/incident-1-rescaled" --profile=full \
+        --formal-dir="${HERE}/../../formal" --report="${R}/verify-rescaled.json" \
+        >"${R}/verify-rescaled.txt" 2>&1
+    code=$?
+    set -e
+    [ "${code}" = 3 ] && [ "$(verdict "${R}/verify-rescaled.json" protocol.conformance)" = unsupported ] ||
+        fail "a run outside the specification was not reported unsupported (exit ${code})"
+    note "exit 3: protocol.conformance unsupported, the validator having checked nothing"
+fi
+
 say "Freezing the restored run's first epoch (${next}) as a regression test"
 "${BIN}/clink" incident-regress "${B}" --op="${window_op}" --epoch="${next}" \
     --out="${WORK}/regression" | tee -a "${R}/summary.txt"

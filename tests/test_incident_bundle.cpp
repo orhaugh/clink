@@ -656,6 +656,188 @@ TEST_F(IncidentBundleTest, WithoutTheValidatorsToolsConformanceIsUnavailableAndN
 
 // ---- replay's starting state -----------------------------------------------------
 
+// ---- the review's findings ------------------------------------------------------
+
+TEST_F(IncidentBundleTest, OnlyTheEvidenceDirectoriesAreScannedAndAListingErrorIsAProblem) {
+    write_checkpoint(1);
+    const auto r = collect(options());
+    // A report written beside the manifest, and the metadata macOS leaves in a
+    // directory it shows, are not evidence and fail nothing.
+    spill(r.bundle / "report.json", "{}");
+    spill(r.bundle / ".DS_Store", "x");
+    spill(r.bundle / "checkpoint" / ".DS_Store", "x");
+    spill(r.bundle / "checkpoint" / "._COMPLETED-1", "x");
+    EXPECT_EQ(verdict_of(verify(r.bundle), "bundle.artifacts"), Verdict::Passed)
+        << reason_of(verify(r.bundle), "bundle.artifacts");
+    // A directory that cannot be listed is not a clean one.
+    const auto hidden = r.bundle / "capture" / "sealed";
+    fs::create_directories(hidden);
+    spill(hidden / "epoch-1.cap", "unlisted");
+    fs::permissions(hidden, fs::perms::none);
+    const auto checks = verify(r.bundle);
+    fs::permissions(hidden, fs::perms::owner_all);
+    EXPECT_EQ(verdict_of(checks, "bundle.artifacts"), Verdict::Failed);
+    EXPECT_NE(reason_of(checks, "bundle.artifacts").find("cannot be listed"), std::string::npos)
+        << reason_of(checks, "bundle.artifacts");
+}
+
+TEST_F(IncidentBundleTest, AListedFileThatCannotBeReadFailsIntegrityInsteadOfEndingTheRun) {
+    write_checkpoint(1);
+    const auto r = collect(options());
+    const auto marker =
+        r.bundle / "checkpoint" / "_jobs" / std::to_string(kIncidentJob) / "COMPLETED-1";
+    fs::permissions(marker, fs::perms::none);
+    std::vector<Check> checks;
+    EXPECT_NO_THROW(checks = verify(r.bundle));
+    fs::permissions(marker, fs::perms::owner_read | fs::perms::owner_write);
+    EXPECT_EQ(verdict_of(checks, "bundle.artifacts"), Verdict::Failed);
+}
+
+TEST_F(IncidentBundleTest, MalformedManifestFieldsAreRefusedRatherThanFatal) {
+    write_checkpoint(1);
+    (void)collect(options());
+    const auto b = root / "bundle";
+    const auto refused = [&](const std::function<void(JsonValue&)>& f, const char* what) {
+        const auto copy = root / ("copy-" + std::string{what});
+        fs::copy(b, copy, fs::copy_options::recursive);
+        edit_manifest(copy, f);
+        EXPECT_THROW((void)read_bundle(copy), BundleRefused) << what;
+    };
+    refused(
+        [](JsonValue& m) { m.as_object()["collector"].as_object()["collected_at"] = JsonValue{7}; },
+        "numeric-time");
+    refused([](JsonValue& m) { m.as_object()["selection"].as_object().erase("engine_choice"); },
+            "no-engine-choice");
+    refused(
+        [](JsonValue& m) {
+            m.as_object()["job"].as_object()["commit_confirmation"] = JsonValue{"yes"};
+        },
+        "text-confirmation");
+    refused(
+        [](JsonValue& m) {
+            m.as_object()["selection"].as_object()["participants"] = JsonValue{"0,1"};
+        },
+        "text-participants");
+    // An artifact outside the evidence directories.
+    refused(
+        [](JsonValue& m) {
+            m.as_object()["artifacts"].as_array().front().as_object()["path"] =
+                JsonValue{"notes.txt"};
+        },
+        "outside-evidence");
+}
+
+TEST_F(IncidentBundleTest, ACapturedEpochMustBeTheFileTheReplayReads) {
+    write_checkpoint(1);
+    const auto cap = root / "capture";
+    for (const char* op : {"op-11", "op-22"}) {
+        spill(cap / op / "subtask-0" / "op.json", R"({"op_type":"identity_row"})");
+        spill(cap / op / "subtask-0" / "epoch-1.cap", std::string(32, 'c'));
+    }
+    auto o = options();
+    o.capture_dir = cap.string();
+    o.include_captures = true;
+    const auto r = collect(o);
+    // Operator ids are text in the manifest: they use all 64 bits.
+    const auto manifest = clink::config::parse(slurp(r.bundle / "manifest.json"));
+    ASSERT_FALSE(manifest.at("captures").as_array().empty());
+    EXPECT_TRUE(manifest.at("captures").as_array().front().at("op").is_string());
+    EXPECT_EQ(read_bundle(r.bundle).captures.size(), 2u);
+    // An entry naming one operator's file as another's is refused: the replay
+    // would read one file while the manifest vouched for the other.
+    edit_manifest(r.bundle, [](JsonValue& m) {
+        m.as_object()["captures"].as_array().front().as_object()["op"] = JsonValue{"22"};
+    });
+    EXPECT_THROW((void)read_bundle(r.bundle), BundleRefused);
+}
+
+TEST_F(IncidentBundleTest, AStateRootThatIsAUriIsOutsideTheBundleWhereverItIsReadFrom) {
+    write_marker(
+        "COMPLETED-1",
+        clink::cluster::completed_marker_body(kIncidentJob, 1, 1, {0}, "rocksdb://_state/7"));
+    auto o = options();
+    o.checkpoint = 1;
+    const auto r = collect(o);
+    const auto outside = verdict_of(verify(r.bundle), "checkpoint.participants");
+    const auto here = fs::current_path();
+    fs::current_path(r.bundle);
+    const auto within = verdict_of(verify(r.bundle), "checkpoint.participants");
+    fs::current_path(here);
+    EXPECT_EQ(outside, Verdict::Unsupported);
+    EXPECT_EQ(within, outside) << "the verdict must not depend on the working directory";
+}
+
+TEST_F(IncidentBundleTest, AMarkerWritersTemporaryFileIsNotCollectedAsAMarker) {
+    write_checkpoint(1);
+    write_marker("COMPLETED-9.tmp.1.0", "job=7\ncheckpoint=9\n");
+    const auto r = collect(options());
+    EXPECT_FALSE(fs::exists(r.bundle / "checkpoint" / "_jobs" / std::to_string(kIncidentJob) /
+                            "COMPLETED-9.tmp.1.0"));
+    EXPECT_EQ(verdict_of(verify(r.bundle), "checkpoint.restore_rule"), Verdict::Passed);
+}
+
+TEST_F(IncidentBundleTest, TheDefaultCaptureWindowHoldsTheRestoredRunsFirstEpoch) {
+    write_checkpoint(1);
+    // A run restored from 1 numbers from 5: its first epoch is 5, not 2.
+    ASSERT_TRUE(clink::cluster::record_restore_point(
+        ckpt.string(), kIncidentJob, 1, {.restore = 1, .next = 5}));
+    const auto cap = root / "capture" / "op-3" / "subtask-0";
+    spill(cap / "op.json", R"({"op_type":"identity_row"})");
+    for (int e : {1, 2, 5, 6}) {
+        spill(cap / ("epoch-" + std::to_string(e) + ".cap"), std::string(32, 'c'));
+    }
+    auto o = options();
+    o.capture_dir = (root / "capture").string();
+    o.include_captures = true;
+    o.out = (root / "bundle/").string();  // a trailing separator publishes the same bundle
+    const auto r = collect(o);
+    EXPECT_EQ(r.bundle.filename(), "bundle");
+    EXPECT_TRUE(leftovers().empty());
+    std::set<std::uint64_t> epochs;
+    for (const auto& c : read_bundle(r.bundle).captures) {
+        epochs.insert(c.epoch);
+    }
+    EXPECT_EQ(epochs, (std::set<std::uint64_t>{1, 2, 5}));
+}
+
+TEST_F(IncidentBundleTest, AnEpochsStartIsKnownOnlyWhereTheRestoresAllowIt) {
+    write_checkpoint(1);
+    write_checkpoint(2);
+    write_checkpoint(3);
+    write_marker("CONFIRMED-1", "");
+    write_marker("CONFIRMED-3", "");
+    ASSERT_TRUE(clink::cluster::record_restore_point(
+        ckpt.string(), kIncidentJob, 1, {.restore = 3, .next = 6}));
+    const auto traces = root / "traces";
+    // An earlier restore the RESTORED record no longer names, in the traces.
+    spill(
+        traces / "coordinator-1.ndjson",
+        R"({"seq":1,"ts":1,"proc":"coordinator-1","event":"Redeploy","job":7,"restore":1,"next":3})"
+        "\n"
+        R"({"seq":2,"ts":2,"proc":"coordinator-1","event":"Redeploy","job":8,"restore":0,"next":4})"
+        "\n");
+    auto o = options();
+    o.commit_confirmation = true;
+    o.trace_dir = traces.string();
+    const auto r = collect(o);
+    const auto b = read_bundle(r.bundle);
+    const auto restores = recorded_restores(b);
+    ASSERT_EQ(restores.size(), 2u) << "the record and this job's traced redeploy, not job 8's";
+    EXPECT_TRUE(epoch_start(b, restores, 6).known);
+    EXPECT_EQ(epoch_start(b, restores, 6).checkpoint, 3u) << "the newest run's first epoch";
+    EXPECT_EQ(epoch_start(b, restores, 3).checkpoint, 1u) << "the traced run's first epoch";
+    EXPECT_EQ(epoch_start(b, restores, 7).checkpoint, 6u);
+    EXPECT_EQ(epoch_start(b, restores, 2).checkpoint, 1u) << "checkpoint 1 was confirmed";
+    EXPECT_EQ(epoch_start(b, restores, 4).checkpoint, 3u)
+        << "checkpoint 3 was confirmed, so whichever run processed epoch 4 started there";
+    EXPECT_FALSE(epoch_start(b, restores, 5).known)
+        << "before the newest restore, after an unconfirmed checkpoint: a run the bundle does "
+           "not record may have started there";
+    EXPECT_TRUE(epoch_discarded(restores, 4));
+    EXPECT_TRUE(epoch_discarded(restores, 5));
+    EXPECT_FALSE(epoch_discarded(restores, 6));
+}
+
 TEST(IncidentEpochs, ARestoredRunsFirstEpochStartsWhereThatRunRestored) {
     // A run restored from checkpoint 3 numbers from 6: its first epoch, 6,
     // holds the events after checkpoint 3, so it starts there. Every other

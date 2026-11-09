@@ -16,6 +16,7 @@
 // read. incident-collect and incident-regress exit 0 when done, 1 when they
 // refuse, and 2 on bad usage.
 
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -27,6 +28,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -92,11 +94,14 @@ Args parse_args(int argc,
     return a;
 }
 
+// A whole number up to 2^64 - 1: operator ids use all 64 bits.
 std::optional<std::uint64_t> parse_u64(const std::string& s) {
-    if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos || s.size() > 19) {
+    std::uint64_t out = 0;
+    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+    if (s.empty() || ec != std::errc{} || end != s.data() + s.size()) {
         return std::nullopt;
     }
-    return std::stoull(s);
+    return out;
 }
 
 void collect_usage() {
@@ -321,7 +326,8 @@ int clink_cmd_incident_verify(int argc, char** argv) {
                                "epoch",
                                "formal-dir",
                                "formal-tools-dir",
-                               "report"},
+                               "report",
+                               "max-replays"},
                               {"json", "help"});
     if (a.switches.contains("help")) {
         verify_usage();
@@ -386,30 +392,37 @@ int clink_cmd_incident_verify(int argc, char** argv) {
         print_report(report, json, a.get("report"));
         return 2;
     }
-    report.checks = verify_core(bundle, o);
-    if (o.profile == "replay" || o.profile == "full") {
-        bool intact = false;
-        for (const auto& c : report.checks) {
-            intact = intact || (c.id == "bundle.artifacts" && c.verdict == Verdict::Passed);
-        }
-        if (intact) {
-            for (auto& c :
-                 clink_incident_replay_checks(bundle, op, subtask, epoch, expected, max_replays)) {
-                report.checks.push_back(std::move(c));
+    try {
+        report.checks = verify_core(bundle, o);
+        if (o.profile == "replay" || o.profile == "full") {
+            bool intact = false;
+            for (const auto& c : report.checks) {
+                intact = intact || (c.id == "bundle.artifacts" && c.verdict == Verdict::Passed);
             }
-        } else {
-            for (const auto& id : required) {
-                if (id.starts_with("replay.")) {
-                    report.checks.push_back(Check{
-                        .id = id,
-                        .verdict = Verdict::Unavailable,
-                        .evidence = {},
-                        .reason = "the bundle's artifacts are not intact, so nothing is replayed",
-                        .next_action = "see bundle.artifacts",
-                        .details = {}});
+            if (intact) {
+                for (auto& c : clink_incident_replay_checks(
+                         bundle, op, subtask, epoch, expected, max_replays)) {
+                    report.checks.push_back(std::move(c));
+                }
+            } else {
+                for (const auto& id : required) {
+                    if (id.starts_with("replay.")) {
+                        report.checks.push_back(Check{
+                            .id = id,
+                            .verdict = Verdict::Unavailable,
+                            .evidence = {},
+                            .reason =
+                                "the bundle's artifacts are not intact, so nothing is replayed",
+                            .next_action = "see bundle.artifacts",
+                            .details = {}});
+                    }
                 }
             }
         }
+    } catch (const std::exception& e) {
+        // The checks report what they find; this is anything they did not foresee.
+        std::cerr << "incident-verify: " << e.what() << "\n";
+        return 2;
     }
     print_report(report, json, a.get("report"));
     return report.exit_code();

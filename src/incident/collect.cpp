@@ -108,6 +108,24 @@ private:
     bool have_captures_{false};
 };
 
+// A state root as a canonical local path, or nullopt for one in a store a
+// URI names (s3://, rocksdb://, ...), which is never inside the checkpoint
+// directory whatever the working directory.
+std::optional<std::string> local_path(const std::string& root) {
+    std::string_view p = root;
+    if (p.starts_with("file://")) {
+        p.remove_prefix(7);
+    } else if (p.find("://") != std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::error_code ec;
+    const auto canon = fs::weakly_canonical(fs::path{std::string{p}}, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return canon.string();
+}
+
 std::string utc_now() {
     const auto t = std::time(nullptr);
     std::tm tm{};
@@ -354,11 +372,20 @@ void Collector::collect_job_manifest() {
 void Collector::collect_checkpoint() {
     const auto marker_dir = cluster::completed_marker_dir_for(o_.checkpoint_dir, o_.job);
     const auto markers = list_markers();
-    // Every marker of the job: the restore rule is recomputed over them.
+    // Every marker of the job: the restore rule is recomputed over them. A
+    // marker is its prefix and a checkpoint id and nothing else, as the
+    // engine's scans read them; a writer's temporary file is not one.
+    const auto is_marker = [](const std::string& name) {
+        for (const std::string_view prefix : {"COMPLETED-", "CONFIRMED-"}) {
+            if (name.size() > prefix.size() && name.starts_with(prefix) &&
+                name.find_first_not_of("0123456789", prefix.size()) == std::string::npos) {
+                return true;
+            }
+        }
+        return name == "RESTORED";
+    };
     for (const auto& name : markers) {
-        const bool marker = name.rfind("COMPLETED-", 0) == 0 || name.rfind("CONFIRMED-", 0) == 0 ||
-                            name == "RESTORED";
-        if (!marker) {
+        if (!is_marker(name)) {
             continue;
         }
         const auto role = name == "RESTORED"                 ? "restored_record"
@@ -378,8 +405,9 @@ void Collector::collect_checkpoint() {
     }
     std::error_code ec;
     const auto ckpt_canon = fs::weakly_canonical(o_.checkpoint_dir, ec).string() + "/";
-    const auto root_canon = fs::weakly_canonical(source_.state_root, ec).string();
-    state_in_checkpoint_dir_ = !source_.legacy && root_canon.rfind(ckpt_canon, 0) == 0;
+    const auto root_canon = local_path(source_.state_root);
+    state_in_checkpoint_dir_ =
+        !source_.legacy && root_canon.has_value() && root_canon->rfind(ckpt_canon, 0) == 0;
     if (!state_in_checkpoint_dir_) {
         absent("snapshot",
                source_.state_root,
@@ -390,7 +418,7 @@ void Collector::collect_checkpoint() {
                      "not collect");
         return;
     }
-    state_rel_ = "checkpoint/" + root_canon.substr(ckpt_canon.size());
+    state_rel_ = "checkpoint/" + root_canon->substr(ckpt_canon.size());
     if (!source_.participants.has_value()) {
         absent("snapshot",
                state_rel_,
@@ -413,12 +441,12 @@ void Collector::collect_checkpoint() {
         }
         if (fs::exists(dir / name, ec)) {
             copy(dir / name, rel, "snapshot", true);
-        } else if (fs::exists(dir / ("checkpoint-" + std::to_string(checkpoint_)), ec)) {
+        } else {
             absent("snapshot",
                    rel,
-                   "an SST checkpoint directory, which this release does not collect");
-        } else {
-            absent("snapshot", rel, "not present in the job's state directory");
+                   "no Arrow snapshot in the participant's state directory: its state is in "
+                   "another backend's format (a RocksDB checkpoint, for one), which this "
+                   "release does not collect, or it is missing");
         }
     }
 }
@@ -430,9 +458,27 @@ void Collector::collect_captures() {
         return;
     }
     // The epochs around the restore point by default: the one that ended at
-    // it, and the one after it, which a restarted run records.
-    const auto first = o_.epochs ? o_.epochs->first : (checkpoint_ == 0 ? 1 : checkpoint_);
-    const auto last = o_.epochs ? o_.epochs->second : checkpoint_ + 1;
+    // it, the one after it, and, when the job's newest restore was from it,
+    // that run's first epoch, which numbers from the RESTORED record's next.
+    std::set<std::uint64_t> chosen_epochs;
+    if (!o_.epochs.has_value()) {
+        chosen_epochs = {std::max<std::uint64_t>(checkpoint_, 1), checkpoint_ + 1};
+        if (restored_.has_value() && restored_->restore == checkpoint_) {
+            chosen_epochs.insert(restored_->next);
+        }
+    }
+    const auto wanted = [&](std::uint64_t epoch) {
+        return o_.epochs ? (epoch >= o_.epochs->first && epoch <= o_.epochs->second)
+                         : chosen_epochs.contains(epoch);
+    };
+    std::string selection_text;
+    if (o_.epochs) {
+        selection_text = std::to_string(o_.epochs->first) + "-" + std::to_string(o_.epochs->second);
+    } else {
+        for (const auto e : chosen_epochs) {
+            selection_text += (selection_text.empty() ? "" : ", ") + std::to_string(e);
+        }
+    }
     std::map<std::string, std::uint64_t> outside;  // op/subtask -> files outside the selection
     std::vector<fs::path> op_dirs;
     for (const auto& e : fs::directory_iterator(o_.capture_dir, ec)) {
@@ -486,7 +532,7 @@ void Collector::collect_captures() {
             }
             std::sort(epochs.begin(), epochs.end());
             for (const auto& [epoch, path] : epochs) {
-                if (epoch < first || epoch > last) {
+                if (!wanted(epoch)) {
                     ++outside[op_name + "/" + sub_name];
                     continue;
                 }
@@ -498,7 +544,8 @@ void Collector::collect_captures() {
                 }
                 have_captures_ = true;
                 config::JsonObject cap;
-                cap["op"] = config::JsonValue{static_cast<std::int64_t>(op_id)};
+                // Text: an operator id is 64 bits, and JSON integers stop at 2^63.
+                cap["op"] = config::JsonValue{std::to_string(op_id)};
                 cap["subtask"] = config::JsonValue{static_cast<std::int64_t>(sub)};
                 cap["epoch"] = config::JsonValue{static_cast<std::int64_t>(epoch)};
                 cap["path"] = config::JsonValue{rel};
@@ -526,9 +573,10 @@ void Collector::collect_captures() {
                         const auto src = cluster::resolve_restore_source(
                             cluster::completed_marker_dir_for(o_.checkpoint_dir, o_.job).string(),
                             prev);
-                        const auto rc = fs::weakly_canonical(src.state_root, ec).string();
+                        const auto local = local_path(src.state_root);
+                        const auto rc = local.value_or("");
                         const auto cc = fs::weakly_canonical(o_.checkpoint_dir, ec).string() + "/";
-                        if (src.legacy || rc.rfind(cc, 0) != 0) {
+                        if (src.legacy || !local.has_value() || rc.rfind(cc, 0) != 0) {
                             absent("replay_state",
                                    base + " epoch " + std::to_string(epoch),
                                    "its starting state is outside the checkpoint directory");
@@ -576,8 +624,7 @@ void Collector::collect_captures() {
     }
     for (const auto& [where, n] : outside) {
         excluded_.push_back(config::JsonValue{"capture/" + where + ": " + std::to_string(n) +
-                                              " epoch file(s) outside epochs " +
-                                              std::to_string(first) + "-" + std::to_string(last)});
+                                              " epoch file(s) outside epochs " + selection_text});
     }
 }
 
@@ -686,7 +733,10 @@ CollectResult Collector::run() {
         throw CollectError("only a local checkpoint directory is collected in this release");
     }
     std::error_code ec;
-    const fs::path out = fs::absolute(o_.out, ec);
+    fs::path out = fs::absolute(o_.out, ec).lexically_normal();
+    if (!out.has_filename()) {
+        out = out.parent_path();  // a trailing separator
+    }
     if (fs::exists(fs::symlink_status(out, ec))) {
         throw CollectError(out.string() + " already exists; a bundle is never written over");
     }

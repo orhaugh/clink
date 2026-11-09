@@ -21,6 +21,7 @@
 // state_dir_for, restore_point_on_disk) and a replay (EpochReplay) run on a
 // bundle unchanged: no check re-implements the recovery protocol.
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -31,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/cluster/in_doubt_resolution.hpp"
 #include "clink/config/json.hpp"
 
 namespace clink::incident {
@@ -91,10 +93,27 @@ struct ReadLimits {
     std::size_t max_json_depth{64};
 };
 
+// One captured epoch the manifest lists. The reader checks that `path` is
+// the file the replay engine reads for (op, subtask, epoch), and that it is a
+// listed artifact.
+struct CapturedEpoch {
+    std::uint64_t op{0};
+    std::uint64_t subtask{0};
+    std::uint64_t epoch{0};
+    std::string path;       // capture/op-<op>/subtask-<subtask>/epoch-<epoch>.cap
+    bool truncated{false};  // the file's header said so when it was collected
+};
+
+// The directories evidence lives in. Every artifact is under one of them, and
+// nothing unlisted may be.
+inline constexpr std::array<const char*, 4> kEvidenceDirs = {
+    "checkpoint", "capture", "traces", "job"};
+
 struct Bundle {
     std::filesystem::path root;  // absolute
     config::JsonValue manifest;
     std::vector<Artifact> artifacts;
+    std::vector<CapturedEpoch> captures;  // sorted by op, subtask, epoch
 
     [[nodiscard]] JobId job() const;
     [[nodiscard]] std::uint64_t checkpoint() const;
@@ -103,6 +122,10 @@ struct Bundle {
     [[nodiscard]] std::filesystem::path checkpoint_dir() const { return root / "checkpoint"; }
     [[nodiscard]] std::filesystem::path capture_dir() const { return root / "capture"; }
     [[nodiscard]] std::filesystem::path trace_dir() const { return root / "traces"; }
+    // `path` relative to the root, when it is a local path inside the bundle:
+    // nullopt for a URI, a relative path, or a place outside. Lexical, so the
+    // working directory and links play no part.
+    [[nodiscard]] std::optional<std::string> inside(const std::string& path) const;
 };
 
 // Thrown when a directory is not a bundle this reader may read: no
@@ -144,14 +167,39 @@ struct VerifyOptions {
 
 // The checkpoint whose state a capture epoch's events were processed from,
 // which a replay of the epoch restores: the checkpoint before it, except for
-// the first epoch of a restored run, which starts where that run restored. A
-// job's RESTORED record names the newest such run (it numbers from `next` and
-// restored from `restore`); an older one's first epoch is not known. 0 is
-// fresh state.
+// the first epoch of a restored run, which starts where that run restored (a
+// run restored from `restored_from` numbers from `restored_next`). 0 is fresh
+// state.
 [[nodiscard]] std::uint64_t epoch_starting_checkpoint(
     std::uint64_t epoch,
     std::optional<std::uint64_t> restored_from,
     std::optional<std::uint64_t> restored_next) noexcept;
+
+// The restores a bundle records for its job: the job's RESTORED record (the
+// newest), and the Redeploy events of its protocol traces (each one in the
+// traced period). Throws when the RESTORED record does not parse.
+[[nodiscard]] std::vector<cluster::RestoredRecord> recorded_restores(const Bundle& bundle);
+
+// Where a replay of `epoch` starts, as far as the bundle shows it. Known: the
+// epoch is a recorded restore's first, or follows one, or a run of the job
+// could only have restored from the checkpoint before it. Not known: an
+// earlier restore the bundle does not record could have started a run at
+// this epoch from another checkpoint; or the epoch begins on a rescale, whose
+// state merges several subtasks' snapshots (unsupported).
+struct EpochStart {
+    bool known{false};
+    std::uint64_t checkpoint{0};  // when known; 0 is fresh state
+    bool unsupported{false};      // when not known: replay cannot rebuild it
+    std::string reason;           // when not known
+};
+[[nodiscard]] EpochStart epoch_start(const Bundle& bundle,
+                                     const std::vector<cluster::RestoredRecord>& restores,
+                                     std::uint64_t epoch);
+
+// Whether a recorded restore discarded the run that processed `epoch`: its
+// events were processed again in the restored run's first epoch.
+[[nodiscard]] bool epoch_discarded(const std::vector<cluster::RestoredRecord>& restores,
+                                   std::uint64_t epoch) noexcept;
 
 // ---- collection -------------------------------------------------------------
 
