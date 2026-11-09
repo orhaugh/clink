@@ -10,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -392,14 +393,71 @@ TEST(ClickHouseSinkFactory, TheSinkGatesTheAckAndTheRecordSaysItMustBeTheOnlySin
     const auto* rec = clink::connectors::CapabilityRegistry::instance().find("clickhouse");
     ASSERT_NE(rec, nullptr);
     EXPECT_TRUE(rec->self_check().empty());
+    EXPECT_EQ(rec->version, "2");
+    // The source restores by its rule, but no whole-job run through a failure
+    // backs a claim that it replays, so the record makes none.
+    EXPECT_FALSE(rec->replayable);
     EXPECT_EQ(rec->limitations,
               (std::vector<std::string>{
-                  "query source re-reads from the start on restart (no offset state)",
+                  "the query source holds its whole result in memory, and its query, once sent, "
+                  "runs to the end before a cancel is seen",
+                  "the query source resumes a restore after the rows its checkpoint covered only "
+                  "when the query returns them again first, in the same order; otherwise it emits "
+                  "every row again",
                   "the text sink is at-least-once: rows after the last completed checkpoint are "
                   "replayed, each batch under a fresh deduplication token, and may appear twice",
                   "the text sink must be the only sink on its chain: Dag::add_sink refuses "
                   "another sink beside it",
               }));
+}
+
+// What a ClickHouse source factory makes of `params`: its refusal, or a note
+// that it built a source. Building does not connect.
+std::string clickhouse_source_refusal(const std::string& type,
+                                      const std::string& channel,
+                                      std::map<std::string, std::string> params) {
+    const auto* f = clink::cluster::OperatorRegistry::default_instance().find_source(type, channel);
+    if (f == nullptr) {
+        throw std::logic_error(type + " is not registered");
+    }
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = std::move(params);
+    try {
+        (void)f->build(ctx);
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return "(built)";
+}
+
+// The three source factories read port and batch_size as the sink reads its
+// integers. Before, batch_size='0' built a source that emitted empty batches
+// without end, port='70000' connected to port 4464, and a typo fell back to
+// the default unnoticed.
+TEST(ClickHouseSourceFactory, PortAndBatchSizeAreReadStrictly) {
+    for (const auto& [type, channel] : std::vector<std::pair<std::string, std::string>>{
+             {"clickhouse_row_source", "clickhouse.row"},
+             {"clickhouse_text_source", "string"},
+             {"clickhouse_source", "string"}}) {
+        const auto with = [&](const std::string& key, const std::string& value) {
+            return clickhouse_source_refusal(type, channel, {{"query", "SELECT 1"}, {key, value}});
+        };
+        EXPECT_EQ(clickhouse_source_refusal(type, channel, {{"query", "SELECT 1"}}), "(built)");
+        EXPECT_EQ(clickhouse_source_refusal(type, channel, {}), type + ": 'query' is required");
+        for (const char* v : {"0", "-1", "lots", "10x", ""}) {
+            EXPECT_EQ(with("batch_size", v),
+                      type + ": batch_size must be a positive integer (got '" + v + "')");
+        }
+        EXPECT_EQ(with("batch_size", "1"), "(built)");
+        // Any positive count still builds: the result is in memory already, and
+        // the count only splits what each call emits.
+        EXPECT_EQ(with("batch_size", "5000000"), "(built)");
+        EXPECT_EQ(with("port", "0"), type + ": port must be a positive integer (got '0')");
+        EXPECT_EQ(with("port", "nine"), type + ": port must be a positive integer (got 'nine')");
+        EXPECT_EQ(with("port", "70000"), type + ": port must be at most 65535 (got '70000')");
+        EXPECT_EQ(with("port", "1"), "(built)");
+        EXPECT_EQ(with("port", "65535"), "(built)");
+    }
 }
 
 }  // namespace

@@ -5,10 +5,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "clink/metrics/connector_metrics.hpp"
+#include "clink/runtime/log_buffer.hpp"
 
 #ifdef CLINK_HAS_CLICKHOUSE
 #include <clickhouse/client.h>
@@ -96,6 +99,39 @@ bool cell_is_null(const clickhouse::ColumnRef& col, std::size_t row) {
 
 }  // namespace
 
+namespace {
+
+// FNV-1a over a row's cells, each as its null flag, its length and its text,
+// so rows that differ anywhere hash apart.
+constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
+constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+
+std::uint64_t mix(std::uint64_t h, const char* data, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        h ^= static_cast<std::uint8_t>(data[i]);
+        h *= kFnvPrime;
+    }
+    return h;
+}
+
+std::uint64_t mix_row(std::uint64_t h, const ClickHouseRow& row) {
+    const auto& values = row.values();
+    for (std::size_t c = 0; c < values.size(); ++c) {
+        const char null = row.is_null(c) ? 1 : 0;
+        h = mix(h, &null, 1);
+        const auto len = static_cast<std::uint64_t>(values[c].size());
+        std::array<char, 8> le{};
+        for (int i = 0; i < 8; ++i) {
+            le[static_cast<std::size_t>(i)] = static_cast<char>((len >> (i * 8)) & 0xFF);
+        }
+        h = mix(h, le.data(), le.size());
+        h = mix(h, values[c].data(), values[c].size());
+    }
+    return h;
+}
+
+}  // namespace
+
 struct ClickHouseSource::Impl {
     Options opts;
     std::unique_ptr<clickhouse::Client> client;
@@ -107,6 +143,13 @@ struct ClickHouseSource::Impl {
     // with backpressure) is a v2.
     std::vector<ClickHouseRow> rows;
     std::size_t next_row{0};
+    // The rows emitted so far, as a hash, checkpointed with next_row.
+    std::uint64_t emitted_hash{kFnvOffset};
+    // What restore_offset() read: where to resume, and, when the checkpoint
+    // holds one, the hash of the rows before that position.
+    bool restored{false};
+    std::size_t restored_row{0};
+    std::optional<std::uint64_t> restored_hash;
 
     std::shared_ptr<const std::vector<std::string>> column_names;
     std::shared_ptr<const std::vector<std::string>> column_types;
@@ -175,12 +218,35 @@ void ClickHouseSource::open() {
         }
     });
 
-    // #60: a cursor restored by restore_offset() (which runs before open())
-    // may exceed this run's row count if the query result shrank between runs.
-    // Clamp so produce() simply finds nothing left to emit rather than reading
-    // out of bounds.
-    if (impl_->next_row > impl_->rows.size()) {
-        impl_->next_row = impl_->rows.size();
+    // A restore resumes by position, which holds only while the query returns
+    // the rows before it again, in the same order: without ORDER BY ClickHouse
+    // returns rows in whatever order its parallel reads finish, and a row
+    // deleted, added or changed among them moves the rest. Resumed after such
+    // a change, the source skipped rows. The rows before the position are
+    // hashed and compared with the hash the checkpoint holds; on a difference,
+    // or with no hash (an earlier release's checkpoint), every row is emitted
+    // again: repeated, which at-least-once allows, never skipped.
+    impl_->next_row = 0;
+    impl_->emitted_hash = kFnvOffset;
+    if (impl_->restored && impl_->restored_row > 0) {
+        bool same = false;
+        if (impl_->restored_hash && impl_->restored_row <= impl_->rows.size()) {
+            std::uint64_t h = kFnvOffset;
+            for (std::size_t r = 0; r < impl_->restored_row; ++r) {
+                h = mix_row(h, impl_->rows[r]);
+            }
+            same = h == *impl_->restored_hash;
+        }
+        if (same) {
+            impl_->next_row = impl_->restored_row;
+            impl_->emitted_hash = *impl_->restored_hash;
+        } else {
+            clink::log::warn("source.clickhouse",
+                             "clickhouse_source: the checkpoint covers the query's first " +
+                                 std::to_string(impl_->restored_row) +
+                                 " rows, and the query no longer returns those rows first, so "
+                                 "every row is emitted again rather than resumed by position");
+        }
     }
 }
 
@@ -196,6 +262,7 @@ bool ClickHouseSource::produce(Emitter<ClickHouseRow>& out) {
 
     Batch<ClickHouseRow> batch;
     for (std::size_t r = impl_->next_row; r < end; ++r) {
+        impl_->emitted_hash = mix_row(impl_->emitted_hash, impl_->rows[r]);
         batch.emplace(std::move(impl_->rows[r]));
     }
     const auto batch_size = batch.size();
@@ -216,31 +283,62 @@ void ClickHouseSource::close() {
 
 namespace {
 constexpr const char* kClickHouseOffsetKey = "__clickhouse_source_row__";
+// The checkpoint's form: a version byte, the next row's index and the hash of
+// the rows before it, each little-endian. An earlier release wrote the index
+// alone, in 8 bytes.
+constexpr std::uint8_t kOffsetVersion = 2;
+constexpr std::size_t kOffsetBytes = 17;
+
+std::uint64_t read_le64(const std::byte* p) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v |= static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(p[i])) << (i * 8);
+    }
+    return v;
+}
 }  // namespace
 
 void ClickHouseSource::snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId) {
+    std::array<char, kOffsetBytes> bytes{};
+    bytes[0] = static_cast<char>(kOffsetVersion);
     const auto cursor = static_cast<std::uint64_t>(impl_->next_row);
-    std::array<std::byte, 8> bytes{};
     for (int i = 0; i < 8; ++i) {
-        bytes[static_cast<std::size_t>(i)] = static_cast<std::byte>((cursor >> (i * 8)) & 0xFF);
+        bytes[static_cast<std::size_t>(1 + i)] = static_cast<char>((cursor >> (i * 8)) & 0xFF);
+        bytes[static_cast<std::size_t>(9 + i)] =
+            static_cast<char>((impl_->emitted_hash >> (i * 8)) & 0xFF);
     }
     backend.put_operator_state(
         op_id,
         StateBackend::KeyView{kClickHouseOffsetKey, std::strlen(kClickHouseOffsetKey)},
-        StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+        StateBackend::ValueView{bytes.data(), bytes.size()});
 }
 
 bool ClickHouseSource::restore_offset(StateBackend& backend, OperatorId op_id) {
     auto v = backend.get_operator_state(
         op_id, StateBackend::KeyView{kClickHouseOffsetKey, std::strlen(kClickHouseOffsetKey)});
-    if (!v.has_value() || v->size() < 8) {
+    if (!v.has_value()) {
         return false;
     }
     std::uint64_t restored = 0;
-    for (int i = 0; i < 8; ++i) {
-        restored |= static_cast<std::uint64_t>(static_cast<std::uint8_t>((*v)[i])) << (i * 8);
+    std::optional<std::uint64_t> hash;
+    if (v->size() == kOffsetBytes && std::to_integer<std::uint8_t>((*v)[0]) == kOffsetVersion) {
+        restored = read_le64(v->data() + 1);
+        hash = read_le64(v->data() + 9);
+    } else if (v->size() == 8) {
+        restored = read_le64(v->data());
+    } else {
+        throw std::runtime_error(
+            "clickhouse_source: the checkpoint's position is in a form this release does not "
+            "read (" +
+            std::to_string(v->size()) + " bytes)");
     }
-    impl_->next_row = static_cast<std::size_t>(restored);
+    impl_->restored = true;
+    impl_->restored_row = static_cast<std::size_t>(restored);
+    impl_->restored_hash = hash;
+    // Until open() compares the rows, the position stands as restored, so a
+    // checkpoint taken before then holds it again.
+    impl_->next_row = impl_->restored_row;
+    impl_->emitted_hash = hash.value_or(kFnvOffset);
     return true;
 }
 

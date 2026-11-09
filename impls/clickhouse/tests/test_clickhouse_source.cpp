@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -95,9 +97,37 @@ TEST(ClickHouseSourceReal, ReplayOffsetRoundTrips) {
     ClickHouseSource src(std::move(opts));
     ASSERT_TRUE(src.restore_offset(seeded, op));
 
+    // An earlier release's 8-byte position restores and is written again in
+    // the versioned form: a version byte, the index and a hash.
     InMemoryStateBackend out;
     src.snapshot_offset(out, op, CheckpointId{1});
-    EXPECT_EQ(out.get_operator_state(op, key), seeded.get_operator_state(op, key));
+    const auto written = out.get_operator_state(op, key);
+    ASSERT_TRUE(written.has_value());
+    ASSERT_EQ(written->size(), 17U);
+    EXPECT_EQ(std::to_integer<int>((*written)[0]), 2);
+    EXPECT_EQ(std::to_integer<int>((*written)[1]), 42);
+
+    // The versioned form round-trips exactly.
+    ClickHouseSource::Options o3;
+    o3.host = "127.0.0.1";
+    o3.port = 1;
+    o3.query = "SELECT 1";
+    ClickHouseSource src3(std::move(o3));
+    ASSERT_TRUE(src3.restore_offset(out, op));
+    InMemoryStateBackend again;
+    src3.snapshot_offset(again, op, CheckpointId{2});
+    EXPECT_EQ(again.get_operator_state(op, key), written);
+
+    // A form neither release wrote is refused.
+    InMemoryStateBackend odd;
+    const std::string five = "abcde";
+    odd.put_operator_state(op, key, StateBackend::ValueView{five.data(), five.size()});
+    ClickHouseSource::Options o4;
+    o4.host = "127.0.0.1";
+    o4.port = 1;
+    o4.query = "SELECT 1";
+    ClickHouseSource src4(std::move(o4));
+    EXPECT_THROW((void)src4.restore_offset(odd, op), std::runtime_error);
 
     // A backend with no persisted offset -> restore is a no-op returning false.
     InMemoryStateBackend empty;

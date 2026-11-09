@@ -57,7 +57,7 @@ std::string clickhouse_row_to_json(const ClickHouseRow& r) {
 class StringClickHouseSource final : public Source<std::string> {
 public:
     // json=false: legacy delimiter-joined string (clickhouse_text_source).
-    // json=true:  a JSON object keyed by column name (clickhouse_source, M2) for
+    // json=true:  a JSON object keyed by column name (clickhouse_source) for
     //             the Row path via json_string_to_row.
     StringClickHouseSource(ClickHouseSource::Options opts, std::string delim, bool json = false)
         : inner_(std::move(opts)), delim_(std::move(delim)), json_(json) {}
@@ -120,20 +120,22 @@ private:
     bool json_{false};
 };
 
-// A clickhouse_sink integer option: the whole value must be the number, from 1
-// to `max`. param_int64_or falls back to the default on garbage, and the casts
-// it fed truncated, so a typo passed unnoticed, batch_rows='0' flushed on every
-// row and port='70000' connected to port 4464.
-// batch_rows and batch_interval_ms take any positive value, because the
-// Stable builder has always passed any value through and a job that ran must
-// keep running. port and the timeouts are bounded: a value past those bounds
-// never worked (a truncated port, an infinite poll).
+// An integer option of the sink or a source: the whole value must be the
+// number, from 1 to `max`. param_int64_or falls back to the default on
+// garbage, and the casts it fed truncated, so a typo passed unnoticed,
+// batch_rows='0' flushed on every row, a source's batch_size='0' emitted empty
+// batches without end and port='70000' connected to port 4464.
+// batch_rows, batch_interval_ms and batch_size take any positive value,
+// because the Stable builder has always passed any value through and a job
+// that ran must keep running. port and the timeouts are bounded: a value past
+// those bounds never worked (a truncated port, an infinite poll).
 constexpr std::int64_t kNoUpperBound = std::numeric_limits<std::int64_t>::max();
 
-std::int64_t sink_integer_param(const clink::plugin::BuildContext& ctx,
-                                const std::string& key,
-                                std::int64_t fallback,
-                                std::int64_t max) {
+std::int64_t integer_param(const clink::plugin::BuildContext& ctx,
+                           const std::string& who,
+                           const std::string& key,
+                           std::int64_t fallback,
+                           std::int64_t max) {
     const auto it = ctx.params.find(key);
     if (it == ctx.params.end()) {
         return fallback;
@@ -147,11 +149,11 @@ std::int64_t sink_integer_param(const clink::plugin::BuildContext& ctx,
     const bool too_large = whole && ((ec == std::errc{} && parsed > max) ||
                                      (ec == std::errc::result_out_of_range && value[0] != '-'));
     if (too_large) {
-        throw std::runtime_error("clickhouse_sink: " + key + " must be at most " +
-                                 std::to_string(max) + " (got '" + it->second + "')");
+        throw std::runtime_error(who + ": " + key + " must be at most " + std::to_string(max) +
+                                 " (got '" + it->second + "')");
     }
     if (!whole || ec != std::errc{} || parsed < 1) {
-        throw std::runtime_error("clickhouse_sink: " + key + " must be a positive integer (got '" +
+        throw std::runtime_error(who + ": " + key + " must be a positive integer (got '" +
                                  it->second + "')");
     }
     return parsed;
@@ -182,12 +184,13 @@ ClickHouseSource::Options parse_source_options(const clink::plugin::BuildContext
                                                const std::string& op_label) {
     ClickHouseSource::Options opts;
     opts.host = ctx.param_or("host", "localhost");
-    opts.port = static_cast<std::uint16_t>(ctx.param_int64_or("port", 9000));
+    opts.port = static_cast<std::uint16_t>(integer_param(ctx, op_label, "port", 9000, 65535));
     opts.database = ctx.param_or("database", "default");
     opts.user = ctx.param_or("user", "default");
     opts.password = ctx.param_or("password", "");
     opts.query = ctx.param_or("query");
-    opts.batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 1024));
+    opts.batch_size =
+        static_cast<std::size_t>(integer_param(ctx, op_label, "batch_size", 1024, kNoUpperBound));
     if (opts.query.empty()) {
         throw std::runtime_error(op_label + ": 'query' is required");
     }
@@ -199,7 +202,7 @@ ClickHouseSource::Options parse_source_options(const clink::plugin::BuildContext
 void install(clink::plugin::PluginRegistry& reg) {
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "clickhouse",
-        .version = "1",
+        .version = "2",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"clickhouse-cpp"},
@@ -207,6 +210,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         .formats = {"tsv", "json"},
         // The source runs a query to completion; the sink streams.
         .boundedness = clink::connectors::Boundedness::Either,
+        // The query source checkpoints the rows it emitted and restores by
+        // the rule in its limitations, which repeats rows rather than skip
+        // them. The record still does not declare it replayable: no run of a
+        // whole job through a failure backs that yet, so a delivery report
+        // judges a job reading it at most once at the source.
         .replayable = false,
         .offset_model = clink::connectors::OffsetModel::None,
         .checkpoint_integrated = true,
@@ -222,7 +230,11 @@ void install(clink::plugin::PluginRegistry& reg) {
         .timeout_options =
             {"connect_timeout_ms", "send_timeout_ms", "receive_timeout_ms", "batch_interval_ms"},
         .available_in_sql = true,
-        .limitations = {"query source re-reads from the start on restart (no offset state)",
+        .limitations = {"the query source holds its whole result in memory, and its query, once "
+                        "sent, runs to the end before a cancel is seen",
+                        "the query source resumes a restore after the rows its checkpoint covered "
+                        "only when the query returns them again first, in the same order; "
+                        "otherwise it emits every row again",
                         "the text sink is at-least-once: rows after the last completed "
                         "checkpoint are replayed, each batch under a fresh deduplication token, "
                         "and may appear twice",
@@ -254,7 +266,8 @@ void install(clink::plugin::PluginRegistry& reg) {
         "clickhouse_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
             ClickHouseSink::Options opts;
             opts.host = ctx.param_or("host", "localhost");
-            opts.port = static_cast<std::uint16_t>(sink_integer_param(ctx, "port", 9000, 65535));
+            opts.port = static_cast<std::uint16_t>(
+                integer_param(ctx, "clickhouse_sink", "port", 9000, 65535));
             opts.database = ctx.param_or("database", "default");
             opts.table = ctx.param_or("table");
             opts.user = ctx.param_or("user", "default");
@@ -264,26 +277,28 @@ void install(clink::plugin::PluginRegistry& reg) {
             }
             apply_sink_format(ctx.param_or("format", "tsv"), opts);
             opts.batch_rows = static_cast<std::size_t>(
-                sink_integer_param(ctx, "batch_rows", 1000, kNoUpperBound));
+                integer_param(ctx, "clickhouse_sink", "batch_rows", 1000, kNoUpperBound));
             opts.batch_interval = std::chrono::milliseconds{
-                sink_integer_param(ctx, "batch_interval_ms", 1000, kNoUpperBound)};
+                integer_param(ctx, "clickhouse_sink", "batch_interval_ms", 1000, kNoUpperBound)};
             opts.connect_timeout = std::chrono::milliseconds{
-                sink_integer_param(ctx, "connect_timeout_ms", 5000, 600000)};
+                integer_param(ctx, "clickhouse_sink", "connect_timeout_ms", 5000, 600000)};
             opts.send_timeout = std::chrono::milliseconds{
-                sink_integer_param(ctx, "send_timeout_ms", 30000, 600000)};
+                integer_param(ctx, "clickhouse_sink", "send_timeout_ms", 30000, 600000)};
             opts.receive_timeout = std::chrono::milliseconds{
-                sink_integer_param(ctx, "receive_timeout_ms", 30000, 600000)};
+                integer_param(ctx, "clickhouse_sink", "receive_timeout_ms", 30000, 600000)};
             return std::make_shared<ClickHouseSink>(std::move(opts));
         });
 
     // clickhouse_row_source: SELECT rows emitted as typed ClickHouseRow
     // records. Downstream operators address columns by index or by name
     // (row.at("col_name")). params:
-    //   host (default "localhost"), port (default 9000)
+    //   host (default "localhost"), port (default 9000, 1 to 65535)
     //   database (default "default"), user (default "default")
     //   password (default "")
     //   query (required) - the SELECT statement to execute
-    //   batch_size (default 1024) - rows emitted per produce() call
+    //   batch_size (default 1024, any positive integer) - rows emitted per
+    //     produce() call
+    // The three source factories read port and batch_size the same way.
     reg.register_source<ClickHouseRow>(
         "clickhouse_row_source",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<ClickHouseRow>> {
@@ -305,7 +320,7 @@ void install(clink::plugin::PluginRegistry& reg) {
                 ctx.subtask_idx, std::make_shared<StringClickHouseSource>(std::move(opts), delim));
         });
 
-    // clickhouse_source (M2): the same SELECT, but each row is a JSON object keyed
+    // clickhouse_source: the same SELECT, but each row is a JSON object keyed
     // by column name on the string channel - bridged to a multi-column Row table
     // via json_string_to_row. The newer pattern (cf. mysql_source); the delimited
     // clickhouse_text_source is kept for back-compat.

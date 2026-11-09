@@ -7,6 +7,7 @@ add_executable(clink_clickhouse_tests
     test_clickhouse_sink.cpp
     test_clickhouse_sink_chain.cpp
     test_clickhouse_source.cpp
+    test_clickhouse_source_live.cpp
     test_builder.cpp
     test_typed_sink.cpp
     test_clickhouse_pins_live.cpp
