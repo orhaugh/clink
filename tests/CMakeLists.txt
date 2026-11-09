@@ -527,6 +527,12 @@ if(CLINK_INTEGRATION_TESTS)
     if(TARGET clink::redis AND TARGET clink::http_connector)
         target_sources(clink_integration_tests PRIVATE integration/test_redis_sink_recovery.cpp)
     endif()
+    # The RabbitMQ sink's recovery cells: as the Redis ones, into a durable
+    # queue on the broker scripts/brokers-live.sh starts, with a verifier that
+    # reads the queue through RabbitMQ's management API. They skip without it.
+    if(TARGET clink::rabbitmq AND TARGET clink::http_connector)
+        target_sources(clink_integration_tests PRIVATE integration/test_rabbitmq_sink_recovery.cpp)
+    endif()
     # The Cassandra and ScyllaDB sinks' recovery cells: a coordinator and two
     # workers polling a feed the test serves into the sinks, against the server
     # scripts/cassandra-live.sh starts, with faults at the sinks' own points and
