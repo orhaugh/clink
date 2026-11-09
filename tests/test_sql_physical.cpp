@@ -3126,6 +3126,58 @@ TEST(SqlPhysical, RedisUpsertSinkSelected) {
     EXPECT_EQ(find_op(spec, "redis_sink"), nullptr);
 }
 
+namespace {
+
+std::string redis_sink_refusal(const std::string& with, bool upsert) {
+    Catalog cat;
+    auto s = parse(
+        "CREATE TABLE src_t (k BIGINT, v BIGINT) "
+        "WITH (connector='file', format='json', path='/tmp/in.ndjson');"
+        "CREATE TABLE r_out (k BIGINT, v BIGINT) WITH (connector='redis', host='localhost'" +
+        std::string{upsert ? ", mode='upsert', primary_key='k'" : ", stream='s'"} + with + ")");
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[0]));
+    cat.register_table(std::get<ast::CreateTableStmt>(s.statements[1]));
+    auto plan = bind_insert(cat, "INSERT INTO r_out SELECT k, v FROM src_t");
+    PhysicalPlanner pp;
+    try {
+        (void)pp.compile(static_cast<const LogicalSink&>(*plan));
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+}  // namespace
+
+// A connector='redis' sink table's options: one the sinks do not read is
+// refused, naming the ones they read; the source's options pass; the Streams
+// options are refused with mode='upsert' and key_prefix without it; the planner
+// derives key_columns itself.
+TEST(SqlPhysical, RedisSinkTablesTakeOnlyOptionsTheSinksRead) {
+    EXPECT_EQ(redis_sink_refusal(", port='6380', db='1', field='v', maxlen='100', "
+                                 "approx_maxlen='0', batch_records='10', max_bytes='4096', "
+                                 "max_record_bytes='512', command_timeout_ms='5000', "
+                                 "linger_ms='100'",
+                                 false),
+              "");
+    EXPECT_EQ(redis_sink_refusal(", group='g', consumer_prefix='c', count='10', block_ms='100', "
+                                 "start_id='0', max_pending='5'",
+                                 false),
+              "");
+    EXPECT_EQ(
+        redis_sink_refusal(", key_prefix='p:', batch_records='10', command_timeout_ms='5'", true),
+        "");
+    auto why = redis_sink_refusal(", ttl='60'", false);
+    EXPECT_NE(why.find("does not read option 'ttl'"), std::string::npos) << why;
+    EXPECT_NE(why.find("command_timeout_ms"), std::string::npos) << why;
+    why = redis_sink_refusal(", maxlen='10'", true);
+    EXPECT_NE(why.find("not read with mode='upsert'"), std::string::npos) << why;
+    why = redis_sink_refusal(", key_prefix='p:'", false);
+    EXPECT_NE(why.find("read only with mode='upsert'"), std::string::npos) << why;
+    why = redis_sink_refusal(", key_columns='k'", true);
+    EXPECT_NE(why.find("PRIMARY KEY"), std::string::npos) << why;
+}
+
 TEST(SqlPhysical, CassandraUpsertSinkSelected) {
     Catalog cat;
     auto s = parse(

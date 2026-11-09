@@ -196,6 +196,7 @@ std::string string_source_factory_for(const TableDef& table) {
 void check_cassandra_options(const TableDef& table, bool upsert);
 void check_mysql_sink_options(const TableDef& table, bool upsert);
 void check_postgres_sink_options(const TableDef& table, bool upsert);
+void check_redis_sink_options(const TableDef& table, bool upsert);
 
 std::string string_sink_factory_for(const TableDef& table) {
     const auto& connector = require_property(table, "connector");
@@ -519,6 +520,76 @@ void check_postgres_sink_options(const TableDef& table, bool upsert) {
         unsupported("table '" + table.name +
                     "': a connector='postgres' sink does not read option '" + key + "'; it reads " +
                     accepted + " (the last four without mode='upsert')");
+    }
+}
+
+void check_redis_sink_options(const TableDef& table, bool upsert) {
+    static const std::vector<std::string> kConnection = {"host",
+                                                         "port",
+                                                         "username",
+                                                         "password",
+                                                         "db",
+                                                         "tls",
+                                                         "tls_ca",
+                                                         "tls_cert",
+                                                         "tls_key",
+                                                         "tls_sni",
+                                                         "tls_verify",
+                                                         "tls_verify_hostname"};
+    static const std::vector<std::string> kSink = {
+        "batch_records", "max_bytes", "max_record_bytes", "command_timeout_ms"};
+    static const std::vector<std::string> kStream = {"maxlen", "approx_maxlen", "linger_ms"};
+    static const std::vector<std::string> kUpsert = {"key_prefix"};
+    // The source's options, and the stream and field the source and the
+    // Streams sink share.
+    static const std::vector<std::string> kSources = {"stream",
+                                                      "field",
+                                                      "group",
+                                                      "consumer_prefix",
+                                                      "count",
+                                                      "block_ms",
+                                                      "start_id",
+                                                      "max_pending"};
+    const auto& interpreted = interpreted_table_options();
+    for (const auto& [key, value] : table.properties) {
+        (void)value;
+        const auto listed = [&key](const std::vector<std::string>& v) {
+            return std::find(v.begin(), v.end(), key) != v.end();
+        };
+        if (listed(kConnection) || listed(kSink) || listed(kSources) || listed(interpreted)) {
+            continue;
+        }
+        if (listed(kStream)) {
+            if (!upsert) {
+                continue;
+            }
+            unsupported("table '" + table.name + "': '" + key +
+                        "' is not read with mode='upsert', which writes one key per row and "
+                        "appends to no stream");
+        }
+        if (listed(kUpsert)) {
+            if (upsert) {
+                continue;
+            }
+            unsupported("table '" + table.name + "': '" + key +
+                        "' is read only with mode='upsert'; the Streams sink appends to "
+                        "'stream'");
+        }
+        if (key == "key_columns") {
+            unsupported("table '" + table.name +
+                        "': connector='redis' takes no 'key_columns' in SQL: mode='upsert' keys "
+                        "rows by the table's PRIMARY KEY");
+        }
+        std::string accepted;
+        for (const auto* list : {&kConnection, &kSink, &kStream, &kUpsert}) {
+            for (const auto& o : *list) {
+                accepted += (accepted.empty() ? "" : ", ") + o;
+            }
+        }
+        unsupported("table '" + table.name + "': a connector='redis' sink does not read option '" +
+                    key + "'; it reads stream, field, " + accepted +
+                    " (maxlen, approx_maxlen and linger_ms without mode='upsert', key_prefix "
+                    "with it)");
     }
 }
 
@@ -1627,6 +1698,7 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
                 "connector='redis' sink is at-least-once (Redis Streams XADD has no producer "
                 "dedup key); exactly-once delivery is not supported");
         }
+        check_redis_sink_options(table, upsert);
         if (upsert) {
             // Changelog-aware key-value upsert: maintain a keyspace by PRIMARY KEY
             // (SET on insert/update_after, DEL on delete/update_before), distinct
