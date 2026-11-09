@@ -495,6 +495,12 @@ WsClient::PollResult WsClient::poll(std::chrono::milliseconds block) {
         }
         if (!error.empty()) {
             impl_->teardown();
+            // Messages that arrived whole before the bad frame are delivered;
+            // thrown at once, the error took them with it.
+            if (!out.texts.empty() || out.binaries_skipped > 0) {
+                out.error = std::move(error);
+                return out;
+            }
             throw std::runtime_error(impl_->opts.name + ": protocol error: " + error);
         }
         if (!out.texts.empty() || out.binaries_skipped > 0) {

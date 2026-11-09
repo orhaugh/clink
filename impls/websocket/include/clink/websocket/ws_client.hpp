@@ -60,11 +60,16 @@ public:
         std::size_t binaries_skipped{0};  // binary messages seen (not delivered)
         bool closed{false};               // the server closed (close frame or EOF); the
                                           // close reply, when owed, was already sent
+        // A protocol error that ended the connection after the messages above,
+        // which arrived whole before it. Empty when there was none.
+        std::string error;
     };
 
     // Read whatever arrives within `block`, answering pings internally.
     // Returns early once at least one message (or the close) is decoded.
-    // Throws on a socket/protocol error; the connection is dead afterwards.
+    // Throws on a protocol error with nothing decoded before it; after
+    // messages it returns them with the error in `error`. Either way the
+    // connection is dead afterwards.
     PollResult poll(std::chrono::milliseconds block);
 
     // Best-effort close handshake (send a close frame, ignore failures),

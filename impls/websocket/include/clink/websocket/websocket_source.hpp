@@ -154,6 +154,15 @@ public:
         if (opts_.max_messages > 0 && emitted_ >= opts_.max_messages) {
             return finish_(out);
         }
+        if (!polled.error.empty()) {
+            // The messages before the bad frame are emitted above; the error
+            // then ends the connection as a thrown one does.
+            clink::metrics::connector::error_inc("websocket", "source");
+            if (!opts_.reconnect) {
+                throw std::runtime_error(opts_.name + ": protocol error: " + polled.error);
+            }
+            return !this->cancelled();
+        }
         if (polled.closed && !opts_.reconnect) {
             return finish_(out);
         }

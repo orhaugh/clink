@@ -337,6 +337,36 @@ TEST(WebSocketSource, ServerCloseWithoutReconnectEndsTheStream) {
     EXPECT_TRUE(got.saw_max_watermark);
 }
 
+// Messages that arrived whole before a frame the client cannot read are
+// emitted, and the protocol error then fails the stream. Thrown at once, the
+// error took them with it.
+TEST(WebSocketSource, MessagesBeforeAProtocolErrorAreEmittedThenItIsRaised) {
+    TestWsServer server({[](TestWsServer& s, int fd) {
+        ASSERT_TRUE(s.handshake(fd));
+        // One write: two whole messages, then a continuation no message began.
+        s.send_raw(fd,
+                   encode_frame(Opcode::Text, "x", /*mask=*/false, 0, true) +
+                       encode_frame(Opcode::Text, "y", /*mask=*/false, 0, true) +
+                       encode_frame(Opcode::Continuation, "z", /*mask=*/false, 0, true));
+        std::this_thread::sleep_for(500ms);
+    }});
+    auto opts = base_options(server);
+    opts.reconnect = false;
+    WebSocketSource src(std::move(opts));
+    src.open();
+    Collected got;
+    auto em = emitter_into(got);
+    std::string why;
+    try {
+        drive(src, em);
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    src.close();
+    EXPECT_EQ(got.values, (std::vector<std::string>{"x", "y"}));
+    EXPECT_NE(why.find("protocol error"), std::string::npos) << why;
+}
+
 TEST(WebSocketSource, BinaryMessagesAreSkippedNotEmitted) {
     TestWsServer server({[](TestWsServer& s, int fd) {
         ASSERT_TRUE(s.handshake(fd));
