@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+**The ClickHouse SELECT source repeats rows after a restore rather than skip
+them, and reads its options strictly.** It resumed a restore at the row index
+its checkpoint held, after running its query again: without `ORDER BY`,
+ClickHouse returns rows in whatever order its parallel reads finish, and a row
+removed, added or changed among those emitted moves the rest. After one of the
+first three rows was removed, the row that moved into third place was never
+emitted. The checkpoint now holds a hash of the rows emitted with their count,
+and a restore resumes after them only when the query's first rows hash the
+same; otherwise, and from an earlier release's checkpoint, it emits every row
+again and says so in its log. `port` and `batch_size` are read strictly:
+`batch_size='0'` emitted empty batches without end, and `port='70000'`
+connected to port 4464. The `clickhouse` record no longer says the source
+keeps no offset state; it states the restore rule, that the source holds its
+whole result in memory, and that a query once sent runs to the end before a
+cancel is seen. `ClickHouseSourceLive` holds the restore cases against the
+server, on each line `scripts/clickhouse-live.sh` runs.
+
 **The Delta sink commits a local version only if no writer has, and names
 each writer's data files apart.** It renamed its log entry into place, which
 replaced an existing version, and named its data file after the version, so
