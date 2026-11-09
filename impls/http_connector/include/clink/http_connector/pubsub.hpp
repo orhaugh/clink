@@ -6,17 +6,27 @@
 //   pubsub_sink   - POST projects/<p>/topics/<t>:publish with a
 //                   {"messages":[{"data":"<base64>"}]} body. At-least-once,
 //                   batched via the shared BatchedHttpBulkSink
-//                   (BulkFraming::PubSubMessages).
+//                   (BulkFraming::PubSubMessages). A publish is all or
+//                   nothing, and a 2xx counts only when it carries one message
+//                   id per message sent: any other reply, a proxy's or another
+//                   service's, is sent again, so a reply lost after the
+//                   service published means the messages twice. An empty
+//                   record is refused before it is sent, since Pub/Sub refuses
+//                   a message with neither data nor attributes and the whole
+//                   request with it: under dlq=drop it alone is dead-lettered,
+//                   and under dlq=fail the sink fails and refuses every later
+//                   record and barrier until it is opened again.
 //   pubsub_source - synchronous Pull + Acknowledge: POST :pull, emit each
 //                   message's base64-decoded data, hold the ackIds, and POST
 //                   :acknowledge once the checkpoint that covers them has
 //                   completed (the ack IS the offset commit). At-least-once.
 //
 // AUTH: this build does not mint OAuth2 tokens. Supply a bearer token via the
-// `auth_token` option (-> "Authorization: Bearer <token>") or arbitrary
-// `headers`; against the Pub/Sub emulator no auth is needed. A static token is
-// valid only for its lifetime (~1h on GCP); metadata-server / service-account
-// token refresh is a documented follow-up.
+// `auth_token` option (-> "Authorization: Bearer <token>"), a file it is
+// re-read from when it changes (`auth_token_file`), or arbitrary `headers`;
+// against the Pub/Sub emulator no auth is needed. A static token is valid only
+// for its lifetime (about an hour on GCP); with the file, an external refresher
+// rotates it without a restart.
 //
 // PULL semantics: the REST synchronous Pull is used with returnImmediately so
 // produce() returns promptly (bounded cancel latency) and the source sleeps the
@@ -59,6 +69,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -162,6 +173,58 @@ inline std::string pubsub_modack_body(const std::vector<std::string>& ack_ids, i
     return b;
 }
 
+// How many message ids a publish response carries, or nothing when the body
+// is not a publish response (not JSON, no "messageIds" array, an id that is not
+// a string).
+inline std::optional<std::size_t> pubsub_message_ids(const std::string& body) {
+    clink::config::JsonValue root;
+    try {
+        root = clink::config::parse(body);
+    } catch (...) {
+        return std::nullopt;
+    }
+    if (!root.is_object()) {
+        return std::nullopt;
+    }
+    const auto& obj = root.as_object();
+    const auto ids = obj.find("messageIds");
+    if (ids == obj.end() || !ids->second.is_array()) {
+        return std::nullopt;
+    }
+    for (const auto& id : ids->second.as_array()) {
+        if (!id.is_string()) {
+            return std::nullopt;
+        }
+    }
+    return ids->second.as_array().size();
+}
+
+// The verdict on a publish of `messages` messages. A publish is all or nothing,
+// so a 2xx counts only when it carries one message id per message; any other
+// 2xx confirms nothing and the request is sent again, never dead-lettered,
+// since the service refused no record. Other statuses as every bulk sink takes
+// them: 400 refuses the records (dead-lettered under dlq=drop), the rest are
+// retried.
+inline BulkResult pubsub_publish_result(const HttpResponse& res, std::size_t messages) {
+    if (res.status < 200 || res.status >= 300) {
+        return whole_batch_result(res, messages, {});
+    }
+    const auto ids = pubsub_message_ids(res.body);
+    if (ids && *ids == messages) {
+        return BulkResult{true, {}, {}, {}};
+    }
+    BulkResult br;
+    br.failed_transient.resize(messages);
+    for (std::size_t i = 0; i < messages; ++i) {
+        br.failed_transient[i] = i;
+    }
+    br.detail = ids ? "the reply confirms " + std::to_string(*ids) + " of the " +
+                          std::to_string(messages) + " messages"
+                    : "the reply is not a publish response and confirms none of the " +
+                          std::to_string(messages) + " messages";
+    return br;
+}
+
 struct PulledMessage {
     std::string ack_id;
     std::string payload;  // base64-decoded message data (empty if absent/undecodable)
@@ -253,10 +316,17 @@ inline std::shared_ptr<Sink<std::string>> make_pubsub_publish_sink(PubSubSinkOpt
     bo.max_age = o.linger;
     bo.dlq_policy = o.dlq_policy;
     bo.name = o.name;
-    // A successful publish is any 2xx; the body carries messageIds. The default
-    // whole-batch 2xx validator is correct (publish is all-or-nothing - there is
-    // no per-message partial-success report to parse).
-    auto render = [](std::string& out, const std::string& rec) {
+    bo.response_handler = pubsub_publish_result;
+    // Pub/Sub refuses a message with neither data nor attributes, and with it
+    // the whole request: one empty record once failed every record of its
+    // batch, all dead-lettered under dlq=drop. Refused here, it is the only one.
+    auto render = [name = o.name](std::string& out, const std::string& rec) {
+        if (rec.empty()) {
+            throw UnrenderableRecord(name +
+                                     ": an empty record cannot be published: Pub/Sub refuses a "
+                                     "message with neither data nor attributes, and the whole "
+                                     "request with it");
+        }
         out += pubsub_message_fragment(rec);
     };
     return std::make_shared<BatchedHttpBulkSink<std::string>>(std::move(bo), std::move(render));

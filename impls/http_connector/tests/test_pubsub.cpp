@@ -13,6 +13,7 @@
 #include <deque>
 #include <httplib.h>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -111,6 +112,49 @@ TEST(PubSubParse, EmptyAndAbsentReceivedMessages) {
     EXPECT_TRUE(pubsub_parse_pull_response("{}").empty());
     EXPECT_TRUE(pubsub_parse_pull_response(R"({"receivedMessages":[]})").empty());
     EXPECT_THROW(pubsub_parse_pull_response("not json"), std::runtime_error);
+}
+
+// A publish is all or nothing, so a 2xx counts only when it carries one
+// message id per message; any other 2xx confirms nothing and is sent again,
+// never dead-lettered.
+TEST(PubSubPublishResult, A2xxCountsOnlyWithOneIdPerMessage) {
+    EXPECT_EQ(pubsub_message_ids(R"({"messageIds":["1","2"]})"), std::optional<std::size_t>{2});
+    EXPECT_EQ(pubsub_message_ids(R"({"messageIds":[]})"), std::optional<std::size_t>{0});
+    EXPECT_EQ(pubsub_message_ids("<html>ok</html>"), std::nullopt);
+    EXPECT_EQ(pubsub_message_ids(R"({"messageIds":[1]})"), std::nullopt);
+    EXPECT_EQ(pubsub_message_ids(R"({"ids":["1"]})"), std::nullopt);
+    EXPECT_EQ(pubsub_message_ids(R"(["1"])"), std::nullopt);
+
+    HttpResponse ok;
+    ok.status = 200;
+    ok.body = R"({"messageIds":["1","2"]})";
+    EXPECT_TRUE(pubsub_publish_result(ok, 2).ok);
+
+    const auto short_reply = pubsub_publish_result(ok, 3);
+    EXPECT_FALSE(short_reply.ok);
+    EXPECT_EQ(short_reply.failed_transient, (std::vector<std::size_t>{0, 1, 2}));
+    EXPECT_TRUE(short_reply.failed_permanent.empty());
+    EXPECT_EQ(short_reply.detail, "the reply confirms 2 of the 3 messages");
+
+    HttpResponse page;
+    page.status = 200;
+    page.body = "<html>ok</html>";
+    const auto none = pubsub_publish_result(page, 1);
+    EXPECT_FALSE(none.ok);
+    EXPECT_EQ(none.failed_transient, (std::vector<std::size_t>{0}));
+    EXPECT_NE(none.detail.find("not a publish response"), std::string::npos);
+}
+
+TEST(PubSubPublishResult, OtherStatusesAsEveryBulkSinkTakesThem) {
+    HttpResponse r;
+    r.status = 400;  // the records refused: dead-lettered under dlq=drop
+    EXPECT_EQ(pubsub_publish_result(r, 2).failed_permanent, (std::vector<std::size_t>{0, 1}));
+    for (const int status : {0, 401, 403, 404, 429, 500, 503}) {
+        r.status = status;  // the endpoint's state, or passing: sent again
+        const auto v = pubsub_publish_result(r, 2);
+        EXPECT_EQ(v.failed_transient, (std::vector<std::size_t>{0, 1})) << status;
+        EXPECT_TRUE(v.failed_permanent.empty()) << status;
+    }
 }
 
 TEST(PubSubOptionValidation, SinkAndSourceRejectMissingIds) {

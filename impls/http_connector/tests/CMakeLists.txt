@@ -21,6 +21,7 @@ add_executable(clink_http_connector_tests
     test_token_refresh.cpp
     test_pubsub.cpp
     test_pubsub_live.cpp
+    test_pubsub_sink_live.cpp
 )
 target_link_libraries(clink_http_connector_tests PRIVATE
     clink::core

@@ -40,29 +40,83 @@ DlqPolicy parse_dlq(const clink::plugin::BuildContext& ctx) {
     return ctx.param_or("dlq", "fail") == "drop" ? DlqPolicy::Drop : DlqPolicy::Fail;
 }
 
+// A Pub/Sub factory's integer option, refused unless it is a whole number from
+// min to max: a typo or a negative once read as the default or wrapped.
+std::int64_t pubsub_integer(const clink::plugin::BuildContext& ctx,
+                            const std::string& who,
+                            const char* key,
+                            std::int64_t fallback,
+                            std::int64_t min,
+                            std::int64_t max) {
+    if (!ctx.params.contains(key)) {
+        return fallback;
+    }
+    const std::string v = ctx.param_or(key);
+    std::int64_t out = 0;
+    const auto* end = v.data() + v.size();
+    const auto [ptr, ec] = std::from_chars(v.data(), end, out);
+    if (v.empty() || ec != std::errc{} || ptr != end || out < min || out > max) {
+        throw std::runtime_error(who + ": '" + key + "' must be an integer from " +
+                                 std::to_string(min) + " to " + std::to_string(max) + "; it is '" +
+                                 v + "'");
+    }
+    return out;
+}
+
+// A Pub/Sub factory's boolean option: 'true' or 'false', nothing else.
+bool pubsub_boolean(const clink::plugin::BuildContext& ctx,
+                    const std::string& who,
+                    const char* key,
+                    bool fallback) {
+    if (!ctx.params.contains(key)) {
+        return fallback;
+    }
+    const std::string v = ctx.param_or(key);
+    if (v != "true" && v != "false") {
+        throw std::runtime_error(who + ": '" + key + "' must be 'true' or 'false'; it is '" + v +
+                                 "'");
+    }
+    return v == "true";
+}
+
 // Build the HTTP transport options shared by the Pub/Sub sink and source. The
 // base URL resolves in priority order: the `endpoint` option, else the
 // PUBSUB_EMULATOR_HOST env var ("host:port" -> http://host:port), else the real
-// service. Auth: `auth_token` -> "Authorization: Bearer <token>"; arbitrary
-// `headers` are merged too (and a header-supplied Authorization wins). The
-// emulator needs no auth.
-HttpRequest::Options pubsub_http_options(const clink::plugin::BuildContext& ctx) {
+// service. Auth: `auth_token_file` (re-read when it changes) or `auth_token` ->
+// "Authorization: Bearer <token>", not both; arbitrary `headers` are merged too
+// (and a header-supplied Authorization wins). The emulator needs no auth.
+HttpRequest::Options pubsub_http_options(const clink::plugin::BuildContext& ctx,
+                                         const std::string& who) {
     HttpRequest::Options http;
     std::string endpoint = ctx.param_or("endpoint", "");
+    if (ctx.params.contains("endpoint") && endpoint.empty()) {
+        throw std::runtime_error(who +
+                                 ": 'endpoint' is empty; leave it out for the emulator "
+                                 "PUBSUB_EMULATOR_HOST names, or the service");
+    }
     if (endpoint.empty()) {
         if (const char* env = std::getenv("PUBSUB_EMULATOR_HOST"); env != nullptr && *env != '\0') {
             endpoint = std::string("http://") + env;
         }
     }
     http.base_url = endpoint.empty() ? "https://pubsub.googleapis.com" : endpoint;
-    http.verify_tls = ctx.param_or("verify_tls", "true") != "false";
+    http.verify_tls = pubsub_boolean(ctx, who, "verify_tls", true);
+    http.connect_timeout_ms =
+        static_cast<int>(pubsub_integer(ctx, who, "connect_timeout_ms", 5000, 1, 600000));
+    http.rw_timeout_ms =
+        static_cast<int>(pubsub_integer(ctx, who, "request_timeout_ms", 30000, 1, 3600000));
     std::map<std::string, std::string> headers;
-    // `auth_token_file` (refreshing) takes precedence over a static `auth_token`: the file is
-    // re-read per request when it changes, so an external refresher rotating the token is picked
-    // up without a restart. With a provider set, do not also add a static Authorization header.
-    if (const std::string token_file = ctx.param_or("auth_token_file", ""); !token_file.empty()) {
+    const std::string token_file = ctx.param_or("auth_token_file", "");
+    const std::string token = ctx.param_or("auth_token", "");
+    if (!token_file.empty() && !token.empty()) {
+        throw std::runtime_error(who + ": set 'auth_token' or 'auth_token_file', not both");
+    }
+    // `auth_token_file` is re-read per request when it changes, so an external
+    // refresher rotating the token is picked up without a restart. With a
+    // provider set, no static Authorization header is added.
+    if (!token_file.empty()) {
         http.auth_token_provider = make_file_token_provider(token_file);
-    } else if (const std::string token = ctx.param_or("auth_token", ""); !token.empty()) {
+    } else if (!token.empty()) {
         headers["Authorization"] = "Bearer " + token;
     }
     for (auto& kv : parse_headers(ctx.param_or("headers", ""))) {
@@ -325,7 +379,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     });
     clink::connectors::declare_connector(clink::connectors::ConnectorCapabilities{
         .name = "pubsub",
-        .version = "1",
+        .version = "2",
         .is_source = true,
         .is_sink = true,
         .build_dependencies = {"cpp-httplib"},
@@ -344,9 +398,13 @@ void install(clink::plugin::PluginRegistry& reg) {
         .tls = true,
         .backpressure = true,
         .retries = true,
-        .timeout_options = {},
+        .timeout_options = {"connect_timeout_ms", "request_timeout_ms"},
         .available_in_sql = true,
-        .limitations = {"publish has no dedup key: a replay re-publishes",
+        .limitations = {"publish has no dedup key: a replay re-publishes, and so does a retry "
+                        "after a reply that did not confirm every message",
+                        "an empty record is refused before it is sent: Pub/Sub refuses a "
+                        "message with neither data nor attributes, and the whole request with it",
+                        "messages carry no attributes and no ordering key",
                         "the sink must be the only sink on its chain: Dag::add_sink refuses "
                         "another sink beside it",
                         "source messages a completed checkpoint covers but whose acknowledge had "
@@ -879,24 +937,36 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   endpoint              - override base URL (e.g. http://emulator:8085).
     //                           Else PUBSUB_EMULATOR_HOST, else the real service.
     //   auth_token            - bearer token -> "Authorization: Bearer <token>"
+    //   auth_token_file       - a file holding the token, re-read when it changes
     //   headers               - extra "K: V; ..." (merged; overrides auth_token)
-    //   batch_records (default 1000; capped at the 1000-message publish limit)
-    //   batch_bytes (default 9437184; stay under the ~10MB request limit)
-    //   max_retries (default 4; clamped to [0, 20])
+    //   batch_records (default 1000; 1 to 1000, the publish limit)
+    //   batch_bytes (default 9437184; 1 to 1 GiB) - flush threshold, rendered bytes
+    //   max_retries (default 4; 0 to 20)
+    //   dlq ("fail" [default] | "drop") - a record the service refuses
+    //   linger_ms (default 0; 0 to 3600000) - flush a partial batch this old
     //   verify_tls ("true" [default] | "false")
+    //   connect_timeout_ms (default 5000), request_timeout_ms (default 30000)
     reg.register_sink<std::string>(
         "pubsub_sink", [](const BuildContext& ctx) -> std::shared_ptr<Sink<std::string>> {
+            const std::string who = "pubsub_sink";
             PubSubSinkOptions o;
-            o.http = pubsub_http_options(ctx);
+            o.http = pubsub_http_options(ctx, who);
             o.project = ctx.param_or("project");
             o.topic = ctx.param_or("topic");
-            o.batch_records = static_cast<std::size_t>(ctx.param_int64_or("batch_records", 1000));
-            o.batch_bytes =
-                static_cast<std::size_t>(ctx.param_int64_or("batch_bytes", 9 * 1024 * 1024));
-            o.max_retries = static_cast<int>(ctx.param_int64_or("max_retries", 4));
+            o.batch_records =
+                static_cast<std::size_t>(pubsub_integer(ctx, who, "batch_records", 1000, 1, 1000));
+            o.batch_bytes = static_cast<std::size_t>(
+                pubsub_integer(ctx, who, "batch_bytes", 9 * 1024 * 1024, 1, std::int64_t{1} << 30));
+            o.max_retries = static_cast<int>(pubsub_integer(ctx, who, "max_retries", 4, 0, 20));
+            if (const std::string dlq = ctx.param_or("dlq", "fail");
+                dlq != "fail" && dlq != "drop") {
+                throw std::runtime_error(who + ": 'dlq' must be 'fail' or 'drop'; it is '" + dlq +
+                                         "'");
+            }
             o.dlq_policy = parse_dlq(ctx);
-            o.linger = std::chrono::milliseconds{ctx.param_int64_or("linger_ms", 0)};
-            o.name = "pubsub_sink";
+            o.linger =
+                std::chrono::milliseconds{pubsub_integer(ctx, who, "linger_ms", 0, 0, 3600000)};
+            o.name = who;
             return make_pubsub_publish_sink(std::move(o));
         });
 
@@ -909,7 +979,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     // load-balances messages across them (no client-side sharding).
     // Params:
     //   project (required), subscription (required)
-    //   endpoint / auth_token / headers / verify_tls - as pubsub_sink
+    //   endpoint / auth_token / auth_token_file / headers / verify_tls /
+    //   connect_timeout_ms / request_timeout_ms - as pubsub_sink
     //   max_messages (default 1000; capped at 1000) - Pull maxMessages
     //   return_immediately ("true" [default] | "false")
     //   poll_interval_ms (default 500) - sleep after an empty pull
@@ -921,7 +992,7 @@ void install(clink::plugin::PluginRegistry& reg) {
     reg.register_source<std::string>(
         "pubsub_source", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             PubSubSourceOptions o;
-            o.http = pubsub_http_options(ctx);
+            o.http = pubsub_http_options(ctx, "pubsub_source");
             o.project = ctx.param_or("project");
             o.subscription = ctx.param_or("subscription");
             o.max_messages = static_cast<int>(ctx.param_int64_or("max_messages", 1000));
