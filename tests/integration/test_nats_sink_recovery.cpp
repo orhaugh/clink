@@ -87,11 +87,6 @@ std::string env_or_empty(const char* name) {
     return v == nullptr ? std::string{} : std::string{v};
 }
 
-std::string env_or(const char* name, const std::string& dflt) {
-    const auto v = env_or_empty(name);
-    return v.empty() ? dflt : v;
-}
-
 // The test's view of the stream: a JetStream connection of its own.
 class StreamReader {
 public:
