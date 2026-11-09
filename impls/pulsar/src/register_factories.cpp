@@ -125,7 +125,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     // (individual ack at checkpoint completion; see PulsarSource for the two ways a restart is
     // replayed). Params: service_url (pulsar://localhost:6650), token, topic (required),
     //   subscription (clink), subscription_type (shared | exclusive), subscribe_timeout_ms
-    //   (60000), receiver_queue_size (1000), receive_timeout_ms (1000), batch_size (256).
+    //   (60000; 1..3600000), receiver_queue_size (1000; 0..1000000), receive_timeout_ms (1000;
+    //   1..600000), batch_size (256; at least 1), each read strictly.
     reg.register_source<std::string>(
         "pulsar_source_string",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
@@ -133,15 +134,23 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.conn = parse_conn(ctx, "pulsar_source_string");
             o.topic = ctx.param_or("topic");
             o.subscription = ctx.param_or("subscription", "clink");
+            const std::string who = "pulsar_source_string";
+            // 0 is the client's zero-queue consumer, which takes no batched messages.
             o.receiver_queue_size =
-                static_cast<int>(ctx.param_int64_or("receiver_queue_size", 1000));
-            o.receive_timeout =
-                std::chrono::milliseconds{ctx.param_int64_or("receive_timeout_ms", 1000)};
-            o.max_batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
+                static_cast<int>(int_option(ctx, who, "receiver_queue_size", 1000, 0, 1000000));
+            o.receive_timeout = std::chrono::milliseconds{
+                int_option(ctx, who, "receive_timeout_ms", 1000, 1, 600000)};
+            o.max_batch_size = static_cast<std::size_t>(int_option(ctx, who, "batch_size", 256, 1));
             o.name = "pulsar_source";
             o.subscription_type = ctx.param_or("subscription_type", "shared");
-            o.subscribe_timeout =
-                std::chrono::milliseconds{ctx.param_int64_or("subscribe_timeout_ms", 60000)};
+            if (o.subscription_type != "shared" && o.subscription_type != "exclusive") {
+                throw std::runtime_error(who +
+                                         ": 'subscription_type' must be 'shared' or 'exclusive' "
+                                         "(got '" +
+                                         o.subscription_type + "')");
+            }
+            o.subscribe_timeout = std::chrono::milliseconds{
+                int_option(ctx, who, "subscribe_timeout_ms", 60000, 1, 3600000)};
             if (o.topic.empty()) {
                 throw std::runtime_error("pulsar_source: 'topic' is required");
             }

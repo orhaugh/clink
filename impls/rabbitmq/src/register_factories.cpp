@@ -128,7 +128,8 @@ void install(clink::plugin::PluginRegistry& reg) {
     // acknowledged).
     // Params: host (localhost), port (5672), vhost (/), user/password (guest), queue (required),
     //   consumer_tag, prefetch (10000; 1..65535: the most held unacknowledged, so the most read per
-    //   checkpoint), poll_timeout_ms (100), batch_size (256).
+    //   checkpoint), poll_timeout_ms (100; 1..600000), batch_size (256; at least 1),
+    //   declare_queue (true | false), each read strictly.
     reg.register_source<std::string>(
         "rabbitmq_source_string",
         [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
@@ -136,16 +137,14 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.conn = parse_conn(ctx, "rabbitmq_source_string");
             o.queue = ctx.param_or("queue");
             o.consumer_tag = ctx.param_or("consumer_tag", "");
-            o.declare_queue = ctx.param_or("declare_queue", "true") != "false";
-            const auto prefetch = ctx.param_int64_or("prefetch", 10000);
-            if (prefetch < 1 || prefetch > 65535) {
-                throw std::runtime_error(
-                    "rabbitmq_source_string: 'prefetch' must be between 1 and "
-                    "65535 (basic.qos prefetch_count; 0 would be unlimited)");
-            }
-            o.prefetch = static_cast<std::uint16_t>(prefetch);
-            o.poll_timeout = std::chrono::milliseconds{ctx.param_int64_or("poll_timeout_ms", 100)};
-            o.max_batch_size = static_cast<std::size_t>(ctx.param_int64_or("batch_size", 256));
+            const std::string who = "rabbitmq_source_string";
+            o.declare_queue = bool_option(ctx, who, "declare_queue", true);
+            // basic.qos prefetch_count, where 0 would mean unlimited.
+            o.prefetch =
+                static_cast<std::uint16_t>(int_option(ctx, who, "prefetch", 10000, 1, 65535));
+            o.poll_timeout =
+                std::chrono::milliseconds{int_option(ctx, who, "poll_timeout_ms", 100, 1, 600000)};
+            o.max_batch_size = static_cast<std::size_t>(int_option(ctx, who, "batch_size", 256, 1));
             o.name = "rabbitmq_source";
             if (o.queue.empty()) {
                 throw std::runtime_error("rabbitmq_source: 'queue' is required");

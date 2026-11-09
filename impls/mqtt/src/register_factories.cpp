@@ -288,12 +288,14 @@ void install(clink::plugin::PluginRegistry& reg) {
     //   host/port/username/password/keepalive + tls*
     //   client_id (default "clink-mqtt-source"; subtask index appended)
     //   topic (required)              - topic filter to subscribe to
-    //   qos (default 1)               - subscription QoS
+    //   qos (default 1)               - subscription QoS, 0 to 2
     //   shared_group (default "")     - non-empty -> "$share/<group>/<topic>" so
     //                                   parallel subtasks share the load (else only
     //                                   subtask 0 is active, others dormant)
     //   include_topic (default false) - true -> emit {"topic":..,"payload":..} JSON
-    //   block_ms (default 500)        - longest wait for a message (bounds cancel latency)
+    //   block_ms (default 500)        - longest wait for a message (bounds cancel latency),
+    //                                   1..600000
+    // Every option is read strictly: a value that is not one it takes is refused.
     //   protocol_version (default 5)  - 5 (MQTT 5) or 3.1.1
     //   receive_maximum (10000)       - MQTT 5: 1..65535 messages the broker may send
     //                                   unacknowledged, so the most read per checkpoint
@@ -306,11 +308,12 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.conn.client_id = client_id_for(ctx, "clink-mqtt-source");
             // The session always persists (the source does not read clean_session):
             // recovery is the broker delivering again what was not acknowledged.
+            const std::string who = "mqtt_source";
             o.topic = ctx.param_or("topic");
-            o.qos = static_cast<int>(ctx.param_int64_or("qos", 1));
+            o.qos = static_cast<int>(int_option(ctx, who, "qos", 1, 0, 2));
             o.shared_group = ctx.param_or("shared_group", "");
-            o.include_topic = ctx.param_or("include_topic", "") == "true";
-            o.block = std::chrono::milliseconds{ctx.param_int64_or("block_ms", 500)};
+            o.include_topic = bool_option(ctx, who, "include_topic", false);
+            o.block = std::chrono::milliseconds{int_option(ctx, who, "block_ms", 500, 1, 600000)};
             const auto version = ctx.param_or("protocol_version", "5");
             if (version == "5") {
                 o.protocol_version = protocol::kMqtt5;
@@ -319,21 +322,19 @@ void install(clink::plugin::PluginRegistry& reg) {
             } else {
                 throw std::runtime_error("mqtt_source: 'protocol_version' must be '5' or '3.1.1'");
             }
-            const auto receive_maximum = ctx.param_int64_or("receive_maximum", 10000);
-            if (receive_maximum < 1 || receive_maximum > 65535) {
-                throw std::runtime_error(
-                    "mqtt_source: 'receive_maximum' must be between 1 and 65535 (the messages "
-                    "the broker may send unacknowledged, so the most read per checkpoint)");
-            }
-            o.receive_maximum = static_cast<std::uint16_t>(receive_maximum);
-            const auto expiry =
-                ctx.param_int64_or("session_expiry_s", protocol::kSessionNeverExpires);
-            if (expiry < 1 || expiry > protocol::kSessionNeverExpires) {
-                throw std::runtime_error(
-                    "mqtt_source: 'session_expiry_s' must be between 1 and 4294967295 (never): "
-                    "a session that ends with its connection delivers nothing again");
-            }
-            o.session_expiry_s = static_cast<std::uint32_t>(expiry);
+            // The messages the broker may send unacknowledged, so the most read per
+            // checkpoint.
+            o.receive_maximum = static_cast<std::uint16_t>(
+                int_option(ctx, who, "receive_maximum", 10000, 1, 65535));
+            // At least 1: a session that ends with its connection delivers nothing
+            // again. The most is never.
+            o.session_expiry_s =
+                static_cast<std::uint32_t>(int_option(ctx,
+                                                      who,
+                                                      "session_expiry_s",
+                                                      protocol::kSessionNeverExpires,
+                                                      1,
+                                                      protocol::kSessionNeverExpires));
             o.subtask_idx = ctx.subtask_idx;
             o.parallelism = ctx.parallelism;
             o.name = "mqtt_source";

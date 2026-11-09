@@ -108,8 +108,9 @@ void install(clink::plugin::PluginRegistry& reg) {
     // nats_source_string: JetStream durable pull consumer; emit each message body as a string.
     // At-least-once (explicit ack at the checkpoint barrier; JetStream redelivers unacked).
     // Params: url (nats://localhost:4222), user/password/token, subject (required), stream,
-    //   durable (clink), batch (256), fetch_timeout_ms (1000), ack_wait_s (60), max_lease_s (3600),
-    //   max_ack_pending (2048, the durable's bound across every subtask).
+    //   durable (clink), batch (256; 1..1000000), fetch_timeout_ms (1000; 1..600000), ack_wait_s
+    //   (60; 1 s to a year), max_lease_s (3600; ack_wait_s to a year), max_ack_pending (2048, the
+    //   durable's bound across every subtask), each read strictly.
     reg.register_source<std::string>(
         "nats_source_string", [](const BuildContext& ctx) -> std::shared_ptr<Source<std::string>> {
             NatsSource::Options o;
@@ -117,26 +118,21 @@ void install(clink::plugin::PluginRegistry& reg) {
             o.subject = ctx.param_or("subject");
             o.stream = ctx.param_or("stream", "");
             o.durable = ctx.param_or("durable", "clink");
-            o.batch = static_cast<int>(ctx.param_int64_or("batch", 256));
-            o.fetch_timeout =
-                std::chrono::milliseconds{ctx.param_int64_or("fetch_timeout_ms", 1000)};
-            const auto ack_wait_s = ctx.param_int64_or("ack_wait_s", 60);
-            if (ack_wait_s < 1) {
-                throw std::runtime_error("nats_source_string: 'ack_wait_s' must be at least 1");
-            }
+            const std::string who = "nats_source_string";
+            o.batch = static_cast<int>(int_option(ctx, who, "batch", 256, 1, 1000000));
+            o.fetch_timeout = std::chrono::milliseconds{
+                int_option(ctx, who, "fetch_timeout_ms", 1000, 1, 600000)};
+            // A year at most, which nats.c holds in nanoseconds with room to spare.
+            const auto ack_wait_s = int_option(ctx, who, "ack_wait_s", 60, 1, 31536000);
             o.ack_wait = std::chrono::seconds{ack_wait_s};
-            const auto max_lease_s = ctx.param_int64_or("max_lease_s", 3600);
+            const auto max_lease_s = int_option(ctx, who, "max_lease_s", 3600, 1, 31536000);
             if (max_lease_s < ack_wait_s) {
                 throw std::runtime_error(
                     "nats_source_string: 'max_lease_s' must be at least 'ack_wait_s'");
             }
             o.max_lease = std::chrono::seconds{max_lease_s};
-            const auto max_ack_pending = ctx.param_int64_or("max_ack_pending", 2048);
-            if (max_ack_pending < 1) {
-                throw std::runtime_error(
-                    "nats_source_string: 'max_ack_pending' must be at least 1");
-            }
-            o.max_ack_pending = static_cast<int>(max_ack_pending);
+            o.max_ack_pending = static_cast<int>(int_option(
+                ctx, who, "max_ack_pending", 2048, 1, std::numeric_limits<std::int32_t>::max()));
             o.name = "nats_source";
             if (o.subject.empty()) {
                 throw std::runtime_error("nats_source: 'subject' is required");

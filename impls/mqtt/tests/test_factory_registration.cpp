@@ -204,6 +204,50 @@ TEST(MqttFactoryRegistration, TheSinkFactoryReadsItsOptionsStrictly) {
     }
 }
 
+// Building a source connects to nothing either. Its own options were read
+// leniently: a typo fell back to the default, qos='1.5' read as 1, and
+// include_topic='True' emitted bare payloads.
+TEST(MqttFactoryRegistration, TheSourceFactoryReadsItsOptionsStrictly) {
+    const auto* f = clink::cluster::OperatorRegistry::default_instance().find_source(
+        "mqtt_source", std::string{clink::cluster::kChannelString});
+    ASSERT_NE(f, nullptr);
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"topic", "t/#"}};
+    EXPECT_NO_THROW((void)f->build(ctx));
+    auto every = ctx;
+    every.params.insert({{"qos", "2"},
+                         {"block_ms", "600000"},
+                         {"include_topic", "true"},
+                         {"receive_maximum", "65535"},
+                         {"session_expiry_s", "4294967295"}});
+    EXPECT_NO_THROW((void)f->build(every));
+    for (const auto& [key, value] :
+         std::vector<std::pair<std::string, std::string>>{{"qos", "3"},
+                                                          {"qos", "1.5"},
+                                                          {"qos", "one"},
+                                                          {"block_ms", "0"},
+                                                          {"block_ms", "600001"},
+                                                          {"receive_maximum", "0"},
+                                                          {"receive_maximum", "65536"},
+                                                          {"session_expiry_s", "0"},
+                                                          {"session_expiry_s", "never"}}) {
+        auto c = ctx;
+        c.params[key] = value;
+        EXPECT_NE(mqtt_thrown([&] { (void)f->build(c); }).find("'" + key + "' must be an integer"),
+                  std::string::npos)
+            << key << "=" << value;
+    }
+    for (const char* value : {"True", "yes"}) {
+        auto c = ctx;
+        c.params["include_topic"] = value;
+        EXPECT_NE(mqtt_thrown([&] {
+                      (void)f->build(c);
+                  }).find("'include_topic' must be 'true' or 'false'"),
+                  std::string::npos)
+            << value;
+    }
+}
+
 TEST(MqttCapabilityRecords, TheSinkRecordNamesItsTimeout) {
     const auto* sink = clink::connectors::CapabilityRegistry::instance().find("mqtt");
     ASSERT_NE(sink, nullptr);

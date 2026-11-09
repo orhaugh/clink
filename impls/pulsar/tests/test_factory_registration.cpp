@@ -99,6 +99,46 @@ TEST(PulsarFactoryRegistration, TheSinkFactoryReadsItsOptionsStrictly) {
     }
 }
 
+// Building a source connects to nothing either. Its own options were read
+// leniently: a typo fell back to the default, and a subscription type other
+// than shared or exclusive built and failed only when the source opened.
+TEST(PulsarFactoryRegistration, TheSourceFactoryReadsItsOptionsStrictly) {
+    const auto* f = clink::cluster::OperatorRegistry::default_instance().find_source(
+        "pulsar_source_string", std::string{clink::cluster::kChannelString});
+    ASSERT_NE(f, nullptr);
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"topic", "t"}};
+    EXPECT_NO_THROW((void)f->build(ctx));
+    auto every = ctx;
+    every.params.insert({{"receiver_queue_size", "0"},
+                         {"receive_timeout_ms", "600000"},
+                         {"batch_size", "1000000"},
+                         {"subscribe_timeout_ms", "3600000"}});
+    EXPECT_NO_THROW((void)f->build(every));
+    for (const auto& [key, value] :
+         std::vector<std::pair<std::string, std::string>>{{"receiver_queue_size", "-1"},
+                                                          {"receiver_queue_size", "1000001"},
+                                                          {"receive_timeout_ms", "0"},
+                                                          {"receive_timeout_ms", "1.5"},
+                                                          {"batch_size", "0"},
+                                                          {"batch_size", "lots"},
+                                                          {"subscribe_timeout_ms", "0"},
+                                                          {"subscribe_timeout_ms", "3600001"}}) {
+        auto c = ctx;
+        c.params[key] = value;
+        EXPECT_NE(
+            pulsar_thrown([&] { (void)f->build(c); }).find("'" + key + "' must be an integer"),
+            std::string::npos)
+            << key << "=" << value;
+    }
+    auto failover = ctx;
+    failover.params["subscription_type"] = "failover";
+    EXPECT_NE(pulsar_thrown([&] {
+                  (void)f->build(failover);
+              }).find("'subscription_type' must be 'shared' or 'exclusive'"),
+              std::string::npos);
+}
+
 TEST(PulsarFactoryRegistration, TheRecordStatesTheSinksContract) {
     const auto* caps = clink::connectors::CapabilityRegistry::instance().find("pulsar");
     ASSERT_NE(caps, nullptr);
