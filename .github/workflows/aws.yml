@@ -1,8 +1,8 @@
 name: aws
 
-# The AWS connectors' gates, one build for both, each against LocalStack
+# The AWS connectors' gates, one build for all of them, each against LocalStack
 # (docker/integration-services.yml's localstack service) and a model of the
-# service. Nothing here runs against AWS.
+# service, or for raw S3 objects against SILO. Nothing here runs against AWS.
 #
 # scripts/kinesis-live.sh, the Kinesis source: its deterministic cases against a
 # model of the service (ownership, discovery, split and merge lineage, restores
@@ -40,6 +40,12 @@ name: aws
 # stream's S3 destination back record by record; and the recovery cells, a
 # worker killed after an acceptance no checkpoint covers or before a send, each
 # bucket checked for every record at least once and nothing else.
+#
+# scripts/s3-live.sh, the raw S3 objects: the text sink, the multipart 2PC sink
+# and the C++ source against SILO, a fork of the MinIO server pinned by digest:
+# every page of a listing, the source's restores by key, the text sink's parts
+# per subtask and after a restore, and the 2PC sink's commit, recovery, abort and
+# contract suite. The 2PC sink's cluster-level suite runs in docker-suites.
 #
 # A live test skips when its endpoint or binary is missing and gtest counts that
 # as a pass, so each gate fails on any skip and on any required suite that did
@@ -90,10 +96,10 @@ jobs:
           restore-keys: |
             ccache-aws-
             ccache-kinesis-
-      # CLINK_WITH_AWS=ON, not AUTO: an SDK missing from the image fails the
-      # configure rather than leaving the gate without its binaries. Debug
-      # without DWARF and stripped, as the build job builds.
-      - name: Build the AWS tests, the recovery cells, the node binary and the SQL submitter
+      # CLINK_WITH_AWS=ON and CLINK_WITH_AWS_S3=ON, not AUTO: an SDK missing from
+      # the image fails the configure rather than leaving a gate without its
+      # binaries. Debug without DWARF and stripped, as the build job builds.
+      - name: Build the AWS and S3 tests, the recovery cells, the node binary and the SQL submitter
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ccache"
@@ -107,10 +113,11 @@ jobs:
               git config --global --add safe.directory "*"
               apt-get update -q >/dev/null && apt-get install -y -q --no-install-recommends ccache >/dev/null
               cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCLINK_BUILD_TESTS=ON -DCLINK_BUILD_SQL=ON \
-                -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_AWS=ON -DCMAKE_C_FLAGS_DEBUG=-g0 \
-                -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s -DCMAKE_SHARED_LINKER_FLAGS=-s
-              cmake --build build --target clink_aws_tests clink_integration_tests clink_node \
-                clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
+                -DCLINK_INTEGRATION_TESTS=ON -DCLINK_WITH_AWS=ON -DCLINK_WITH_AWS_S3=ON \
+                -DCMAKE_C_FLAGS_DEBUG=-g0 -DCMAKE_CXX_FLAGS_DEBUG=-g0 -DCMAKE_EXE_LINKER_FLAGS=-s \
+                -DCMAKE_SHARED_LINKER_FLAGS=-s
+              cmake --build build --target clink_aws_tests clink_s3_tests clink_integration_tests \
+                clink_node clink_submit_sql -j "$(( $(nproc) / 2 + 1 ))"
               ccache -s | tail -3'
       - name: Save compiler cache
         if: always()
@@ -157,6 +164,19 @@ jobs:
             -e AWS_EC2_METADATA_DISABLED \
             ${TOOLCHAIN}"
           scripts/firehose-live.sh build 2>&1 | tee "${RUNNER_TEMP}/firehose-gate.log"
+      - name: Run the raw S3 gate
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          export REPORT_DIR="${RUNNER_TEMP}/s3-live-reports"
+          export PIN_RUNNER="docker run --rm --user root --network host \
+            -v ${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE} -w ${GITHUB_WORKSPACE} \
+            -v ${RUNNER_TEMP}:${RUNNER_TEMP} \
+            -e CLINK_S3_TEST_ENDPOINT -e CLINK_S3_TEST_BUCKET \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION -e AWS_REGION \
+            -e AWS_EC2_METADATA_DISABLED \
+            ${TOOLCHAIN}"
+          scripts/s3-live.sh build 2>&1 | tee "${RUNNER_TEMP}/s3-gate.log"
       - name: Keep the Kinesis reports and the cells' evidence
         # The reports carry every case's result; the gate log and each run's log
         # carry the recovery cells' verdict lines and the fault framework's
@@ -191,6 +211,16 @@ jobs:
           path: |
             ${{ runner.temp }}/firehose-live-reports/**
             ${{ runner.temp }}/firehose-gate.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Keep the raw S3 reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-gate
+          path: |
+            ${{ runner.temp }}/s3-live-reports/**
+            ${{ runner.temp }}/s3-gate.log
           if-no-files-found: warn
           retention-days: 90
       - name: Upload the harness logs on failure
