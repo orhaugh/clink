@@ -245,11 +245,17 @@ TEST(MqttSinkContractLive, ABrokerThatRefusesAMessageFailsTheFlushNamingItsReaso
     }
 }
 
-// Under MQTT 5 a broker that ends a connection says why in its DISCONNECT, and
-// the failure carries that reason: here a second connection under the sink's
-// client id takes its session over while a flush waits for its
-// acknowledgements.
-TEST(MqttSinkContractLive, ABrokerThatEndsTheConnectionGivesItsReason) {
+// A second connection under the sink's client id takes its session over while a
+// 100,000-message flush is under way, and the flush fails with what became of
+// its messages. Mosquitto sends the old connection a DISCONNECT naming the
+// takeover and closes it, but the sink is still writing the flush, and closing
+// a connection with the client's bytes still arriving resets it: the client can
+// see the reset before it reads the DISCONNECT, and then the error says the
+// connection was lost, as it often does on CI. So the reason is required where
+// the sink is only reading when the DISCONNECT comes
+// (MqttSinkLogic.ABrokerThatEndsTheConnectionGivesItsReason, against the
+// in-process broker), and here the error is either.
+TEST(MqttSinkContractLive, ABrokerThatEndsTheConnectionDuringAFlushFailsIt) {
     REQUIRE_MQTT();
     const auto topic = "clink/sinkc/" + unique("takeover");
     Collector c(topic);
@@ -272,11 +278,15 @@ TEST(MqttSinkContractLive, ABrokerThatEndsTheConnectionGivesItsReason) {
     });
     const auto why = thrown([&] { sink.on_barrier(kBarrier); });
     usurper.join();
-    EXPECT_NE(why.find("the broker ended the connection while waiting for the broker's "
-                       "acknowledgements (Session taken over)"),
-              std::string::npos)
-        << why;
+    const bool named = why.find(
+                           "the broker ended the connection while waiting for the "
+                           "broker's acknowledgements (Session taken over)") != std::string::npos;
+    const bool lost = why.find(
+                          "the connection failed while waiting for the broker's "
+                          "acknowledgements") != std::string::npos;
+    EXPECT_TRUE(named || lost) << why;
     EXPECT_NE(why.find("of the flush's 100000 messages"), std::string::npos) << why;
+    EXPECT_NE(thrown([&] { sink.flush(); }).find("failed earlier"), std::string::npos);
     sink.close();
 }
 

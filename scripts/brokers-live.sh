@@ -220,7 +220,7 @@ expectations_of() {  # <broker> <phase>
             echo 'SourceAckTest.*=12'
             ;;
         mqtt/sinks)
-            echo 'MqttSinkLogic.*=4'
+            echo 'MqttSinkLogic.*=5'
             echo 'MqttSinkContractLive.*=11'
             echo 'MqttFactoryRegistration.*=3'
             echo 'MqttCapabilityRecords.*=4'

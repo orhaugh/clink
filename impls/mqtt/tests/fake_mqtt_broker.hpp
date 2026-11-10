@@ -4,8 +4,10 @@
 // source's subscriber offline: one client at a time, a persistent session per
 // client id that delivers again on reconnect what was not acknowledged, and a
 // record of every acknowledgement in the order it came. Tests publish into it
-// and read back what the client acknowledged. Not a general broker: one
-// subscription per session, and no routing.
+// and read back what the client acknowledged. A client's own publishes are
+// counted and never acknowledged, so a publisher (the sink) waits on them for
+// as long as a test wants, writing nothing, until end_connection(). Not a
+// general broker: one subscription per session, and no routing.
 
 #include <algorithm>
 #include <chrono>
@@ -121,6 +123,28 @@ public:
                 send_locked(publish_packet(m.topic, m.payload, m.qos, m.id, true));
             }
         }
+    }
+
+    // End the client's connection as a broker does under MQTT 5: a DISCONNECT
+    // with this reason code, then the end of what the broker sends. Returns once
+    // the client has closed its side.
+    void end_connection(std::uint8_t reason) {
+        {
+            std::lock_guard lk(mu_);
+            if (client_fd_ >= 0) {
+                std::string body;
+                protocol::put_u8(body, reason);
+                protocol::put_varint(body, 0);
+                send_locked(protocol::packet(protocol::PacketType::Disconnect, 0, body));
+                ::shutdown(client_fd_, SHUT_WR);
+            }
+        }
+        wait_for([this] { return client_fd_ < 0; }, std::chrono::seconds{5});
+    }
+
+    // Waits until the client has published at least `n` messages.
+    bool wait_for_publishes(std::size_t n, std::chrono::milliseconds timeout) {
+        return wait_for([this, n] { return publishes_ >= n; }, timeout);
     }
 
     // Close the client's connection, as a broker or network failure does.
@@ -372,6 +396,9 @@ private:
                 ++pingreqs_;
                 send_locked(protocol::packet(PacketType::Pingresp, 0, {}));
                 return;
+            case PacketType::Publish:
+                ++publishes_;  // counted, never acknowledged
+                return;
             case PacketType::Disconnect:
                 ++disconnects_;
                 close_client_locked();
@@ -443,6 +470,7 @@ private:
     std::size_t pubcomps_{0};
     std::size_t pingreqs_{0};
     std::size_t disconnects_{0};
+    std::size_t publishes_{0};
     std::optional<Connect> last_connect_;
 };
 
