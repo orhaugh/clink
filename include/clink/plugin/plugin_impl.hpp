@@ -174,6 +174,17 @@ inline const clink::cluster::TypeOps& require_type_ops(const clink::cluster::Typ
     return *ops;
 }
 
+// The OperatorId values of the runners a subtask's Dag hosts, whose
+// operator-state rows its restore keeps (StateBackendSpec::hosted_operators).
+inline std::vector<std::uint64_t> hosted_operator_ids(const clink::Dag& dag) {
+    std::vector<std::uint64_t> ids;
+    ids.reserve(dag.runners().size());
+    for (const auto& runner : dag.runners()) {
+        ids.push_back(runner.id.value());
+    }
+    return ids;
+}
+
 // JobConfig with a per-subtask state backend, selected via the global
 // StateBackendFactory. A bare checkpoint_dir is interpreted as the
 // "file" scheme to keep existing CheckpointConfig.checkpoint_dir
@@ -187,7 +198,11 @@ inline const clink::cluster::TypeOps& require_type_ops(const clink::cluster::Typ
 // can be used while checkpoint_dir stays the coordinator's LOCAL coordination
 // directory for COMPLETED-N markers and HA recovery. Empty preserves the
 // legacy behaviour where checkpoint_dir doubles as the backend URI.
-inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerContext& rctx) {
+//
+// `hosted_operators` names the operators the subtask runs (hosted_operator_ids),
+// so its restore keeps their operator-state rows and no others.
+inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerContext& rctx,
+                                                std::vector<std::uint64_t> hosted_operators = {}) {
     clink::JobConfig cfg;
     // Record-capture flight recorder: thread the job's capture config through
     // to the runner contexts (the operator runner tees input records into
@@ -218,6 +233,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     spec.restore_generation = rctx.restore_from_generation;
     spec.restore_from_subtask_idx = rctx.restore_from_subtask_idx;
     spec.restore_from_parent_count = rctx.restore_from_parent_count;
+    spec.hosted_operators = std::move(hosted_operators);
     // Build through the HOST's factory when provided (rctx.state_backend_factory):
     // a dlopen'd plugin's .so-local StateBackendFactory singleton only has the
     // ctor builtins (memory/file/changelog), NOT the dynamically-registered
@@ -591,7 +607,7 @@ void PluginRegistry::register_source(
                     [stop_signal]() { stop_signal->store(true, std::memory_order_release); },
                 });
             }
-            auto cfg = detail::make_subtask_job_config(rctx);
+            auto cfg = detail::make_subtask_job_config(rctx, detail::hosted_operator_ids(dag));
             cfg.drain_target = drain_signal;
             cfg.drain_at_checkpoint = arm_signal;
             cfg.stop_requested = stop_signal;
@@ -773,7 +789,8 @@ void PluginRegistry::register_sink(
             // This subtask hosts one logical operator (the sink); its input network
             // bridges' bytes are the sink's bytes_received.
             dag.set_all_runners_attributed_op_id(dag.runner_id_at(hs.runner_index));
-            clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
+            auto cfg = detail::make_subtask_job_config(rctx, detail::hosted_operator_ids(dag));
+            clink::LocalExecutor exec(std::move(dag), std::move(cfg));
             // Constructed after exec so reverse destruction retires the commit
             // dispatch gate before the executor and the StateBackend the sink's
             // finalise path touches are destroyed. The sink's runner has normally
@@ -923,7 +940,8 @@ void PluginRegistry::register_operator(
             // bridges' bytes to it (bytes_received) and its output bridges'
             // bytes to it (bytes_sent).
             dag.set_all_runners_attributed_op_id(dag.runner_id_at(h1.runner_index));
-            clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
+            auto cfg = detail::make_subtask_job_config(rctx, detail::hosted_operator_ids(dag));
+            clink::LocalExecutor exec(std::move(dag), std::move(cfg));
             detail::run_subtask_to_completion(exec, rctx.cancel_token);
         };
     runner_registry_.register_operator(op_type, in_channel, out_channel, std::move(runner));
@@ -1119,7 +1137,8 @@ void PluginRegistry::register_co_operator(
         // bridges' bytes (bytes_received) and output bridges' bytes (bytes_sent)
         // to it.
         dag.set_all_runners_attributed_op_id(dag.runner_id_at(h_out.runner_index));
-        clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
+        auto cfg = detail::make_subtask_job_config(rctx, detail::hosted_operator_ids(dag));
+        clink::LocalExecutor exec(std::move(dag), std::move(cfg));
         detail::run_subtask_to_completion(exec, rctx.cancel_token);
     };
     runner_registry_.register_co_operator(

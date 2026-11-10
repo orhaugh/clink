@@ -258,6 +258,87 @@ TEST(StateBackendFactory, RescaleUnionsOperatorStateFromAllParents) {
     std::filesystem::remove_all(working_root);
 }
 
+// A restore unions every participant's operator-state rows, because a source's
+// offsets must cross its subtasks, and then keeps only those of the operators
+// the restoring subtask runs. A sink subtask used to come back holding the
+// source's offsets as well, and carried them, stale, in every later snapshot.
+TEST(StateBackendFactory, ARestoreKeepsOnlyTheOperatorRowsOfTheOperatorsTheSubtaskRuns) {
+    const auto restore_root = make_temp_dir("hosted_src");
+    const std::uint64_t ckpt_id = 12;
+    const clink::OperatorId source{1};
+    const clink::OperatorId sink{2};
+    using KV = clink::StateBackend::KeyView;
+    using VV = clink::StateBackend::ValueView;
+    const auto publish = [&](std::uint32_t idx, clink::InMemoryStateBackend& backend) {
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(
+            gen_dir(restore_root, idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+            snap.bytes,
+            ckpt_id);
+    };
+    // The source at parallelism 2, one partition's offset each.
+    for (std::uint32_t idx : {0u, 1u}) {
+        clink::InMemoryStateBackend source_subtask;
+        const std::string off = "off:" + std::to_string(idx);
+        source_subtask.put_operator_state(source, KV{off}, VV{"FRESH" + std::to_string(idx)});
+        publish(idx, source_subtask);
+    }
+    // The sink, with its own operator row and keyed row, and a stale copy of
+    // the source's first offset that a restore before this rule left it.
+    {
+        clink::InMemoryStateBackend sink_subtask;
+        sink_subtask.put_operator_state(sink, KV{"handle"}, VV{"H"});
+        sink_subtask.put(sink, KV{"pending"}, VV{"P"});
+        sink_subtask.put_operator_state(source, KV{"off:0"}, VV{"STALE0"});
+        clink::StateVersionMap versions;
+        versions.set(sink, "commit-handle", 3);
+        sink_subtask.set_state_versions(versions);
+        publish(2, sink_subtask);
+    }
+    const auto restore = [&](std::uint32_t idx, std::vector<std::uint64_t> hosted) {
+        const auto working_root = make_temp_dir("hosted_dst" + std::to_string(idx));
+        clink::StateBackendSpec spec;
+        spec.uri = "file://" + working_root.string();
+        spec.subtask_idx = idx;
+        spec.restore_uri = "file://" + restore_root.string();
+        spec.restore_checkpoint_id = ckpt_id;
+        spec.hosted_operators = std::move(hosted);
+        auto built = clink::StateBackendFactory::default_instance().build(spec);
+        EXPECT_TRUE(built.restore_from.has_value());
+        auto backend = std::make_shared<clink::InMemoryStateBackend>();
+        backend->restore(*built.restore_from);
+        std::filesystem::remove_all(working_root);
+        return backend;
+    };
+    const auto text = [](const std::optional<std::vector<std::byte>>& v) {
+        return v ? std::string(reinterpret_cast<const char*>(v->data()), v->size())
+                 : std::string{"<absent>"};
+    };
+
+    // The sink keeps its own rows and none of the source's, its stale copy
+    // included, and its snapshot's state versions survive.
+    auto sink_backend = restore(2, {sink.value()});
+    EXPECT_EQ(text(sink_backend->get_operator_state(sink, KV{"handle"})), "H");
+    EXPECT_EQ(text(sink_backend->get(sink, KV{"pending"})), "P");
+    EXPECT_EQ(text(sink_backend->get_operator_state(source, KV{"off:0"})), "<absent>");
+    EXPECT_EQ(text(sink_backend->get_operator_state(source, KV{"off:1"})), "<absent>");
+    EXPECT_EQ(sink_backend->restored_state_versions().get(sink, "commit-handle"), 3u);
+
+    // A source subtask still receives its peer's offsets, fresh, and none of
+    // the sink's rows.
+    auto source_backend = restore(0, {source.value()});
+    EXPECT_EQ(text(source_backend->get_operator_state(source, KV{"off:0"})), "FRESH0");
+    EXPECT_EQ(text(source_backend->get_operator_state(source, KV{"off:1"})), "FRESH1");
+    EXPECT_EQ(text(source_backend->get_operator_state(sink, KV{"handle"})), "<absent>");
+
+    // A caller that does not say what it runs keeps every row, as before.
+    auto unsaid = restore(2, {});
+    EXPECT_EQ(text(unsaid->get_operator_state(sink, KV{"handle"})), "H");
+    EXPECT_EQ(text(unsaid->get_operator_state(source, KV{"off:1"})), "FRESH1");
+
+    std::filesystem::remove_all(restore_root);
+}
+
 TEST(StateBackendFactory, RestoreUriEmptyLeavesRestoreFromUnset) {
     const auto dir = make_temp_dir("no_restore");
     clink::StateBackendSpec spec;

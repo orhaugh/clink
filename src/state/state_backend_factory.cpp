@@ -594,6 +594,20 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             std::vector<std::byte> final_bytes =
                 parts.size() == 1 ? std::move(parts.front())
                                   : InMemoryStateBackend::merge_snapshot_bytes(parts);
+            // Then only the operator-state rows of the operators this subtask
+            // runs. The union above takes every participant's, the sinks' and
+            // the operators' as well as the sources', and a subtask that kept
+            // them carried another operator's rows, a Kafka source's offsets
+            // among them, in every snapshot after the restore: stale copies
+            // that only ever lost a collision, but that a reader of the
+            // snapshots had to know to discard. Its own snapshot's copies from
+            // before this rule go the same way.
+            if (!spec.hosted_operators.empty()) {
+                final_bytes = InMemoryStateBackend::retain_operator_state_of(
+                    final_bytes,
+                    std::set<std::uint64_t>(spec.hosted_operators.begin(),
+                                            spec.hosted_operators.end()));
+            }
             // Handed over IN MEMORY, deliberately not staged as a file here.
             //
             // It used to be written to <base>/<this subtask idx>/checkpoint-<id>.snap

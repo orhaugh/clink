@@ -788,11 +788,15 @@ std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> kafka_positions(
                                      static_cast<unsigned char>(value[static_cast<std::size_t>(i)]))
                                  << (i * 8);
                         }
-                        // After a restore every subtask holds a copy of the sources'
-                        // positions at the restore point, which only the source's
-                        // own subtask moves on; a copy never runs ahead of it. The
-                        // greatest is the source's own, as the engine's restore keeps
-                        // the greater offset on a collision (state_backend_factory).
+                        // A checkpoint taken after a restore by an engine that kept
+                        // every participant's operator rows in every subtask holds
+                        // copies of the sources' positions at the restore point,
+                        // which only the source's own subtask moves on; a copy never
+                        // runs ahead of it. The greatest is the source's own, as the
+                        // engine's restore keeps the greater offset on a collision
+                        // (state_backend_factory). A restore now keeps only the rows
+                        // of the operators a subtask runs, so newer checkpoints hold
+                        // none, but a bundle may come from an older one.
                         const std::pair<std::uint64_t, std::int32_t> k{
                             op.value(), static_cast<std::int32_t>(*p)};
                         const auto offset = static_cast<std::int64_t>(u);
@@ -813,8 +817,8 @@ std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> kafka_positions(
     if (stale > 0) {
         notes.push_back("checkpoint " + std::to_string(checkpoint) + ": " + std::to_string(stale) +
                         " older cop" + (stale == 1 ? "y" : "ies") +
-                        " of a source position, which a restore hands every subtask, set aside "
-                        "for the source's own");
+                        " of a source position, which an earlier engine's restore left in every "
+                        "subtask, set aside for the source's own");
     }
     const Artifact* marker = b.find("checkpoint/_jobs/" + std::to_string(b.job()) + "/COMPLETED-" +
                                     std::to_string(checkpoint));

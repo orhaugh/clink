@@ -3352,7 +3352,9 @@ void Worker::run_generic_subtask_(JobId job_id,
             register_source_injectors_(
                 job_id, task.subtask_idx, held_triggers, dag.source_injectors());
         }
-        LocalExecutor exec(std::move(dag), clink::plugin::detail::make_subtask_job_config(rctx));
+        auto cfg = clink::plugin::detail::make_subtask_job_config(
+            rctx, clink::plugin::detail::hosted_operator_ids(dag));
+        LocalExecutor exec(std::move(dag), std::move(cfg));
         // Constructed after exec so reverse destruction retires the commit
         // dispatch gate - draining any in-flight CommitCheckpoint/
         // AbortCheckpoint dispatch into the fused endpoints - before the

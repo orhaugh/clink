@@ -287,6 +287,15 @@ public:
     static std::set<std::pair<std::uint64_t, std::string>> operator_state_keys(
         std::span<const std::byte> snapshot_bytes);
 
+    // The snapshot with its OPERATOR-state rows narrowed to those of
+    // `operators` (OperatorId values). Keyed rows and the schema metadata pass
+    // through unchanged. A restoring subtask keeps only the operator rows of the
+    // operators it runs: the union above hands it every participant's, and a row
+    // of an operator it does not run is never read, while every later snapshot
+    // of the subtask would carry it as a stale copy.
+    static std::vector<std::byte> retain_operator_state_of(
+        std::span<const std::byte> snapshot_bytes, const std::set<std::uint64_t>& operators);
+
 private:
     static std::string memory_key_(OperatorId op, KeyView key) {
         return std::to_string(op.value()) + ":" + std::string(key);

@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "clink/state/state_backend.hpp"
 
@@ -74,6 +75,13 @@ struct StateBackendSpec {
     // so a job that never rescales sees <base>/v1/<idx> for its whole life.
     std::uint32_t generation{1};
     std::uint32_t restore_generation{1};
+    // The operators the subtask runs, by OperatorId value. A restore hands a
+    // subtask every participant's operator-state rows, because source offsets
+    // must cross subtasks, and keeps only those of these operators: a row of an
+    // operator the subtask does not run is never read, and every later snapshot
+    // of the subtask would carry it as a stale copy. Empty keeps every row, for
+    // a caller that does not say.
+    std::vector<std::uint64_t> hosted_operators;
 };
 
 // The ONE place a state path is composed, so eleven call sites across six backends

@@ -26,6 +26,20 @@ column on a columnar carrier is converted rather than written as NULL. One
 query that bound before is refused now: `COALESCE(bigint_col, 0.5)` is a
 DECIMAL, so inserting it into a BIGINT column needs a `CAST`.
 
+**A restored subtask no longer carries other operators' operator state in its
+snapshots.** A restore unions every participant's operator-state rows into
+every subtask, because a source's offsets must cross its subtasks, so a sink or
+an operator subtask came back holding the sources' offsets as well and wrote
+them, stale, into every later snapshot. They lost every collision with the
+source's own rows, so recovery was not affected, but anything reading the
+snapshots had to know to discard them, and the destination reconciler at first
+did not. The restore now keeps only the rows of the operators the subtask runs,
+which the Worker names from the subtask's `Dag`
+(`StateBackendSpec::hosted_operators`), and drops a copy its own snapshot
+carried from an earlier restore. `tests/test_state_backend_factory.cpp` covers a sink, a source subtask
+that still receives its peer's offsets, and a caller that names no operators
+and keeps every row.
+
 **Destination reconciliation: whether ClickHouse holds exactly what a
 checkpoint owed it.** Offline verification reads no destination, so nothing
 said whether a table held what a job wrote. With the flight recorder armed
