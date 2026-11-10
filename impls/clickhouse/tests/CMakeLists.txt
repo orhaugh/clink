@@ -11,6 +11,7 @@ add_executable(clink_clickhouse_tests
     test_builder.cpp
     test_typed_sink.cpp
     test_clickhouse_pins_live.cpp
+    test_reconcile_destination_live.cpp
 )
 target_link_libraries(clink_clickhouse_tests PRIVATE
     clink::core

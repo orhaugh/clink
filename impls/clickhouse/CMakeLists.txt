@@ -323,6 +323,8 @@ set(_ch_sources
     src/clickhouse_sink.cpp
     src/clickhouse_source.cpp
     src/register_factories.cpp
+    # incident-reconcile's read-only reader (clink/clickhouse/reconcile_destination.hpp).
+    src/reconcile_destination.cpp
     # Quoting and tokens, shared with the HTTP sink; no client include.
     src/native/sql_text.cpp
     src/native/errors.cpp

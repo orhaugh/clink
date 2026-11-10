@@ -1174,6 +1174,27 @@ ResultSet FakeServer::Impl::answer(MetaQuery kind, const std::string& sql) {
             }
             break;
         }
+        case MetaQuery::Identity: {
+            const std::string db = required_literal(sql, "database = ");
+            const std::string name = required_literal(sql, "AND name = ");
+            const std::lock_guard<std::mutex> lock(mu);
+            out.columns = {"server_uuid",
+                           "host_name",
+                           "uuid",
+                           "engine_full",
+                           "create_table_query",
+                           "metadata_modification_time"};
+            if (const TableState* t = find(db, name)) {
+                out.rows.push_back(
+                    {server_uuid,
+                     host_name,
+                     t->def.uuid.empty() ? fake_uuid(1000) : t->def.uuid,
+                     t->def.engine_full,
+                     "CREATE TABLE " + db + "." + name + " ENGINE = " + t->def.engine_full,
+                     "2026-01-01 00:00:00"});
+            }
+            break;
+        }
         case MetaQuery::Columns: {
             const std::string db = required_literal(sql, "database = ");
             const std::string name = required_literal(sql, "AND table = ");

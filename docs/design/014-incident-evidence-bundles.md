@@ -84,7 +84,7 @@ stable identifier, the evidence it used, the reason, and the next action.
 | `replay.determinism` | two replays of an epoch produce identical emissions | `EpochReplay` |
 | `replay.recorded_output` | the replay's emissions equal the records its single downstream operator captured for the same epoch | `EpochReplay`, the capture reader |
 | `replay.expected_output` | the selected epochs of one operator, each replayed from its starting state, emit an independent expectation's rows, given with `--expected`, compared as multisets | `EpochReplay` |
-| `destination.reconciliation` | (reported unsupported in every `full` report and required by no profile: offline verification reads no destination) | - |
+| `destination.reconciliation` | (reported unsupported in every `full` report and required by no profile: offline verification reads no destination; `clink incident-reconcile` reads one, explicitly, as [record 015](015-destination-reconciliation.md) sets out) | - |
 
 Profiles name the checks a run requires: `integrity` (the `bundle.*` checks),
 `consistency` (adds `checkpoint.*` and `state.decode`), `replay` (adds
@@ -195,8 +195,9 @@ manifest records whether they were.
 Coordination stores other than the local filesystem (an `s3://` checkpoint
 directory), RocksDB SST checkpoints for `state.decode`, state outside the
 checkpoint directory, replay of multi-input operators, non-Row channels and
-plugin operators, a live per-subtask view of a running job, destination
-reconciliation, signing.
+plugin operators, a live per-subtask view of a running job, signing.
+Destination reconciliation is the separate, explicit command record 015 adds;
+offline verification still reads no destination.
 
 ## Implementation and tests
 

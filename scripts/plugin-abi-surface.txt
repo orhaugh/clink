@@ -168,6 +168,7 @@ include/clink/runtime/output_tag.hpp
 include/clink/runtime/record_capture.hpp
 include/clink/runtime/runtime_context.hpp
 include/clink/runtime/sharded_keyed_stage.hpp
+include/clink/runtime/sink_evidence.hpp
 include/clink/runtime/snapshot_worker.hpp
 include/clink/runtime/subtask_emitter.hpp
 include/clink/runtime/timer_service.hpp

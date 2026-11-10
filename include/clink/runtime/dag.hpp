@@ -35,6 +35,7 @@
 #include "clink/runtime/record_capture.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/runtime/sharded_keyed_stage.hpp"
+#include "clink/runtime/sink_evidence.hpp"
 #include "clink/runtime/snapshot_worker.hpp"
 #include "clink/runtime/subtask_emitter.hpp"
 #include "clink/runtime/union_rebind.hpp"
@@ -4413,7 +4414,15 @@ public:
 
     // ---- Sink ------------------------------------------------------------
     template <typename In>
-    StageHandle<In> add_sink(StageHandle<In> upstream, std::shared_ptr<Sink<In>> sink) {
+    // `capture_codec` (optional) arms the flight recorder for this sink, as
+    // add_operator's does for an operator: when the executor's JobConfig names
+    // a capture_dir, the runner records the sink's input per checkpoint
+    // interval and writes each interval's evidence (sink_evidence.hpp) before
+    // the barrier is acknowledged. nullptr leaves the sink unrecorded, which is
+    // what the engine's own sinks (network bridges) get.
+    StageHandle<In> add_sink(StageHandle<In> upstream,
+                             std::shared_ptr<Sink<In>> sink,
+                             std::shared_ptr<const Codec<In>> capture_codec = nullptr) {
         const OperatorId id = derive_id_with_uid_(*sink);
         sink->set_id(id);
         sinks_.push_back(sink);
@@ -4559,10 +4568,64 @@ public:
         runner.id = id;
         runner.spec_node_id = sink->spec_node_id();
         runner.spec_uid = sink->uid();
-        runner.run = [sink, in_channel, sink_owns_checkpoint, id, chain_epoch = chain_epoch_](
-                         RuntimeContext& ctx, const std::function<bool()>& should_stop) {
+        runner.run = [sink,
+                      in_channel,
+                      sink_owns_checkpoint,
+                      id,
+                      capture_codec,
+                      chain_epoch = chain_epoch_](RuntimeContext& ctx,
+                                                  const std::function<bool()>& should_stop) {
             sink->attach_runtime(&ctx);
             detail::SinkExitGuard<In> exit_guard(sink.get());
+            // Interval evidence (sink_evidence.hpp), armed with the flight
+            // recorder: the sink's input is recorded per checkpoint interval,
+            // and every barrier the sink returns from writes what the interval
+            // came to, with the sink's own account of it, before the barrier
+            // is acknowledged.
+            std::unique_ptr<capture::EpochCaptureBuffer<In>> recorder;
+            auto* const evidence_sink = dynamic_cast<IntervalEvidenceSink*>(sink.get());
+            std::string attempt;
+            std::uint64_t previous_barrier = 0;
+            std::optional<std::int64_t> last_watermark;
+            if (capture_codec && !ctx.capture_dir().empty()) {
+                recorder =
+                    std::make_unique<capture::EpochCaptureBuffer<In>>(ctx.capture_dir(),
+                                                                      id,
+                                                                      ctx.capture_subtask_idx(),
+                                                                      ctx.capture_records(),
+                                                                      capture_codec);
+                attempt = capture::new_attempt_id();
+                if (evidence_sink != nullptr) {
+                    evidence_sink->arm_interval_evidence();
+                }
+            }
+            // After the sink's on_barrier returned, and before any ack.
+            const auto record_interval = [&](std::uint64_t ckpt) {
+                if (!recorder) {
+                    return;
+                }
+                if (ckpt == std::numeric_limits<std::uint64_t>::max()) {
+                    recorder->on_barrier(ckpt);  // the end-of-stream tail: no checkpoint
+                    return;
+                }
+                const auto summary = recorder->close_epoch(ckpt);
+                capture::SinkIntervalHeader h;
+                h.op = id;
+                h.subtask_idx = ctx.capture_subtask_idx();
+                h.checkpoint = ckpt;
+                h.previous_barrier = previous_barrier;
+                h.attempt = attempt;
+                h.capture = summary.disarmed ? "disarmed" : (summary.written ? "written" : "empty");
+                h.records_seen = summary.seen;
+                h.records_stored = summary.stored;
+                h.truncated = summary.truncated;
+                h.watermark_ms = last_watermark;
+                const std::string sink_json = evidence_sink != nullptr
+                                                  ? evidence_sink->interval_evidence(ckpt)
+                                                  : std::string{};
+                (void)capture::write_sink_interval(ctx.capture_dir(), h, sink_json);
+                previous_barrier = ckpt;
+            };
             sink->open();
             // Per-subtask async snapshot worker (FileBacked + disk-backed
             // changelog). Only the non-terminal snapshot+ack path uses it;
@@ -4584,6 +4647,9 @@ public:
                     // only throughput signal).
                     clink::metrics::op::records_in_inc(
                         ctx.metrics(), id.value(), maybe->as_data().size());
+                    if (recorder) {
+                        recorder->on_data(maybe->as_data());
+                    }
                     // Pass by rvalue so move-aware sinks (e.g.
                     // NetworkBridgeSink forwarding to a channel) can
                     // take ownership instead of deep-copying.
@@ -4591,6 +4657,11 @@ public:
                         sink->on_data(std::move(maybe->as_data()));
                     }
                 } else if (maybe->is_watermark()) {
+                    if (recorder) {
+                        const auto wm = maybe->as_watermark();
+                        recorder->on_watermark(wm.timestamp().millis(), wm.is_idle());
+                        last_watermark = wm.timestamp().millis();
+                    }
                     sink->on_watermark(maybe->as_watermark());
                 } else if (maybe->is_drain()) {
                     // A drain (rescale wind-down of an upstream subtask) is a
@@ -4610,6 +4681,7 @@ public:
                         // delta-commit backend. Run the user hook + terminal
                         // commit only - no snapshot, no ack (the owner acks).
                         sink->on_barrier(barrier);
+                        record_interval(ckpt_id.value());
                         if (barrier.is_terminal()) {
                             // As below: a task being torn down does not
                             // publish its tail.
@@ -4654,6 +4726,7 @@ public:
                         // emits nothing downstream and its only state IS the
                         // pending handles.
                         sink->on_barrier(barrier);
+                        record_interval(ckpt_id.value());
                         try {
                             handle = ctx.state_backend()->capture(ckpt_id);
                         } catch (const std::exception& e) {
@@ -4682,6 +4755,7 @@ public:
                         // the sink's handle must be inside the checkpoint it
                         // names.
                         sink->on_barrier(barrier);
+                        record_interval(ckpt_id.value());
                         if (ctx.has_state_backend() && !barrier.is_terminal()) {
                             try {
                                 ctx.state_backend()->snapshot(ckpt_id);
@@ -4722,6 +4796,11 @@ public:
                 } else {
                     snap_worker->drain_and_join();
                 }
+            }
+            if (recorder) {
+                // What the sink received after its last barrier, as an
+                // operator runner keeps it. No checkpoint covers it.
+                recorder->flush_final();
             }
             if (!should_stop() && !in_channel->close_cancelled()) {
                 sink->flush();

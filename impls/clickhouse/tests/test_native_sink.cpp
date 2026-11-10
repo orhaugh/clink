@@ -2646,5 +2646,87 @@ TEST(NativeSinkContract, RowsBeforeTheBarrierLandAsOftenAsAcknowledgedAndNoRowIs
     }
 }
 
+// --- Destination evidence ----------------------------------------------------------
+
+// Armed for destination evidence, the sink reads who the destination is at
+// open and keeps the INSERTs each barrier waited for: one interval's account
+// names the server and table, lists each acknowledged INSERT, and accounts for
+// every row the interval carried.
+TEST(NativeSinkEvidence, AnIntervalsAccountNamesTheDestinationAndEveryAcknowledgedInsert) {
+    NsDirect d;
+    d.params["batch_rows"] = "40";
+    NativeSink& sink = d.build();
+    sink.arm_interval_evidence();
+    sink.open();
+    sink.on_data(ns_rows(0, 100));
+    sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    const auto doc = config::parse(sink.interval_evidence(1));
+    EXPECT_EQ(doc.at("connector").as_string(), "clickhouse_native");
+    EXPECT_EQ(doc.at("guarantee").as_string(), "at_least_once");
+    const auto& dest = doc.at("destination");
+    EXPECT_EQ(dest.at("database").as_string(), "db");
+    EXPECT_EQ(dest.at("table").as_string(), kNsTable);
+    EXPECT_EQ(dest.at("engine").as_string(), "MergeTree");
+    EXPECT_EQ(dest.at("server").at("uuid").as_string(), d.server->server_uuid());
+    EXPECT_FALSE(dest.at("table_uuid").as_string().empty());
+    EXPECT_TRUE(dest.at("keeps_dedup_log").as_bool());
+    ASSERT_EQ(dest.at("columns").as_array().size(), 2U);
+    EXPECT_EQ(dest.at("columns").as_array()[0].at("target").as_string(), "Int64");
+    std::int64_t rows = 0;
+    for (const auto& ins : doc.at("inserts").as_array()) {
+        rows += ins.at("rows").as_int();
+        EXPECT_FALSE(ins.at("in_doubt").as_bool());
+        EXPECT_TRUE(ins.at("token").as_string().starts_with("clink1-"));
+    }
+    EXPECT_EQ(rows, 100);
+    EXPECT_EQ(doc.at("rows_acknowledged").as_int(), 100);
+    EXPECT_GE(doc.at("inserts").as_array().size(), 3U) << "batch_rows=40 closes INSERTs of 40";
+    // The next interval's account holds only its own INSERTs.
+    sink.on_data(ns_rows(100, 110));
+    sink.on_barrier(CheckpointBarrier{CheckpointId{2}});
+    const auto next = config::parse(sink.interval_evidence(2));
+    EXPECT_EQ(next.at("rows_acknowledged").as_int(), 10);
+    // Asked about a barrier the ledger was not taken at, it says so.
+    EXPECT_TRUE(config::parse(sink.interval_evidence(1)).at("inserts").is_null());
+    sink.close();
+}
+
+// An INSERT that landed and lost its reply is resent in doubt. Into a table
+// that keeps a deduplication log the resend keeps its token and is dropped,
+// and the ledger says it was deduplicated; into one that keeps none it can
+// land twice, and the ledger says so.
+TEST(NativeSinkEvidence, AnInsertResentInDoubtIsMarkedWithWhatTheResendCouldDo) {
+    for (const std::size_t window : {std::size_t{100}, std::size_t{0}}) {
+        NsDirect d{ns_table(window)};
+        fake::Fault doubt = ns_fault(fake::Step::End, fake::Fault::Kind::SystemError);
+        doubt.landing = fake::Fault::Landing::Everything;
+        d.server->inject(std::move(doubt));
+        NativeSink& sink = d.build();
+        sink.arm_interval_evidence();
+        sink.open();
+        sink.on_data(ns_rows(0, 20));
+        sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+        const auto doc = config::parse(sink.interval_evidence(1));
+        const auto& inserts = doc.at("inserts").as_array();
+        ASSERT_EQ(inserts.size(), 1U) << "window " << window;
+        EXPECT_TRUE(inserts[0].at("in_doubt").as_bool());
+        EXPECT_EQ(inserts[0].at("attempts").as_int(), 2);
+        EXPECT_EQ(inserts[0].at("resend").as_string(),
+                  window > 0 ? "deduplicated" : "may_duplicate");
+        EXPECT_EQ(d.server->rows(kNsTable), window > 0 ? 20U : 40U) << "window " << window;
+        sink.close();
+    }
+}
+
+// Without the flight recorder the sink reads nothing more and keeps no ledger.
+TEST(NativeSinkEvidence, UnarmedItReadsNothingMoreAndAccountsForNothing) {
+    NsDirect d;
+    NativeSink& sink = d.open();
+    sink.on_data(ns_rows(0, 10));
+    sink.on_barrier(CheckpointBarrier{CheckpointId{1}});
+    EXPECT_TRUE(sink.interval_evidence(1).empty());
+    sink.close();
+}
+
 }  // namespace
 }  // namespace clink::clickhouse::native

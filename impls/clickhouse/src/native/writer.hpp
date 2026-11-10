@@ -80,7 +80,39 @@ struct WriterConfig {
     // (PartRateMonitor). Tests shorten them to reach the warning quickly.
     std::chrono::milliseconds part_rate_span{std::chrono::seconds{60}};
     std::chrono::milliseconds part_rate_quiet{std::chrono::minutes{10}};
+    // The job records destination evidence: keep a ledger of the INSERTs the
+    // server acknowledged, which the sink takes at each barrier.
+    bool record_ledger{false};
 };
+
+// One INSERT the server acknowledged, as destination evidence records it.
+struct LedgerEntry {
+    std::string token;  // clink1-<nonce>-<seq>
+    std::uint64_t seq{0};
+    std::uint64_t rows{0};
+    std::uint32_t attempts{1};
+    // An attempt failed after its blocks were sent, so they may have landed
+    // before the attempt that was acknowledged.
+    bool in_doubt{false};
+    // What that resend can do: "deduplicated" (under its own token, to the
+    // same server, on a target that keeps a deduplication log, which drops it
+    // if the first attempt landed) or "may_duplicate" (any other resend: a
+    // fresh token, another server, or a target that keeps no log). Empty when
+    // not in doubt.
+    std::string resend;
+    std::string server;                  // the server that acknowledged it
+    std::int64_t acknowledged_at_ms{0};  // wall clock
+};
+
+struct Ledger {
+    std::vector<LedgerEntry> entries;
+    // Acknowledged INSERTs past the cap, counted but not listed.
+    std::uint64_t unlisted{0};
+    std::uint64_t unlisted_rows{0};
+};
+
+// The most INSERTs one ledger lists between two takes.
+inline constexpr std::size_t kLedgerCap = 10000;
 
 struct WriterStats {
     std::uint64_t rows_acknowledged{0};
@@ -146,6 +178,9 @@ public:
     void abort() noexcept;
 
     [[nodiscard]] WriterStats stats() const;
+    // The INSERTs acknowledged since the last take, oldest first, when the
+    // config asked for a ledger. Any thread.
+    [[nodiscard]] Ledger take_ledger();
     [[nodiscard]] std::size_t queue_bytes() const noexcept;
     // Task thread: drops the batches of the shares_input chunks the writer
     // has let go of since the last call, here rather than on the writer, and

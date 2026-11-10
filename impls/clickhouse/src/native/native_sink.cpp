@@ -234,4 +234,12 @@ void NativeSink::close_cancelled() {
     impl_->core.close_cancelled();
 }
 
+void NativeSink::arm_interval_evidence() {
+    impl_->core.arm_evidence();
+}
+
+std::string NativeSink::interval_evidence(std::uint64_t checkpoint_id) noexcept {
+    return impl_->core.interval_evidence(checkpoint_id);
+}
+
 }  // namespace clink::clickhouse::native

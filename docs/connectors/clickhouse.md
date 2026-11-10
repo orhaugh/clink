@@ -517,6 +517,24 @@ clickhouse native sink closed: subtask=3/8 rows_acknowledged=10485760 inserts=11
 
 Setting `CLINK_DISABLE_COLUMNAR=1` in a worker's environment sends every batch through its rows, at the sink as at every columnar operator, which is the A/B for a suspected difference between the two paths: the landed values must be the same, and `row_batches` takes the place of `columnar_batches`. The text sink (`format='json'`) is row-only and stays so: it writes one JSON text per row, so a columnar batch is turned into rows before it, and no columnar path for it is planned.
 
+### Destination evidence and reconciliation
+
+A Worker that runs with the flight recorder (`--capture-dir`) records every sink's input per checkpoint interval, and after each barrier writes the interval's evidence beside it ([incident verification](../internals/incident-verification.md#destination-reconciliation)). The SQL native sink adds its own account:
+
+- **At open**, after the checks above, one more metadata read gives the destination's identity: `serverUUID()`, `hostName()`, and the table's `uuid`, `engine_full`, `create_table_query` and `metadata_modification_time` from `system.tables`. It is retried and bounded like the open's other reads, and needs no grant beyond the open's own.
+- **The evidence** carries that identity with the server's version and endpoint, the engine, the deduplication and async-insert settings, whether a resend keeps its token, and the column plan.
+- **The ledger.** The writer keeps one entry for each INSERT the server acknowledged: its token, rows, attempts, and, when an attempt failed after its blocks were sent, what the resend could do. `deduplicated` means it went under its own token to the same server, on a target that keeps a log. `may_duplicate` covers anything else. Each barrier takes the INSERTs it waited for, at most 10,000 listed and the rest counted.
+
+Without the flight recorder none of this happens, and the sink runs as before.
+
+`clink incident-reconcile` reads such a destination back, for one completed checkpoint of a bundle, on a connection the operator gives:
+
+- Every statement is a `SELECT` carrying `readonly = 2`, `max_execution_time` and `max_result_rows`, the last two set to throw.
+- The server's and the table's UUIDs must be the evidence's.
+- The rows of the checkpoint's keys are read twice and compared with what the sink received, typed value for value.
+
+Give it a user with `SELECT` on the table and on `system.tables`, `system.columns` and `system.mutations`, and nothing else. It supports a plain non-replicated `MergeTree` without TTL ([record 015](../design/015-destination-reconciliation.md)). With `non_replicated_deduplication_window` above 0, an INSERT resent in doubt under its own token lands once. Without it the resend can land twice, which the reconciliation reports as duplicates and puts down to the resend.
+
 ### C++: typed structs
 
 `clink/clickhouse/native_sink.hpp` writes a C++ struct to ClickHouse through the same native sink, with no SQL. Declare the struct's fields with `CLINK_FIELDS` and the sink takes its column types from the Arrow schema the declaration derives, so there is no `sql_column_types` and no encoder to write. The header is installed with `clink::clickhouse` and is Internal: the helpers and their options may still change between releases.
@@ -675,11 +693,11 @@ For each line it runs, in order:
 
 | Profile | Services | Host ports (26.3 / 26.8) | What runs |
 | --- | --- | --- | --- |
-| Plain | the line's server and its async-default twin, whose `<merge_tree>` sets `async_insert=1` | 19103 and 19113 / 19108 and 19118 | `ClickHouseNativeLive.*`, the source's `ClickHouseSourceLive.*` on its own, then the SQL-linked `ClickHouseNativeSqlLive.*`, then `ClickHouseLegacySqlLive.*` on its own |
+| Plain | the line's server and its async-default twin, whose `<merge_tree>` sets `async_insert=1` | 19103 and 19113 / 19108 and 19118 | `ClickHouseNativeLive.*`, the source's `ClickHouseSourceLive.*` on its own, `incident-reconcile`'s reader `ClickHouseReconcileLive.*` on its own, then the SQL-linked `ClickHouseNativeSqlLive.*`, then `ClickHouseLegacySqlLive.*` on its own |
 | Replicated | two replicas sharing one Keeper, whose `<replicated_merge_tree>` sets `async_insert=1` | 19133 and 19143 / 19138 and 19148 | pin P18, then `ClickHouseNativeLiveReplicated.*`, whose failover case shuts the first replica down |
 | TLS, 26.8 only | a server with the native port over TLS; the script generates a CA, a certificate for `localhost` and an unrelated CA | 19158 plain, 19458 TLS | `ClickHouseNativeLiveTls.*` |
 
-Last, it runs `ClickHouseLegacySqlLive.*` against a 25.3 server on port 19203, for the legacy sink's round trip. A failing case fails the run. Each `ClickHouseSourceLive.*` and `ClickHouseLegacySqlLive.*` run writes a googletest report under `REPORT_DIR` (default `<BUILD_DIR>/clickhouse-live-reports`), and `scripts/check-gtest-reports.py` fails the run unless every one of its cases passed: a case that skips, because its server variable never reached it, fails the run rather than reading as a pass.
+Last, it runs `ClickHouseLegacySqlLive.*` against a 25.3 server on port 19203, for the legacy sink's round trip. A failing case fails the run. Each `ClickHouseSourceLive.*`, `ClickHouseReconcileLive.*` and `ClickHouseLegacySqlLive.*` run writes a googletest report under `REPORT_DIR` (default `<BUILD_DIR>/clickhouse-live-reports`), and `scripts/check-gtest-reports.py` fails the run unless every one of its cases passed: a case that skips, because its server variable never reached it, fails the run rather than reading as a pass.
 
 It sets these for the test binaries, per profile: `CLINK_CLICKHOUSE_TEST_HOST`, `CLINK_CLICKHOUSE_TEST_PORT`, `CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT_PORT`, `CLINK_CLICKHOUSE_TEST_REPLICA_PORTS` (`<r1>,<r2>`), `CLINK_CLICKHOUSE_TEST_RMT_ASYNC_DEFAULT=1`, `CLINK_CLICKHOUSE_TEST_TLS_PORT`, `CLINK_CLICKHOUSE_TEST_TLS_CA`, `CLINK_CLICKHOUSE_TEST_TLS_WRONG_CA` and `CLINK_CLICKHOUSE_TEST_LINE`. `CLINK_CLICKHOUSE_TEST_USER` and `CLINK_CLICKHOUSE_TEST_PASSWORD` pass through when set. Its own knobs:
 

@@ -20,6 +20,7 @@
 #include "clink/cluster/in_doubt_resolution.hpp"
 #include "clink/cluster/state_location.hpp"
 #include "clink/core/sha256.hpp"
+#include "clink/runtime/sink_evidence.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
@@ -489,7 +490,7 @@ void validate_manifest(const config::JsonValue& m) {
     require(m, "contents", "contents");
     const auto& contents = m.at("contents");
     expect(contents.is_object(), "contents", "an object");
-    for (const char* key : {"state", "captures", "traces", "job_manifest"}) {
+    for (const char* key : {"state", "captures", "traces", "job_manifest", "sink_intervals"}) {
         expect_optional(contents,
                         key,
                         std::string{"contents."} + key,
@@ -534,6 +535,11 @@ bool in_evidence_dir(const std::string& path) {
 std::string capture_path_of(std::uint64_t op, std::uint64_t subtask, std::uint64_t epoch) {
     return "capture/op-" + std::to_string(op) + "/subtask-" + std::to_string(subtask) + "/epoch-" +
            std::to_string(epoch) + ".cap";
+}
+
+std::string sink_interval_path_of(std::uint64_t op, std::uint64_t subtask, std::uint64_t epoch) {
+    return "capture/op-" + std::to_string(op) + "/subtask-" + std::to_string(subtask) + "/epoch-" +
+           std::to_string(epoch) + ".sink.json";
 }
 
 }  // namespace
@@ -705,6 +711,59 @@ Bundle read_bundle(const fs::path& root_in, const ReadLimits& limits) {
                                  std::tie(y.op, y.subtask, y.epoch);
                       });
         }
+        if (b.manifest.contains("sink_intervals")) {
+            const auto& ivs = b.manifest.at("sink_intervals");
+            expect(ivs.is_array(), "sink_intervals", "an array");
+            std::set<std::string> taken;
+            for (const auto& c : ivs.as_array()) {
+                expect(c.is_object(), "sink_intervals[]", "an object");
+                SinkInterval e;
+                e.op = expect_u64(member(c, "op", "sink_intervals[].op"), "sink_intervals[].op");
+                e.subtask = expect_uint(member(c, "subtask", "sink_intervals[].subtask"),
+                                        "sink_intervals[].subtask");
+                e.epoch = expect_uint(member(c, "epoch", "sink_intervals[].epoch"),
+                                      "sink_intervals[].epoch");
+                expect(e.epoch > 0, "sink_intervals[].epoch", "an epoch (from 1)");
+                expect(member(c, "path", "sink_intervals[].path").is_string(),
+                       "sink_intervals[].path",
+                       "a string");
+                e.path = c.at("path").as_string();
+                // As for a captured epoch: the listing must name the file a
+                // reconciliation reads for that sink, subtask and interval.
+                const auto expected = sink_interval_path_of(e.op, e.subtask, e.epoch);
+                if (e.path != expected) {
+                    throw BundleRefused("sink interval " + e.path + " is listed as op " +
+                                        std::to_string(e.op) + " subtask " +
+                                        std::to_string(e.subtask) + " epoch " +
+                                        std::to_string(e.epoch) + ", whose file is " + expected);
+                }
+                if (b.find(e.path) == nullptr) {
+                    throw BundleRefused("sink interval " + e.path + " is not a listed artifact");
+                }
+                if (!taken.insert(e.path).second) {
+                    throw BundleRefused("sink interval " + e.path + " is listed twice");
+                }
+                b.sink_intervals.push_back(std::move(e));
+            }
+            std::sort(b.sink_intervals.begin(),
+                      b.sink_intervals.end(),
+                      [](const SinkInterval& x, const SinkInterval& y) {
+                          return std::tie(x.op, x.subtask, x.epoch) <
+                                 std::tie(y.op, y.subtask, y.epoch);
+                      });
+        }
+        // A sink's captured epochs are its recorded input, not an operator's.
+        std::set<std::uint64_t> sink_ops;
+        for (const auto& iv : b.sink_intervals) {
+            sink_ops.insert(iv.op);
+        }
+        if (!sink_ops.empty()) {
+            std::vector<CapturedEpoch> operators;
+            for (auto& c : b.captures) {
+                (sink_ops.contains(c.op) ? b.sink_captures : operators).push_back(std::move(c));
+            }
+            b.captures = std::move(operators);
+        }
     } catch (const BundleRefused&) {
         throw;
     } catch (const std::exception& e) {
@@ -731,25 +790,7 @@ std::string sha256_file(const fs::path& path) {
 }
 
 bool looks_like_credential(const std::string& name) noexcept {
-    std::string lower = name;
-    for (auto& c : lower) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    static constexpr std::array<std::string_view, 12> kWords = {"password",
-                                                                "passwd",
-                                                                "secret",
-                                                                "token",
-                                                                "credential",
-                                                                "api_key",
-                                                                "apikey",
-                                                                "access_key",
-                                                                "private_key",
-                                                                "sasl",
-                                                                "auth",
-                                                                "conninfo"};
-    return std::any_of(kWords.begin(), kWords.end(), [&](std::string_view w) {
-        return lower.find(w) != std::string::npos;
-    });
+    return capture::looks_like_credential(name);
 }
 
 std::uint64_t epoch_starting_checkpoint(std::uint64_t epoch,
@@ -1099,6 +1140,9 @@ Check bundle_completeness_check(const Bundle& b) {
             missing.push_back("capture epochs (the manifest claims the captures)");
         }
     }
+    if (b.contains("sink_intervals") && b.sink_intervals.empty()) {
+        missing.push_back("sink interval evidence (the manifest claims it)");
+    }
     if (b.contains("traces")) {
         bool any = false;
         for (const auto& a : b.artifacts) {
@@ -1126,6 +1170,10 @@ Check bundle_completeness_check(const Bundle& b) {
     for (const char* what : {"state", "captures", "traces", "job_manifest"}) {
         c.details.push_back(std::string{what} + ": " +
                             (b.contains(what) ? "collected" : "not collected"));
+    }
+    if (b.contains("sink_intervals")) {
+        c.details.push_back("sink_intervals: collected (" +
+                            std::to_string(b.sink_intervals.size()) + ")");
     }
     if (missing.empty()) {
         c.reason =
@@ -1396,7 +1444,7 @@ Check state_decode_check(const Bundle& b) {
     std::vector<std::string> problems;
     std::size_t decoded = 0;
     for (const auto& a : b.artifacts) {
-        if (a.role != "snapshot" && a.role != "replay_state") {
+        if (a.role != "snapshot" && a.role != "replay_state" && a.role != "interval_state") {
             continue;
         }
         c.evidence.push_back(a.path);
@@ -1788,15 +1836,18 @@ std::vector<Check> verify_core(const Bundle& b, const VerifyOptions& o) {
         out.push_back(std::move(conformance));
         // Said in every full report, so that passing is never read as saying
         // what a destination holds. No profile requires it.
-        out.push_back(Check{
-            .id = "destination.reconciliation",
-            .verdict = Verdict::Unsupported,
-            .evidence = {},
-            .reason = "offline verification reads no destination, so whether the job's sinks "
-                      "hold what it wrote is not checked",
-            .next_action = "compare the destination with the job's expected output where it lives",
-            .details = {},
-            .counts = {}});
+        out.push_back(
+            Check{.id = "destination.reconciliation",
+                  .verdict = Verdict::Unsupported,
+                  .evidence = {},
+                  .reason = "offline verification reads no destination, so whether the job's sinks "
+                            "hold what it wrote is not checked",
+                  .next_action =
+                      "for a ClickHouse destination, run clink incident-reconcile, which reads "
+                      "it explicitly and read-only; otherwise compare the destination with "
+                      "the job's expected output where it lives",
+                  .details = {},
+                  .counts = {}});
     }
     return out;
 }

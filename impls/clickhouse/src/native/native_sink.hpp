@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
 #include "clink/operators/operator_base.hpp"
+#include "clink/runtime/sink_evidence.hpp"
 #include "clink/sql/row.hpp"
 
 #include "native/insert_transport.hpp"
@@ -28,7 +30,7 @@ namespace clink::clickhouse::native {
 // The open, the writer, the barrier and the closes are a SinkCore's
 // (native_sink_core.hpp); this class adds what is particular to Rows: the
 // columns from sql_column_types, the RowArrowBuilder and the columnar intake.
-class NativeSink final : public Sink<sql::Row> {
+class NativeSink final : public Sink<sql::Row>, public IntervalEvidenceSink {
 public:
     // Throws NativeSinkError(option_invalid) when sql_column_types does not
     // parse, or when the options name no endpoint or no table. An empty
@@ -69,6 +71,11 @@ public:
     // checkpoint, so Dag::add_sink keeps it the only sink on its chain.
     [[nodiscard]] bool gates_checkpoint_ack() const noexcept override { return true; }
     [[nodiscard]] std::string name() const override { return "clickhouse_native_sink"; }
+
+    // Destination evidence (runtime/sink_evidence.hpp): the destination as the
+    // open found it, and the INSERTs each interval's barrier waited for.
+    void arm_interval_evidence() override;
+    [[nodiscard]] std::string interval_evidence(std::uint64_t checkpoint_id) noexcept override;
 
     struct Impl;
 

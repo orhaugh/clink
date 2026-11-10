@@ -57,6 +57,12 @@ struct InsertText {
 [[nodiscard]] std::string select_table(std::string_view db,
                                        std::string_view table,
                                        std::chrono::seconds budget);
+// The server's and the table's identity, for destination evidence: the
+// server's UUID and host name, the table's UUID, engine_full,
+// create_table_query and metadata_modification_time.
+[[nodiscard]] std::string select_identity(std::string_view db,
+                                          std::string_view table,
+                                          std::chrono::seconds budget);
 [[nodiscard]] std::string select_columns(std::string_view db,
                                          std::string_view table,
                                          std::chrono::seconds budget);

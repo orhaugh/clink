@@ -8,8 +8,9 @@
 # For each line it brings up, runs and tears down, one profile at a time, the
 # services of docker/integration-services.yml:
 #   - the line's plain and async-default servers (the same two the pins use):
-#     ClickHouseNativeLive.*, the SELECT source's ClickHouseSourceLive.* (its
-#     report counted, none skipped), then the SQL-linked
+#     ClickHouseNativeLive.*, the SELECT source's ClickHouseSourceLive.* and
+#     incident-reconcile's reader, ClickHouseReconcileLive.* (their reports
+#     counted, none skipped), then the SQL-linked
 #     ClickHouseNativeSqlLive.* and ClickHouseLegacySqlLive.*, which include the
 #     typed job module's plugin route;
 #   - two replicas sharing one Keeper: pin P18 first, then
@@ -191,6 +192,9 @@ for line in ${CLICKHOUSE_LINES}; do
         CLINK_CLICKHOUSE_TEST_ASYNC_DEFAULT_PORT="${async_port}"
     run_counted "${line} SELECT source" "${BIN}" 'ClickHouseSourceLive.*' \
         "ClickHouseSourceLive.*=4" \
+        CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}"
+    run_counted "${line} reconcile reader" "${BIN}" 'ClickHouseReconcileLive.*' \
+        "ClickHouseReconcileLive.*=4" \
         CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}"
     if [ "${CLICKHOUSE_LIVE_SQL}" = "1" ]; then
         run "${line} SQL-level" "${SQL_BIN}" 'ClickHouseNativeSqlLive.*' \

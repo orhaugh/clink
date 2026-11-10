@@ -25,3 +25,4 @@ subsystems work today, and take precedence wherever detail has evolved.
 | [012](012-machine-checked-exactly-once.md) | The exactly-once protocol is a machine-checked specification, and the engine's traces are validated against it |
 | [013](013-state-namespaced-by-job.md) | State is namespaced by job |
 | [014](014-incident-evidence-bundles.md) | Incident evidence bundles |
+| [015](015-destination-reconciliation.md) | Destination reconciliation |

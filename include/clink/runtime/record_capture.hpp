@@ -523,6 +523,30 @@ public:
 
     [[nodiscard]] bool disarmed() const { return disarmed_; }
 
+    // What an epoch came to when on_barrier closed it, for a runner that
+    // reports it (the sink runner's interval evidence).
+    struct EpochSummary {
+        std::uint64_t seen{0};    // data records the epoch held
+        std::uint64_t stored{0};  // of them, in the file
+        bool truncated{false};
+        bool written{false};   // the epoch file was written
+        bool disarmed{false};  // a write failed, now or before: the file is absent or stale
+    };
+
+    // on_barrier, and what it wrote.
+    [[nodiscard]] EpochSummary close_epoch(std::uint64_t checkpoint_id) {
+        EpochSummary s;
+        s.seen = seen_;
+        s.stored = data_stored_;
+        s.truncated = truncated_;
+        const bool had_any = !events_.empty() || seen_ != 0;
+        const bool was_disarmed = disarmed_;
+        on_barrier(checkpoint_id);
+        s.disarmed = disarmed_;
+        s.written = had_any && !was_disarmed && !disarmed_;
+        return s;
+    }
+
 private:
     void flush_(const std::string& filename) {
         if (disarmed_) {

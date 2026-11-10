@@ -71,6 +71,10 @@ private:
     void collect_job_manifest();
     void collect_checkpoint();
     void collect_captures();
+    // With --include-state: each participant's snapshot of a completed
+    // checkpoint that bounds a collected sink interval, so the source
+    // positions at both ends of the interval travel with it.
+    void collect_interval_state(std::uint64_t checkpoint);
     void collect_traces();
     std::string manifest_text() const;
 
@@ -83,6 +87,7 @@ private:
     config::JsonArray absent_;
     config::JsonArray excluded_;
     config::JsonArray capture_list_;
+    config::JsonArray interval_list_;  // sink interval evidence
     std::vector<std::string> notes_;
 
     // Selection.
@@ -106,6 +111,7 @@ private:
 
     bool traces_{false};
     bool have_captures_{false};
+    std::set<std::uint64_t> interval_states_;  // checkpoints collect_interval_state took
 };
 
 // A state root as a canonical local path, or nullopt for one in a store a
@@ -451,6 +457,61 @@ void Collector::collect_checkpoint() {
     }
 }
 
+void Collector::collect_interval_state(std::uint64_t checkpoint) {
+    if (checkpoint == 0 || !interval_states_.insert(checkpoint).second) {
+        return;
+    }
+    const auto marker_dir = cluster::completed_marker_dir_for(o_.checkpoint_dir, o_.job);
+    std::error_code ec;
+    if (!fs::exists(marker_dir / ("COMPLETED-" + std::to_string(checkpoint)), ec)) {
+        return;  // a barrier whose checkpoint did not complete has no state to read
+    }
+    cluster::RestoreSource src;
+    try {
+        src = cluster::resolve_restore_source(marker_dir.string(), checkpoint);
+    } catch (const std::exception& e) {
+        absent("interval_state",
+               "checkpoint " + std::to_string(checkpoint),
+               std::string{"cannot be resolved: "} + e.what());
+        return;
+    }
+    const auto local = local_path(src.state_root);
+    const auto cc = fs::weakly_canonical(o_.checkpoint_dir, ec).string() + "/";
+    if (src.legacy || !local.has_value() || local->rfind(cc, 0) != 0 || !src.participants) {
+        absent("interval_state",
+               "checkpoint " + std::to_string(checkpoint),
+               "its state is outside the checkpoint directory or its participants are unknown");
+        return;
+    }
+    const auto rel_root = "checkpoint/" + local->substr(cc.size());
+    const auto name = "checkpoint-" + std::to_string(checkpoint) + ".snap";
+    for (const auto sub : *src.participants) {
+        const fs::path snap = fs::path{state_dir_for(src.state_root, src.generation, sub)} / name;
+        const auto rel = state_dir_for(rel_root, src.generation, sub) + "/" + name;
+        bool have = false;
+        for (const auto& a : artifacts_) {
+            have = have || a.at("path").as_string() == rel;
+        }
+        if (have) {
+            continue;
+        }
+        if (!fs::exists(snap, ec)) {
+            absent("interval_state", rel, "not present in the job's state directory");
+            continue;
+        }
+        copy(snap, rel, "interval_state", false);
+        if (fs::exists(snap.string() + ".meta", ec)) {
+            bool have_meta = false;
+            for (const auto& a : artifacts_) {
+                have_meta = have_meta || a.at("path").as_string() == rel + ".meta";
+            }
+            if (!have_meta) {
+                copy(snap.string() + ".meta", rel + ".meta", "interval_state_meta", false);
+            }
+        }
+    }
+}
+
 void Collector::collect_captures() {
     std::error_code ec;
     if (!fs::is_directory(o_.capture_dir, ec)) {
@@ -519,8 +580,24 @@ void Collector::collect_captures() {
                 copy(sub_dir / "op.json", base + "/op.json", "capture_spec", false);
             }
             std::vector<std::pair<std::uint64_t, fs::path>> epochs;
+            // A sink's interval evidence, epoch-<N>.sink.json, beside its
+            // epochs; an interval with no records has evidence and no epoch file.
+            std::map<std::uint64_t, fs::path> intervals;
             for (const auto& e : fs::directory_iterator(sub_dir, ec)) {
                 const auto n = e.path().filename().string();
+                static constexpr std::string_view kIntervalSuffix = ".sink.json";
+                if (n.rfind("epoch-", 0) == 0 && n.size() > 6 + kIntervalSuffix.size() &&
+                    n.substr(n.size() - kIntervalSuffix.size()) == kIntervalSuffix) {
+                    const auto digits = n.substr(6, n.size() - 6 - kIntervalSuffix.size());
+                    if (!digits.empty() &&
+                        digits.find_first_not_of("0123456789") == std::string::npos) {
+                        try {
+                            intervals.emplace(std::stoull(digits), e.path());
+                        } catch (...) {
+                        }
+                    }
+                    continue;
+                }
                 if (n.rfind("epoch-", 0) != 0 || n.size() < 11 ||
                     n.substr(n.size() - 4) != ".cap") {
                     continue;
@@ -531,6 +608,47 @@ void Collector::collect_captures() {
                 }
             }
             std::sort(epochs.begin(), epochs.end());
+            for (const auto& [epoch, path] : intervals) {
+                if (!wanted(epoch)) {
+                    ++outside[op_name + "/" + sub_name];
+                    continue;
+                }
+                const auto rel = base + "/" + path.filename().string();
+                const auto before = artifacts_.size();
+                copy(path, rel, "sink_interval", false);
+                if (artifacts_.size() == before) {
+                    continue;  // excluded by a bound
+                }
+                config::JsonObject iv;
+                iv["op"] = config::JsonValue{std::to_string(op_id)};
+                iv["subtask"] = config::JsonValue{static_cast<std::int64_t>(sub)};
+                iv["epoch"] = config::JsonValue{static_cast<std::int64_t>(epoch)};
+                iv["path"] = config::JsonValue{rel};
+                interval_list_.push_back(config::JsonValue{std::move(iv)});
+                if (o_.include_state) {
+                    collect_interval_state(epoch);
+                    // A run's first interval begins at the checkpoint the run
+                    // restored from, which its evidence names as barrier 0.
+                    if (restored_.has_value()) {
+                        collect_interval_state(restored_->restore);
+                    }
+                    try {
+                        std::ifstream in(path, std::ios::binary);
+                        std::ostringstream text;
+                        text << in.rdbuf();
+                        const auto doc = config::parse(text.str());
+                        if (doc.contains("previous_barrier") &&
+                            doc.at("previous_barrier").is_integral_number() &&
+                            doc.at("previous_barrier").as_int() > 0) {
+                            collect_interval_state(
+                                static_cast<std::uint64_t>(doc.at("previous_barrier").as_int()));
+                        }
+                    } catch (const std::exception&) {
+                        // An interval that does not parse is listed as it is;
+                        // reconciliation says why it cannot use it.
+                    }
+                }
+            }
             for (const auto& [epoch, path] : epochs) {
                 if (!wanted(epoch)) {
                     ++outside[op_name + "/" + sub_name];
@@ -703,6 +821,7 @@ std::string Collector::manifest_text() const {
     config::JsonObject contents;
     contents["state"] = config::JsonValue{o_.include_state && state_in_checkpoint_dir_};
     contents["captures"] = config::JsonValue{have_captures_};
+    contents["sink_intervals"] = config::JsonValue{!interval_list_.empty()};
     contents["traces"] = config::JsonValue{traces_};
     contents["job_manifest"] = config::JsonValue{have_job_manifest_};
     m["contents"] = config::JsonValue{std::move(contents)};
@@ -714,6 +833,7 @@ std::string Collector::manifest_text() const {
     m["limits"] = config::JsonValue{std::move(limits)};
 
     m["captures"] = config::JsonValue{capture_list_};
+    m["sink_intervals"] = config::JsonValue{interval_list_};
     m["artifacts"] = config::JsonValue{artifacts_};
     m["absent"] = config::JsonValue{absent_};
     m["excluded"] = config::JsonValue{excluded_};

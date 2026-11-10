@@ -1,6 +1,6 @@
 # Incident verification
 
-> How `clink incident-collect`, `clink incident-verify` and `clink incident-regress` turn a job's checkpoints, flight-recorder captures and protocol traces into a portable bundle, check it offline, and freeze a reproduced epoch as a regression test. The design record is [014](../design/014-incident-evidence-bundles.md).
+> How `clink incident-collect`, `clink incident-verify` and `clink incident-regress` turn a job's checkpoints, flight-recorder captures and protocol traces into a portable bundle, check it offline, and freeze a reproduced epoch as a regression test; and how `clink incident-reconcile` reads a ClickHouse destination, explicitly and read-only, to say whether it holds exactly what one completed checkpoint owed it. The design records are [014](../design/014-incident-evidence-bundles.md) and [015](../design/015-destination-reconciliation.md).
 
 An incident leaves its evidence spread across a job's directories: the checkpoint markers that say which checkpoint a restore chooses, the participants' snapshots and their integrity sidecars, the flight recorder's epochs, the protocol traces of each process, and the coordinator's job manifest. Each of them already has a reader in the engine. A bundle gathers them into one directory with a manifest, so the same readers can run anywhere else, with no cluster and no services, and say what the evidence does and does not establish.
 
@@ -27,9 +27,13 @@ clink incident-verify incident-1 --profile=full --op=<window op> --expected=expe
 # Freeze an epoch, then run it as its generated test does.
 clink incident-regress incident-1 --op=<op> --epoch=<n> --out=tests/incidents/incident-1
 clink replay --run-test=tests/incidents/incident-1
+
+# Online, explicitly: does the ClickHouse table hold exactly what checkpoint 12 owed it?
+CH_PASSWORD=... clink incident-reconcile incident-1 --checkpoint=12 --key=event_id \
+    --host=clickhouse.internal --user=reconciler --password-env=CH_PASSWORD --json
 ```
 
-`incident-collect` exits 0 when it published a bundle, 1 when it refused (and left nothing at `--out`), 2 on bad usage. `incident-verify` exits 0 when every check the profile requires passed, 1 when any check failed, 3 when none failed but a required check is unavailable or unsupported, and 2 on bad usage or a bundle the reader refuses. A partial result (3) is never reported as success. `incident-regress` exits 0 when the regression bundle is written and passes on this build, 1 when it refuses.
+`incident-collect` exits 0 when it published a bundle, 1 when it refused (and left nothing at `--out`), 2 on bad usage. `incident-verify` exits 0 when every check the profile requires passed, 1 when any check failed, 3 when none failed but a required check is unavailable or unsupported, and 2 on bad usage or a bundle the reader refuses. A partial result (3) is never reported as success. `incident-regress` exits 0 when the regression bundle is written and passes on this build, 1 when it refuses. `incident-reconcile` exits as `incident-verify` does, and 2 when the request does not fit the bundle or the destination is not the one its evidence names.
 
 ## The bundle
 
@@ -42,7 +46,9 @@ The bundle keeps the engine's own layout under `checkpoint/` and `capture/`, so 
 | `checkpoint/_jobs/<job>/` | every `COMPLETED-`, `CONFIRMED-` marker and the `RESTORED` record | always |
 | `checkpoint/_state/<job>/v<gen>/<sub>/checkpoint-<id>.snap.meta` | each participant's integrity sidecar for the selected checkpoint | always |
 | `checkpoint/_state/<job>/v<gen>/<sub>/checkpoint-<id>.snap` | each participant's snapshot, and each captured epoch's starting snapshot | `--include-state` |
-| `capture/op-<id>/subtask-<s>/op.json`, `epoch-<n>.cap` | the flight recorder's epochs and the operator specs | `--include-captures` |
+| `capture/op-<id>/subtask-<s>/op.json`, `epoch-<n>.cap` | the flight recorder's epochs and the operator specs; for a sink, its recorded input, and its `op.json` with credential-like parameters redacted | `--include-captures` |
+| `capture/op-<sink>/subtask-<s>/epoch-<n>.sink.json` | a sink's interval evidence: what its interval's capture came to, the barrier before it, and the sink's own account (for the ClickHouse native sink, the destination's identity and the ledger of acknowledged INSERTs) | `--include-captures` |
+| `checkpoint/_state/<job>/v<gen>/<sub>/checkpoint-<id>.snap` (role `interval_state`) | each participant's snapshot of the completed checkpoints that bound a collected sink interval, and of the run's restore point, which hold the source positions at both ends | `--include-state` with `--include-captures` |
 | `traces/<process>.ndjson` | one run of protocol traces | `--trace-dir` |
 
 Snapshots and captures hold the job's records and keyed state. No redaction makes them safe to share, so they are collected only when asked for, and the manifest records whether they were.
@@ -141,9 +147,88 @@ Only `enforced` lets a verification run. Anything else stops the example before 
 
 `incident-regress` freezes one captured epoch of a bundle whose artifacts verify into the regression bundle `clink replay --emit-test` writes: the epoch, its starting snapshot, the golden emissions, and a generated gtest whose body is one call to `clink::sql::run_replay_regression`. It runs the bundle once before returning, so a bundle that would not pass is never handed back. `clink replay --run-test=<dir>` runs it as the generated test does, from the command line, and exits 1 with the first divergence when it fails.
 
+## Destination reconciliation
+
+`clink incident-reconcile` answers what offline verification cannot: whether a destination holds exactly the effects one completed checkpoint owed it. It is a separate command, run when asked, against a connection the operator names. Offline verification stays network-free. [Record 015](../design/015-destination-reconciliation.md) sets out the contract and why.
+
+**Supported.** In this release:
+
+- **Source**: a Kafka SQL source.
+- **Transformation**: record-wise (filters and projections).
+- **Sink**: the ClickHouse native sink, at least once.
+- **Table**: a plain non-replicated `MergeTree` with no `TTL`.
+- **Key**: integer or `String` columns (`--key`) that identify one row the job writes.
+
+Anything else is refused or reported unsupported, by name.
+
+**The evidence.** The flight recorder now records each sink as it records an operator. Workers armed with `--capture-dir` do two things for the user's sinks (not the engine's network bridges):
+
+- record the sink's input per checkpoint interval;
+- after the sink's `on_barrier` returns and before the barrier is acknowledged, write `epoch-<N>.sink.json` atomically (`include/clink/runtime/sink_evidence.hpp`).
+
+The ClickHouse native sink adds its own account through the Internal `IntervalEvidenceSink` interface:
+
+- the destination as its open found it: the server's and the table's UUIDs, the engine and its definition, the deduplication and async-insert settings, and the column plan;
+- the INSERTs the interval's barrier waited for: each one's token, rows, attempts, and whether a resend in doubt was one the table deduplicates or one that may land twice.
+
+`incident-collect --include-captures` takes these files. With `--include-state` it also takes the snapshots of the checkpoints that bound each interval, where the Kafka positions are. A sink's captures are left out of the replay checks, which see a bundle as before.
+
+**The scope** of completed checkpoint N is every interval it completed: back through each interval's previous barrier to the previous completed checkpoint, or to the start of the run. When the run began at a restore, it starts at the restore point. Every sink subtask's evidence for each interval must be there, whole and untruncated. The expected rows are the sink's recorded input over those intervals. For a record-wise job, they are the transformation of the source records between the bounding checkpoints' positions, which the report gives per partition. Kafka positions are the next offset to read, so a scope consumed `[from, to)`.
+
+**The read.**
+
+- **The connection is the operator's.** It is given on the command line, with the password from the environment variable `--password-env` names. Nothing is taken from the bundle but names, quoted as identifiers, and key values, rendered as typed literals.
+- **Read only.** Every statement is a `SELECT` carrying `readonly = 2`, under which the server refuses any write in it.
+- **Bounded.** Every statement runs under `max_execution_time` and `max_result_rows`, both set to throw. `--query-timeout-ms`, `--max-rows-per-query` and `--keys-per-query` set them. A read past a bound leaves the comparison unavailable rather than decided on part of an answer.
+- **Identity.** The server's and the table's UUIDs must be the evidence's, or the run is refused.
+- **Two reads.** The rows of the scope's keys are read twice, `--settle-ms` apart. The table's mutations are read before and after.
+
+The reader's user needs `SELECT` on the table and on `system.tables`, `system.columns` and `system.mutations`.
+
+**The comparison** is of whole rows as multisets, key by key. Counts, totals and digests decide nothing.
+
+| Type | Compared as |
+| --- | --- |
+| integers, `Bool` | exact |
+| floats | IEEE-754 bits; every NaN equal, -0.0 and +0.0 different |
+| decimals | the unscaled integer at the column's scale |
+| `DateTime64` | ticks at the column's precision, from the row's epoch milliseconds |
+| dates | days |
+| strings | bytes |
+| NULL | equal only to NULL |
+
+Each key's rows are missing, changed, duplicated or unexpected, and any of these fails the result. The report separates them:
+
+- Missing, changed and unexpected rows break the at-least-once guarantee.
+- Duplicates do not, but the table then does not hold the scope exactly once. When the evidence explains them, by a resend that may land twice or a restore at the scope's start, the report says so.
+
+**The checks and verdicts.**
+
+| Check | Passed means |
+| --- | --- |
+| `bundle.manifest`, `bundle.artifacts`, `bundle.completeness` | as for `incident-verify`; when they fail, nothing else is read |
+| `reconcile.scope` | the sink's input for the scope is in the bundle whole, and the key identifies one row of it |
+| `reconcile.destination` | the destination is the one the evidence names, a plain `MergeTree` without TTL, with every column the sink wrote as it was |
+| `reconcile.rows` | the table holds exactly the scope's rows, each once and value for value, and two reads agreed |
+
+The result is:
+
+- **Exit 0**: every check passed.
+- **Exit 1**: a check failed.
+- **Exit 3**: none failed, but one is unavailable or unsupported. Examples are evidence missing, truncated or disarmed; a sink ledger that does not account for exactly the rows its recorded input holds; a scope whose intervals held no rows, which establishes nothing; a bound or timeout hit; a mutation in progress or begun during the read; a key read differently twice; or an unsupported table, column type or key.
+- **Exit 2**: refused. That is another job (`--job`), a checkpoint the bundle does not hold as completed, or another database, table, server or table UUID than the evidence's.
+
+`--json` and `--report` write the versioned report (`"format": "clink-reconcile-report"`, `"version": 1`). It holds the observation's times on both clocks, the scope with its source ranges and each interval's INSERT ledger, the destination as recorded and as observed, the method, the assumptions, mutations done before the read, each check, and the first discrepancies (`--list`). `--expected-out` writes the expected rows as canonical cells, one JSON object per line, for an independent check of the expectation. [`examples/destination-reconciliation/`](https://github.com/orhaugh/clink/tree/main/examples/destination-reconciliation) does that check: it reads each scope's source range back from Kafka and runs every scenario the contract covers.
+
+**Three kinds of assurance.** None implies the next:
+
+- The delivery report in the bundle says what the job's configuration supports.
+- `incident-verify` says that the recorded execution is intact and passes the protocol and replay checks.
+- `incident-reconcile` says that the destination, observed once, holds exactly what one checkpoint owed it.
+
 ## What passing does not mean
 
-The digests establish that nothing in a bundle changed after it was collected. They do not establish who collected it: anyone who can replace the bundle can replace its manifest too, and signing is out of scope. A passing bundle is evidence about the files in it, checked by this build's readers. It is not a proof that the implementation is correct, that the job's business logic is right, or that any external system holds what the job wrote: nothing offline reads a destination.
+The digests establish that nothing in a bundle changed after it was collected. They do not establish who collected it: anyone who can replace the bundle can replace its manifest too, and signing is out of scope. A passing bundle is evidence about the files in it, checked by this build's readers. It is not a proof that the implementation is correct, that the job's business logic is right, or that any external system holds what the job wrote: nothing offline reads a destination. A passing reconciliation establishes one checkpoint's effects in one table at one observation time, against what the job's own sink received. It does not establish that the transformation is right, which the replay checks and an independent reference address, nor that the rows survive the server's host losing power, nor anything about the table after the read.
 
 ## Measured
 
@@ -160,7 +245,17 @@ The recorder's cost is what capturing every operator's input of every epoch cost
 
 ## Not supported in this release
 
-Coordination stores other than the local filesystem (an `s3://` checkpoint directory), RocksDB SST checkpoints in `state.decode`, state outside the checkpoint directory, replay of multi-input operators, non-Row channels and plugin operators, a live per-subtask view of a running job, destination reconciliation, and signing.
+Coordination stores other than the local filesystem (an `s3://` checkpoint directory), RocksDB SST checkpoints in `state.decode`, state outside the checkpoint directory, replay of multi-input operators, non-Row channels and plugin operators, a live per-subtask view of a running job, and signing.
+
+Destination reconciliation does not support:
+
+- destinations other than the ClickHouse native sink into a plain `MergeTree`;
+- replicated, distributed or row-rewriting tables, and tables with a TTL;
+- column types beyond those above;
+- jobs that are not record-wise, where a key repeats;
+- sinks of an embedded `clink run`, which the recorder does not record;
+- the Kafka cluster and topic ids, which the source does not checkpoint;
+- `system.query_log` as acknowledgement evidence.
 
 ## Source
 
@@ -169,7 +264,9 @@ Coordination stores other than the local filesystem (an `s3://` checkpoint direc
 | The bundle, its reader, the checks without SQL, collection | `include/clink/incident/bundle.hpp`, `src/incident/bundle.cpp`, `src/incident/collect.cpp` |
 | The restore rule both sides share | `restore_point_on_disk`, `read_restore_point` in `include/clink/cluster/in_doubt_resolution.hpp` |
 | The replay checks and regression bundles | `include/clink/sql/incident_replay.hpp`, `src/sql/incident_replay.cpp` |
-| The commands | `tools/clink_incident.cpp`, with `tools/clink_incident_replay.cpp` or its SQL-off stub |
-| Tests | `tests/test_incident_bundle.cpp` (collection, the reader, the core checks), `tests/test_incident_replay.cpp` (replay on a real captured run) |
+| The commands | `tools/clink_incident.cpp`, with `tools/clink_incident_replay.cpp` or its SQL-off stub, and `tools/clink_incident_reconcile.cpp` or its stub without the ClickHouse connector |
+| Sink interval evidence | `include/clink/runtime/sink_evidence.hpp`, `src/runtime/sink_evidence.cpp`, the sink runner in `include/clink/runtime/dag.hpp`; the ClickHouse native sink's account in `impls/clickhouse/src/native/` |
+| Destination reconciliation | `include/clink/incident/reconcile.hpp`, `src/incident/reconcile.cpp`; the ClickHouse reader `impls/clickhouse/include/clink/clickhouse/reconcile_destination.hpp`, `impls/clickhouse/src/reconcile_destination.cpp` |
+| Tests | `tests/test_incident_bundle.cpp` (collection, the reader, the core checks), `tests/test_incident_replay.cpp` (replay on a real captured run), `tests/test_incident_reconcile.cpp` (the cells, the comparison, the sink's interval evidence, whole reconciliations), `impls/clickhouse/tests/test_reconcile_destination_live.cpp` (the reader against a real server, in `scripts/clickhouse-live.sh`), and the example `examples/destination-reconciliation/` |
 | The example and gate | `examples/incident-verification/`; `scripts/incident-gate.sh` runs both suites, requires every case to have run, then the example |
 | Network isolation, proven before verification relies on it | `scripts/network-isolation.sh`, tested by `scripts/tests/test_network_isolation.py` |

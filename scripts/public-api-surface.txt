@@ -228,6 +228,7 @@ impls/cassandra/include/clink/cassandra/cassandra_upsert_sink.hpp
 impls/cassandra/include/clink/cassandra/connection_params.hpp
 impls/clickhouse/include/clink/clickhouse/clickhouse_row_codec.hpp
 impls/clickhouse/include/clink/clickhouse/native_sink.hpp
+impls/clickhouse/include/clink/clickhouse/reconcile_destination.hpp
 impls/clickhouse/include/clink/clickhouse/typed_sink.hpp
 impls/etcd/include/clink/etcd/etcd_ha_coordinator.hpp
 impls/forst/include/clink/state/forst_state_backend.hpp
@@ -408,6 +409,7 @@ include/clink/http/forward.hpp
 include/clink/http/json_writer.hpp
 include/clink/http/static_files.hpp
 include/clink/incident/bundle.hpp
+include/clink/incident/reconcile.hpp
 include/clink/metrics/async_metrics.hpp
 include/clink/metrics/checkpoint_metrics.hpp
 include/clink/metrics/connector_metrics.hpp
@@ -466,6 +468,7 @@ include/clink/runtime/network/wire.hpp
 include/clink/runtime/record_capture.hpp
 include/clink/runtime/sharded_checkpoint_store.hpp
 include/clink/runtime/sharded_keyed_stage.hpp
+include/clink/runtime/sink_evidence.hpp
 include/clink/runtime/snapshot_worker.hpp
 include/clink/runtime/subtask_emitter.hpp
 include/clink/runtime/union_rebind.hpp
@@ -593,6 +596,7 @@ include/clink/runtime/network/network_socket.hpp
 include/clink/runtime/network/wire.hpp
 include/clink/runtime/record_capture.hpp
 include/clink/runtime/sharded_keyed_stage.hpp
+include/clink/runtime/sink_evidence.hpp
 include/clink/runtime/snapshot_worker.hpp
 include/clink/runtime/subtask_emitter.hpp
 include/clink/runtime/union_rebind.hpp

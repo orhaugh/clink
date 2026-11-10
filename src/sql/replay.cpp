@@ -139,6 +139,17 @@ std::vector<CapturedOp> list_captured_ops(const std::string& capture_dir) {
             if (!sub_entry.is_directory() || !sub_name.starts_with("subtask-")) {
                 continue;
             }
+            // A sink's recorded input, kept beside its interval evidence
+            // (runtime/sink_evidence.hpp) for destination reconciliation, is
+            // not an operator to replay.
+            bool sink = false;
+            std::error_code ec;
+            for (const auto& f : fs::directory_iterator(sub_entry.path(), ec)) {
+                sink = sink || f.path().filename().string().ends_with(".sink.json");
+            }
+            if (sink) {
+                continue;
+            }
             try {
                 out.push_back(CapturedOp{op_id, std::stoull(sub_name.substr(8))});
             } catch (const std::exception&) {

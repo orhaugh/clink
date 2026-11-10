@@ -53,7 +53,9 @@ The correctness claim is one you can check rather than take on trust:
 State is also an open dataset: checkpoints are documented Arrow IPC that
 open in pyarrow, DuckDB or Polars, and a running job's state answers point
 lookups and scans over HTTP. A flight recorder can replay an incident
-deterministically and freeze it into a regression test.
+deterministically and freeze it into a regression test, and, for a Kafka to
+ClickHouse job, say whether the table holds exactly what a completed
+checkpoint owed it.
 
 clink is young and pre-1.0, written by one maintainer with extensive AI
 assistance. The specification, the qualification campaigns and the

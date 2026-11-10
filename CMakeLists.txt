@@ -504,6 +504,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/runtime/event_bus.cpp
     src/runtime/local_executor.cpp
     src/runtime/memory_size.cpp
+    src/runtime/sink_evidence.cpp
     src/runtime/local_submitter.cpp
     src/runtime/log_buffer.cpp
     src/runtime/logging.cpp
@@ -524,6 +525,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/cluster/in_doubt_resolution.cpp
     src/incident/bundle.cpp
     src/incident/collect.cpp
+    src/incident/reconcile.cpp
     src/cluster/state_location.cpp
     src/cluster/outbox.cpp
     src/cluster/protocol_trace.cpp
@@ -1577,6 +1579,14 @@ else()
                                           tools/clink_replay_stub.cpp
                                           tools/clink_state_query_stub.cpp
                                           tools/clink_incident_replay_stub.cpp)
+endif()
+# `clink incident-reconcile` reads ClickHouse through the connector's read-only
+# reader; a build without the connector links a stub that refuses every run.
+if(TARGET clink::clickhouse)
+    target_sources(clink_cli_cmds PRIVATE tools/clink_incident_reconcile.cpp)
+    target_link_libraries(clink_cli_cmds PUBLIC clink::clickhouse)
+else()
+    target_sources(clink_cli_cmds PRIVATE tools/clink_incident_reconcile_stub.cpp)
 endif()
 # Flight SQL is independent of the embed gate. clink::flightsql exists only
 # when the embedded engine is built AND Arrow ships Flight SQL, so it is

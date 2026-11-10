@@ -42,7 +42,10 @@ enum class MetaQuery : std::uint8_t {
     ClusterTables,
     ClusterMergeTreeSettings,
     ReplicatedMergeTreeSettings,
-    ClusterReplicatedMergeTreeSettings
+    ClusterReplicatedMergeTreeSettings,
+    // Only when the job records destination evidence: who the server and
+    // the table are (read_destination_identity).
+    Identity
 };
 
 struct TransportCounters {

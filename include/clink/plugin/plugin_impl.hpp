@@ -664,120 +664,143 @@ void PluginRegistry::register_sink(
         throw std::runtime_error(
             "register_sink<T>: T not registered (call register_type<T>(name, codec) first)");
     }
-    clink::cluster::SubtaskRunner runner = [factory, channel, &type_registry = type_registry_](
-                                               const clink::cluster::RunnerContext& rctx) {
-        auto sink = factory(detail::build_ctx_from(rctx));
-        detail::apply_chain_identity(sink, rctx);
-        // A STATEFUL sink (2PC / committing) keys its per-checkpoint
-        // committable state and external transaction ids on its
-        // OperatorId. Without a uid, derive_id_with_uid_ position-hashes
-        // it, so sibling sinks of the same type in same-shaped subtasks
-        // collide - five postgres_2pc_sink instances sharing one PREPARE
-        // TRANSACTION gid. Fall back to the unique graph-local spec id
-        // (stable across restarts for a given graph) so each sink gets a
-        // distinct, restart-stable identity even when the author set no
-        // uid. Sinks are terminal, so this never affects routing; stateless
-        // sinks are unaffected by the id.
-        if (sink->uid().empty() && !rctx.chain.ops.empty() && !rctx.chain.ops[0].id.empty()) {
-            sink->set_uid(rctx.chain.ops[0].id);
-        }
-        // Armed-cutover commit gate: the arm callback records the cutover
-        // checkpoint id; the commit callback below records observed
-        // commits; after the executor exits, an armed runner waits for the
-        // cutover checkpoint's commit before returning (see
-        // detail::ArmedCutoverCommitGate for why the gate must be
-        // runner-owned).
-        auto cutover_gate = std::make_shared<detail::ArmedCutoverCommitGate>();
-        if (rctx.register_cutover_arm_callbacks) {
-            rctx.register_cutover_arm_callbacks({
-                [cutover_gate](std::uint64_t cutover_ckpt) { cutover_gate->arm(cutover_ckpt); },
-            });
-        }
-        // 2PC support: route CommitCheckpoint -> sink->on_commit.
-        // Non-2PC sinks have the default no-op so this is harmless.
-        // Weak-capture the sink: a late CommitCheckpoint can outlive the
-        // sink object, and the weak_ptr lock returns nullptr after
-        // destruction. It never reaches a sink that has begun its teardown:
-        // the fence installed below refuses it first.
-        if (rctx.register_commit_callbacks) {
-            std::weak_ptr<clink::Sink<T>> weak_sink = sink;
-            rctx.register_commit_callbacks({
-                [weak_sink, cutover_gate](std::uint64_t ckpt) {
-                    if (auto s = weak_sink.lock()) {
-                        s->on_commit(ckpt);
-                    }
-                    // After on_commit: "observed" must mean the sink's
-                    // commit work ran, not merely that the frame arrived.
-                    cutover_gate->record_commit(ckpt);
-                },
-            });
-        }
-        // Register abort callback alongside commit. The
-        // worker dispatches it on AbortCheckpoint; non-2PC sinks ignore
-        // the call (Sink::on_abort default no-op).
-        if (rctx.register_abort_callbacks) {
-            std::weak_ptr<clink::Sink<T>> weak_sink = sink;
-            rctx.register_abort_callbacks({
-                [weak_sink](std::uint64_t ckpt) {
-                    if (auto s = weak_sink.lock()) {
-                        s->on_abort(ckpt);
-                    }
-                },
-            });
-        }
-        // The worker dispatches those callbacks on its own threads, each
-        // inside this task's commit-dispatch gate. Retiring the gate as the
-        // sink's teardown begins drains a dispatch already running, so close()
-        // never runs under a commit, and refuses every later one, so none
-        // reaches the sink once it is closed. (A running dispatch that has not
-        // yet started its external call declines, so the drain never waits on
-        // an external system it had not yet asked.) Retired only when the
-        // executor was destroyed, the gate let a commit reach a sink already
-        // closed and detached, which finalised nothing and was confirmed all
-        // the same.
-        if (rctx.commit_dispatch_gate) {
-            sink->set_commit_dispatch_fence(
-                [gate = rctx.commit_dispatch_gate] { gate->retire_and_drain(); });
-        }
-        clink::Dag dag;
-        auto h0 = clink::cluster::build_typed_input_stage<T>(
-            dag,
-            rctx.in_bridges,
-            &detail::require_type_ops(type_registry, channel),
-            &rctx.chain,
-            rctx.register_input_rebind);
-        auto hs = dag.template add_sink<T>(h0, sink);
-        // This subtask hosts one logical operator (the sink); its input network
-        // bridges' bytes are the sink's bytes_received.
-        dag.set_all_runners_attributed_op_id(dag.runner_id_at(hs.runner_index));
-        clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
-        // Constructed after exec so reverse destruction retires the commit
-        // dispatch gate before the executor and the StateBackend the sink's
-        // finalise path touches are destroyed. The sink's runner has normally
-        // retired it already, through the fence above; this is the backstop
-        // for an executor whose sink runner never ran.
-        clink::cluster::CommitDispatchRetirer commit_retirer(rctx.commit_dispatch_gate);
-        detail::run_subtask_to_completion(exec, rctx.cancel_token);
-        // Armed cutover: C is staged and acked and the input has closed,
-        // but its CommitCheckpoint only arrives once the coordinator
-        // completes C. Returning now would erase this subtask's committer
-        // registration (the worker's exit cleanup) and strand the staged
-        // transaction with no restart coming to recover it. The input closes
-        // as a clean end of stream, so a sink that reports staged commits
-        // holds its teardown open until C's commit has run, and this wait
-        // finds it recorded. A sink that does not was already torn down,
-        // and its commit is refused: the wait then times out, loudly, for
-        // the same reason the EOS final-checkpoint wait does: completing
-        // silently without durability is the failure mode, not the
-        // safeguard.
-        if (!detail::await_armed_cutover_commit(
-                *cutover_gate, rctx.cancel_token, clink::eos_final_checkpoint_timeout())) {
-            throw std::runtime_error(
-                "armed cutover: the cutover checkpoint's commit did not arrive within the "
-                "bound; failing the subtask rather than completing it with a staged, "
-                "uncommitted transaction");
-        }
-    };
+    // Capture codec, as for an operator: armed with the flight recorder, the
+    // sink runner records the sink's input per checkpoint interval and writes
+    // the interval's evidence (runtime/sink_evidence.hpp). Null (an
+    // unregistered codec) leaves the sink unrecorded.
+    auto capture_codec = codec_for<T>();
+    clink::cluster::SubtaskRunner runner =
+        [factory, channel, capture_codec, &type_registry = type_registry_](
+            const clink::cluster::RunnerContext& rctx) {
+            auto sink = factory(detail::build_ctx_from(rctx));
+            detail::apply_chain_identity(sink, rctx);
+            // A STATEFUL sink (2PC / committing) keys its per-checkpoint
+            // committable state and external transaction ids on its
+            // OperatorId. Without a uid, derive_id_with_uid_ position-hashes
+            // it, so sibling sinks of the same type in same-shaped subtasks
+            // collide - five postgres_2pc_sink instances sharing one PREPARE
+            // TRANSACTION gid. Fall back to the unique graph-local spec id
+            // (stable across restarts for a given graph) so each sink gets a
+            // distinct, restart-stable identity even when the author set no
+            // uid. Sinks are terminal, so this never affects routing; stateless
+            // sinks are unaffected by the id.
+            if (sink->uid().empty() && !rctx.chain.ops.empty() && !rctx.chain.ops[0].id.empty()) {
+                sink->set_uid(rctx.chain.ops[0].id);
+            }
+            // Armed-cutover commit gate: the arm callback records the cutover
+            // checkpoint id; the commit callback below records observed
+            // commits; after the executor exits, an armed runner waits for the
+            // cutover checkpoint's commit before returning (see
+            // detail::ArmedCutoverCommitGate for why the gate must be
+            // runner-owned).
+            auto cutover_gate = std::make_shared<detail::ArmedCutoverCommitGate>();
+            if (rctx.register_cutover_arm_callbacks) {
+                rctx.register_cutover_arm_callbacks({
+                    [cutover_gate](std::uint64_t cutover_ckpt) { cutover_gate->arm(cutover_ckpt); },
+                });
+            }
+            // 2PC support: route CommitCheckpoint -> sink->on_commit.
+            // Non-2PC sinks have the default no-op so this is harmless.
+            // Weak-capture the sink: a late CommitCheckpoint can outlive the
+            // sink object, and the weak_ptr lock returns nullptr after
+            // destruction. It never reaches a sink that has begun its teardown:
+            // the fence installed below refuses it first.
+            if (rctx.register_commit_callbacks) {
+                std::weak_ptr<clink::Sink<T>> weak_sink = sink;
+                rctx.register_commit_callbacks({
+                    [weak_sink, cutover_gate](std::uint64_t ckpt) {
+                        if (auto s = weak_sink.lock()) {
+                            s->on_commit(ckpt);
+                        }
+                        // After on_commit: "observed" must mean the sink's
+                        // commit work ran, not merely that the frame arrived.
+                        cutover_gate->record_commit(ckpt);
+                    },
+                });
+            }
+            // Register abort callback alongside commit. The
+            // worker dispatches it on AbortCheckpoint; non-2PC sinks ignore
+            // the call (Sink::on_abort default no-op).
+            if (rctx.register_abort_callbacks) {
+                std::weak_ptr<clink::Sink<T>> weak_sink = sink;
+                rctx.register_abort_callbacks({
+                    [weak_sink](std::uint64_t ckpt) {
+                        if (auto s = weak_sink.lock()) {
+                            s->on_abort(ckpt);
+                        }
+                    },
+                });
+            }
+            // The worker dispatches those callbacks on its own threads, each
+            // inside this task's commit-dispatch gate. Retiring the gate as the
+            // sink's teardown begins drains a dispatch already running, so close()
+            // never runs under a commit, and refuses every later one, so none
+            // reaches the sink once it is closed. (A running dispatch that has not
+            // yet started its external call declines, so the drain never waits on
+            // an external system it had not yet asked.) Retired only when the
+            // executor was destroyed, the gate let a commit reach a sink already
+            // closed and detached, which finalised nothing and was confirmed all
+            // the same.
+            if (rctx.commit_dispatch_gate) {
+                sink->set_commit_dispatch_fence(
+                    [gate = rctx.commit_dispatch_gate] { gate->retire_and_drain(); });
+            }
+            clink::Dag dag;
+            auto h0 = clink::cluster::build_typed_input_stage<T>(
+                dag,
+                rctx.in_bridges,
+                &detail::require_type_ops(type_registry, channel),
+                &rctx.chain,
+                rctx.register_input_rebind);
+            auto hs = dag.template add_sink<T>(h0, sink, capture_codec);
+            // The op-spec sidecar beside the sink's recorded intervals, as an
+            // operator's: what the sink was built from. A sink's parameters carry
+            // its destination's credentials, which never reach the file.
+            if (capture_codec && !rctx.capture_dir.empty() && !rctx.chain.ops.empty()) {
+                const auto& co = rctx.chain.ops[0];
+                clink::capture::write_op_spec(
+                    rctx.capture_dir,
+                    clink::OperatorId{dag.runner_id_at(hs.runner_index)},
+                    rctx.chain.subtask_idx,
+                    clink::capture::OpSpecSidecar{
+                        .op_type = co.type,
+                        .in_channel = co.in_channel,
+                        .out_channel = co.out_channel,
+                        .uid = co.uid,
+                        .params = clink::capture::redact_credentials(co.params),
+                    });
+            }
+            // This subtask hosts one logical operator (the sink); its input network
+            // bridges' bytes are the sink's bytes_received.
+            dag.set_all_runners_attributed_op_id(dag.runner_id_at(hs.runner_index));
+            clink::LocalExecutor exec(std::move(dag), detail::make_subtask_job_config(rctx));
+            // Constructed after exec so reverse destruction retires the commit
+            // dispatch gate before the executor and the StateBackend the sink's
+            // finalise path touches are destroyed. The sink's runner has normally
+            // retired it already, through the fence above; this is the backstop
+            // for an executor whose sink runner never ran.
+            clink::cluster::CommitDispatchRetirer commit_retirer(rctx.commit_dispatch_gate);
+            detail::run_subtask_to_completion(exec, rctx.cancel_token);
+            // Armed cutover: C is staged and acked and the input has closed,
+            // but its CommitCheckpoint only arrives once the coordinator
+            // completes C. Returning now would erase this subtask's committer
+            // registration (the worker's exit cleanup) and strand the staged
+            // transaction with no restart coming to recover it. The input closes
+            // as a clean end of stream, so a sink that reports staged commits
+            // holds its teardown open until C's commit has run, and this wait
+            // finds it recorded. A sink that does not was already torn down,
+            // and its commit is refused: the wait then times out, loudly, for
+            // the same reason the EOS final-checkpoint wait does: completing
+            // silently without durability is the failure mode, not the
+            // safeguard.
+            if (!detail::await_armed_cutover_commit(
+                    *cutover_gate, rctx.cancel_token, clink::eos_final_checkpoint_timeout())) {
+                throw std::runtime_error(
+                    "armed cutover: the cutover checkpoint's commit did not arrive within the "
+                    "bound; failing the subtask rather than completing it with a staged, "
+                    "uncommitted transaction");
+            }
+        };
     runner_registry_.register_sink(op_type, channel, std::move(runner));
 
     // Mirror into OperatorRegistry as a BoxedFactory so the chain-

@@ -489,6 +489,9 @@ struct Writer::Core {
 
     mutable std::mutex stats_mu_;
     WriterStats stats_;
+
+    std::mutex ledger_mu_;
+    Ledger ledger_;
 };
 
 template <class F>
@@ -1476,6 +1479,30 @@ void Writer::Core::acknowledged(Insert& in) {
     }
     current_acked_ += rows;
     track_in_flight();
+    if (config_.record_ledger) {
+        LedgerEntry e;
+        e.token = in.token.text();
+        e.seq = in.token.seq;
+        e.rows = rows;
+        e.attempts = in.failures + 1;
+        e.in_doubt = in.counted_resent || in.counted_duplicate;
+        if (in.counted_duplicate) {
+            e.resend = "may_duplicate";
+        } else if (in.counted_resent) {
+            e.resend = "deduplicated";
+        }
+        e.server = identity_text(live_.server);
+        e.acknowledged_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+        const std::lock_guard<std::mutex> lock(ledger_mu_);
+        if (ledger_.entries.size() < kLedgerCap) {
+            ledger_.entries.push_back(std::move(e));
+        } else {
+            ++ledger_.unlisted;
+            ledger_.unlisted_rows += rows;
+        }
+    }
     const bool retried = in.retried;
     report([&] {
         if (Counter* outcome = retried ? metrics_.inserts_retried_ok : metrics_.inserts_ok) {
@@ -1902,6 +1929,13 @@ void Writer::abort() noexcept {
 
 WriterStats Writer::stats() const {
     return core_->snapshot_stats();
+}
+
+Ledger Writer::take_ledger() {
+    const std::lock_guard<std::mutex> lock(core_->ledger_mu_);
+    Ledger out = std::move(core_->ledger_);
+    core_->ledger_ = Ledger{};
+    return out;
 }
 
 std::size_t Writer::queue_bytes() const noexcept {

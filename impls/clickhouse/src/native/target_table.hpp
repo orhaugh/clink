@@ -71,6 +71,21 @@ struct TargetInfo {
 // retry can cure.
 [[nodiscard]] TargetInfo probe_target(InsertTransport& transport, const SinkOptions& opts);
 
+// Who the destination is, read once at open when the job records destination
+// evidence (runtime/sink_evidence.hpp): what a reconciliation later checks the
+// server it reads against. Throws NativeSinkError(target_missing) when the
+// table is gone, and lets the client's exceptions through, as probe_target does.
+struct DestinationIdentity {
+    std::string server_uuid;
+    std::string host_name;
+    std::string table_uuid;
+    std::string engine_full;
+    std::string create_table_query;
+    std::string metadata_modification_time;
+};
+[[nodiscard]] DestinationIdentity read_destination_identity(InsertTransport& transport,
+                                                            const SinkOptions& opts);
+
 // Pieces, exposed for tests.
 
 // The raw value text of `name` in the top-level SETTINGS clause of

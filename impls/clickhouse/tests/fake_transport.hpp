@@ -80,6 +80,9 @@ struct FakeTable {
     std::size_t dedup_window{0};  // blocks kept in the deduplication log; 0 = none
     // Partition of a row, from the first column's Int64 value; empty = one partition.
     std::function<std::int64_t(std::int64_t)> partition_of;
+    // system.tables.uuid, which destination evidence records; empty gives a
+    // fixed fake one.
+    std::string uuid;
 };
 
 // Values are rendered as text, one string per column in the INSERT's column

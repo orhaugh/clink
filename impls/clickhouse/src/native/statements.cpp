@@ -185,6 +185,19 @@ std::string select_table(std::string_view db, std::string_view table, std::chron
         budget);
 }
 
+std::string select_identity(std::string_view db,
+                            std::string_view table,
+                            std::chrono::seconds budget) {
+    return bounded(
+        "SELECT CAST(toString(serverUUID()) AS String), CAST(hostName() AS String), "
+        "CAST(toString(uuid) AS String), CAST(engine_full AS String), "
+        "CAST(create_table_query AS String), "
+        "CAST(toString(metadata_modification_time) AS String) FROM system.tables WHERE "
+        "database = " +
+            quote_string(db) + " AND name = " + quote_string(table),
+        budget);
+}
+
 std::string select_columns(std::string_view db,
                            std::string_view table,
                            std::chrono::seconds budget) {

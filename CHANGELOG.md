@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+**Destination reconciliation: whether ClickHouse holds exactly what a
+checkpoint owed it.** Offline verification reads no destination, so nothing
+said whether a table held what a job wrote. With the flight recorder armed
+(`--capture-dir`), each sink now records its input per checkpoint interval
+and, after its barrier and before the barrier is acknowledged, writes the
+interval's evidence: what its capture came to, the barrier before it, and the
+sink's own account. The ClickHouse native sink adds the destination's
+identity as its open found it (server and table UUIDs, engine, settings,
+column plan) and the INSERTs the barrier waited for, including any resent in
+doubt. `incident-collect` takes them, and the snapshots of the checkpoints that
+bound them, where the Kafka positions are. The new `clink incident-reconcile`
+reads the table on a connection the operator names, with bounded `SELECT`s
+under `readonly = 2`, refuses a destination whose UUIDs are not the
+evidence's, and compares the checkpoint's rows whole as typed values, so
+missing, changed, unexpected and duplicated rows each fail, equal counts and
+totals included, and a read past a bound, a mutation in progress or a row
+landing mid-read is a partial result (exit 3). Duplicates the at-least-once
+contract allows are reported as such, and put down to the resend or restore
+the evidence shows. Supported: a Kafka source, record-wise SQL, the native
+sink into a plain `MergeTree` (design record 015). A sink's captures stay out
+of the replay checks, and a sink's `op.json` carries no credential. New:
+`tests/test_incident_reconcile.cpp`, the live reader cases in
+`scripts/clickhouse-live.sh`, and `examples/destination-reconciliation/`,
+which runs every scenario against Kafka and ClickHouse and checks each verdict
+against an independent reference that reads the source back from Kafka.
+
 **Incident verification no longer reports incomplete verification as
 success.** A replay check passed on the epochs it reached: with
 `--max-replays` below the selection, `incident-verify` replayed that many,

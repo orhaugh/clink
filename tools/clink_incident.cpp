@@ -1,9 +1,11 @@
-// clink incident-collect, incident-verify and incident-regress: incident
-// evidence bundles (design record 014, docs/internals/incident-verification.md).
+// clink incident-collect, incident-verify, incident-regress and
+// incident-reconcile: incident evidence bundles (design record 014,
+// docs/internals/incident-verification.md).
 //
 //   clink incident-collect --checkpoint-dir=<dir> --job=<id> --out=<dir> [...]
 //   clink incident-verify <bundle> [--profile=<p>] [--expected=<ndjson>] [--json]
 //   clink incident-regress <bundle> --op=<id> --epoch=<n> --out=<dir>
+//   clink incident-reconcile <bundle> --host=<h> --key=<col>[,<col>] [...]
 //
 // The library is clink::incident (include/clink/incident/bundle.hpp); the
 // replay checks and incident-regress run on the SQL frontend's replay engine
@@ -14,11 +16,15 @@
 // a check failed, 3 when none failed but a required check is unavailable or
 // unsupported (a partial result), and 2 on bad usage or a bundle that cannot be
 // read. incident-collect and incident-regress exit 0 when done, 1 when they
-// refuse, and 2 on bad usage.
+// refuse, and 2 on bad usage. incident-reconcile exits as incident-verify
+// does, and 2 when the request does not fit the bundle or the destination is
+// not the one its evidence names. It is the only one of them that opens a
+// connection, to the destination the operator names, and only reads.
 
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -35,6 +41,9 @@
 
 #include "clink/config/json.hpp"
 #include "clink/incident/bundle.hpp"
+#include "clink/incident/reconcile.hpp"
+
+#include "clink_incident_reconcile.hpp"
 
 // tools/clink_incident_replay.cpp, or clink_incident_replay_stub.cpp.
 std::vector<clink::incident::Check> clink_incident_replay_checks(
@@ -160,6 +169,36 @@ void regress_usage() {
               << "build, and refuses a bundle whose artifacts do not verify.\n"
               << "\n"
               << "Exit status: 0 written and passing, 1 refused, 2 bad usage.\n";
+}
+
+void reconcile_usage() {
+    std::cerr << "Usage: clink incident-reconcile <bundle> --host=<host> --key=<col>[,<col>...]\n"
+              << "         [--port=N] [--user=<user>] [--password-env=<VAR>] [--secure]\n"
+              << "         [--tls-ca-file=<file>] [--tls-verify=true|false]\n"
+              << "         [--checkpoint=<id>] [--sink-op=<id>] [--job=<id>]\n"
+              << "         [--database=<db>] [--table=<table>]\n"
+              << "         [--query-timeout-ms=N] [--max-rows-per-query=N] [--keys-per-query=N]\n"
+              << "         [--settle-ms=N] [--list=N] [--expected-out=<ndjson>] [--json]\n"
+              << "         [--report=<file>]\n"
+              << "\n"
+              << "Reads the ClickHouse destination a job's sink wrote, and says whether it holds,\n"
+              << "for one completed checkpoint (--checkpoint, default the bundle's), exactly the\n"
+              << "rows the sink received in that checkpoint's intervals: no row missing, changed,\n"
+              << "unexpected or duplicated. The expected rows are the sink's own record of its\n"
+              << "input, which the bundle carries when the job's Workers ran with --capture-dir\n"
+              << "and it was collected with --include-captures; --key names the columns that\n"
+              << "identify one row the job writes.\n"
+              << "\n"
+              << "The connection is the operator's: nothing it connects with or runs comes from\n"
+              << "the bundle, and the password is read from the environment variable\n"
+              << "--password-env names. Every statement is a bounded SELECT under readonly = 2.\n"
+              << "The destination must be the one the evidence names, by server and table UUID,\n"
+              << "or the run is refused. --expected-out writes the expected rows, as canonical\n"
+              << "cells, for an independent check of the expectation.\n"
+              << "\n"
+              << "Exit status: 0 the destination holds the scope exactly, 1 it does not (or the\n"
+              << "bundle's integrity failed), 3 the comparison could not be made whole or stable\n"
+              << "(partial), 2 bad usage or a refused request.\n";
 }
 
 void print_report(const Report& r, bool json, const std::string& report_path) {
@@ -429,6 +468,161 @@ int clink_cmd_incident_verify(int argc, char** argv) {
         return 2;
     }
     print_report(report, json, a.get("report"));
+    return report.exit_code();
+}
+
+int clink_cmd_incident_reconcile(int argc, char** argv) {
+    const auto a = parse_args(argc,
+                              argv,
+                              {"host",
+                               "port",
+                               "user",
+                               "password-env",
+                               "tls-ca-file",
+                               "tls-verify",
+                               "key",
+                               "checkpoint",
+                               "sink-op",
+                               "job",
+                               "database",
+                               "table",
+                               "query-timeout-ms",
+                               "max-rows-per-query",
+                               "keys-per-query",
+                               "settle-ms",
+                               "list",
+                               "expected-out",
+                               "report"},
+                              {"json", "help", "secure"});
+    if (a.switches.contains("help")) {
+        reconcile_usage();
+        return 0;
+    }
+    std::string error = a.error;
+    if (error.empty() && a.positional.size() != 1) {
+        error = "name exactly one bundle directory";
+    }
+    if (error.empty() && a.get("host").empty()) {
+        error = "--host is required: the destination is the operator's to name";
+    }
+    namespace rc = clink::incident::reconcile;
+    rc::Options o;
+    ClinkReconcileTarget target;
+    target.host = a.get("host");
+    if (a.has("user")) {
+        target.user = a.get("user");
+    }
+    target.secure = a.switches.contains("secure");
+    target.tls_ca_file = a.get("tls-ca-file");
+    if (a.has("tls-verify")) {
+        const auto v = a.get("tls-verify");
+        if (v != "true" && v != "false") {
+            error = "--tls-verify takes true or false";
+        }
+        target.tls_verify = v == "true";
+    }
+    if (!target.secure && (a.has("tls-ca-file") || a.has("tls-verify")) && error.empty()) {
+        error = "--tls-ca-file and --tls-verify need --secure";
+    }
+    if (a.has("password-env")) {
+        const char* v = std::getenv(a.get("password-env").c_str());
+        if (v == nullptr) {
+            error = "--password-env names " + a.get("password-env") + ", which is not set";
+        } else {
+            target.password = v;
+        }
+    }
+    const auto number =
+        [&](const char* flag, std::uint64_t lo, std::uint64_t hi) -> std::optional<std::uint64_t> {
+        if (!a.has(flag)) {
+            return std::nullopt;
+        }
+        const auto v = parse_u64(a.get(flag));
+        if (!v || *v < lo || *v > hi) {
+            error = std::string{"--"} + flag + " takes a whole number from " + std::to_string(lo) +
+                    " to " + std::to_string(hi);
+            return std::nullopt;
+        }
+        return v;
+    };
+    if (const auto v = number("port", 1, 65535)) {
+        target.port = static_cast<std::uint16_t>(*v);
+    }
+    if (const auto v = number("checkpoint", 1, UINT64_MAX)) {
+        o.checkpoint = *v;
+    }
+    if (const auto v = number("sink-op", 1, UINT64_MAX)) {
+        o.sink_op = *v;
+    }
+    if (const auto v = number("job", 0, UINT64_MAX)) {
+        o.job = *v;
+    }
+    if (const auto v = number("query-timeout-ms", 1, 3600000)) {
+        o.bounds.query_timeout = std::chrono::milliseconds{*v};
+    }
+    if (const auto v = number("max-rows-per-query", 1, 100000000)) {
+        o.bounds.max_rows_per_query = *v;
+    }
+    if (const auto v = number("keys-per-query", 1, 100000)) {
+        o.bounds.keys_per_query = static_cast<std::size_t>(*v);
+    }
+    if (const auto v = number("settle-ms", 0, 600000)) {
+        o.settle = std::chrono::milliseconds{*v};
+    }
+    if (const auto v = number("list", 0, 100000)) {
+        o.list_limit = static_cast<std::size_t>(*v);
+    }
+    o.database = a.get("database");
+    o.table = a.get("table");
+    {
+        std::string keys = a.get("key");
+        std::size_t start = 0;
+        while (start <= keys.size() && !keys.empty()) {
+            const auto comma = keys.find(',', start);
+            const auto part =
+                keys.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            if (part.empty()) {
+                error = "--key takes column names separated by commas";
+                break;
+            }
+            o.key.push_back(part);
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+        if (o.key.empty() && error.empty()) {
+            error = "--key is required: the columns that identify one row the job writes";
+        }
+    }
+    if (!error.empty()) {
+        std::cerr << "incident-reconcile: " << error << "\n\n";
+        reconcile_usage();
+        return 2;
+    }
+    rc::Report report;
+    try {
+        report = clink_incident_reconcile(a.positional.front(), target, o);
+    } catch (const std::exception& e) {
+        std::cerr << "incident-reconcile: " << e.what() << "\n";
+        return 2;
+    }
+    const bool json = a.switches.contains("json");
+    std::cout << (json ? report.render_json() : report.render_text());
+    if (a.has("report")) {
+        std::ofstream out(a.get("report"), std::ios::binary | std::ios::trunc);
+        out << report.render_json();
+        if (!out) {
+            std::cerr << "incident-reconcile: cannot write " << a.get("report") << "\n";
+        }
+    }
+    if (a.has("expected-out") && !report.refused) {
+        std::ofstream out(a.get("expected-out"), std::ios::binary | std::ios::trunc);
+        out << rc::expected_ndjson(report.scope);
+        if (!out) {
+            std::cerr << "incident-reconcile: cannot write " << a.get("expected-out") << "\n";
+        }
+    }
     return report.exit_code();
 }
 

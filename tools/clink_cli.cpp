@@ -47,6 +47,7 @@ int clink_cmd_checkpoint_verify(int argc, char** argv);
 int clink_cmd_incident_collect(int argc, char** argv);
 int clink_cmd_incident_verify(int argc, char** argv);
 int clink_cmd_incident_regress(int argc, char** argv);
+int clink_cmd_incident_reconcile(int argc, char** argv);
 int clink_cmd_lint(int argc, char** argv);
 
 namespace {
@@ -104,6 +105,9 @@ void usage() {
         << "                    point, state, protocol traces and replay. Exits 3 on a\n"
         << "                    partial result.\n"
         << "  incident-regress  Freeze a bundle's captured epoch as a replay regression test.\n"
+        << "  incident-reconcile Read a ClickHouse destination, read-only, and say whether it\n"
+        << "                    holds exactly what a bundle's sink received for one completed\n"
+        << "                    checkpoint. Exits 3 on a partial result.\n"
         << "  lint              Check a job/cluster configuration for settings that will be\n"
         << "                    ignored or that contradict each other. No cluster needed;\n"
         << "                    exits 1 on anything submission would refuse.\n"
@@ -168,7 +172,7 @@ int main(int argc, char** argv) {
     if (cmd == "state-cat" || cmd == "state-diff" || cmd == "state-export" ||
         cmd == "state-query" || cmd == "check-savepoint" || cmd == "capture-cat" ||
         cmd == "replay-diff" || cmd == "incident-collect" || cmd == "incident-verify" ||
-        cmd == "incident-regress") {
+        cmd == "incident-regress" || cmd == "incident-reconcile") {
         ::setenv("CLINK_LOG_LEVEL", "off", /*overwrite=*/0);
     }
 
@@ -249,6 +253,9 @@ int main(int argc, char** argv) {
     }
     if (cmd == "incident-regress") {
         return clink_cmd_incident_regress(sub_argc, sub_argv);
+    }
+    if (cmd == "incident-reconcile") {
+        return clink_cmd_incident_reconcile(sub_argc, sub_argv);
     }
 
     std::cerr << "clink: unknown command '" << cmd << "'\n\n";

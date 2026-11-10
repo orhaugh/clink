@@ -1,0 +1,57 @@
+-- The example job: payments from Kafka, filtered and projected record by
+-- record, written to ClickHouse through the native sink. Record-wise, so the
+-- rows a checkpoint's intervals hand the sink are exactly those derived from
+-- the Kafka records between the checkpoint's source positions. run.sh fills
+-- in the @...@ values.
+CREATE TABLE events (
+    event_id BIGINT,
+    account  VARCHAR,
+    kind     VARCHAR,
+    amount   DECIMAL(18, 2),
+    ts       TIMESTAMP(3),
+    note     VARCHAR
+) WITH (
+    connector         = 'kafka',
+    format            = 'json',
+    brokers           = '@BROKERS@',
+    topic             = '@TOPIC@',
+    group_id          = '@TOPIC@-group',
+    auto_offset_reset = 'earliest'
+);
+
+-- At least once into a plain MergeTree (see the README for the contract).
+CREATE TABLE payments (
+    event_id     BIGINT,
+    account      VARCHAR,
+    kind         VARCHAR,
+    amount       DECIMAL(18, 2),
+    amount_cents BIGINT,
+    fee          DOUBLE,
+    flagged      BOOLEAN,
+    note         VARCHAR,
+    occurred_at  TIMESTAMP(3)
+) WITH (
+    connector         = 'clickhouse',
+    format            = 'json',
+    insert_format     = 'native',
+    host              = '127.0.0.1',
+    port              = '@CH_PORT@',
+    database          = 'demo',
+    table             = '@TABLE@',
+    user              = 'clink',
+    password          = 'env://CLINK_DEMO_CH_PASSWORD',
+    batch_interval_ms = '200'
+);
+
+INSERT INTO payments
+SELECT event_id,
+       account,
+       kind,
+       amount,
+       CAST(amount * 100 AS BIGINT) AS amount_cents,
+       CAST(CAST(amount * 100 AS BIGINT) AS DOUBLE PRECISION) * CAST(0.029 AS DOUBLE PRECISION) AS fee,
+       CASE WHEN amount >= 1000 THEN TRUE ELSE FALSE END AS flagged,
+       note,
+       ts AS occurred_at
+FROM events
+WHERE kind IN ('purchase', 'refund') AND amount >= 1.00;

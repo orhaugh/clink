@@ -130,6 +130,16 @@ struct CapturedEpoch {
     bool truncated{false};  // the file's header said so when it was collected
 };
 
+// One sink interval's evidence the manifest lists (runtime/sink_evidence.hpp):
+// capture/op-<op>/subtask-<subtask>/epoch-<epoch>.sink.json, written by the
+// sink runner when the barrier of checkpoint `epoch` had passed the sink.
+struct SinkInterval {
+    std::uint64_t op{0};
+    std::uint64_t subtask{0};
+    std::uint64_t epoch{0};
+    std::string path;
+};
+
 // The directories evidence lives in. Every artifact is under one of them, and
 // nothing unlisted may be.
 inline constexpr std::array<const char*, 4> kEvidenceDirs = {
@@ -139,7 +149,14 @@ struct Bundle {
     std::filesystem::path root;  // absolute
     config::JsonValue manifest;
     std::vector<Artifact> artifacts;
-    std::vector<CapturedEpoch> captures;  // sorted by op, subtask, epoch
+    // The captured epochs of operators, which the replay checks and
+    // incident-regress read; sorted by op, subtask, epoch.
+    std::vector<CapturedEpoch> captures;
+    // A sink's recorded input: the captured epochs of every operator the
+    // manifest lists sink interval evidence for, kept apart from `captures`
+    // because a sink is not an operator to replay. Sorted likewise.
+    std::vector<CapturedEpoch> sink_captures;
+    std::vector<SinkInterval> sink_intervals;  // sorted by op, subtask, epoch
 
     [[nodiscard]] JobId job() const;
     [[nodiscard]] std::uint64_t checkpoint() const;

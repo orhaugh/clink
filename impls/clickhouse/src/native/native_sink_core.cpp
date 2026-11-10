@@ -22,6 +22,7 @@
 
 #include <arrow/api.h>
 
+#include "clink/config/json.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/metrics/counter.hpp"
 #include "clink/metrics/metrics_registry.hpp"
@@ -147,10 +148,63 @@ bool is_refusal(std::string_view code) {
 
 // What the opener hands the task thread: a client connected to a server that
 // passed every check, that server's description, and the column plan.
+// The destination as the open found it, for destination evidence: where the
+// rows go, who answered, what the table is, and how each declared column binds
+// to it. Repeated in every interval's evidence, so each file stands alone.
+config::JsonValue describe_destination(const SinkOptions& options,
+                                       const TargetInfo& target,
+                                       const ColumnPlan& plan,
+                                       const std::optional<DestinationIdentity>& identity) {
+    config::JsonObject server;
+    server["name"] = config::JsonValue{target.server.display_name};
+    server["version"] = config::JsonValue{std::to_string(target.server.major) + "." +
+                                          std::to_string(target.server.minor) + "." +
+                                          std::to_string(target.server.patch)};
+    server["tested_line"] = config::JsonValue{target.tested_line};
+    server["endpoint"] = config::JsonValue{endpoint_text(target.server.endpoint)};
+    if (identity) {
+        server["uuid"] = config::JsonValue{identity->server_uuid};
+        server["host_name"] = config::JsonValue{identity->host_name};
+    }
+    config::JsonArray columns;
+    for (const ColumnBinding& c : plan.columns) {
+        config::JsonObject col;
+        col["name"] = config::JsonValue{c.name};
+        col["declared"] = config::JsonValue{c.source.spelling};
+        col["target"] = config::JsonValue{c.target.spelling};
+        columns.emplace_back(std::move(col));
+    }
+    config::JsonArray omitted;
+    for (const TargetColumn& c : plan.omitted) {
+        omitted.emplace_back(config::JsonValue{c.name});
+    }
+    config::JsonObject d;
+    d["database"] = config::JsonValue{options.database};
+    d["table"] = config::JsonValue{options.table};
+    d["server"] = config::JsonValue{std::move(server)};
+    d["engine"] = config::JsonValue{target.engine};
+    if (identity) {
+        d["table_uuid"] = config::JsonValue{identity->table_uuid};
+        d["engine_full"] = config::JsonValue{identity->engine_full};
+        d["create_table_query"] = config::JsonValue{identity->create_table_query};
+        d["metadata_modification_time"] = config::JsonValue{identity->metadata_modification_time};
+    }
+    d["dedup"] = config::JsonValue{target.dedup_report};
+    d["keeps_dedup_log"] = config::JsonValue{target.keeps_dedup_log};
+    d["async_insert"] = config::JsonValue{target.async_report};
+    d["token_on_resend"] =
+        config::JsonValue{std::string{target.keep_token_on_resend ? "kept" : "fresh"}};
+    d["columns"] = config::JsonValue{std::move(columns)};
+    d["omitted_columns"] = config::JsonValue{std::move(omitted)};
+    return config::JsonValue{std::move(d)};
+}
+
 struct Opened {
     std::unique_ptr<InsertTransport> transport;
     TargetInfo target;
     ColumnPlan plan;
+    // Read only when the job records destination evidence.
+    std::optional<DestinationIdentity> identity;
 };
 
 // The opener's whole world: what it reads, what it produces, and what the task
@@ -167,6 +221,8 @@ struct OpenState {
     spdlog::logger* logger{nullptr};
     MetricsRegistry* metrics{nullptr};
     std::uint64_t op_id{0};
+    // The job records destination evidence: read who the destination is too.
+    bool read_identity{false};
 
     std::atomic<bool> stop{false};
 
@@ -181,6 +237,9 @@ struct OpenState {
     std::optional<TargetInfo> target;
     std::optional<ColumnPlan> plan;
     std::exception_ptr failure;
+    // Written by the opener thread alone, and read by the task thread after
+    // the join.
+    std::optional<DestinationIdentity> identity;
 
     // The registry and the logger belong to the host, and a detached opener
     // can outlive the job, so every report goes through report(), which stops
@@ -288,6 +347,9 @@ void OpenState::attempts(std::unique_ptr<InsertTransport>& t,
             phase = Phase::Metadata;
             TargetInfo info = probe_target(*t, options);
             ColumnPlan p = compile_or_refuse(columns, info.columns, qualified, kind);
+            if (read_identity) {
+                identity = read_destination_identity(*t, options);
+            }
             found = std::move(info);
             planned = std::move(p);
             return;
@@ -491,6 +553,14 @@ struct SinkCore::Impl {
     Counter* columnar_batches{nullptr};
     Counter* row_batches{nullptr};
 
+    // Destination evidence, when armed: the destination as the open found
+    // it, and the ledger the last barrier took.
+    bool record_evidence{false};
+    config::JsonValue destination;
+    std::string token_nonce;
+    std::uint64_t ledger_checkpoint{0};
+    Ledger ledger;
+
     // Declared last, so it goes first: its destructor aborts a writer that
     // was never closed.
     std::unique_ptr<Writer> writer;
@@ -566,6 +636,7 @@ Opened SinkCore::Impl::open_target() {
     state->logger = logger;
     state->metrics = metrics;
     state->op_id = op_id;
+    state->read_identity = record_evidence;
     // The opener's own share of the state is what makes a detach safe.
     OpenerThread opener(state);
 
@@ -587,8 +658,10 @@ Opened SinkCore::Impl::open_target() {
         if (state->failure) {
             std::rethrow_exception(state->failure);
         }
-        return Opened{
-            std::move(state->transport), std::move(*state->target), std::move(*state->plan)};
+        return Opened{std::move(state->transport),
+                      std::move(*state->target),
+                      std::move(*state->plan),
+                      std::move(state->identity)};
     }
 
     // A cancel must not wait on a blocked socket call: interrupt it, give the
@@ -641,8 +714,14 @@ void SinkCore::Impl::start(Opened opened, const std::function<void()>& prepare) 
     // Runs on the writer thread, which may outlive this sink once detached, so
     // it holds its own copy of the options and nothing else.
     config.reprobe = [opts = options](InsertTransport& t) { return probe_target(t, opts); };
-    writer = std::make_unique<Writer>(
-        std::move(config), std::move(opened.transport), TokenSource::random());
+    config.record_ledger = record_evidence;
+    if (record_evidence) {
+        destination = describe_destination(options, config.target, config.plan, opened.identity);
+    }
+    TokenSource tokens = TokenSource::random();
+    token_nonce = tokens.nonce_hex();
+    writer =
+        std::make_unique<Writer>(std::move(config), std::move(opened.transport), std::move(tokens));
 }
 
 void SinkCore::Impl::report_open(const TargetInfo& target, const ColumnPlan& plan) const {
@@ -877,8 +956,63 @@ void SinkCore::barrier(CheckpointBarrier barrier) {
         s.writer->abort();
         throw;
     }
+    if (s.record_evidence) {
+        // Every INSERT of the interval is acknowledged and none of the next has
+        // begun, so the ledger holds exactly the interval's.
+        s.ledger_checkpoint = barrier.id().value();
+        s.ledger = s.writer->take_ledger();
+    }
     // The flush let go of every chunk acknowledged before the barrier.
     s.writer->drain_released();
+}
+
+void SinkCore::arm_evidence() noexcept {
+    impl_->record_evidence = true;
+}
+
+std::string SinkCore::interval_evidence(std::uint64_t checkpoint_id) const noexcept {
+    const Impl& s = *impl_;
+    if (!s.record_evidence || !s.writer) {
+        return {};
+    }
+    try {
+        config::JsonObject o;
+        o["connector"] = config::JsonValue{std::string{"clickhouse_native"}};
+        o["guarantee"] = config::JsonValue{std::string{"at_least_once"}};
+        o["subtask"] = config::JsonValue{static_cast<std::int64_t>(s.options.subtask_idx)};
+        o["parallelism"] = config::JsonValue{static_cast<std::int64_t>(s.options.parallelism)};
+        o["destination"] = s.destination;
+        o["token_nonce"] = config::JsonValue{s.token_nonce};
+        if (s.ledger_checkpoint != checkpoint_id) {
+            // The barrier this was asked about is not the one the ledger was
+            // taken at: say so rather than attribute another interval's INSERTs.
+            o["inserts"] = config::JsonValue{};
+            o["ledger"] = config::JsonValue{std::string{"not taken at this barrier"}};
+            return config::JsonValue{std::move(o)}.serialize(0);
+        }
+        config::JsonArray inserts;
+        std::uint64_t rows = 0;
+        for (const LedgerEntry& e : s.ledger.entries) {
+            config::JsonObject i;
+            i["token"] = config::JsonValue{e.token};
+            i["seq"] = config::JsonValue{static_cast<std::int64_t>(e.seq)};
+            i["rows"] = config::JsonValue{static_cast<std::int64_t>(e.rows)};
+            i["attempts"] = config::JsonValue{static_cast<std::int64_t>(e.attempts)};
+            i["in_doubt"] = config::JsonValue{e.in_doubt};
+            i["resend"] = e.resend.empty() ? config::JsonValue{} : config::JsonValue{e.resend};
+            i["server"] = config::JsonValue{e.server};
+            i["acknowledged_at_ms"] = config::JsonValue{e.acknowledged_at_ms};
+            inserts.emplace_back(std::move(i));
+            rows += e.rows;
+        }
+        o["inserts"] = config::JsonValue{std::move(inserts)};
+        o["inserts_unlisted"] = config::JsonValue{static_cast<std::int64_t>(s.ledger.unlisted)};
+        o["rows_acknowledged"] =
+            config::JsonValue{static_cast<std::int64_t>(rows + s.ledger.unlisted_rows)};
+        return config::JsonValue{std::move(o)}.serialize(0);
+    } catch (...) {
+        return {};
+    }
 }
 
 void SinkCore::flush() {

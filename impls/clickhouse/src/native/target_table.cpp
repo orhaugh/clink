@@ -1051,6 +1051,25 @@ TargetInfo probe_target(InsertTransport& transport, const SinkOptions& opts) {
     return info;
 }
 
+DestinationIdentity read_destination_identity(InsertTransport& transport, const SinkOptions& opts) {
+    const std::chrono::seconds budget = metadata_budget(opts.receive_timeout);
+    const ResultSet r =
+        transport.select(MetaQuery::Identity, select_identity(opts.database, opts.table, budget));
+    if (r.rows.empty()) {
+        throw NativeSinkError(code::kTargetMissing,
+                              qualified_table(opts.database, opts.table) +
+                                  " does not exist; create it first; the sink does not create "
+                                  "tables");
+    }
+    const auto& row = r.rows.front();
+    return DestinationIdentity{.server_uuid = cell(row, 0),
+                               .host_name = cell(row, 1),
+                               .table_uuid = cell(row, 2),
+                               .engine_full = cell(row, 3),
+                               .create_table_query = cell(row, 4),
+                               .metadata_modification_time = cell(row, 5)};
+}
+
 std::optional<std::string> engine_full_setting(std::string_view engine_full,
                                                std::string_view name) {
     SettingLookup found = lookup_engine_setting(engine_full, name);

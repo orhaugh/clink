@@ -79,6 +79,13 @@ public:
     void close();
     void close_cancelled() noexcept;
 
+    // Destination evidence (runtime/sink_evidence.hpp). arm_evidence(), before
+    // open(), makes the open read who the destination is and the writer keep a
+    // ledger of acknowledged INSERTs; interval_evidence() after barrier(N)
+    // describes the interval that ended there, as a JSON object. Never throws.
+    void arm_evidence() noexcept;
+    [[nodiscard]] std::string interval_evidence(std::uint64_t checkpoint_id) const noexcept;
+
     // Logs a chunk that could not be built from a batch.
     void conversion_failed(const ConversionError& e) const;
     void log(LogSeverity level, const std::string& message) const;
