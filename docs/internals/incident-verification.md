@@ -31,9 +31,16 @@ clink replay --run-test=tests/incidents/incident-1
 # Online, explicitly: does the ClickHouse table hold exactly what checkpoint 12 owed it?
 CH_PASSWORD=... clink incident-reconcile incident-1 --checkpoint=12 --key=event_id \
     --host=clickhouse.internal --user=reconciler --password-env=CH_PASSWORD --json
+
+# Audit it against a reference computed outside the job (see "Independent reference audit").
+clink incident-scope incident-1 --checkpoint=12 --out=scope.json
+python3 my_reference.py --scope=scope.json --bootstrap=kafka.internal:9092 --out=reference.ndjson
+CH_PASSWORD=... clink incident-reconcile incident-1 --checkpoint=12 --key=event_id \
+    --reference=reference.ndjson --host=clickhouse.internal --user=reconciler \
+    --password-env=CH_PASSWORD
 ```
 
-`incident-collect` exits 0 when it published a bundle, 1 when it refused (and left nothing at `--out`), 2 on bad usage. `incident-verify` exits 0 when every check the profile requires passed, 1 when any check failed, 3 when none failed but a required check is unavailable or unsupported, and 2 on bad usage or a bundle the reader refuses. A partial result (3) is never reported as success. `incident-regress` exits 0 when the regression bundle is written and passes on this build, 1 when it refuses. `incident-reconcile` exits as `incident-verify` does, and 2 when the request does not fit the bundle or the destination is not the one its evidence names.
+`incident-collect` exits 0 when it published a bundle, 1 when it refused (and left nothing at `--out`), 2 on bad usage. `incident-verify` exits 0 when every check the profile requires passed, 1 when any check failed, 3 when none failed but a required check is unavailable or unsupported, and 2 on bad usage or a bundle the reader refuses. A partial result (3) is never reported as success. `incident-regress` exits 0 when the regression bundle is written and passes on this build, 1 when it refuses. `incident-reconcile` exits as `incident-verify` does, and 2 when the request does not fit the bundle, the destination is not the one its evidence names, or a reference artifact is malformed or bound to another scope. `incident-scope` exits 0 when it wrote the scope document, 3 when it wrote one whose evidence or source positions are not whole, and 2 on bad usage or a request the bundle does not fit.
 
 ## The bundle
 
@@ -226,9 +233,77 @@ The result is:
 - `incident-verify` says that the recorded execution is intact and passes the protocol and replay checks.
 - `incident-reconcile` says that the destination, observed once, holds exactly what one checkpoint owed it.
 
+## Independent reference audit
+
+Reconciliation compares the destination with the sink's own record of its input. That establishes whether the writes arrived. A transformation that computes the wrong rows writes them faithfully, so its captured input and its destination agree and reconciliation passes. Only an expectation computed outside the job, from the same source records, can tell. The audit takes one from the operator and compares three relationships separately, so that one passing cannot hide another failing.
+
+```mermaid
+flowchart LR
+    B["bundle"] -->|"incident-scope (offline)"| S["scope document<br/>logs, ranges, columns,<br/>scope_sha256"]
+    S --> R["the operator's reference<br/>reads the exact Kafka range,<br/>own transformation"]
+    R --> A["reference artifact<br/>rows, hashes, complete?"]
+    A -->|"incident-reconcile --reference"| C["reference vs captured input<br/>captured input vs destination<br/>reference vs destination"]
+```
+
+**The scope document.** `clink incident-scope` reads the bundle alone, with its integrity checked, and writes the scope a reference computes from (format `clink-audit-scope`, version 1). It holds:
+
+- the job, the sink and its runner attempts, and the SHA-256 of the job graph the bundle recorded;
+- the bounding checkpoints, and whether the scope spans the run from its start (`--from-run-start`);
+- each Kafka source's topic, cluster id and topic id, isolation level, and per partition the range `[from, to)`;
+- the sink's columns, and the comparison's semantics (`clink-canonical-cells-v1`);
+- `scope_sha256`, over the rest.
+
+**The reference artifact** (format `clink-reference-result`, version 1) is NDJSON:
+
+1. a header holding the scope document verbatim and the implementation's name, version and configuration;
+2. one line per expected row, as canonical cells, with copies kept;
+3. an end line holding the row count, the SHA-256 of the row lines and of the header line, whether the reference is complete, and if not why, and what its writer verified and recorded.
+
+The audit refuses (exit 2) an artifact that is malformed, has no end line, does not hash to its end line, holds a cell that is not canonical for its column, or names another scope. The refusal names the first field that differs, such as another checkpoint, range, topic id or column. An artifact that says it is incomplete is bound and never compared, so the audit is partial.
+
+Nothing an artifact names is run, loaded or connected to. Its hashes show the file is whole as its writer finished it, not who wrote it, and not that its implementation is independent of the job. The report keeps what the audit verified apart from what the artifact only records:
+
+- **Verified:** the binding to the scope, the hashes, and the cells' form.
+- **Recorded:** the implementation, its configuration, the client library, and any offsets the operator supplied.
+- **The writer's own checks:** listed as such.
+
+**A reference implementation.** [`python/clink-reference`](https://github.com/orhaugh/clink/tree/main/python/clink-reference) reads a scope's exact Kafka ranges on a connection and credentials the operator gives, and writes the artifact. The transformation is the operator's, written from the job's specification and never from clink's evaluator or sink conversions. Before reading, the library confirms the cluster's id and the topic's id are the ones the job recorded, and that the topic does not compact. Under `read_committed`, a range's transaction markers and aborted records hold offsets that are never delivered. So the library does not take a range's span as its record count, and does not take a quiet poll as its end. A range is complete only once a record at or past its end was delivered, or the end of the log was reached at or past it. Each of these leaves the reference incomplete, with the reason, rather than complete over what remains:
+
+- expired or compacted history;
+- a recreated topic, or another cluster;
+- a log that ends early;
+- an error, a deadline or a bound reached first.
+
+**The audit.** `clink incident-reconcile --reference=<artifact>` adds these checks to the reconciliation's:
+
+| Check | Compares | A failure means |
+| --- | --- | --- |
+| `reference.scope` | the artifact against the audit's own scope document | (unavailable when the reference is incomplete) |
+| `reference.capture` | the reference's rows against the sink's captured input | the transformation: the job computed other rows than the reference, before any write |
+| `reconcile.rows` | the captured input against the destination, over its own keys, as without a reference | the delivery: the destination does not hold what the sink received |
+| `reference.destination` | the reference against the destination, over the union of the reference's and the captured input's keys | the destination does not hold what the reference computes |
+| `destination.coverage` | with `--coverage=complete-table`: the whole table against the expected rows | the table holds rows the scope does not account for, or lacks some |
+
+Every comparison is of whole typed rows with their copies counted, under the canonical cells above. NULLs, decimals, timestamps, strings and floats are compared as reconciliation compares them. The destination is read for the union of keys, so a row the job dropped is looked for under the reference's key, and a row it introduced is read under its own. The report lists findings by relationship (`transformation`, `delivery`, `reference-destination`, `coverage`), so that a wrong transformation written faithfully reads as one, and is not mistaken for a delivery fault. The verdicts are reconciliation's:
+
+- **Exit 0:** every required check completed and passed.
+- **Exit 1:** any check failed. An observed discrepancy wins over evidence that is unavailable.
+- **Exit 3:** none failed, but one required check is unavailable or unsupported.
+- **Exit 2:** refused.
+
+**Coverage.** A destination read selects keys, and rows of other keys are not read. A passing result therefore says "for the selected keys", and the report's `coverage` names how many keys were selected and that the rest of the table is not established. `--coverage=complete-table` also reads the table whole, at most `--max-table-rows` rows, and requires it to hold exactly the expected rows: the reference's when there is one, the captured input's otherwise. That catches a row of a key neither side names. Its scope spans the run from its start (as `--from-run-start`). The check is established only when all of these hold, and is otherwise unavailable:
+
+- the operator declares the table holds this one bounded run's writes and nothing else (recorded as an assumption);
+- the run began with no state, so no earlier run's rows can be in the table;
+- the bundle shows the run had stopped writing: every sink subtask's interval for at least two barriers after the checkpoint, all empty, and none after it with rows;
+- the table's active parts are the same before and after the read (`system.parts`, so the reconciling user needs `SELECT` on it);
+- no mutation is in progress.
+
+Two equal reads alone do not establish that a table was still. A shared or continuously written table keeps the selected-key comparison, and its completeness stays unavailable. An empty expected output does not pass by having nothing to compare: with selected keys no key is selected and the result is partial, and read whole it passes only when the table is empty.
+
 ## What passing does not mean
 
-The digests establish that nothing in a bundle changed after it was collected. They do not establish who collected it: anyone who can replace the bundle can replace its manifest too, and signing is out of scope. A passing bundle is evidence about the files in it, checked by this build's readers. It is not a proof that the implementation is correct, that the job's business logic is right, or that any external system holds what the job wrote: nothing offline reads a destination. A passing reconciliation establishes one checkpoint's effects in one table at one observation time, against what the job's own sink received. It does not establish that the transformation is right, which the replay checks and an independent reference address, nor that the rows survive the server's host losing power, nor anything about the table after the read.
+The digests establish that nothing in a bundle changed after it was collected. They do not establish who collected it: anyone who can replace the bundle can replace its manifest too, and signing is out of scope. A passing bundle is evidence about the files in it, checked by this build's readers. It is not a proof that the implementation is correct, that the job's business logic is right, or that any external system holds what the job wrote: nothing offline reads a destination. A passing reconciliation establishes one checkpoint's effects in one table at one observation time, against what the job's own sink received. It does not establish that the transformation is right, which the replay checks and an independent reference address, nor that the rows survive the server's host losing power, nor anything about the table after the read. A passing audit adds that the job's output, and the destination over the keys read, equal what a reference computed outside the job, from the same records. That is only as independent as the reference is, and the audit cannot establish that. With selected keys, it establishes nothing about rows of other keys.
 
 ## Measured
 

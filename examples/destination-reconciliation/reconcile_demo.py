@@ -180,11 +180,28 @@ TABLE_DDL = """CREATE TABLE demo.{table} (
 SETTINGS async_insert = 0, non_replicated_deduplication_window = {window}"""
 
 
+# Defects put into the job on purpose, each as (what the job says, what it
+# says instead): the job writes what it computes faithfully, and only a
+# reference computed outside it can tell.
+JOB_VARIANTS = {
+    # Values: the amount in cents is computed at the wrong scale.
+    "wrong-projection": ("CAST(amount * 100 AS BIGINT) AS amount_cents",
+                         "CAST(amount * 10 AS BIGINT) AS amount_cents"),
+    # A filter that drops valid payments: a threshold of 10.00, not 1.00.
+    "faulty-filter": ("amount >= 1.00;", "amount >= 10.00;"),
+    # A filter that lets through rows it should not: chargebacks.
+    "extra-output": ("kind IN ('purchase', 'refund')", "kind IN ('purchase', 'refund', 'chargeback')"),
+    # Every row and every amount is there, so counts and totals agree: the
+    # account is written in capitals.
+    "equal-totals": ("SELECT event_id,\n       account,", "SELECT event_id,\n       UPPER(account) AS account,"),
+}
+
+
 class Cluster:
     """A Coordinator and two Workers from the build, for one scenario."""
 
     def __init__(self, demo, name, worker1_faults="", worker2_late=False, capture=True,
-                 capture_records=100000, interval_ms=1000, defer_worker2=False):
+                 capture_records=100000, interval_ms=1000, defer_worker2=False, variant=None):
         self.demo = demo
         self.name = name
         self.dir = demo.work / name
@@ -198,6 +215,8 @@ class Cluster:
         # worker-2 is left to the scenario to start (worker(2)), when it wants
         # the job to restore there.
         self.defer_worker2 = defer_worker2
+        # A defect put into the job's SQL on purpose (JOB_VARIANTS), or None.
+        self.variant = variant
         self.capture = capture
         self.capture_records = capture_records
         self.interval_ms = interval_ms
@@ -247,6 +266,11 @@ class Cluster:
         for k, v in {"@BROKERS@": "127.0.0.1:%d" % self.demo.services.kafka_port, "@TOPIC@": topic,
                      "@CH_PORT@": str(ch_port), "@TABLE@": table}.items():
             sql = sql.replace(k, v)
+        if self.variant is not None:
+            right, wrong = JOB_VARIANTS[self.variant]
+            if right not in sql:
+                raise Failed("the job's SQL has no %r for variant %s" % (right, self.variant))
+            sql = sql.replace(right, wrong)
         (self.dir / "job.sql").write_text(sql)
         args = [str(self.demo.bin / "clink"), "run", str(self.dir / "job.sql"),
                 "--coordinator-host=127.0.0.1", "--coordinator-port=%d" % self.coord_http,
@@ -323,6 +347,10 @@ class Demo:
         self.summary = open(self.results / "summary.txt", "a")
         self.only = set(args.only.split(",")) if args.only else None
         self.feed_rate = args.rate
+        # The interpreter with clink_reference and its Kafka client installed
+        # (run.sh makes a virtual environment for it).
+        self.reference_python = args.reference_python
+        (self.results / "references").mkdir(parents=True, exist_ok=True)
 
     # -- reporting --------------------------------------------------------------
     def say(self, text):
@@ -359,7 +387,7 @@ class Demo:
         # Read only: SELECT on the example's tables and the three system
         # tables a reconciliation reads, and nothing else.
         s.ch("GRANT SELECT ON demo.* TO reconciler")
-        for t in ("tables", "columns", "mutations"):
+        for t in ("tables", "columns", "mutations", "parts"):
             s.ch("GRANT SELECT ON system.%s TO reconciler" % t)
 
     def create_table(self, table, window=1000):
@@ -384,6 +412,35 @@ class Demo:
         if data is not None:
             data["_elapsed_s"] = elapsed
         return r.returncode, data, r.stdout + r.stderr
+
+    def scope(self, label, bundle, checkpoint, whole_run=False):
+        """clink incident-scope: the scope document a reference computes from.
+        Returns (exit code, path)."""
+        out = self.results / "references" / ("%s.scope.json" % label)
+        args = [str(self.bin / "clink"), "incident-scope", str(bundle),
+                "--checkpoint=%d" % checkpoint, "--out=%s" % out]
+        if whole_run:
+            args.append("--from-run-start")
+        r = subprocess.run(logged(args, label), capture_output=True, text=True, timeout=120)
+        (self.results / "references" / ("%s.scope.txt" % label)).write_text(r.stdout + r.stderr)
+        return r.returncode, out
+
+    def reference(self, label, scope_path, run_start=None, extra=()):
+        """The example's reference implementation (reference_payments.py) over
+        the scope, reading Kafka on the connection given here. Returns (exit
+        code, artifact path, seconds, its output)."""
+        out = self.results / "references" / ("%s.reference.ndjson" % label)
+        args = [self.reference_python, str(HERE / "reference_payments.py"),
+                "--scope=%s" % scope_path, "--bootstrap=127.0.0.1:%d" % self.services.kafka_port,
+                "--out=%s" % out, *extra]
+        if run_start is not None:
+            args.append("--run-start-offset=ALL=%d" % run_start)
+        t0 = time.time()
+        r = subprocess.run(logged(args, label), capture_output=True, text=True, timeout=900,
+                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        elapsed = time.time() - t0
+        (self.results / "references" / ("%s.reference.txt" % label)).write_text(r.stdout + r.stderr)
+        return r.returncode, out, elapsed, (r.stdout + r.stderr).strip()
 
     # -- the independent check -------------------------------------------------------
     def destination_rows(self, table, ids):
@@ -563,6 +620,7 @@ def main():
     ap.add_argument("--clickhouse-port", type=int, default=29100)
     ap.add_argument("--rate", type=int, default=200)
     ap.add_argument("--only", default="")
+    ap.add_argument("--reference-python", default=sys.executable)
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
     demo = Demo(args)

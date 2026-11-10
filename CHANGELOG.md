@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+**An independent reference audit for the Kafka to ClickHouse pipeline.**
+Destination reconciliation compares the destination with the sink's own
+record of its input, so a transformation that computes the wrong rows, and
+writes them faithfully, passed it. `clink incident-scope` now exports a
+checkpoint's scope from the bundle alone: the run, the job graph's
+fingerprint, the bounding checkpoints, each Kafka log with its cluster and
+topic ids, ranges and isolation level, and the sink's columns. The operator's
+own reference implementation computes the expected output from exactly that
+source range. `python/clink-reference` reads the range, confirms the logs, and
+writes a versioned, hashed artifact with an explicit completeness status.
+Under `read_committed` it passes a range's end rather than counting to it, and
+expired history, a recreated topic, compaction, an error or a bound leave the
+artifact incomplete. `clink incident-reconcile --reference` refuses an
+artifact that is malformed, unfinished or bound to another scope, and compares
+the reference with the captured input (the transformation), the captured input
+with the destination (the delivery), and the reference with the destination,
+over the union of their keys, as whole typed rows with their copies. A passing
+selected-key read now says it covered the selected keys. `--coverage=complete-table`
+reads a table declared dedicated to one bounded run whole, once the bundle
+shows the run had stopped writing and the table's parts held still, and an
+empty expected output passes only that way. The destination-reconciliation
+example adds jobs with deliberate defects, among them a wrong projection that
+reconciliation passes and the audit fails, plus destination faults, an
+unrelated key, an empty output and references that cannot be compared, each
+checked from the source with Kafka's own console consumer.
+
 **A restored Kafka source no longer seeks its offsets in a log they do not
 describe.** The source checkpointed one offset per partition and nothing of
 which topic or cluster they were for, so a job restored after its topic was

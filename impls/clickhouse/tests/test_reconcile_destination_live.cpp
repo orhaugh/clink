@@ -6,6 +6,7 @@
 // CLINK_CLICKHOUSE_TEST_HOST names a server; scripts/clickhouse-live.sh runs
 // it on each line.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -245,6 +246,36 @@ TEST(ClickHouseReconcileLive, AReadPastItsBoundFailsWholeRatherThanReturningPart
     auto ok =
         clink::clickhouse::make_reconcile_destination(reconcile_connection(t), rc::ReadBounds{});
     EXPECT_EQ(ok->read(cols, {0}, {{"I1"}, {"I2"}}).size(), 2U);
+    admin.Execute("DROP TABLE default." + t);
+}
+
+// The whole-table read a complete-table audit makes: every row, or nothing
+// past its bound, and a parts marker that changes when an INSERT or a merge
+// does and not otherwise.
+TEST(ClickHouseReconcileLive, AWholeReadIsBoundedAndItsPartsMarkerSeesEveryChange) {
+    REQUIRE_RECONCILE_SERVER();
+    auto admin = reconcile_admin();
+    const auto t = reconcile_table();
+    admin.Execute("CREATE TABLE default." + t +
+                  " (id Int64, s Nullable(String)) ENGINE = MergeTree ORDER BY id "
+                  "SETTINGS async_insert = 0");
+    admin.Execute("INSERT INTO default." + t + " VALUES (1, 'a'), (2, NULL)");
+    const auto cols = columns_of({{"id", "Int64"}, {"s", "Nullable(String)"}});
+    auto d =
+        clink::clickhouse::make_reconcile_destination(reconcile_connection(t), rc::ReadBounds{});
+    auto all = d->read_all(cols, 10);
+    std::sort(all.begin(), all.end());
+    EXPECT_EQ(all, (std::vector<rc::Row>{{"I1", "Sa"}, {"I2", "N"}}));
+    EXPECT_THROW((void)d->read_all(cols, 1), rc::DestinationUnavailable);
+    const std::string still = d->parts_marker();
+    EXPECT_FALSE(still.empty());
+    EXPECT_EQ(d->parts_marker(), still) << "nothing changed";
+    admin.Execute("INSERT INTO default." + t + " VALUES (3, 'c')");
+    const std::string inserted = d->parts_marker();
+    EXPECT_NE(inserted, still) << "an INSERT adds a part";
+    admin.Execute("OPTIMIZE TABLE default." + t + " FINAL");
+    EXPECT_NE(d->parts_marker(), inserted) << "a merge replaces parts";
+    EXPECT_EQ(d->read_all(cols, 10).size(), 3U);
     admin.Execute("DROP TABLE default." + t);
 }
 

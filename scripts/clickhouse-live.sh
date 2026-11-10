@@ -194,7 +194,7 @@ for line in ${CLICKHOUSE_LINES}; do
         "ClickHouseSourceLive.*=4" \
         CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}"
     run_counted "${line} reconcile reader" "${BIN}" 'ClickHouseReconcileLive.*' \
-        "ClickHouseReconcileLive.*=4" \
+        "ClickHouseReconcileLive.*=5" \
         CLINK_CLICKHOUSE_TEST_PORT="${port}" CLINK_CLICKHOUSE_TEST_LINE="${line}"
     if [ "${CLICKHOUSE_LIVE_SQL}" = "1" ]; then
         run "${line} SQL-level" "${SQL_BIN}" 'ClickHouseNativeSqlLive.*' \

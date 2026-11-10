@@ -186,6 +186,41 @@ public:
         return out;
     }
 
+    std::vector<rc::Row> read_all(const std::vector<rc::Column>& columns,
+                                  std::uint64_t max_rows) override {
+        const auto rows = select(
+            reconcile_read_all_statement(conn_.database, conn_.table, columns, max_rows, bounds_),
+            columns.size() * 2);
+        std::vector<rc::Row> out;
+        out.reserve(rows.size());
+        for (const auto& r : rows) {
+            rc::Row row;
+            row.reserve(columns.size());
+            for (std::size_t i = 0; i < columns.size(); ++i) {
+                row.push_back(canon_observed(r[2 * i] == "1", r[2 * i + 1], columns[i].type));
+            }
+            out.push_back(std::move(row));
+        }
+        return out;
+    }
+
+    // The active parts by name, rows and modification time: an INSERT adds a
+    // part and a merge or mutation replaces some, so any of them between two
+    // markers shows.
+    std::string parts_marker() override {
+        std::string marker;
+        for (const auto& row :
+             select("SELECT CAST(name AS String), CAST(toString(rows) AS String), "
+                    "CAST(toString(modification_time) AS String) FROM system.parts WHERE "
+                    "database = " +
+                        quote_string(conn_.database) + " AND table = " + quote_string(conn_.table) +
+                        " AND active ORDER BY name " + reconcile_settings(bounds_),
+                    3)) {
+            marker += row[0] + ":" + row[1] + ":" + row[2] + ";";
+        }
+        return marker;
+    }
+
 private:
     // One SELECT, whole or not at all: every exception the client raises is
     // turned into DestinationUnavailable, and the client is rebuilt after it.
@@ -373,6 +408,24 @@ std::string reconcile_read_statement(std::string_view database,
         }
     }
     sql += ") " + reconcile_settings(bounds);
+    return sql;
+}
+
+std::string reconcile_read_all_statement(std::string_view database,
+                                         std::string_view table,
+                                         const std::vector<rc::Column>& columns,
+                                         std::uint64_t max_rows,
+                                         const rc::ReadBounds& bounds) {
+    std::string sql = "SELECT ";
+    for (std::size_t i = 0; i < columns.size(); ++i) {
+        const std::string q = quote_identifier(columns[i].name);
+        sql += (i == 0 ? "" : ", ");
+        sql += "CAST(toString(isNull(" + q + ")) AS String), " +
+               reconcile_value_expr(q, columns[i].type);
+    }
+    rc::ReadBounds whole = bounds;
+    whole.max_rows_per_query = std::max<std::uint64_t>(max_rows, 1);
+    sql += " FROM " + native::qualified_table(database, table) + " " + reconcile_settings(whole);
     return sql;
 }
 

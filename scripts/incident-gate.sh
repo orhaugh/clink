@@ -50,7 +50,8 @@ python3 "${here}/scripts/check-gtest-reports.py" \
     --expect 'IncidentBundleTest.*=35' --expect 'IncidentEpochs.*=1' \
     --expect 'IncidentSelection.*=3' --expect 'ResolutionFixture.TheRestorePointOnDisk*=1' \
     --expect 'ReconcileCanon.*=8' --expect 'ReconcileCompare.*=5' \
-    --expect 'ReconcileSinkRunner.*=3' --expect 'ReconcileBundle.*=19' \
+    --expect 'ReconcileSinkRunner.*=3' --expect 'ReconcileBundle.*=30' \
+    --expect 'ReconcileMultiset.*=3' \
     --expect 'IncidentReplayTest.*=20' \
     "${out}/core.json" "${out}/sql.json"
 

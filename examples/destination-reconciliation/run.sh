@@ -8,7 +8,9 @@
 #   examples/destination-reconciliation/run.sh                 # every scenario
 #   ONLY=healthy,corruption examples/destination-reconciliation/run.sh
 #
-# Needs Docker, Python 3, and clink_node and clink built with tests in
+# Needs Docker, Python 3.10+ (and pip, to install python/clink-reference and
+# its Kafka client into a virtual environment under WORK), and clink_node and
+# clink built with tests in
 # CLINK_BIN_DIR (default ../../build): the scenarios drive fault points, which
 # only a test build compiles in. Kafka and ClickHouse run from the images
 # docker-compose.yml pins, on 127.0.0.1 only, under a compose project of their
@@ -45,7 +47,15 @@ export PYTHONDONTWRITEBYTECODE=1
 } >"${WORK}/results/build.txt"
 cp "${HERE}/docker-compose.yml" "${HERE}/job.sql.in" "${WORK}/results/"
 
-args=(--bin-dir="${BIN}" --work="${WORK}")
+# The reference implementation's library and its Kafka client
+# (python/clink-reference, confluent-kafka), apart from the system's Python.
+python3 -m venv "${WORK}/venv"
+# The client pinned at the version the example qualifies with.
+"${WORK}/venv/bin/pip" install -q "${REPO}/python/clink-reference" "confluent-kafka==2.16.1"
+"${WORK}/venv/bin/python" -c 'import clink_reference as r; print("confluent-kafka %s, librdkafka %s" % r.client_versions())' \
+    >>"${WORK}/results/build.txt"
+
+args=(--bin-dir="${BIN}" --work="${WORK}" --reference-python="${WORK}/venv/bin/python")
 [ -n "${ONLY:-}" ] && args+=(--only="${ONLY}")
 [ "${KEEP:-0}" = 1 ] && args+=(--keep)
 set +e

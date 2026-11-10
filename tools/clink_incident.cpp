@@ -6,6 +6,7 @@
 //   clink incident-verify <bundle> [--profile=<p>] [--expected=<ndjson>] [--json]
 //   clink incident-regress <bundle> --op=<id> --epoch=<n> --out=<dir>
 //   clink incident-reconcile <bundle> --host=<h> --key=<col>[,<col>] [...]
+//   clink incident-scope <bundle> --out=<file> [--checkpoint=<id>] [...]
 //
 // The library is clink::incident (include/clink/incident/bundle.hpp); the
 // replay checks and incident-regress run on the SQL frontend's replay engine
@@ -17,9 +18,12 @@
 // unsupported (a partial result), and 2 on bad usage or a bundle that cannot be
 // read. incident-collect and incident-regress exit 0 when done, 1 when they
 // refuse, and 2 on bad usage. incident-reconcile exits as incident-verify
-// does, and 2 when the request does not fit the bundle or the destination is
-// not the one its evidence names. It is the only one of them that opens a
+// does, and 2 when the request does not fit the bundle, the destination is
+// not the one its evidence names, or a reference artifact is malformed or
+// bound to another scope. It is the only one of them that opens a
 // connection, to the destination the operator names, and only reads.
+// incident-scope reads the bundle alone and writes the scope document a
+// reference implementation computes from (clink/incident/reference.hpp).
 
 #include <charconv>
 #include <chrono>
@@ -42,6 +46,7 @@
 #include "clink/config/json.hpp"
 #include "clink/incident/bundle.hpp"
 #include "clink/incident/reconcile.hpp"
+#include "clink/incident/reference.hpp"
 
 #include "clink_incident_reconcile.hpp"
 
@@ -179,7 +184,9 @@ void reconcile_usage() {
               << "         [--database=<db>] [--table=<table>]\n"
               << "         [--query-timeout-ms=N] [--max-rows-per-query=N] [--keys-per-query=N]\n"
               << "         [--settle-ms=N] [--list=N] [--expected-out=<ndjson>] [--json]\n"
-              << "         [--report=<file>]\n"
+              << "         [--report=<file>] [--from-run-start]\n"
+              << "         [--reference=<artifact>] [--max-reference-bytes=N]\n"
+              << "         [--coverage=selected-keys|complete-table] [--max-table-rows=N]\n"
               << "\n"
               << "Reads the ClickHouse destination a job's sink wrote, and says whether it holds,\n"
               << "for one completed checkpoint (--checkpoint, default the bundle's), exactly the\n"
@@ -196,9 +203,43 @@ void reconcile_usage() {
               << "or the run is refused. --expected-out writes the expected rows, as canonical\n"
               << "cells, for an independent check of the expectation.\n"
               << "\n"
+              << "--reference audits against a reference artifact computed outside the job from\n"
+              << "the scope `clink incident-scope` exports: the reference against the sink's\n"
+              << "captured input (reference.capture: the transformation), the captured input\n"
+              << "against the destination (reconcile.rows: the delivery), and the reference\n"
+              << "against the destination over the keys of both (reference.destination). An\n"
+              << "artifact that is malformed, unfinished or bound to another scope is refused;\n"
+              << "one that says it is incomplete leaves the audit partial. Nothing the artifact\n"
+              << "names is run, and its hashes show it is whole, not who wrote it.\n"
+              << "\n"
+              << "The destination is read for the selected keys, and rows of other keys are not\n"
+              << "read. --coverage=complete-table also reads the table whole, at most\n"
+              << "--max-table-rows rows, and requires it to hold exactly the expected rows: the\n"
+              << "operator declares the table holds this one bounded run's writes and nothing\n"
+              << "else, and the scope then spans the run from its start (as --from-run-start).\n"
+              << "\n"
               << "Exit status: 0 the destination holds the scope exactly, 1 it does not (or the\n"
-              << "bundle's integrity failed), 3 the comparison could not be made whole or stable\n"
-              << "(partial), 2 bad usage or a refused request.\n";
+              << "bundle's integrity failed, or the job's output differs from the reference), 3\n"
+              << "the comparison could not be made whole or stable (partial), 2 bad usage or a\n"
+              << "refused request.\n";
+}
+
+void scope_usage() {
+    std::cerr
+        << "Usage: clink incident-scope <bundle> --out=<file> [--checkpoint=<id>]\n"
+        << "         [--sink-op=<id>] [--job=<id>] [--from-run-start]\n"
+        << "\n"
+        << "Writes the scope document of one completed checkpoint (--checkpoint, default the\n"
+        << "bundle's), from the bundle alone: the run, its job graph's fingerprint, the\n"
+        << "bounding checkpoints, each Kafka source's topic, cluster and topic ids,\n"
+        << "isolation level and offset ranges, and the sink's columns. A reference\n"
+        << "implementation computes the scope's expected output from it, and\n"
+        << "`clink incident-reconcile --reference` refuses an artifact computed for any\n"
+        << "other scope. Reads no network.\n"
+        << "\n"
+        << "Exit status: 0 written, 3 written for a scope whose evidence or source\n"
+        << "positions are not whole (no reference can be complete for it), 2 bad usage or\n"
+        << "a request the bundle does not fit.\n";
 }
 
 void print_report(const Report& r, bool json, const std::string& report_path) {
@@ -492,8 +533,12 @@ int clink_cmd_incident_reconcile(int argc, char** argv) {
                                "settle-ms",
                                "list",
                                "expected-out",
-                               "report"},
-                              {"json", "help", "secure"});
+                               "report",
+                               "reference",
+                               "max-reference-bytes",
+                               "coverage",
+                               "max-table-rows"},
+                              {"json", "help", "secure", "from-run-start"});
     if (a.switches.contains("help")) {
         reconcile_usage();
         return 0;
@@ -572,6 +617,22 @@ int clink_cmd_incident_reconcile(int argc, char** argv) {
     if (const auto v = number("list", 0, 100000)) {
         o.list_limit = static_cast<std::size_t>(*v);
     }
+    if (const auto v = number("max-reference-bytes", 1, std::uint64_t{1} << 40)) {
+        o.max_reference_bytes = *v;
+    }
+    if (const auto v = number("max-table-rows", 1, 1000000000)) {
+        o.max_table_rows = *v;
+    }
+    o.from_run_start = a.switches.contains("from-run-start");
+    o.reference = a.get("reference");
+    if (a.has("coverage")) {
+        const auto c = a.get("coverage");
+        if (c == "complete-table") {
+            o.coverage = rc::Options::Coverage::CompleteTable;
+        } else if (c != "selected-keys") {
+            error = "--coverage takes selected-keys or complete-table";
+        }
+    }
     o.database = a.get("database");
     o.table = a.get("table");
     {
@@ -624,6 +685,101 @@ int clink_cmd_incident_reconcile(int argc, char** argv) {
         }
     }
     return report.exit_code();
+}
+
+int clink_cmd_incident_scope(int argc, char** argv) {
+    const auto a =
+        parse_args(argc, argv, {"out", "checkpoint", "sink-op", "job"}, {"help", "from-run-start"});
+    if (a.switches.contains("help")) {
+        scope_usage();
+        return 0;
+    }
+    std::string error = a.error;
+    if (error.empty() && a.positional.size() != 1) {
+        error = "name exactly one bundle directory";
+    }
+    if (error.empty() && a.get("out").empty()) {
+        error = "--out is required";
+    }
+    std::uint64_t checkpoint = 0;
+    std::uint64_t sink_op = 0;
+    std::optional<std::uint64_t> job;
+    for (const auto& [flag, into] :
+         {std::pair{"checkpoint", &checkpoint}, std::pair{"sink-op", &sink_op}}) {
+        if (error.empty() && a.has(flag)) {
+            const auto v = parse_u64(a.get(flag));
+            if (!v || *v == 0) {
+                error = std::string{"--"} + flag + " takes a whole number above 0";
+            } else {
+                *into = *v;
+            }
+        }
+    }
+    if (error.empty() && a.has("job")) {
+        job = parse_u64(a.get("job"));
+        if (!job) {
+            error = "--job takes a whole number";
+        }
+    }
+    if (!error.empty()) {
+        std::cerr << "incident-scope: " << error << "\n\n";
+        scope_usage();
+        return 2;
+    }
+    namespace rc = clink::incident::reconcile;
+    clink::incident::Bundle b;
+    try {
+        b = clink::incident::read_bundle(a.positional.front());
+    } catch (const clink::incident::BundleRefused& e) {
+        std::cerr << "incident-scope: the bundle cannot be read: " << e.what() << "\n";
+        return 2;
+    }
+    if (job && *job != b.job()) {
+        std::cerr << "incident-scope: wrong run: the bundle is evidence of job " << b.job()
+                  << ", not job " << *job << "\n";
+        return 2;
+    }
+    clink::incident::VerifyOptions vo;
+    vo.profile = "integrity";
+    for (const auto& c : clink::incident::verify_core(b, vo)) {
+        if (c.verdict != clink::incident::Verdict::Passed) {
+            std::cerr << "incident-scope: the bundle's integrity check " << c.id
+                      << " did not pass (" << c.reason << "), so its evidence is not read\n";
+            return 2;
+        }
+    }
+    rc::Scope sc;
+    try {
+        sc = rc::load_scope(b, checkpoint, sink_op, a.switches.contains("from-run-start"));
+    } catch (const rc::ScopeRefused& e) {
+        std::cerr << "incident-scope: " << e.what() << "\n";
+        return 2;
+    }
+    if (sc.columns.empty()) {
+        std::cerr << "incident-scope: the scope names no columns"
+                  << (sc.gap ? ": " + *sc.gap : std::string{}) << "\n";
+        return 2;
+    }
+    const auto doc = rc::scope_document(b, sc);
+    std::ofstream out(a.get("out"), std::ios::binary | std::ios::trunc);
+    out << doc.serialize(2) << "\n";
+    if (!out) {
+        std::cerr << "incident-scope: cannot write " << a.get("out") << "\n";
+        return 2;
+    }
+    std::cout << "scope " << doc.string_or("scope_sha256", "") << ": job " << sc.job
+              << ", checkpoint " << sc.checkpoint << ", " << sc.expected.size()
+              << " captured row(s), written to " << a.get("out") << "\n";
+    if (sc.gap) {
+        std::cerr << "incident-scope: the scope is not whole: " << *sc.gap << "\n";
+        return 3;
+    }
+    if (!doc.bool_or("sources_complete", false)) {
+        std::cerr << "incident-scope: the scope does not record every source position and log "
+                     "(collect with --include-state), so no reference can be complete for it\n";
+        return 3;
+    }
+    return 0;
 }
 
 int clink_cmd_incident_regress(int argc, char** argv) {

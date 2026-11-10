@@ -7,6 +7,7 @@ import json
 import subprocess
 import threading
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import workload
@@ -108,6 +109,22 @@ def healthy(demo):
             demo.agree("healthy", "the reconciliation", code, report, ind)
         demo.outcome("healthy", "the job kept writing while it was read", "a later checkpoint",
                      "checkpoint %d completed" % later, later > n)
+        scode, scope_path = demo.scope("healthy-scope", bundle, n)
+        rcode, ref, _, rtext = demo.reference("healthy-reference", scope_path)
+        acode, areport, _ = demo.reconcile("healthy-audit", bundle, n, extra=["--reference=%s" % ref])
+        v = verdicts(areport)
+        demo.outcome("healthy", "the audit on selected keys, the job still writing",
+                     "exit 0, every check passed, the table outside the keys not established",
+                     "scope exit %d, reference exit %d, audit exit %d, %s" % (scode, rcode, acode, sorted(set(v.values()))),
+                     scode == 0 and rcode == 0 and acode == 0 and set(v.values()) == {"passed"} and
+                     not areport["coverage"]["complete_established"], rtext[-160:])
+        wcode, wreport, _ = demo.reconcile("healthy-whole", bundle, n, extra=["--coverage=complete-table"])
+        wv = verdicts(wreport)
+        demo.outcome("healthy", "a whole-table read of a table the job is still writing",
+                     "exit 3, destination.coverage unavailable", "exit %d, %s" % (wcode, wv.get("destination.coverage")),
+                     wcode == 3 and wv.get("destination.coverage") == "unavailable",
+                     next((c["reason"] for c in wreport["checks"] if c["id"] == "destination.coverage"), "")[:200]
+                     if wreport else "")
         verify_offline(demo, "healthy", bundle)
         demo.healthy = {"bundle": bundle, "checkpoint": n, "topic": topic, "table": table}
     finally:
@@ -274,6 +291,18 @@ def expired_history(demo):
                  ind["verdict"] == "unavailable", ind.get("why", ""))
     demo.outcome("expired history", "incident-reconcile, which reads only the bundle and the destination",
                  "exit 1 (the corruption above), not unavailable", "exit %d" % code, code == 1)
+    scode, scope_path = demo.scope("expired-scope", h["bundle"], h["checkpoint"])
+    rcode, ref, _, rtext = demo.reference("expired-reference", scope_path)
+    demo.outcome("expired history", "the reference over the expired range", "exit 3: incomplete, saying the "
+                 "offsets are no longer in the topic", "exit %d" % rcode,
+                 scode == 0 and rcode == 3 and "no longer in the topic" in rtext, rtext[-200:])
+    code, report, _ = demo.reconcile("expired-audit", h["bundle"], h["checkpoint"],
+                                     extra=["--reference=%s" % ref])
+    v = verdicts(report)
+    demo.outcome("expired history", "the audit with that reference",
+                 "reference.scope unavailable; exit 1, as the corruption above still fails",
+                 "exit %d, reference.scope %s" % (code, v.get("reference.scope")),
+                 code == 1 and v.get("reference.scope") == "unavailable")
 
 
 def recreated_topic(demo):
@@ -321,6 +350,16 @@ def recreated_topic(demo):
                      "unavailable: another log", ind["verdict"],
                      ind["verdict"] == "unavailable" and "Kafka now has" in ind.get("why", ""),
                      ind.get("why", ""))
+        scode, scope_path = demo.scope(name + "-scope", bundle, n)
+        rcode, ref, _, rtext = demo.reference(name + "-reference", scope_path)
+        demo.outcome(name, "the reference over the topic created again",
+                     "exit 3: incomplete, the topic deleted and created again", "exit %d" % rcode,
+                     scode == 0 and rcode == 3 and "deleted and created again" in rtext, rtext[-200:])
+        code, report, _ = demo.reconcile(name + "-audit", bundle, n, extra=["--reference=%s" % ref])
+        v = verdicts(report)
+        demo.outcome(name, "the audit with that reference", "exit 3, reference.scope unavailable",
+                     "exit %d, reference.scope %s" % (code, v.get("reference.scope")),
+                     code == 3 and v.get("reference.scope") == "unavailable")
 
         cluster.worker(2)
         log = cluster.dir / "logs" / "worker-2.log"
@@ -521,6 +560,7 @@ def overhead(demo):
     demo.services.produce(topic, range(1, count + 1))
     runs = {"off": [], "on": []}
     reconcile_cost = None
+    audit_cost = None
     for rep in range(5):
         for mode in ("off", "on"):
             name = "overhead-%s-%d" % (mode, rep)
@@ -549,6 +589,9 @@ def overhead(demo):
                                "capture_files": sum(1 for _ in (cluster.dir / "capture").rglob("*")
                                                     if _.is_file())})
             if mode == "on" and rep == 4:
+                # Two empty intervals after the audited checkpoint, for the
+                # whole-table audit below.
+                cluster.await_completed(len(cluster.completed()) + 3, timeout=120)
                 bundle = demo.work / "bundles" / "overhead"
                 info = cluster.collect(bundle)
                 best, best_rows = None, -1
@@ -566,12 +609,15 @@ def overhead(demo):
             cluster.stop()
             if landed < want:
                 raise Failed("the %s run landed %d of %d rows" % (name, landed, want))
+            if mode == "on" and rep == 4:
+                audit_cost = measure_audit(demo, {"name": name, "table": table, "bundle": bundle,
+                                                  "checkpoint": completed_in(bundle)[-3]})
     med = {}
     for mode in ("off", "on"):
         med[mode] = {k: statistics.median(r[k] for r in runs[mode])
                      for k in ("seconds_to_land", "worker_cpu_seconds", "capture_bytes", "capture_files")}
     results = {"events": count, "rows_owed": want, "parallelism": 2, "checkpoint_interval_ms": 1000,
-               "runs": runs, "median": med, "reconcile": reconcile_cost,
+               "runs": runs, "median": med, "reconcile": reconcile_cost, "audit": audit_cost,
                "cpu_increase_pct_median": round(100.0 * (med["on"]["worker_cpu_seconds"] -
                                                          med["off"]["worker_cpu_seconds"]) /
                                                 max(med["off"]["worker_cpu_seconds"], 0.01), 1)}
@@ -587,6 +633,352 @@ def overhead(demo):
                  all(r["rows"] == want for m in ("off", "on") for r in runs[m]))
     demo.outcome("overhead", "the reconciliation of the largest scope", "exit 0",
                  "exit %d" % reconcile_cost["exit"], reconcile_cost["exit"] == 0)
+    demo.note("auditing the whole run of %(rows)d rows: scope %(scope_seconds)s s, reference "
+              "%(reference_seconds)s s (%(records_read)d records read, %(artifact_bytes)d bytes), "
+              "audit %(audit_seconds)s s" % audit_cost)
+    demo.outcome("overhead", "the whole run audited against the reference, the table read whole",
+                 "reference exit 0, audit exit 0", "reference exit %d, audit exit %d"
+                 % (audit_cost["reference_exit"], audit_cost["exit"]),
+                 audit_cost["reference_exit"] == 0 and audit_cost["exit"] == 0)
+
+
+def measure_audit(demo, run):
+    """The cost of the independent audit on one bounded run: exporting the
+    scope, computing the reference over the whole run's source range, and the
+    audit with its whole-table read."""
+    demo.services.ch("OPTIMIZE TABLE demo.%s FINAL" % run["table"])
+    t0 = time.time()
+    code, scope_path = demo.scope("overhead-audit", run["bundle"], run["checkpoint"], whole_run=True)
+    scope_s = time.time() - t0
+    if code != 0:
+        raise Failed("incident-scope exited %d" % code)
+    rcode, ref, ref_s, text = demo.reference("overhead-audit", scope_path, 0)
+    acode, report, _ = audit(demo, run, "overhead-audit", ref)
+    records = sum(int(e.get("records", 0)) for line in Path(ref).read_text(encoding="utf-8").splitlines()
+                  if "end" in (o := json.loads(line)) for e in o["end"]["read"])
+    return {"checkpoint": run["checkpoint"], "rows": len(artifact_rows(ref)), "records_read": records,
+            "artifact_bytes": Path(ref).stat().st_size, "scope_seconds": round(scope_s, 3),
+            "reference_seconds": round(ref_s, 3), "reference_exit": rcode,
+            "audit_seconds": round(report["_elapsed_s"], 3) if report else None, "exit": acode,
+            "table_rows_read": report["coverage"]["table_rows_read"] if report else None}
+
+
+# -- the independent reference audit --------------------------------------------------
+
+def completed_in(bundle):
+    """The completed checkpoints a bundle holds markers for."""
+    return sorted(int(m.name.split("-", 1)[1]) for m in (Path(bundle) / "checkpoint" / "_jobs" / "1").glob("COMPLETED-*")
+                  if m.name.split("-", 1)[1].isdigit())
+
+
+def verdicts(report):
+    return {c["id"]: c["verdict"] for c in report["checks"]} if report else {}
+
+
+def counts(report, check):
+    c = next((c for c in (report or {}).get("checks", []) if c["id"] == check), None)
+    return c.get("counts", {}) if c else {}
+
+
+def kept(e, variant):
+    """Whether the job, with `variant`'s defect, writes a row for event e."""
+    kinds = ("purchase", "refund", "chargeback") if variant == "extra-output" else ("purchase", "refund")
+    floor = 1000 if variant == "faulty-filter" else 100
+    return e["kind"] in kinds and e["cents"] >= floor
+
+
+def bounded_run(demo, name, ids, variant=None):
+    """One bounded run into a table dedicated to it: the events `ids` are in a
+    topic of their own before the job starts, the job reads them all, two more
+    checkpoints complete with nothing in them, the cluster stops, and the
+    operator merges the table's parts so nothing changes it while it is read."""
+    topic, table = "payments-" + name, "payments_" + name.replace("-", "_")
+    s = demo.services
+    s.create_topic(topic)
+    demo.create_table(table)
+    s.produce(topic, ids)
+    writes = sum(1 for i in ids if kept(workload.event(i), variant))
+    cluster = Cluster(demo, name, variant=variant)
+    cluster.start(topic, table, s.ch_port)
+    try:
+        cluster.await_completed(3, timeout=180)
+        deadline, last, steady = time.time() + 300, -1, 0
+        while time.time() < deadline:
+            n = int(s.ch("SELECT count() FROM demo.%s" % table).strip() or 0)
+            steady = steady + 1 if n == last else 0
+            last = n
+            if n == writes and steady >= 4:
+                break
+            time.sleep(0.5)
+        else:
+            raise Failed("the run into %s did not settle at %d rows (it holds %d)" % (table, writes, last))
+        cluster.await_completed(len(cluster.completed()) + 3, timeout=120)
+        bundle = demo.work / "bundles" / name
+        cluster.collect(bundle)
+    finally:
+        cluster.stop()
+    s.ch("OPTIMIZE TABLE demo.%s FINAL" % table)
+    # The audited checkpoint has two more after it in the bundle, both empty:
+    # the bundle's own evidence that the run had stopped writing.
+    checkpoint = completed_in(bundle)[-3]
+    demo.note("bounded run %s: %d events, %d rows written, audited at checkpoint %d"
+              % (name, len(ids), writes, checkpoint))
+    return {"name": name, "topic": topic, "table": table, "bundle": bundle,
+            "checkpoint": checkpoint, "writes": writes, "ids": ids}
+
+
+def reference_for(demo, run, label, whole_run=True, checkpoint=None, extra=()):
+    """incident-scope, then the example's reference over the scope it wrote."""
+    ckpt = checkpoint or run["checkpoint"]
+    code, scope_path = demo.scope(label, run["bundle"], ckpt, whole_run)
+    if code != 0:
+        raise Failed("incident-scope exited %d for %s" % (code, label))
+    rcode, ref, secs, text = demo.reference(label, scope_path, 0 if whole_run else None, extra)
+    return rcode, ref, scope_path, secs, text
+
+
+def audit(demo, run, label, ref, coverage="complete-table", extra=()):
+    args = ["--reference=%s" % ref, "--coverage=%s" % coverage, *extra]
+    if coverage == "selected-keys":
+        args.append("--from-run-start")
+    return demo.reconcile(label, run["bundle"], run["checkpoint"], extra=args)
+
+
+def source_events(demo, scope_path):
+    """Every event in the scope's ranges, read back with Kafka's own console
+    consumer (the Java client, not the reference's librdkafka). The example's
+    topics have no transactions, so a range's offsets are all records; a
+    range that starts at the run's start is read from 0, where they begin."""
+    doc = json.loads(Path(scope_path).read_text())
+    events = []
+    for src in doc["sources"]:
+        for r in src["partitions"]:
+            start = r["from"] if r["from"] is not None else 0
+            got = demo.services.read_range(src["topic"], r["partition"], start, r["to"])
+            if [o for o, _ in got] != list(range(start, r["to"])):
+                raise Failed("%s[%d] [%d, %d) could not be read back whole"
+                             % (src["topic"], r["partition"], start, r["to"]))
+            for _, value in got:
+                v = json.loads(value, parse_float=Decimal)
+                events.append({"event_id": v["event_id"], "kind": v["kind"], "account": v["account"],
+                               "cents": int(Decimal(v["amount"]) * 100), "ts": v["ts"], "note": v["note"]})
+    return events
+
+
+def artifact_rows(path):
+    rows = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        o = json.loads(line)
+        if "row" in o:
+            rows.append(o["row"])
+    return rows
+
+
+def independent_audit_check(demo, scenario, label, scope_path, ref_path, report, variant):
+    """The audit's verdict, checked from the source: the reference artifact's
+    rows must be workload.reference_row() of the events read back with the
+    console consumer, and reference.capture's counts the ones `variant`'s
+    defect gives those events."""
+    events = source_events(demo, scope_path)
+    want = {}
+    for e in events:
+        row = workload.reference_row(e)
+        if row is not None:
+            want[row["event_id"]] = row
+    got = artifact_rows(ref_path)
+    same = len(got) == len(want) and {r["event_id"]: r for r in got} == want
+    demo.outcome(scenario, label + ": the reference artifact is the source's transformation, computed again",
+                 "same rows", "same rows" if same else "%d rows against %d" % (len(got), len(want)), same)
+    ref_keys = {e["event_id"] for e in events if kept(e, None)}
+    job_keys = {e["event_id"] for e in events if kept(e, variant)}
+    changed = len(ref_keys & job_keys) if variant in ("wrong-projection", "equal-totals") else 0
+    expect = {"missing": len(ref_keys - job_keys), "changed": changed,
+              "unexpected": len(job_keys - ref_keys), "duplicated": 0}
+    c = counts(report, "reference.capture")
+    observed = {k: c.get(k) for k in expect}
+    demo.outcome(scenario, label + ": reference.capture's counts agree with the source",
+                 str(expect), str(observed), observed == expect)
+    return expect
+
+
+def audit_healthy(demo):
+    """A faithful job, a reference that agrees, and a dedicated table read
+    whole: every required check passes."""
+    ids = list(range(1, 3001))
+    run = bounded_run(demo, "audit-healthy", ids)
+    demo.audit_run = run
+    rcode, ref, scope_path, secs, text = reference_for(demo, run, "audit-healthy")
+    demo.outcome("audit-healthy", "the reference", "complete (exit 0)", "exit %d" % rcode, rcode == 0, text)
+    code, report, _ = audit(demo, run, "audit-healthy", ref)
+    v = verdicts(report)
+    every = all(x == "passed" for x in v.values())
+    demo.outcome("audit-healthy", "incident-reconcile --reference --coverage=complete-table",
+                 "exit 0, every check passed", "exit %d, %s" % (code, sorted(set(v.values()))),
+                 code == 0 and every and "destination.coverage" in v)
+    demo.outcome("audit-healthy", "coverage", "the table read whole",
+                 str(report["coverage"]["complete_established"]), report["coverage"]["complete_established"])
+    independent_audit_check(demo, "audit-healthy", "audit-healthy", scope_path, ref, report, None)
+    code, report, _ = audit(demo, run, "audit-healthy-selected", ref, coverage="selected-keys")
+    cov = report["coverage"] if report else {}
+    demo.outcome("audit-healthy", "the same audit on selected keys", "exit 0, coverage not complete",
+                 "exit %d, complete %s" % (code, cov.get("complete_established")),
+                 code == 0 and cov.get("complete_established") is False and
+                 "not established" in cov.get("complete_reason", ""))
+    run["reference"] = ref
+    run["scope"] = scope_path
+
+
+def audit_destination(demo):
+    """Faults in the destination alone, on the healthy run's dedicated table: a
+    row of a key neither side names, which only the whole table shows; then a
+    changed value and a duplicate, which fail the delivery and not the
+    transformation."""
+    run = demo.audit_run
+    s = demo.services
+    s.ch("INSERT INTO demo.%s SELECT 999999999, 'acct-99', 'purchase', 5.00, 500, 14.5, false, NULL, "
+         "toDateTime64('2026-01-01 00:00:00', 3, 'UTC') SETTINGS insert_deduplicate = 0" % run["table"])
+    code, report, _ = audit(demo, run, "audit-unrelated-whole", run["reference"])
+    v = verdicts(report)
+    demo.outcome("audit-destination", "an unrelated key, the table read whole",
+                 "exit 1: destination.coverage failed, 1 unexpected, the rest passed",
+                 "exit %d, %s, unexpected %s" % (code, v.get("destination.coverage"),
+                                                counts(report, "destination.coverage").get("unexpected")),
+                 code == 1 and v.get("destination.coverage") == "failed" and
+                 counts(report, "destination.coverage").get("unexpected") == 1 and
+                 all(v[k] == "passed" for k in ("reference.capture", "reconcile.rows", "reference.destination")))
+    code, report, _ = audit(demo, run, "audit-unrelated-selected", run["reference"], coverage="selected-keys")
+    cov = report["coverage"] if report else {}
+    demo.outcome("audit-destination", "the same, on selected keys", "exit 0, saying rows of other keys were not read",
+                 "exit %d: %s" % (code, cov.get("complete_reason", "")[:90]),
+                 code == 0 and not cov.get("complete_established") and "not established" in cov.get("complete_reason", ""))
+    s.ch("ALTER TABLE demo.%s DELETE WHERE event_id = 999999999 SETTINGS mutations_sync = 2" % run["table"])
+    # Kept, so the faults below can be undone for the scenarios after them.
+    s.ch("CREATE TABLE demo.%s_kept AS demo.%s" % (run["table"], run["table"]))
+    s.ch("INSERT INTO demo.%s_kept SELECT * FROM demo.%s" % (run["table"], run["table"]))
+    victim = min(int(r["event_id"][1:]) for r in artifact_rows(run["reference"]))
+    s.ch("ALTER TABLE demo.%s UPDATE note = 'changed' WHERE event_id = %d SETTINGS mutations_sync = 2"
+         % (run["table"], victim))
+    s.ch("INSERT INTO demo.%s SELECT * FROM demo.%s WHERE event_id = (SELECT max(event_id) FROM demo.%s) "
+         "SETTINGS insert_deduplicate = 0" % (run["table"], run["table"], run["table"]))
+    code, report, _ = audit(demo, run, "audit-delivery", run["reference"])
+    v = verdicts(report)
+    rel = {f["relationship"] for f in report["audit"]["findings"]} if report else set()
+    rows = counts(report, "reconcile.rows")
+    demo.outcome("audit-destination", "a changed value and a duplicate in the destination",
+                 "exit 1: the delivery failed (1 changed, 1 duplicated), the transformation passed",
+                 "exit %d, reference.capture %s, reconcile.rows %s (changed %s, duplicated %s), findings %s"
+                 % (code, v.get("reference.capture"), v.get("reconcile.rows"), rows.get("changed"),
+                    rows.get("duplicated"), sorted(rel)),
+                 code == 1 and v.get("reference.capture") == "passed" and v.get("reconcile.rows") == "failed" and
+                 rows.get("changed") == 1 and rows.get("duplicated") == 1 and "delivery" in rel and
+                 "transformation" not in rel)
+    s.ch("TRUNCATE TABLE demo.%s" % run["table"])
+    s.ch("INSERT INTO demo.%s SELECT * FROM demo.%s_kept SETTINGS insert_deduplicate = 0" % (run["table"], run["table"]))
+    s.ch("OPTIMIZE TABLE demo.%s FINAL" % run["table"])
+
+
+def audit_refusals(demo):
+    """References that cannot be compared: one computed for another scope, an
+    unfinished one, one that says it is incomplete, and a table past the bound
+    of a whole read."""
+    run = demo.audit_run
+    earlier = max(c for c in completed_in(run["bundle"]) if c < run["checkpoint"])
+    _, other, _, _, _ = reference_for(demo, run, "audit-other-scope", checkpoint=earlier)
+    code, _, text = audit(demo, run, "audit-wrong-scope", other)
+    demo.outcome("audit-refusals", "a reference computed for checkpoint %d, audited at %d" % (earlier, run["checkpoint"]),
+                 "exit 2 (refused), naming the checkpoint", "exit %d" % code,
+                 code == 2 and "another scope" in text and "checkpoint" in text)
+    cut = demo.results / "references" / "audit-unfinished.reference.ndjson"
+    lines = Path(run["reference"]).read_bytes().split(b"\n")
+    cut.write_bytes(b"\n".join(lines[:-2]) + b"\n")
+    code, _, text = audit(demo, run, "audit-unfinished", cut)
+    demo.outcome("audit-refusals", "a reference without its end line", "exit 2 (refused)", "exit %d" % code,
+                 code == 2 and "no end line" in text)
+    rcode, short, _, _, rtext = reference_for(demo, run, "audit-bounded-reference", extra=["--max-records=10"])
+    code, report, _ = audit(demo, run, "audit-incomplete", short)
+    v = verdicts(report)
+    demo.outcome("audit-refusals", "a reference whose read reached its bound",
+                 "the reference exits 3; the audit exits 3, reference.scope unavailable",
+                 "reference exit %d, audit exit %d, %s" % (rcode, code, v.get("reference.scope")),
+                 rcode == 3 and code == 3 and v.get("reference.scope") == "unavailable", rtext[-160:])
+    code, report, _ = audit(demo, run, "audit-table-bound", run["reference"], extra=["--max-table-rows=10"])
+    v = verdicts(report)
+    demo.outcome("audit-refusals", "a whole read past --max-table-rows", "exit 3, destination.coverage unavailable",
+                 "exit %d, %s" % (code, v.get("destination.coverage")),
+                 code == 3 and v.get("destination.coverage") == "unavailable")
+
+
+def faulty_transformation(demo, variant, scenario):
+    """A job with a defect writes what it computes, faithfully: reconciliation
+    of its own record with the destination passes, and only the reference
+    fails it."""
+    ids = list(range(1, 3001))
+    run = bounded_run(demo, scenario, ids, variant=variant)
+    plain, _, _ = demo.reconcile(scenario + "-reconcile-only", run["bundle"], run["checkpoint"],
+                                 extra=["--from-run-start"])
+    demo.outcome(scenario, "incident-reconcile without a reference", "exit 0: the delivery was faithful",
+                 "exit %d" % plain, plain == 0)
+    rcode, ref, scope_path, _, text = reference_for(demo, run, scenario)
+    code, report, _ = audit(demo, run, scenario, ref)
+    v = verdicts(report)
+    rel = [f["relationship"] for f in report["audit"]["findings"]] if report else []
+    demo.outcome(scenario, "incident-reconcile --reference", "exit 1, the transformation named, the delivery passed",
+                 "exit %d, reference.capture %s, reconcile.rows %s, findings %s"
+                 % (code, v.get("reference.capture"), v.get("reconcile.rows"), rel),
+                 rcode == 0 and code == 1 and v.get("reference.capture") == "failed" and
+                 v.get("reconcile.rows") == "passed" and rel and rel[0] == "transformation" and
+                 "delivery" not in rel)
+    expect = independent_audit_check(demo, scenario, scenario, scope_path, ref, report, variant)
+    return run, report, expect
+
+
+def wrong_projection(demo):
+    faulty_transformation(demo, "wrong-projection", "wrong-projection")
+
+
+def faulty_filter(demo):
+    faulty_transformation(demo, "faulty-filter", "faulty-filter")
+
+
+def extra_output(demo):
+    faulty_transformation(demo, "extra-output", "extra-output")
+
+
+def equal_totals(demo):
+    run, report, expect = faulty_transformation(demo, "equal-totals", "equal-totals")
+    ref_rows = artifact_rows(demo.results / "references" / "equal-totals.reference.ndjson")
+    ref_count = len(ref_rows)
+    ref_total = sum(int(r["amount"][1:].split("@")[0]) for r in ref_rows)
+    got = demo.services.ch("SELECT count(), toString(sum(toInt64(amount * 100))) FROM demo.%s" % run["table"]).split()
+    demo.outcome("equal-totals", "the destination's count and total against the reference's",
+                 "equal (%d rows, %d cents)" % (ref_count, ref_total), "%s rows, %s cents" % (got[0], got[1]),
+                 int(got[0]) == ref_count and int(got[1]) == ref_total)
+
+
+def empty_output(demo):
+    """A run whose every event the filter drops: the expected output is
+    genuinely empty. It passes only when the whole table is read and is empty,
+    and fails when the table holds anything."""
+    ids = [i for i in range(1, 6001) if workload.reference_row(workload.event(i)) is None][:1500]
+    run = bounded_run(demo, "empty-output", ids)
+    rcode, ref, _, _, text = reference_for(demo, run, "empty-output")
+    demo.outcome("empty-output", "the reference", "complete and empty", "exit %d, %d rows" % (rcode, len(artifact_rows(ref))),
+                 rcode == 0 and not artifact_rows(ref), text)
+    code, report, _ = audit(demo, run, "empty-selected", ref, coverage="selected-keys")
+    v = verdicts(report)
+    demo.outcome("empty-output", "on selected keys", "exit 3: nothing selected, the destination not established",
+                 "exit %d, reference.destination %s" % (code, v.get("reference.destination")),
+                 code == 3 and v.get("reference.destination") == "unavailable")
+    code, report, _ = audit(demo, run, "empty-whole", ref)
+    demo.outcome("empty-output", "the empty table read whole", "exit 0", "exit %d" % code, code == 0)
+    demo.services.ch("INSERT INTO demo.%s SELECT 999999998, 'acct-98', 'refund', 2.00, 200, 5.8, false, NULL, "
+                     "toDateTime64('2026-01-01 00:00:00', 3, 'UTC') SETTINGS insert_deduplicate = 0"
+                     % run["table"])
+    code, report, _ = audit(demo, run, "empty-whole-not-empty", ref)
+    v = verdicts(report)
+    demo.outcome("empty-output", "a row in the table that should be empty", "exit 1, destination.coverage failed",
+                 "exit %d, %s" % (code, v.get("destination.coverage")),
+                 code == 1 and v.get("destination.coverage") == "failed")
 
 
 ALL = [
@@ -597,6 +989,14 @@ ALL = [
     ("corruption", corruption),
     ("expired-history", expired_history),
     ("recreated-topic", recreated_topic),
+    ("audit-healthy", audit_healthy),
+    ("audit-destination", audit_destination),
+    ("audit-refusals", audit_refusals),
+    ("wrong-projection", wrong_projection),
+    ("faulty-filter", faulty_filter),
+    ("extra-output", extra_output),
+    ("equal-totals", equal_totals),
+    ("empty-output", empty_output),
     ("truncated", truncated),
     ("crash-after-publish", crash_after_publish),
     ("crash-before-publish", crash_before_publish),

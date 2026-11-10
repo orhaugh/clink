@@ -128,6 +128,31 @@ The checks are the bundle's integrity (`bundle.*`), `reconcile.scope`, `reconcil
 
 None implies the next. A job configured at least once can have a destination that lost rows, and a destination that matches one checkpoint can still be wrong for another.
 
+## The independent reference audit
+
+Reconciliation's expectation is the sink's own record of its input, so it establishes the delivery and nothing about the transformation: a job that computes the wrong rows writes them faithfully, and its captured input and its destination agree. An expectation that can catch that must come from outside the job. The audit takes one from the operator and keeps three relationships apart:
+
+- the reference against the captured input, which is the transformation;
+- the captured input against the destination, which is the delivery;
+- the reference against the destination.
+
+**The reference is computed by the operator, not by clink.** clink exports the scope offline (`incident-scope`), and the operator runs their own implementation over it and hands back its output. The audit never runs, loads or connects to anything an artifact names, and the reference never uses clink's SQL evaluator or the sink's conversions. A reference computed by clink would share whatever is wrong with the job's evaluation, which is the circularity the audit exists to break. `python/clink-reference` does the parts every reference shares: reading the exact Kafka range, confirming its identity, and writing the artifact. The transformation stays the operator's.
+
+**The artifact is bound to one scope.** Its header carries the scope document verbatim, with a fingerprint over the job, run attempts, job graph, bounding checkpoints, Kafka logs, ranges, isolation level and output columns. The audit compares it with the scope it computes from the bundle and refuses any difference, naming the first field. A reference for another checkpoint, another run, a recreated topic or another schema cannot be compared by mistake.
+
+**Integrity is not provenance.** The end line's hashes over the header and the rows show the file is whole as its writer finished it, and a file without the end line is refused as unfinished. They do not show who wrote it or whether its implementation is independent of the job. The report keeps what the audit verified (the binding, the hashes, the cells' form) apart from what the artifact only records (its implementation, configuration, client and any offsets the operator supplied).
+
+**An incomplete reference is never compared.** Reading a Kafka range completely under `read_committed` means passing its end, not counting to it: transaction markers and aborted records hold offsets that are never delivered, and a quiet poll proves nothing. Expired or compacted history, a recreated topic, another cluster, a log that ends early, an error, a deadline or a bound each make the reference say it is incomplete and why. The audit then holds it unavailable instead of comparing whatever remained.
+
+**Coverage is stated, not implied.** A destination read selects keys. With a reference it reads the union of the reference's and the captured input's keys, so a row the job dropped is looked for and a row it introduced is read. A row of a key neither names is invisible to it, so a passing result says it covered the selected keys, and the report says the rest of the table is not established. Completeness of the whole table is claimed only under `--coverage=complete-table`, and only when:
+
+- the operator declares the table dedicated to one bounded run;
+- the run began with no state;
+- the bundle shows the run's sink quiet for two barriers after the checkpoint;
+- the table's parts are unchanged across a bounded full read.
+
+Two equal reads do not establish a frozen table, and no checkpoint attribution is invented for rows of a live, shared table. An empty expected output passes only when the table is read whole and is empty.
+
 ## Unsupported in this release
 
 The following are not supported:
@@ -149,7 +174,10 @@ The following are not supported:
 | The reconciliation | `include/clink/incident/reconcile.hpp`, `src/incident/reconcile.cpp` |
 | The ClickHouse reader | `impls/clickhouse/include/clink/clickhouse/reconcile_destination.hpp`, `impls/clickhouse/src/reconcile_destination.cpp` |
 | The command | `tools/clink_incident.cpp`, `tools/clink_incident_reconcile.cpp`, or its stub without the connector |
+| The audit: the scope document, the artifact's reader and binding, the multiset comparison | `include/clink/incident/reference.hpp`, `src/incident/reference.cpp`; the relationships and the whole-table check in `src/incident/reconcile.cpp` |
+| The reference library | `python/clink-reference/` (`scope.py`, `canonical.py`, `kafka_range.py`, `artifact.py`) |
 
 - **Unit tests**: `tests/test_incident_reconcile.cpp`. These cover the cells, the comparison, the sink runner's evidence, and whole reconciliations of collected bundles against a destination served from memory: every kind of difference, refusals, missing and truncated evidence, limits, instability, mutations, unsupported forms, and source positions after a restore. The incident gate runs them and requires every case.
 - **Live tests**: `impls/clickhouse/tests/test_reconcile_destination_live.cpp`, on each line in `scripts/clickhouse-live.sh`. These cover what the reader reads against the expectation's cells, identity, mutations, bounds, and the server's refusal of a write.
-- **The example**: `examples/destination-reconciliation/`, with Kafka and ClickHouse and every scenario checked against an independent reference.
+- **The example**: `examples/destination-reconciliation/`, with Kafka and ClickHouse and every scenario checked against an independent reference. It includes jobs with a deliberate defect (a wrong projection, a filter that drops valid rows, one that lets through others, counts and totals equal over different rows), faults in the destination alone, an unrelated key, an empty expected output, references for another scope, unfinished or incomplete, and the cost of the audit.
+- **The audit's tests**: `tests/test_incident_reconcile.cpp` (`ReconcileMultiset.*`, and the `ReconcileBundle` audit cases covering the artifact's binding and refusals, each relationship, failure precedence, coverage, and empty scopes). `python/clink-reference/tests/` covers the canonical cells and the artifact offline, and with `scripts/reference-live.sh` the range reader against Apache Kafka, with committed and aborted transactions.

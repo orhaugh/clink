@@ -11,7 +11,8 @@
 // refuses any write in it, with max_execution_time, max_result_rows and
 // max_rows_to_read set to throw, so a read past a bound fails rather than
 // returning part of its answer. Give it a user that can only read:
-// SELECT on the table, system.tables, system.columns and system.mutations.
+// SELECT on the table, system.tables, system.columns and system.mutations,
+// and system.parts for a whole-table read (--coverage=complete-table).
 
 #include <chrono>
 #include <cstdint>
@@ -60,6 +61,13 @@ struct ReconcileConnection {
     const std::vector<incident::reconcile::Column>& columns,
     const std::vector<std::size_t>& key,
     const std::vector<incident::reconcile::Row>& keys,
+    const incident::reconcile::ReadBounds& bounds);
+// Every row of the table, at most `max_rows`, past which the server throws.
+[[nodiscard]] std::string reconcile_read_all_statement(
+    std::string_view database,
+    std::string_view table,
+    const std::vector<incident::reconcile::Column>& columns,
+    std::uint64_t max_rows,
     const incident::reconcile::ReadBounds& bounds);
 [[nodiscard]] std::string reconcile_settings(const incident::reconcile::ReadBounds& bounds);
 

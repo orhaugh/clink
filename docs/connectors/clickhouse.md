@@ -533,7 +533,7 @@ Without the flight recorder none of this happens, and the sink runs as before.
 - The server's and the table's UUIDs must be the evidence's.
 - The rows of the checkpoint's keys are read twice and compared with what the sink received, typed value for value.
 
-Give it a user with `SELECT` on the table and on `system.tables`, `system.columns` and `system.mutations`, and nothing else. It supports a plain non-replicated `MergeTree` without TTL ([record 015](../design/015-destination-reconciliation.md)). With `non_replicated_deduplication_window` above 0, an INSERT resent in doubt under its own token lands once. Without it the resend can land twice, which the reconciliation reports as duplicates and puts down to the resend.
+Give it a user with `SELECT` on the table and on `system.tables`, `system.columns` and `system.mutations`, and `system.parts` for a whole-table read (`--coverage=complete-table`), and nothing else. It supports a plain non-replicated `MergeTree` without TTL ([record 015](../design/015-destination-reconciliation.md)). With `non_replicated_deduplication_window` above 0, an INSERT resent in doubt under its own token lands once. Without it the resend can land twice, which the reconciliation reports as duplicates and puts down to the resend.
 
 ### C++: typed structs
 

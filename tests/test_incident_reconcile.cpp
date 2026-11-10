@@ -31,8 +31,10 @@
 #include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/sha256.hpp"
 #include "clink/incident/bundle.hpp"
 #include "clink/incident/reconcile.hpp"
+#include "clink/incident/reference.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/local_executor.hpp"
@@ -462,6 +464,10 @@ public:
     std::function<void(int)> before_read;
     std::optional<std::string> fail;
     int reads{0};
+    // The parts marker's text; bumped by before_marker to show a change.
+    int parts_version{1};
+    std::function<void(int)> before_marker;
+    int markers{0};
 
     FakeDestination() {
         desc.server_uuid = kServerUuid;
@@ -504,7 +510,80 @@ public:
         }
         return out;
     }
+    std::vector<Row> read_all(const std::vector<Column>& /*columns*/,
+                              std::uint64_t max_rows) override {
+        if (fail) {
+            throw DestinationUnavailable(*fail);
+        }
+        if (rows.size() > max_rows) {
+            throw DestinationUnavailable("more than " + std::to_string(max_rows) + " rows");
+        }
+        return rows;
+    }
+    std::string parts_marker() override {
+        ++markers;
+        if (before_marker) {
+            before_marker(markers);
+        }
+        return "all_1_1_0:" + std::to_string(rows.size()) + ":v" + std::to_string(parts_version);
+    }
 };
+
+// A reference artifact for `doc`, as a writer of the format writes one: the
+// header, a line per row (cells id, amount, note), and the end line with its
+// hashes. `edit` changes the lines before they are written.
+void write_reference(const fs::path& path,
+                     const JsonValue& doc,
+                     const std::vector<Row>& rows,
+                     bool complete = true,
+                     const std::vector<std::string>& incomplete = {},
+                     const std::function<void(std::vector<std::string>&)>& edit = {}) {
+    using clink::config::JsonObject;
+    JsonObject h;
+    h["format"] = JsonValue{std::string{kReferenceFormat}};
+    h["version"] = JsonValue{kReferenceVersion};
+    h["scope"] = doc;
+    JsonObject impl;
+    impl["name"] = JsonValue{std::string{"test-reference"}};
+    impl["version"] = JsonValue{std::string{"1"}};
+    h["implementation"] = JsonValue{std::move(impl)};
+    const std::string header = JsonValue{std::move(h)}.serialize(0) + "\n";
+    std::vector<std::string> lines{header};
+    clink::Sha256 rows_hash;
+    for (const auto& r : rows) {
+        JsonObject cells;
+        cells["id"] = JsonValue{r.at(0)};
+        cells["amount"] = JsonValue{r.at(1)};
+        cells["note"] = JsonValue{r.at(2)};
+        JsonObject line;
+        line["row"] = JsonValue{std::move(cells)};
+        const std::string text = JsonValue{std::move(line)}.serialize(0) + "\n";
+        rows_hash.update(text.data(), text.size());
+        lines.push_back(text);
+    }
+    clink::Sha256 header_hash;
+    header_hash.update(header.data(), header.size());
+    JsonObject end;
+    end["rows"] = JsonValue{static_cast<std::int64_t>(rows.size())};
+    end["rows_sha256"] = JsonValue{clink::Sha256::to_hex(rows_hash.finalize())};
+    end["header_sha256"] = JsonValue{clink::Sha256::to_hex(header_hash.finalize())};
+    end["complete"] = JsonValue{complete};
+    clink::config::JsonArray why;
+    for (const auto& w : incomplete) {
+        why.emplace_back(w);
+    }
+    end["incomplete"] = JsonValue{std::move(why)};
+    JsonObject endline;
+    endline["end"] = JsonValue{std::move(end)};
+    lines.push_back(JsonValue{std::move(endline)}.serialize(0) + "\n");
+    if (edit) {
+        edit(lines);
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    for (const auto& l : lines) {
+        out << l;
+    }
+}
 
 class ReconcileBundle : public ::testing::Test {
 protected:
@@ -689,6 +768,67 @@ protected:
         return collect_bundle(1, 2);
     }
 
+    // healthy(), with the Kafka source's positions and log in both checkpoints,
+    // which a reference's scope needs.
+    static constexpr const char* kLog =
+        R"({"version":1,"topic":"events","cluster_id":"c1","topic_id":"t1"})";
+    // Two empty intervals of both sink subtasks after checkpoint 2: the run
+    // had stopped writing, which a whole-table read needs to see.
+    void quiet_after_two() const {
+        write_checkpoint_with_offsets(3, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+        write_checkpoint_with_offsets(4, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+        for (const std::uint64_t e : {std::uint64_t{3}, std::uint64_t{4}}) {
+            write_interval(e, e - 1, 0, 2, {});
+            write_interval(e, e - 1, 1, 2, {});
+        }
+    }
+
+    fs::path audited() {
+        write_checkpoint_with_offsets(1, {{0, {{0, 10}}}, {1, {{1, 20}}}}, kLog);
+        write_checkpoint_with_offsets(2, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+        quiet_after_two();
+        write_interval(1, 0, 0, 2, {row_json(100, "1.00")});
+        write_interval(1, 0, 1, 2, {});
+        write_interval(2, 1, 0, 2, {row_json(1, "10.50"), row_json(2, "20.00", "late")});
+        write_interval(2, 1, 1, 2, {row_json(3, "-0.05"), row_json(4, "7")});
+        dest.rows = {observed_row(100, "D100@2"),
+                     observed_row(1, "D1050@2"),
+                     observed_row(2, "D2000@2", "Slate"),
+                     observed_row(3, "D-5@2"),
+                     observed_row(4, "D700@2")};
+        return collect_bundle(1, 4);
+    }
+
+    // The rows the job owes checkpoint 2 in audited(), as a reference computes them.
+    static std::vector<Row> owed() {
+        return {observed_row(1, "D1050@2"),
+                observed_row(2, "D2000@2", "Slate"),
+                observed_row(3, "D-5@2"),
+                observed_row(4, "D700@2")};
+    }
+
+    // The audit's scope document, as incident-scope writes it.
+    static JsonValue scope_of(const fs::path& bundle, std::uint64_t checkpoint, bool whole_run) {
+        const Bundle b = read_bundle(bundle);
+        return scope_document(b, load_scope(b, checkpoint, 0, whole_run));
+    }
+
+    reconcile::Report audit(const fs::path& bundle,
+                            const std::vector<Row>& reference,
+                            Options o = {},
+                            bool complete = true,
+                            const std::vector<std::string>& incomplete = {}) {
+        const auto path = root / "reference.ndjson";
+        const bool whole = o.from_run_start || o.coverage == Options::Coverage::CompleteTable;
+        write_reference(path,
+                        scope_of(bundle, o.checkpoint != 0 ? o.checkpoint : 2, whole),
+                        reference,
+                        complete,
+                        incomplete);
+        o.reference = path.string();
+        return reconcile(bundle, o);
+    }
+
     reconcile::Report reconcile(const fs::path& bundle, Options o = {}) {
         if (o.key.empty()) {
             o.key = {"id"};
@@ -716,6 +856,10 @@ protected:
                               const std::vector<Row>& keys) override {
             return d_.read(c, k, keys);
         }
+        std::vector<Row> read_all(const std::vector<Column>& c, std::uint64_t max_rows) override {
+            return d_.read_all(c, max_rows);
+        }
+        std::string parts_marker() override { return d_.parts_marker(); }
 
     private:
         FakeDestination& d_;
@@ -1096,6 +1240,340 @@ TEST_F(ReconcileBundle, CheckpointsThatRecordNoSourceLogSaySo) {
         noted = noted || n.find("record no log for the sources' positions") != std::string::npos;
     }
     EXPECT_TRUE(noted) << r.render_text();
+}
+
+// ---- the independent reference audit -------------------------------------------
+
+// Multisets of whole rows, paired by key: multiplicity counts, a further copy
+// of an expected row is a duplicate, a row left under its key is changed, and
+// the rest are missing or unexpected. Keys need not be unique.
+TEST(ReconcileMultiset, MultiplicityPairingAndInstabilityAreCounted) {
+    const Row a = {"I1", "D100@2", "N"};
+    const Row a2 = {"I1", "D200@2", "N"};
+    const Row b = {"I2", "D300@2", "N"};
+    const std::vector<std::size_t> key{0};
+    auto c = compare_multiset({a, a}, key, {a}, {a}, 10);
+    EXPECT_EQ(c.matched, 1U);
+    EXPECT_EQ(c.missing, 1U);
+    c = compare_multiset({a}, key, {a, a, a}, {a, a, a}, 10);
+    EXPECT_EQ(c.matched, 1U);
+    EXPECT_EQ(c.duplicated, 2U);
+    EXPECT_EQ(c.unexpected, 0U);
+    c = compare_multiset({a, a}, key, {a, a}, {a, a}, 10);
+    EXPECT_EQ(c.matched, 2U);
+    EXPECT_EQ(c.duplicated + c.missing + c.unexpected + c.mismatched, 0U);
+    c = compare_multiset({a}, key, {a2}, {a2}, 10);
+    EXPECT_EQ(c.mismatched, 1U);
+    ASSERT_EQ(c.listed.size(), 1U);
+    EXPECT_EQ(c.listed[0].differing, std::vector<std::size_t>{1});
+    c = compare_multiset({a}, key, {a, b}, {a, b}, 10);
+    EXPECT_EQ(c.unexpected, 1U);
+    c = compare_multiset({}, key, {}, {}, 10);
+    EXPECT_EQ(c.expected_rows + c.observed_rows, 0U);
+    // A key read differently twice is not compared.
+    c = compare_multiset({a, b}, key, {a, b}, {a2, b}, 10);
+    EXPECT_EQ(c.unstable_keys, 1U);
+    EXPECT_EQ(c.matched, 1U);
+    EXPECT_EQ(c.mismatched, 0U);
+}
+
+TEST(ReconcileMultiset, OnUniqueKeysItAgreesWithTheKeyedComparison) {
+    const std::vector<std::size_t> key{0};
+    const std::vector<Row> expected = {{"I1", "Sa"}, {"I2", "Sb"}, {"I3", "Sc"}, {"I4", "Sd"}};
+    const std::vector<Row> observed = {
+        {"I1", "Sa"}, {"I2", "Sx"}, {"I4", "Sd"}, {"I4", "Sd"}, {"I5", "Se"}};
+    const auto m = compare_multiset(expected, key, observed, observed, 10);
+    const auto k = compare(expected, key, observed, observed, 10);
+    EXPECT_EQ(std::tuple(m.matched, m.missing, m.mismatched, m.unexpected, m.duplicated),
+              std::tuple(k.matched, k.missing, k.mismatched, k.unexpected, k.duplicated));
+}
+
+TEST(ReconcileMultiset, ACellIsCanonicalOnlyForItsColumnsType) {
+    const auto t = [](const char* spelling) { return parse_column_type(spelling); };
+    EXPECT_TRUE(canonical_for("I-12", t("Int64")));
+    EXPECT_FALSE(canonical_for("I-12", t("UInt64")));
+    EXPECT_FALSE(canonical_for("I012", t("Int64")));
+    EXPECT_FALSE(canonical_for("I-0", t("Int64")));
+    EXPECT_TRUE(canonical_for("D-5@2", t("Decimal(18, 2)")));
+    EXPECT_FALSE(canonical_for("D-5@3", t("Decimal(18, 2)")));
+    EXPECT_TRUE(canonical_for("F3ff0000000000000", t("Float64")));
+    EXPECT_FALSE(canonical_for("F3FF0000000000000", t("Float64")));
+    EXPECT_TRUE(canonical_for("Fnan", t("Float64")));
+    EXPECT_TRUE(canonical_for("f3f800000", t("Float32")));
+    EXPECT_TRUE(canonical_for("T1700000000123@3", t("DateTime64(3, 'UTC')")));
+    EXPECT_FALSE(canonical_for("T1700000000123@6", t("DateTime64(3, 'UTC')")));
+    EXPECT_TRUE(canonical_for("B1", t("Bool")));
+    EXPECT_TRUE(canonical_for("S", t("String")));
+    EXPECT_TRUE(canonical_for("N", t("Nullable(String)")));
+    EXPECT_TRUE(canonical_for("d19000", t("Date")));
+    EXPECT_FALSE(canonical_for("!not exact", t("Decimal(18, 2)")));
+    EXPECT_FALSE(canonical_for("", t("String")));
+}
+
+// The healthy run: the reference, the captured input and the destination
+// agree, every check passes, and the result says what it covered.
+TEST_F(ReconcileBundle, AReferenceThatAgreesWithTheJobAndTheDestinationPasses) {
+    const auto r = audit(audited(), owed());
+    ASSERT_FALSE(r.refused.has_value()) << *r.refused;
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    for (const char* id : {"reconcile.scope",
+                           "reference.scope",
+                           "reference.capture",
+                           "reconcile.destination",
+                           "reconcile.rows",
+                           "reference.destination"}) {
+        EXPECT_EQ(check_of(r, id).verdict, Verdict::Passed) << id << ": " << r.render_text();
+    }
+    EXPECT_TRUE(r.findings.empty());
+    EXPECT_EQ(r.coverage.mode, "selected-keys");
+    EXPECT_EQ(r.coverage.keys_selected, 4U);
+    EXPECT_FALSE(r.coverage.complete_established);
+    EXPECT_NE(r.render_text().find("for the selected keys; rows of other keys were not read"),
+              std::string::npos);
+    const auto json = clink::config::parse(r.render_json());
+    EXPECT_TRUE(json.at("audit").at("reference").at("complete").as_bool());
+    EXPECT_EQ(json.at("audit").at("reference").at("rows").as_int(), 4);
+    EXPECT_EQ(json.at("coverage").at("mode").as_string(), "selected-keys");
+}
+
+// The decisive case: the job computes a wrong value and writes it faithfully.
+// The captured input and the destination agree, so reconciliation alone
+// passes; the reference does not, and the audit names the transformation.
+TEST_F(ReconcileBundle, AWrongTransformationWrittenFaithfullyFailsAgainstTheReference) {
+    const auto bundle = audited();
+    auto reference = owed();
+    reference[0] = observed_row(1, "D1051@2");  // what the transformation should have computed
+    EXPECT_EQ(reconcile(bundle).exit_code(), 0) << "reconciliation alone cannot see it";
+    const auto r = audit(bundle, reference);
+    EXPECT_EQ(r.exit_code(), 1) << r.render_text();
+    EXPECT_EQ(check_of(r, "reconcile.rows").verdict, Verdict::Passed);
+    EXPECT_EQ(check_of(r, "reference.capture").verdict, Verdict::Failed);
+    EXPECT_EQ(check_of(r, "reference.destination").verdict, Verdict::Failed);
+    ASSERT_TRUE(r.reference_capture.has_value());
+    EXPECT_EQ(r.reference_capture->mismatched, 1U);
+    ASSERT_FALSE(r.findings.empty());
+    EXPECT_EQ(r.findings.front().relationship, "transformation");
+    bool delivery = false;
+    for (const auto& f : r.findings) {
+        delivery = delivery || f.relationship == "delivery";
+    }
+    EXPECT_FALSE(delivery) << "the delivery was faithful";
+}
+
+// A row the job dropped is looked for under the reference's key, and one it
+// introduced is read under the captured key: each fails where it belongs.
+TEST_F(ReconcileBundle, ARowDroppedOrIntroducedByTheJobFails) {
+    const auto bundle = audited();
+    auto with_five = owed();
+    with_five.push_back(observed_row(5, "D500@2"));
+    auto r = audit(bundle, with_five);
+    EXPECT_EQ(r.exit_code(), 1);
+    EXPECT_EQ(r.reference_capture->missing, 1U);
+    EXPECT_EQ(r.reference_destination->missing, 1U);
+    EXPECT_EQ(r.coverage.keys_selected, 5U) << "the reference's key is read too";
+    EXPECT_EQ(check_of(r, "reconcile.rows").verdict, Verdict::Passed);
+
+    auto without_four = owed();
+    without_four.pop_back();
+    r = audit(bundle, without_four);
+    EXPECT_EQ(r.exit_code(), 1);
+    EXPECT_EQ(r.reference_capture->unexpected, 1U);
+    EXPECT_EQ(r.reference_destination->unexpected, 1U);
+}
+
+// A destination fault with a right transformation: the delivery fails, the
+// transformation passes, and the findings say which.
+TEST_F(ReconcileBundle, ADeliveryFaultIsToldApartFromTheTransformation) {
+    const auto bundle = audited();
+    dest.rows.erase(dest.rows.begin() + 3);                    // row 3 lost
+    dest.rows.push_back(observed_row(2, "D2000@2", "Slate"));  // row 2 twice
+    const auto r = audit(bundle, owed());
+    EXPECT_EQ(r.exit_code(), 1);
+    EXPECT_EQ(check_of(r, "reference.capture").verdict, Verdict::Passed);
+    EXPECT_EQ(check_of(r, "reconcile.rows").verdict, Verdict::Failed);
+    EXPECT_EQ(check_of(r, "reference.destination").verdict, Verdict::Failed);
+    std::set<std::string> rel;
+    for (const auto& f : r.findings) {
+        rel.insert(f.relationship);
+    }
+    EXPECT_TRUE(rel.contains("delivery"));
+    EXPECT_FALSE(rel.contains("transformation"));
+}
+
+// A reference that says it is incomplete is never compared, and leaves the
+// audit partial; a failure observed elsewhere still decides the result.
+TEST_F(ReconcileBundle, AnIncompleteReferenceIsPartialAndAFailureStillWins) {
+    const auto bundle = audited();
+    auto r = audit(bundle, owed(), {}, false, {"partition 0: offsets [10, 12) expired"});
+    EXPECT_EQ(r.exit_code(), 3) << r.render_text();
+    EXPECT_EQ(check_of(r, "reference.scope").verdict, Verdict::Unavailable);
+    EXPECT_NE(check_of(r, "reference.scope").reason.find("expired"), std::string::npos);
+    EXPECT_EQ(check_of(r, "reference.capture").verdict, Verdict::Unavailable);
+    dest.rows.pop_back();
+    r = audit(bundle, owed(), {}, false, {"partition 0: offsets [10, 12) expired"});
+    EXPECT_EQ(r.exit_code(), 1);
+}
+
+// Malformed, unfinished, tampered, or computed for another scope: refused,
+// with what is wrong.
+TEST_F(ReconcileBundle, AReferenceThatIsMalformedOrForAnotherScopeIsRefused) {
+    const auto bundle = audited();
+    const auto path = root / "reference.ndjson";
+    const auto refused_with = [&](const std::string& why) {
+        Options o;
+        o.reference = path.string();
+        const auto r = reconcile(bundle, o);
+        EXPECT_EQ(r.exit_code(), 2) << r.render_text();
+        EXPECT_TRUE(r.refused.has_value() && r.refused->find(why) != std::string::npos)
+            << (r.refused ? *r.refused : std::string{"not refused"});
+    };
+    write_reference(path, scope_of(bundle, 1, false), owed());
+    refused_with("checkpoint is 1 in the reference and 2 in this audit's scope");
+    const auto doc = scope_of(bundle, 2, false);
+    write_reference(path, doc, owed(), true, {}, [](auto& lines) { lines.pop_back(); });
+    refused_with("no end line");
+    write_reference(path, doc, owed(), true, {}, [](auto& lines) {
+        lines[1].replace(lines[1].find("D1050@2"), 7, "D1051@2");
+    });
+    refused_with("do not hash");
+    write_reference(path, doc, {observed_row(1, "D105@1")});
+    refused_with("not a canonical cell of Decimal(18, 2)");
+    write_reference(path, doc, owed(), true, {}, [](auto& lines) {
+        lines[1].replace(lines[1].find("\"id\""), 4, "\"ID\"");
+    });
+    refused_with("not a column of the scope");
+    write_reference(path, doc, owed(), true, {}, [](auto& lines) { lines.push_back(lines[1]); });
+    refused_with("lines after its end line");
+    write_reference(path, doc, owed(), false, {});
+    refused_with("does not say why");
+}
+
+// Selected keys cannot see a row of a key neither side names; the dedicated
+// table, read whole, can, and the report says which coverage it had.
+TEST_F(ReconcileBundle, AnUnrelatedKeyFailsOnlyAWholeTableRead) {
+    const auto bundle = audited();
+    dest.rows.push_back(observed_row(999, "D1@2"));
+    auto whole_run = owed();
+    whole_run.insert(whole_run.begin(), observed_row(100, "D100@2"));
+    Options sel;
+    sel.from_run_start = true;
+    auto r = audit(bundle, whole_run, sel);
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    EXPECT_FALSE(r.coverage.complete_established);
+    EXPECT_NE(r.coverage.complete_reason.find("not established"), std::string::npos);
+
+    Options whole;
+    whole.coverage = Options::Coverage::CompleteTable;
+    r = audit(bundle, whole_run, whole);
+    EXPECT_EQ(r.exit_code(), 1) << r.render_text();
+    EXPECT_EQ(check_of(r, "destination.coverage").verdict, Verdict::Failed);
+    EXPECT_TRUE(r.coverage.complete_established);
+    EXPECT_EQ(r.table_comparison->unexpected, 1U);
+    EXPECT_EQ(check_of(r, "reference.destination").verdict, Verdict::Passed);
+
+    dest.rows.pop_back();
+    r = audit(bundle, whole_run, whole);
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    EXPECT_EQ(check_of(r, "destination.coverage").verdict, Verdict::Passed);
+    EXPECT_EQ(r.coverage.table_rows_read, 5U);
+}
+
+// A whole-table read is a claim about one state of the table: parts that
+// change across it, a table past the bound, or rows the sink received after
+// the checkpoint leave it unavailable.
+TEST_F(ReconcileBundle, AWholeTableReadNeedsAStillBoundedTableAndNothingAfter) {
+    const auto bundle = audited();
+    auto whole_run = owed();
+    whole_run.insert(whole_run.begin(), observed_row(100, "D100@2"));
+    Options whole;
+    whole.coverage = Options::Coverage::CompleteTable;
+    dest.before_marker = [&](int n) {
+        if (n % 2 == 0) {
+            ++dest.parts_version;
+        }
+    };
+    auto r = audit(bundle, whole_run, whole);
+    EXPECT_EQ(r.exit_code(), 3);
+    EXPECT_NE(check_of(r, "destination.coverage").reason.find("parts changed"), std::string::npos);
+    dest.before_marker = {};
+    whole.max_table_rows = 4;
+    r = audit(bundle, whole_run, whole);
+    EXPECT_EQ(r.exit_code(), 3);
+    EXPECT_NE(check_of(r, "destination.coverage").reason.find("could not be read whole"),
+              std::string::npos);
+}
+
+TEST_F(ReconcileBundle, RowsTheSinkReceivedAfterTheCheckpointLeaveTheWholeTableUnestablished) {
+    write_checkpoint_with_offsets(1, {{0, {{0, 10}}}, {1, {{1, 20}}}}, kLog);
+    write_checkpoint_with_offsets(2, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+    write_interval(1, 0, 0, 2, {row_json(1, "10.50")});
+    write_interval(1, 0, 1, 2, {});
+    write_interval(2, 1, 0, 2, {});
+    write_interval(2, 1, 1, 2, {});
+    write_interval(3, 2, 0, 2, {row_json(7, "1.00")});  // after checkpoint 2, never completed
+    write_interval(3, 2, 1, 2, {});
+    dest.rows = {observed_row(1, "D1050@2"), observed_row(7, "D100@2")};
+    const auto bundle = collect_bundle(1, 3);
+    Options whole;
+    whole.coverage = Options::Coverage::CompleteTable;
+    const auto r = audit(bundle, {observed_row(1, "D1050@2")}, whole);
+    EXPECT_EQ(r.exit_code(), 3) << r.render_text();
+    EXPECT_NE(check_of(r, "destination.coverage").reason.find("after checkpoint 2"),
+              std::string::npos);
+}
+
+// Without two empty intervals of every subtask after the checkpoint, the
+// bundle does not show the run had stopped writing.
+TEST_F(ReconcileBundle, AWholeTableReadNeedsTheRunSeenQuietAfterTheCheckpoint) {
+    write_checkpoint_with_offsets(1, {{0, {{0, 10}}}, {1, {{1, 20}}}}, kLog);
+    write_checkpoint_with_offsets(2, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+    write_checkpoint_with_offsets(3, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+    write_interval(1, 0, 0, 2, {row_json(1, "10.50")});
+    write_interval(1, 0, 1, 2, {});
+    write_interval(2, 1, 0, 2, {});
+    write_interval(2, 1, 1, 2, {});
+    write_interval(3, 2, 0, 2, {});
+    write_interval(3, 2, 1, 2, {});
+    dest.rows = {observed_row(1, "D1050@2")};
+    const auto bundle = collect_bundle(1, 3);
+    Options whole;
+    whole.coverage = Options::Coverage::CompleteTable;
+    const auto r = audit(bundle, {observed_row(1, "D1050@2")}, whole);
+    EXPECT_EQ(r.exit_code(), 3) << r.render_text();
+    EXPECT_NE(check_of(r, "destination.coverage").reason.find("two are needed"), std::string::npos)
+        << check_of(r, "destination.coverage").reason;
+}
+
+// An empty expected output does not pass by having nothing to compare: with
+// selected keys it is unavailable; read whole, an empty dedicated table passes
+// and a table holding anything fails.
+TEST_F(ReconcileBundle, AnEmptyScopeDoesNotPassVacuously) {
+    write_checkpoint_with_offsets(1, {{0, {{0, 10}}}, {1, {{1, 20}}}}, kLog);
+    write_checkpoint_with_offsets(2, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+    write_interval(1, 0, 0, 2, {});
+    write_interval(1, 0, 1, 2, {});
+    write_interval(2, 1, 0, 2, {});
+    write_interval(2, 1, 1, 2, {});
+    quiet_after_two();
+    dest.rows.clear();
+    const auto bundle = collect_bundle(1, 4);
+    Options sel;
+    sel.from_run_start = true;
+    auto r = audit(bundle, {}, sel);
+    EXPECT_EQ(r.exit_code(), 3) << r.render_text();
+    EXPECT_EQ(check_of(r, "reference.capture").verdict, Verdict::Passed)
+        << "both sides established, both empty";
+    EXPECT_EQ(check_of(r, "reference.destination").verdict, Verdict::Unavailable);
+    Options whole;
+    whole.coverage = Options::Coverage::CompleteTable;
+    r = audit(bundle, {}, whole);
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    EXPECT_EQ(check_of(r, "destination.coverage").verdict, Verdict::Passed);
+    EXPECT_EQ(check_of(r, "reference.destination").verdict, Verdict::Passed);
+    dest.rows = {observed_row(42, "D1@2")};
+    r = audit(bundle, {}, whole);
+    EXPECT_EQ(r.exit_code(), 1) << r.render_text();
+    EXPECT_EQ(check_of(r, "destination.coverage").verdict, Verdict::Failed);
 }
 
 // The command: its usage refusals, a request the bundle does not fit, and a

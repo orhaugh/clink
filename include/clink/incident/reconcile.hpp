@@ -165,6 +165,15 @@ public:
     [[nodiscard]] virtual std::vector<Row> read(const std::vector<Column>& columns,
                                                 const std::vector<std::size_t>& key,
                                                 const std::vector<Row>& keys) = 0;
+    // Every row of the table, every column canonical, or DestinationUnavailable
+    // past `max_rows`: for a claim about the whole table. A destination that
+    // cannot read whole throws.
+    [[nodiscard]] virtual std::vector<Row> read_all(const std::vector<Column>& columns,
+                                                    std::uint64_t max_rows);
+    // The table's active parts as one comparable text, so that a whole read can
+    // tell its table did not change under it. A destination that cannot say
+    // throws DestinationUnavailable.
+    [[nodiscard]] virtual std::string parts_marker();
 };
 
 // ---- the scope: what the bundle says the sink received ------------------------
@@ -225,6 +234,8 @@ struct SourcePositions {
     bool to_complete{false};
     std::vector<std::string> topics;  // from the job graph: "<topic> (<op type>)"
     std::string isolation;            // as the job configured it, or librdkafka's default
+    std::string isolation_level{"read_committed"};  // the level itself
+    bool isolation_set_by_job{false};
     std::vector<std::string> notes;
 };
 
@@ -237,6 +248,9 @@ struct Scope {
     std::vector<std::uint64_t> epochs;
     std::uint64_t starts_after{0};  // the completed checkpoint before them; 0: the run's start
     bool starts_at_run_start{false};
+    // Asked to span every interval from the run's start, through the
+    // completed checkpoints between, rather than back to the previous one.
+    bool whole_run{false};
     std::vector<IntervalEvidence> intervals;
     config::JsonValue destination;  // as the sink's open found it
     std::vector<Column> columns;    // the sink's planned columns
@@ -262,9 +276,12 @@ struct ScopeRefused : std::runtime_error {
 // `sink_op` (0: the only sink with evidence for it), from a bundle whose
 // artifacts the caller has verified. Reads the interval files and the sink's
 // captured epochs; a gap is recorded in the scope rather than thrown.
+// With `whole_run`, the scope spans every interval from the run's start to the
+// checkpoint, through the completed checkpoints between.
 [[nodiscard]] Scope load_scope(const Bundle& bundle,
                                std::uint64_t checkpoint,
-                               std::uint64_t sink_op);
+                               std::uint64_t sink_op,
+                               bool whole_run = false);
 
 // ---- the comparison ----------------------------------------------------------
 
@@ -315,6 +332,34 @@ struct Options {
     // Pause between the two reads, so that a write landing in the scope while
     // it is read shows as instability rather than as a verdict.
     std::chrono::milliseconds settle{std::chrono::seconds{1}};
+    // The scope from the run's start through the checkpoint (load_scope's
+    // whole_run).
+    bool from_run_start{false};
+    // A reference artifact (reference.hpp) to audit against; empty: none.
+    std::string reference;
+    std::uint64_t max_reference_bytes{std::uint64_t{1} << 30};
+    // Selected keys reads the rows of the keys the scope names; complete
+    // table also reads the whole table, which the operator declares holds
+    // this one bounded run's writes and nothing else, and requires it to hold
+    // exactly the expected rows.
+    enum class Coverage : std::uint8_t { SelectedKeys, CompleteTable };
+    Coverage coverage{Coverage::SelectedKeys};
+    std::uint64_t max_table_rows{1000000};
+};
+
+// What a destination comparison covered.
+struct Coverage {
+    std::string mode;  // "selected-keys" or "complete-table"
+    std::uint64_t keys_selected{0};
+    bool complete_established{false};
+    std::string complete_reason;  // why it is, or why not
+    std::uint64_t table_rows_read{0};
+};
+
+// One relationship the audit found broken, named for what it implicates.
+struct Finding {
+    std::string relationship;  // "transformation", "delivery", "reference-destination", "coverage"
+    std::string summary;
 };
 
 struct Report {
@@ -331,6 +376,22 @@ struct Report {
     std::string server_time_to;
     std::vector<std::string> assumptions;
     std::vector<std::string> mutations_noted;
+    // The audit, when a reference was given.
+    std::optional<config::JsonValue> scope_document;
+    std::optional<std::string> reference_path;
+    bool reference_complete{false};
+    std::vector<std::string> reference_incomplete;
+    std::string reference_implementation;
+    std::string reference_rows_sha256;
+    std::uint64_t reference_rows{0};
+    std::vector<std::string> reference_recorded;
+    std::vector<std::string> reference_writer_verified;
+    std::vector<std::string> reference_verified;
+    std::optional<Comparison> reference_capture;      // reference vs captured input
+    std::optional<Comparison> reference_destination;  // reference vs destination
+    std::optional<Comparison> table_comparison;       // complete table vs expectation
+    Coverage coverage;
+    std::vector<Finding> findings;
 
     // 0: every check passed. 1: one failed. 3: none failed, one is unavailable
     // or unsupported. 2: refused.

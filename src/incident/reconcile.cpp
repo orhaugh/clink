@@ -16,6 +16,7 @@
 
 #include "clink/cluster/state_location.hpp"
 #include "clink/config/decimal.hpp"
+#include "clink/incident/reference.hpp"
 #include "clink/runtime/record_capture.hpp"
 #include "clink/runtime/sink_evidence.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
@@ -612,6 +613,15 @@ std::string display(std::string_view c, std::size_t max_bytes) {
     }
 }
 
+std::vector<Row> Destination::read_all(const std::vector<Column>& /*columns*/,
+                                       std::uint64_t /*max_rows*/) {
+    throw DestinationUnavailable("this destination cannot be read whole");
+}
+
+std::string Destination::parts_marker() {
+    throw DestinationUnavailable("this destination cannot say whether its table changed");
+}
+
 const char* to_string(Discrepancy::Kind k) noexcept {
     switch (k) {
         case Discrepancy::Kind::Missing:
@@ -899,6 +909,8 @@ std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> kafka_positions(
 
 void describe_sources(const Bundle& b, SourcePositions& sp) {
     sp.isolation = "read_committed (librdkafka's default; the job sets no isolation.level)";
+    sp.isolation_level = "read_committed";
+    sp.isolation_set_by_job = false;
     if (b.find("job/manifest.json") == nullptr) {
         sp.notes.push_back(
             "the bundle holds no job manifest, so the sources' topics are not named");
@@ -922,6 +934,8 @@ void describe_sources(const Bundle& b, SourcePositions& sp) {
             for (const auto& [k, v] : params.as_object()) {
                 if (std::string_view{k}.ends_with("isolation.level") && v.is_string()) {
                     sp.isolation = v.as_string() + " (set by the job)";
+                    sp.isolation_level = v.as_string();
+                    sp.isolation_set_by_job = true;
                 }
             }
         }
@@ -944,8 +958,9 @@ std::optional<bool> SourceIdentity::same_log() const {
            agree(start->topic_id, end->topic_id);
 }
 
-Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_op) {
+Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_op, bool whole_run) {
     Scope sc;
+    sc.whole_run = whole_run;
     sc.job = b.job();
     sc.checkpoint = checkpoint != 0 ? checkpoint : b.checkpoint();
     const std::uint64_t n = sc.checkpoint;
@@ -1086,13 +1101,15 @@ Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_o
             return gap("interval evidence names barrier " + std::to_string(prev) +
                        " as the one before " + std::to_string(epoch));
         }
-        if (completed.contains(prev)) {
+        if (completed.contains(prev) && !whole_run) {
             sc.starts_after = prev;
             break;
         }
-        sc.notes.push_back("checkpoint " + std::to_string(prev) +
-                           " did not complete, so checkpoint " + std::to_string(n) +
-                           " also completed the interval ending at its barrier");
+        if (!completed.contains(prev)) {
+            sc.notes.push_back("checkpoint " + std::to_string(prev) +
+                               " did not complete, so checkpoint " + std::to_string(n) +
+                               " also completed the interval ending at its barrier");
+        }
         epoch = prev;
     }
     std::sort(sc.intervals.begin(), sc.intervals.end(), [](const auto& x, const auto& y) {
@@ -1553,6 +1570,146 @@ std::string key_text(const Row& key,
 
 }  // namespace
 
+namespace {
+
+// destination.coverage: the table read whole against the expected rows (the
+// reference's when there is one, the captured input's otherwise). Established
+// only for a scope that spans a run begun with no state, whose sink the bundle
+// shows quiet after the audited checkpoint (two or more empty intervals of
+// every subtask, none with rows), and a table whose parts did not change
+// across the read; that nothing else writes the table is the operator's
+// declaration, recorded as an assumption.
+void audit_whole_table(const Bundle& b,
+                       const Scope& sc,
+                       const std::vector<std::size_t>& key,
+                       Destination& dest,
+                       const Options& o,
+                       const std::vector<Row>* reference,
+                       const std::vector<std::string>& unsettled,
+                       Check& check,
+                       Report& r) {
+    r.assumptions.push_back(
+        "the operator declared the table dedicated to this one bounded run "
+        "(--coverage=complete-table): nothing else writes it, and the run wrote nothing after the "
+        "audited checkpoint that the bundle does not show");
+    const auto unavailable = [&](std::string why, std::string next) {
+        check.verdict = Verdict::Unavailable;
+        check.reason = why;
+        check.next_action = std::move(next);
+        r.coverage.complete_reason = std::move(why);
+    };
+    if (!(sc.whole_run && sc.starts_at_run_start && sc.starts_after == 0)) {
+        unavailable(
+            sc.starts_after > 0
+                ? "the scope begins where the run restored from checkpoint " +
+                      std::to_string(sc.starts_after) +
+                      ", so rows an earlier run wrote can be in the table and outside the scope"
+                : "the scope does not span the job's writes from a run that began with no state",
+            "audit a run that began with no state, from its start");
+        return;
+    }
+    // The run had stopped writing: the bundle shows every sink subtask's
+    // interval for at least two barriers after the checkpoint, all empty. A
+    // run still receiving rows shows them, or has no such quiet stretch yet.
+    const std::uint64_t parallelism = sc.intervals.front().parallelism;
+    std::map<std::uint64_t, std::set<std::uint64_t>> quiet;  // epoch -> sink subtasks
+    for (const auto& iv : b.sink_intervals) {
+        if (iv.op != sc.sink_op || iv.epoch <= sc.checkpoint) {
+            continue;
+        }
+        IntervalEvidence e;
+        try {
+            e = read_interval(b, iv);
+        } catch (const std::exception& ex) {
+            unavailable(iv.path + " cannot be read: " + ex.what(), "collect the bundle again");
+            return;
+        }
+        if (e.records_seen > 0) {
+            unavailable("the sink received " + std::to_string(e.records_seen) +
+                            " row(s) in the interval ending at barrier " + std::to_string(e.epoch) +
+                            ", after checkpoint " + std::to_string(sc.checkpoint) +
+                            ": the run was still writing, and the table can hold rows the scope "
+                            "does not",
+                        "audit a checkpoint after the run's last rows, once two empty intervals "
+                        "have followed it");
+            return;
+        }
+        quiet[e.epoch].insert(e.sink_subtask);
+    }
+    std::size_t whole_quiet = 0;
+    for (const auto& [epoch, subtasks] : quiet) {
+        whole_quiet += subtasks.size() == parallelism ? 1 : 0;
+    }
+    if (whole_quiet < 2) {
+        unavailable("the bundle shows " + std::to_string(whole_quiet) +
+                        " empty interval(s) of every sink subtask after checkpoint " +
+                        std::to_string(sc.checkpoint) +
+                        "; two are needed to show the run had stopped writing, as a run still "
+                        "writing can add rows the scope does not hold",
+                    "audit a checkpoint two or more intervals before the bundle's last, after "
+                    "the run's last rows");
+        return;
+    }
+    if (!unsettled.empty()) {
+        unavailable("a mutation of the table was in progress or began while it was read",
+                    "run again once the table's mutations are done");
+        return;
+    }
+    try {
+        const std::string before = dest.parts_marker();
+        std::vector<Row> all = dest.read_all(sc.columns, o.max_table_rows);
+        const std::string after = dest.parts_marker();
+        if (before != after) {
+            unavailable(
+                "the table's parts changed while it was read whole, so the read is not of one "
+                "state of the table",
+                "run again once nothing writes or merges the table");
+            return;
+        }
+        r.coverage.table_rows_read = all.size();
+        const std::vector<Row>& want = reference != nullptr ? *reference : sc.expected;
+        const std::string whose = reference != nullptr ? "the reference's" : "the captured input's";
+        Comparison t = compare_multiset(want, key, all, all, o.list_limit);
+        check.counts = {{"expected", t.expected_rows},
+                        {"rows_read", all.size()},
+                        {"matched", t.matched},
+                        {"missing", t.missing},
+                        {"changed", t.mismatched},
+                        {"unexpected", t.unexpected},
+                        {"duplicated", t.duplicated}};
+        check.evidence.push_back(std::to_string(all.size()) + " row(s) read whole, parts " +
+                                 (before.size() > 64 ? before.substr(0, 64) + "..." : before));
+        r.coverage.complete_established = true;
+        if (t.missing + t.mismatched + t.unexpected + t.duplicated > 0) {
+            check.verdict = Verdict::Failed;
+            check.reason =
+                "the table, read whole (" + std::to_string(all.size()) +
+                " row(s)), does not hold exactly " + whose + " " + std::to_string(want.size()) +
+                " expected row(s): " + std::to_string(t.missing) + " missing, " +
+                std::to_string(t.mismatched) + " changed, " + std::to_string(t.unexpected) +
+                " unexpected, " + std::to_string(t.duplicated) + " duplicated";
+            check.details.push_back(
+                "unexpected rows here include rows of keys neither the reference nor the "
+                "captured input names, which a selected-key read cannot see");
+            check.next_action = "inspect the listed rows in the table";
+        } else {
+            check.verdict = Verdict::Passed;
+            check.reason = "the table, read whole, holds exactly " + whose + " " +
+                           std::to_string(want.size()) +
+                           " expected row(s) and nothing else; its parts did not change across "
+                           "the read, and the scope spans the run from a start with no state";
+        }
+        r.coverage.complete_reason = check.reason;
+        r.table_comparison = std::move(t);
+    } catch (const DestinationUnavailable& e) {
+        unavailable(std::string{"the table could not be read whole: "} + e.what(),
+                    "raise --max-table-rows, or audit a smaller run; part of a table is never "
+                    "compared");
+    }
+}
+
+}  // namespace
+
 Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Options& o) {
     Report r;
     r.bundle = bundle_dir.string();
@@ -1590,10 +1747,78 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
     Check scope_check = make_check("reconcile.scope");
     Check dest_check = make_check("reconcile.destination");
     Check rows_check = make_check("reconcile.rows");
+    // The audit's, when a reference is given or the whole table is asked for.
+    const bool auditing = !o.reference.empty();
+    const bool complete_table = o.coverage == Options::Coverage::CompleteTable;
+    Check ref_scope_check = make_check("reference.scope");
+    Check ref_capture_check = make_check("reference.capture");
+    Check ref_dest_check = make_check("reference.destination");
+    Check coverage_check = make_check("destination.coverage");
+    r.coverage.mode = complete_table ? "complete-table" : "selected-keys";
     const auto finish = [&]() -> Report& {
-        r.checks.push_back(std::move(scope_check));
-        r.checks.push_back(std::move(dest_check));
-        r.checks.push_back(std::move(rows_check));
+        std::vector<Check*> order{&scope_check};
+        if (auditing) {
+            order.push_back(&ref_scope_check);
+            order.push_back(&ref_capture_check);
+        }
+        order.push_back(&dest_check);
+        order.push_back(&rows_check);
+        if (auditing) {
+            order.push_back(&ref_dest_check);
+        }
+        if (complete_table) {
+            order.push_back(&coverage_check);
+        }
+        for (Check* c : order) {
+            if (c->reason.empty()) {
+                c->reason = "not run: a check it depends on did not pass";
+            }
+            r.checks.push_back(std::move(*c));
+        }
+        const auto counted = [&](const char* id) {
+            std::string out;
+            for (const auto& c : r.checks) {
+                if (c.id == id) {
+                    for (const auto& [name, n] : c.counts) {
+                        if (n > 0 && name != "expected" && name != "observed" &&
+                            name != "matched" && name != "queries" && name != "rows_read" &&
+                            name != "unstable_keys") {
+                            out += (out.empty() ? "" : ", ") + std::to_string(n) + " " + name;
+                        }
+                    }
+                }
+            }
+            return out;
+        };
+        for (const auto& c : r.checks) {
+            if (c.verdict != Verdict::Failed) {
+                continue;
+            }
+            if (c.id == "reference.capture") {
+                r.findings.push_back(Finding{
+                    "transformation",
+                    "the job's sink received other rows than the independent reference computes "
+                    "from the same source range (" +
+                        counted("reference.capture") +
+                        "): the transformation is wrong, or the "
+                        "reference is"});
+            } else if (c.id == "reconcile.rows") {
+                r.findings.push_back(Finding{"delivery",
+                                             "the destination does not hold what the sink "
+                                             "received (" +
+                                                 counted("reconcile.rows") + ")"});
+            } else if (c.id == "reference.destination") {
+                r.findings.push_back(Finding{"reference-destination",
+                                             "the destination does not hold what the independent "
+                                             "reference computes (" +
+                                                 counted("reference.destination") + ")"});
+            } else if (c.id == "destination.coverage") {
+                r.findings.push_back(Finding{"coverage",
+                                             "the dedicated table does not hold exactly the "
+                                             "expected rows (" +
+                                                 counted("destination.coverage") + ")"});
+            }
+        }
         return r;
     };
     if (!intact) {
@@ -1606,7 +1831,7 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
         return finish();
     }
     try {
-        r.scope = load_scope(b, o.checkpoint, o.sink_op);
+        r.scope = load_scope(b, o.checkpoint, o.sink_op, o.from_run_start || complete_table);
     } catch (const ScopeRefused& e) {
         r.refused = e.what();
         return r;
@@ -1691,6 +1916,119 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
     }
     scope_check.counts = {{"intervals", sc.intervals.size()},
                           {"expected_rows", sc.expected.size()}};
+
+    // The reference: bound to this scope, whole, and complete by its own
+    // account, or refused. Nothing it names is run or read.
+    std::optional<Reference> ref;
+    if (auditing) {
+        r.reference_path = o.reference;
+        r.assumptions.push_back(
+            "the reference implementation computes the transformation independently of the job: "
+            "the audit establishes that the artifact is whole and bound to this scope, not who "
+            "wrote it or how");
+        if (sc.columns.empty()) {
+            ref_scope_check.reason =
+                "not read: the scope names no columns, so the reference has nothing to be bound to";
+        } else {
+            r.scope_document = scope_document(b, sc);
+            try {
+                ref = read_reference(
+                    o.reference, *r.scope_document, sc.columns, o.max_reference_bytes);
+            } catch (const ReferenceRefused& e) {
+                r.refused = std::string{"the reference cannot be audited: "} + e.what();
+                return r;
+            }
+            r.reference_complete = ref->complete;
+            r.reference_incomplete = ref->incomplete;
+            r.reference_implementation = ref->implementation;
+            r.reference_rows_sha256 = ref->rows_sha256;
+            r.reference_rows = ref->rows.size();
+            r.reference_recorded = ref->recorded;
+            r.reference_writer_verified = ref->writer_verified;
+            r.reference_verified = ref->verified;
+            ref_scope_check.evidence.push_back(o.reference);
+            ref_scope_check.counts = {{"rows", ref->rows.size()}};
+            for (const auto& v : ref->verified) {
+                ref_scope_check.details.push_back("verified: " + v);
+            }
+            for (const auto& v : ref->writer_verified) {
+                ref_scope_check.details.push_back("its writer says it checked: " + v);
+            }
+            for (const auto& v : ref->recorded) {
+                ref_scope_check.details.push_back("recorded, not established: " + v);
+            }
+            const bool sources_whole = r.scope_document->bool_or("sources_complete", false);
+            if (sc.gap) {
+                ref_scope_check.verdict =
+                    sc.gap_unsupported ? Verdict::Unsupported : Verdict::Unavailable;
+                ref_scope_check.reason =
+                    "the scope could not be established whole, so the reference is not compared";
+            } else if (!ref->complete) {
+                std::string why;
+                for (const auto& w : ref->incomplete) {
+                    why += (why.empty() ? "" : "; ") + w;
+                }
+                ref_scope_check.reason = "the reference is incomplete by its own account: " + why;
+                ref_scope_check.next_action =
+                    "compute the reference again once the whole source range can be read; an "
+                    "incomplete reference is never compared";
+            } else if (!sources_whole) {
+                ref_scope_check.reason =
+                    "the scope does not record every source range and log, so no reference can "
+                    "be complete for it, whatever its writer says";
+                ref_scope_check.next_action = "collect the bundle with --include-state";
+            } else {
+                ref_scope_check.verdict = Verdict::Passed;
+                ref_scope_check.reason =
+                    "the reference is bound to this scope, whole, and complete by its own "
+                    "account: " +
+                    std::to_string(ref->rows.size()) + " row(s) from " + ref->implementation;
+            }
+        }
+        if (ref_scope_check.verdict == Verdict::Passed && scope_check.verdict == Verdict::Passed) {
+            Comparison rc =
+                compare_multiset(ref->rows, key, sc.expected, sc.expected, o.list_limit);
+            ref_capture_check.counts = {{"expected", rc.expected_rows},
+                                        {"observed", rc.observed_rows},
+                                        {"matched", rc.matched},
+                                        {"missing", rc.missing},
+                                        {"changed", rc.mismatched},
+                                        {"unexpected", rc.unexpected},
+                                        {"duplicated", rc.duplicated}};
+            if (rc.missing + rc.mismatched + rc.unexpected + rc.duplicated > 0) {
+                ref_capture_check.verdict = Verdict::Failed;
+                ref_capture_check.reason =
+                    "the job's sink received other rows than the reference computes from the same "
+                    "source range: " +
+                    std::to_string(rc.missing) + " missing, " + std::to_string(rc.mismatched) +
+                    " changed, " + std::to_string(rc.unexpected) + " unexpected, " +
+                    std::to_string(rc.duplicated) + " duplicated";
+                ref_capture_check.details.push_back(
+                    "missing rows the reference computes and the job did not produce; changed, a "
+                    "row under the key with other values; unexpected, rows the job produced and "
+                    "the reference does not; duplicated, further copies of a reference row");
+                ref_capture_check.details.push_back(
+                    "this is the transformation, not the delivery: the comparison is of what the "
+                    "sink received, before any write");
+                ref_capture_check.next_action =
+                    "inspect the listed rows against the source records the scope's ranges name";
+            } else {
+                ref_capture_check.verdict = Verdict::Passed;
+                ref_capture_check.reason =
+                    "the sink received exactly the " + std::to_string(rc.expected_rows) +
+                    " row(s) the reference computes from the scope's source range, value for "
+                    "value and copy for copy";
+            }
+            r.reference_capture = std::move(rc);
+        } else if (ref_capture_check.reason.empty()) {
+            ref_capture_check.verdict = scope_check.verdict == Verdict::Unsupported ||
+                                                ref_scope_check.verdict == Verdict::Unsupported
+                                            ? Verdict::Unsupported
+                                            : Verdict::Unavailable;
+            ref_capture_check.reason =
+                "not compared: the scope or the reference could not be established";
+        }
+    }
 
     // The destination: the one the evidence names, in a form the comparison
     // supports.
@@ -1813,12 +2151,29 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
         return finish();
     }
 
-    // Two reads of every key, with the table's mutations around them.
+    // Two reads of every key, with the table's mutations around them: the
+    // captured input's keys, and with a reference the reference's too, so a
+    // row the job dropped is looked for and one it introduced is read.
+    const bool ref_usable = ref && ref_scope_check.verdict == Verdict::Passed;
     std::vector<Row> keys;
-    keys.reserve(sc.expected.size());
-    for (const auto& row : sc.expected) {
-        keys.push_back(key_cells(row, key));
+    std::set<std::string> capture_keys;
+    {
+        std::set<std::string> seen;
+        for (const auto& row : sc.expected) {
+            capture_keys.insert(key_of(row, key));
+            if (seen.insert(key_of(row, key)).second) {
+                keys.push_back(key_cells(row, key));
+            }
+        }
+        if (ref_usable) {
+            for (const auto& row : ref->rows) {
+                if (seen.insert(key_of(row, key)).second) {
+                    keys.push_back(key_cells(row, key));
+                }
+            }
+        }
     }
+    r.coverage.keys_selected = keys.size();
     std::vector<Row> first;
     std::vector<Row> second;
     std::vector<Mutation> before;
@@ -1892,8 +2247,26 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
         }
     }
 
-    Comparison c = compare(sc.expected, key, first, second, o.list_limit);
+    // The captured input against the destination, over the captured keys only,
+    // as without a reference.
+    const auto of_capture = [&](const std::vector<Row>& rows) {
+        std::vector<Row> out;
+        for (const auto& row : rows) {
+            if (capture_keys.contains(key_of(row, key))) {
+                out.push_back(row);
+            }
+        }
+        return out;
+    };
+    Comparison c = compare(sc.expected, key, of_capture(first), of_capture(second), o.list_limit);
     const bool empty_scope = sc.expected.empty();
+
+    // The whole table, when the operator declares it holds this one bounded
+    // run's writes and nothing else.
+    if (complete_table) {
+        audit_whole_table(
+            b, sc, key, dest, o, ref_usable ? &ref->rows : nullptr, unsettled, coverage_check, r);
+    }
     rows_check.counts = {{"expected", c.expected_rows},
                          {"observed", c.observed_rows},
                          {"matched", c.matched},
@@ -1954,11 +2327,18 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
             "so the comparison is not stable";
         rows_check.details = unsettled;
         rows_check.next_action = "run again once the table's mutations are done";
+    } else if (empty_scope && coverage_check.verdict == Verdict::Passed) {
+        rows_check.verdict = Verdict::Passed;
+        rows_check.reason =
+            "the scope's intervals held no rows, and the whole table, read under "
+            "destination.coverage, holds none of its own either";
     } else if (empty_scope) {
         rows_check.reason =
             "the scope's intervals held no rows, so there was nothing to compare and the "
             "destination is not established either way";
-        rows_check.next_action = "reconcile a checkpoint whose intervals carried rows";
+        rows_check.next_action =
+            "reconcile a checkpoint whose intervals carried rows, or read a dedicated table whole "
+            "(--coverage=complete-table)";
     } else if (c.unstable_keys > 0) {
         rows_check.reason = std::to_string(c.unstable_keys) +
                             " key(s) of the scope were read differently twice: rows of the "
@@ -1982,6 +2362,75 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
         rows_check.details.push_back("mutation done before the read: " + m);
     }
     r.comparison = std::move(c);
+
+    // The reference against the destination, over the union of keys.
+    if (auditing) {
+        if (!ref_usable) {
+            ref_dest_check.verdict = ref_scope_check.verdict == Verdict::Unsupported
+                                         ? Verdict::Unsupported
+                                         : Verdict::Unavailable;
+            ref_dest_check.reason = "not compared: the reference could not be established";
+        } else {
+            Comparison rd = compare_multiset(ref->rows, key, first, second, o.list_limit);
+            ref_dest_check.counts = {{"expected", rd.expected_rows},
+                                     {"observed", rd.observed_rows},
+                                     {"matched", rd.matched},
+                                     {"missing", rd.missing},
+                                     {"changed", rd.mismatched},
+                                     {"unexpected", rd.unexpected},
+                                     {"duplicated", rd.duplicated},
+                                     {"unstable_keys", rd.unstable_keys},
+                                     {"keys_selected", keys.size()}};
+            if (rd.missing + rd.mismatched + rd.unexpected + rd.duplicated > 0) {
+                ref_dest_check.verdict = Verdict::Failed;
+                ref_dest_check.reason =
+                    "the destination does not hold what the reference computes, over the " +
+                    std::to_string(keys.size()) +
+                    " key(s) of the reference and the captured "
+                    "input: " +
+                    std::to_string(rd.missing) + " missing, " + std::to_string(rd.mismatched) +
+                    " changed, " + std::to_string(rd.unexpected) + " unexpected, " +
+                    std::to_string(rd.duplicated) + " duplicated";
+                ref_dest_check.next_action =
+                    "read reference.capture and reconcile.rows: one names the transformation, "
+                    "the other the delivery";
+            } else if (!unsettled.empty()) {
+                ref_dest_check.reason =
+                    "a mutation of the table was in progress or began while it was read";
+            } else if (keys.empty() && coverage_check.verdict == Verdict::Passed) {
+                ref_dest_check.verdict = Verdict::Passed;
+                ref_dest_check.reason =
+                    "the reference and the captured input are both empty, and the whole table, "
+                    "read under destination.coverage, is empty as well";
+            } else if (keys.empty()) {
+                ref_dest_check.reason =
+                    "the reference and the captured input are both empty, so no key is selected "
+                    "and whether the destination is empty for the scope is not established";
+                ref_dest_check.next_action =
+                    "read a dedicated table whole (--coverage=complete-table)";
+            } else if (rd.unstable_keys > 0) {
+                ref_dest_check.reason =
+                    std::to_string(rd.unstable_keys) + " key(s) were read differently twice";
+                ref_dest_check.next_action = "run again once nothing writes the scope's keys";
+            } else {
+                ref_dest_check.verdict = Verdict::Passed;
+                ref_dest_check.reason =
+                    "the destination holds exactly the " + std::to_string(rd.expected_rows) +
+                    " row(s) the reference computes, over its " + std::to_string(keys.size()) +
+                    " selected key(s); rows of other keys were " +
+                    (coverage_check.verdict == Verdict::Passed ? std::string{"read whole under "
+                                                                             "destination.coverage"}
+                                                               : std::string{"not read"});
+            }
+            r.reference_destination = std::move(rd);
+        }
+    }
+    if (!complete_table) {
+        r.coverage.complete_reason =
+            "the read selected " + std::to_string(keys.size()) +
+            " key(s); whether the table holds rows of other keys is not established, which "
+            "needs a table dedicated to one bounded run read whole (--coverage=complete-table)";
+    }
     return finish();
 }
 
@@ -2042,6 +2491,14 @@ std::string Report::render_text() const {
         k += (k.empty() ? "" : ", ") + name;
     }
     out << "key:         " << k << "\n";
+    if (reference_path) {
+        out << "reference:   " << *reference_path;
+        if (!reference_implementation.empty()) {
+            out << ", " << reference_implementation << ", " << reference_rows << " row(s), "
+                << (reference_complete ? "complete" : "incomplete") << " by its own account";
+        }
+        out << "\n";
+    }
     if (!observed_from.empty()) {
         out << "observed:    " << observed_from << " to " << observed_to << " (server "
             << server_time_from << " to " << server_time_to << ")\n";
@@ -2103,15 +2560,61 @@ std::string Report::render_text() const {
             out << "    next: " << c.next_action << "\n";
         }
     }
-    if (comparison && !comparison->listed.empty()) {
-        std::vector<std::size_t> idx;
-        for (const auto& name : key) {
-            for (std::size_t i = 0; i < scope.columns.size(); ++i) {
-                if (scope.columns[i].name == name) {
-                    idx.push_back(i);
-                }
+    std::vector<std::size_t> idx;
+    for (const auto& name : key) {
+        for (std::size_t i = 0; i < scope.columns.size(); ++i) {
+            if (scope.columns[i].name == name) {
+                idx.push_back(i);
             }
         }
+    }
+    const auto list_text = [&](const char* title, const Comparison& cmp) {
+        if (cmp.listed.empty()) {
+            return;
+        }
+        out << "\n" << title << " (first " << cmp.listed.size() << "):\n";
+        for (const auto& d : cmp.listed) {
+            out << "  " << to_string(d.kind) << " " << key_text(d.key, idx, scope.columns);
+            if (d.kind == Discrepancy::Kind::Duplicate) {
+                out << ": " << d.copies << " extra cop" << (d.copies == 1 ? "y" : "ies");
+            } else if (d.kind == Discrepancy::Kind::Mismatch) {
+                for (const auto i : d.differing) {
+                    out << "\n      " << scope.columns[i].name << ": expected "
+                        << display(d.expected[i]) << ", found " << display(d.observed[i]);
+                }
+            } else if (d.kind == Discrepancy::Kind::Unexpected) {
+                out << ": " << row_text(d.observed, scope.columns);
+            } else {
+                out << ": " << row_text(d.expected, scope.columns);
+            }
+            out << "\n";
+        }
+    };
+    if (!findings.empty()) {
+        out << "\nfindings:\n";
+        for (const auto& f : findings) {
+            out << "  " << f.relationship << ": " << f.summary << "\n";
+        }
+    }
+    out << "\ncoverage:    " << coverage.mode << ", " << coverage.keys_selected
+        << " key(s) selected";
+    if (coverage.complete_established) {
+        out << "; the table read whole (" << coverage.table_rows_read << " row(s))";
+    }
+    if (!coverage.complete_reason.empty()) {
+        out << "\n             " << coverage.complete_reason;
+    }
+    out << "\n";
+    if (reference_capture) {
+        list_text("reference against captured input", *reference_capture);
+    }
+    if (reference_destination) {
+        list_text("reference against destination", *reference_destination);
+    }
+    if (table_comparison) {
+        list_text("whole table against the expected rows", *table_comparison);
+    }
+    if (comparison && !comparison->listed.empty()) {
         out << "\ndiscrepancies (first " << comparison->listed.size() << "):\n";
         for (const auto& d : comparison->listed) {
             out << "  " << to_string(d.kind) << " " << key_text(d.key, idx, scope.columns);
@@ -2138,6 +2641,8 @@ std::string Report::render_text() const {
     out << "\nresult: " << result_of(code) << " (exit " << code << ")";
     if (code == 3) {
         out << ": nothing failed, but the reconciliation is not complete";
+    } else if (code == 0 && !coverage.complete_established) {
+        out << ": for the selected keys; rows of other keys were not read";
     }
     out << "\n";
     return out.str();
@@ -2323,15 +2828,97 @@ std::string Report::render_json() const {
     }
     o["checks"] = config::JsonValue{std::move(checks_a)};
 
-    if (comparison) {
-        std::vector<std::size_t> idx;
-        for (const auto& name : key) {
-            for (std::size_t i = 0; i < scope.columns.size(); ++i) {
-                if (scope.columns[i].name == name) {
-                    idx.push_back(i);
-                }
+    std::vector<std::size_t> idx;
+    for (const auto& name : key) {
+        for (std::size_t i = 0; i < scope.columns.size(); ++i) {
+            if (scope.columns[i].name == name) {
+                idx.push_back(i);
             }
         }
+    }
+    const auto listed_json = [&](const Comparison& cmp) {
+        config::JsonArray ds;
+        for (const auto& d : cmp.listed) {
+            config::JsonObject dj;
+            dj["kind"] = config::JsonValue{std::string{to_string(d.kind)}};
+            config::JsonObject kj;
+            for (std::size_t i = 0; i < d.key.size() && i < idx.size(); ++i) {
+                kj[scope.columns[idx[i]].name] = config::JsonValue{display(d.key[i])};
+            }
+            dj["key"] = config::JsonValue{std::move(kj)};
+            if (!d.expected.empty()) {
+                dj["expected"] = row_json(d.expected, scope.columns);
+            }
+            if (!d.observed.empty()) {
+                dj["observed"] = row_json(d.observed, scope.columns);
+            }
+            if (!d.differing.empty()) {
+                config::JsonArray cols;
+                for (const auto i : d.differing) {
+                    cols.emplace_back(scope.columns[i].name);
+                }
+                dj["columns"] = config::JsonValue{std::move(cols)};
+            }
+            if (d.kind == Discrepancy::Kind::Duplicate) {
+                dj["extra_copies"] = config::JsonValue{static_cast<std::int64_t>(d.copies)};
+            }
+            ds.emplace_back(std::move(dj));
+        }
+        return config::JsonValue{std::move(ds)};
+    };
+    {
+        config::JsonObject cov;
+        cov["mode"] = config::JsonValue{coverage.mode};
+        cov["keys_selected"] = config::JsonValue{static_cast<std::int64_t>(coverage.keys_selected)};
+        cov["complete_established"] = config::JsonValue{coverage.complete_established};
+        cov["complete_reason"] = config::JsonValue{coverage.complete_reason};
+        cov["table_rows_read"] =
+            config::JsonValue{static_cast<std::int64_t>(coverage.table_rows_read)};
+        o["coverage"] = config::JsonValue{std::move(cov)};
+    }
+    if (reference_path) {
+        config::JsonObject a;
+        config::JsonObject rj;
+        const auto strings = [](const std::vector<std::string>& v) {
+            config::JsonArray out;
+            for (const auto& x : v) {
+                out.emplace_back(x);
+            }
+            return config::JsonValue{std::move(out)};
+        };
+        rj["path"] = config::JsonValue{*reference_path};
+        rj["implementation"] = config::JsonValue{reference_implementation};
+        rj["rows"] = config::JsonValue{static_cast<std::int64_t>(reference_rows)};
+        rj["rows_sha256"] = config::JsonValue{reference_rows_sha256};
+        rj["complete"] = config::JsonValue{reference_complete};
+        rj["incomplete"] = strings(reference_incomplete);
+        rj["recorded"] = strings(reference_recorded);
+        rj["writer_verified"] = strings(reference_writer_verified);
+        rj["verified"] = strings(reference_verified);
+        a["reference"] = config::JsonValue{std::move(rj)};
+        if (scope_document) {
+            a["scope_sha256"] = config::JsonValue{scope_document->string_or("scope_sha256", "")};
+        }
+        config::JsonArray fs_;
+        for (const auto& f : findings) {
+            config::JsonObject fj;
+            fj["relationship"] = config::JsonValue{f.relationship};
+            fj["summary"] = config::JsonValue{f.summary};
+            fs_.emplace_back(std::move(fj));
+        }
+        a["findings"] = config::JsonValue{std::move(fs_)};
+        if (reference_capture) {
+            a["reference_capture_discrepancies"] = listed_json(*reference_capture);
+        }
+        if (reference_destination) {
+            a["reference_destination_discrepancies"] = listed_json(*reference_destination);
+        }
+        o["audit"] = config::JsonValue{std::move(a)};
+    }
+    if (table_comparison) {
+        o["table_discrepancies"] = listed_json(*table_comparison);
+    }
+    if (comparison) {
         config::JsonArray ds;
         for (const auto& d : comparison->listed) {
             config::JsonObject dj;

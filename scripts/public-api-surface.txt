@@ -410,6 +410,7 @@ include/clink/http/json_writer.hpp
 include/clink/http/static_files.hpp
 include/clink/incident/bundle.hpp
 include/clink/incident/reconcile.hpp
+include/clink/incident/reference.hpp
 include/clink/metrics/async_metrics.hpp
 include/clink/metrics/checkpoint_metrics.hpp
 include/clink/metrics/connector_metrics.hpp
