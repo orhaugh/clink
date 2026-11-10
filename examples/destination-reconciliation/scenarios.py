@@ -439,9 +439,10 @@ def dir_bytes(path):
 
 def overhead(demo):
     """One bounded workload, the same job with the flight recorder off and
-    on, three times each, alternating: time to land every row, the Workers'
-    CPU, what the recorder wrote; medians reported. Then the cost of
-    reconciling the largest checkpoint scope of the last run with it on."""
+    on, five times each, alternating: time to land every row; the Workers'
+    CPU and what the recorder wrote, once a checkpoint has completed after
+    the rows landed; medians reported. Then the cost of reconciling the
+    largest checkpoint scope of the last run with it on."""
     import statistics
     count = 40_000
     want = sum(1 for i in range(1, count + 1) if workload.reference_row(workload.event(i)))
@@ -450,7 +451,7 @@ def overhead(demo):
     demo.services.produce(topic, range(1, count + 1))
     runs = {"off": [], "on": []}
     reconcile_cost = None
-    for rep in range(3):
+    for rep in range(5):
         for mode in ("off", "on"):
             name = "overhead-%s-%d" % (mode, rep)
             table = "payments_%s" % name.replace("-", "_")
@@ -465,13 +466,19 @@ def overhead(demo):
                     break
                 time.sleep(0.2)
             wall = time.time() - t0
+            # The recorder writes an epoch when the next barrier passes, so the
+            # work it does for these rows is done only once a checkpoint
+            # completes after they landed. Both modes wait for one, so their
+            # CPU covers the same span.
+            done = len(cluster.completed())
+            cluster.await_completed(done + 1, timeout=120)
             cpu = sum(cpu_seconds(cluster.procs[w].pid) or 0.0 for w in ("worker-1", "worker-2"))
             runs[mode].append({"rows": landed, "seconds_to_land": round(wall, 2),
                                "worker_cpu_seconds": round(cpu, 2),
                                "capture_bytes": dir_bytes(cluster.dir / "capture"),
                                "capture_files": sum(1 for _ in (cluster.dir / "capture").rglob("*")
                                                     if _.is_file())})
-            if mode == "on" and rep == 2:
+            if mode == "on" and rep == 4:
                 bundle = demo.work / "bundles" / "overhead"
                 info = cluster.collect(bundle)
                 best, best_rows = None, -1
@@ -499,13 +506,13 @@ def overhead(demo):
                                                          med["off"]["worker_cpu_seconds"]) /
                                                 max(med["off"]["worker_cpu_seconds"], 0.01), 1)}
     (demo.results / "measurements.json").write_text(json.dumps(results, indent=2))
-    demo.note("recorder off, medians of 3: %(seconds_to_land)s s to land, %(worker_cpu_seconds)s Worker CPU s"
+    demo.note("recorder off, medians of 5: %(seconds_to_land)s s to land, %(worker_cpu_seconds)s Worker CPU s"
               % med["off"])
-    demo.note("recorder on,  medians of 3: %(seconds_to_land)s s to land, %(worker_cpu_seconds)s Worker CPU s, "
+    demo.note("recorder on,  medians of 5: %(seconds_to_land)s s to land, %(worker_cpu_seconds)s Worker CPU s, "
               "%(capture_bytes)d bytes in %(capture_files)d files" % med["on"])
     demo.note("reconciling checkpoint %(checkpoint)d: %(rows_compared)d rows, %(queries)d queries, "
               "%(seconds)s s" % reconcile_cost)
-    demo.outcome("overhead", "every run landed every row it owes", "%d rows x 6" % want,
+    demo.outcome("overhead", "every run landed every row it owes", "%d rows x 10" % want,
                  ", ".join(str(r["rows"]) for m in ("off", "on") for r in runs[m]),
                  all(r["rows"] == want for m in ("off", "on") for r in runs[m]))
     demo.outcome("overhead", "the reconciliation of the largest scope", "exit 0",

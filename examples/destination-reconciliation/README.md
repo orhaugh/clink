@@ -82,16 +82,16 @@ A restored run's first checkpoint shows the at-least-once contract at work: rows
 
 ## Measured
 
-The `overhead` scenario of one qualification run, on an Apple M2 Pro with 32 GB, Docker Desktop, sharing the machine with other work. 40,000 events from a pre-filled topic, 25,758 rows owed, parallelism 2, checkpoints every second; each mode run three times, alternating, medians shown:
+The `overhead` scenario on an Apple M2 Pro with 32 GB, Docker Desktop, sharing the machine with other work: 40,000 events from a pre-filled topic, 25,758 rows owed, parallelism 2, checkpoints every second. Each mode ran five times, alternating. The Workers' CPU and what the recorder wrote are taken once a checkpoint has completed after the last row landed, since the recorder writes an epoch when the next barrier passes. Medians:
 
 | What | Recorder off | Recorder on |
 | --- | --- | --- |
-| Time from submission until every row was in ClickHouse | 1.28 s | 1.12 s |
-| Both Workers' CPU time | 0.47 s | 0.67 s (+43%) |
-| What the recorder wrote | nothing | 21.5 MB in 20 files |
+| Time from submission until every row was in ClickHouse | 1.13 s | 1.03 s |
+| Both Workers' CPU time | 0.47 s (0.45 to 0.49) | 0.72 s (0.69 to 0.74), +53% |
+| What the recorder wrote | nothing | 21.5 MB in 22 files |
 
-The three runs with the recorder on took 0.49, 0.67 and 0.71 CPU seconds, and the three without it 0.45 to 0.48, so the increase varied from about 4% to 51% between runs. The time to land is dominated by start-up at this size, and did not move.
+At this size the time to land is start-up, and the recorder did not move it.
 
-Reconciling the largest scope of the last run (one checkpoint covering all 25,758 rows) took 1.81 s: 52 bounded queries, two reads of 26 chunks of up to 1,000 keys, into a table sorted by the key. Its bundle held 21.5 MB in 34 files.
+Reconciling the largest scope of the last run (one checkpoint covering all 25,758 rows) took 1.87 s: 52 bounded queries, two reads of 26 chunks of up to 1,000 keys, against a table sorted by the key. Its bundle held 21.5 MB in 34 files.
 
 These are one run's figures on one machine, for this job, not a benchmark. The recorder captures every operator's input and the sink's, so its cost grows with the job's operators and rows. Arm it for the jobs whose destination you will reconcile, and size `--capture-records` to the rows a checkpoint interval carries.
