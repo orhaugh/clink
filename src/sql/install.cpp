@@ -1091,15 +1091,20 @@ clink::config::JsonValue finalize_agg(const AggState& st, const AggSpec& spec) {
             if (st.sum_saw_decimal)
                 return clink::config::make_dec_value(
                     st.extras_read().running_sum_dec);  // exact decimal
-            // All-integer SUM: emit an exact int64 when it fits, else the exact
-            // decimal - never rounding the total through a double (past 2^53 the
-            // old running-double path lost precision).
+            // All-integer SUM is a BIGINT: the exact int64 when it fits, never
+            // rounded through a double (past 2^53 the old running-double path
+            // lost precision), and NULL past the int64 range, as integer
+            // overflow is in SQL arithmetic. It used to be the exact DECIMAL,
+            // which a BIGINT column then held as NULL anyway.
             if (auto i = clink::config::dec_to_int64(st.extras_read().running_sum_dec))
                 return clink::config::JsonValue{*i};
-            return clink::config::make_dec_value(st.extras_read().running_sum_dec);
+            return clink::config::JsonValue{nullptr};
         }
-        // A double was summed, or the exact sum overflowed: the double running_sum
-        // is the answer.
+        // A DECIMAL sum whose exact total overflowed is NULL, as DECIMAL
+        // arithmetic is; the double beside it is not of the declared type.
+        if (st.sum_dec_started && st.sum_saw_decimal)
+            return clink::config::JsonValue{nullptr};
+        // A double was summed: the double running_sum is the answer.
         return clink::config::JsonValue{st.running_sum};
     }
     if (spec.fn == "avg") {

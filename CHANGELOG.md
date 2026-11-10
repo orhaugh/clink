@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Every aggregate is of the type its query declares.** The type conformance
+suite now runs every aggregate over every column type through the operators a
+`GROUP BY`, each window and `OVER` compile to, with the columnar decoder and
+without it, and found 66 values of another type, all from `SUM`. A total over
+`DECIMAL(p, s)` was declared at the column's precision and outgrew it, so its
+column held it as NULL; it is now `DECIMAL(38, s)`. A BIGINT total past the
+int64 range was an exact DECIMAL; it is now NULL, as integer overflow is in SQL
+arithmetic. `SUM`, `AVG`, the variance family and `PERCENTILE` over text or a
+boolean folded nothing (`SUM('12')` was 0.0, typed as text) and are now refused
+at bind time with what to do instead.
+
 **A SQL value is of the type its expression is declared, so a DOUBLE column
 no longer receives a DECIMAL as NULL.** The binder types an expression from
 its operands' types, but the evaluator chose its arithmetic from their values

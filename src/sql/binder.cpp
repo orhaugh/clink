@@ -14,6 +14,8 @@
 #include <utility>
 #include <variant>
 
+#include <arrow/type_traits.h>
+
 #include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
 #include "clink/metrics/sql_metrics.hpp"
@@ -1955,6 +1957,23 @@ ast::Expression rewrite_expression(const ast::Expression& expr, const ExprLeafRe
 std::shared_ptr<arrow::DataType> aggregate_output_type(const std::string& fn,
                                                        const TableDef& source,
                                                        const std::string& input_column) {
+    // SUM, AVG, the variance family and PERCENTILE need a number. Over text or a
+    // boolean the runtime folded nothing (SUM('12') was 0.0, typed as text);
+    // PostgreSQL and DuckDB refuse them too.
+    if ((fn == "sum" || fn == "avg" || fn == "stddev" || fn == "stddev_pop" ||
+         fn == "stddev_samp" || fn == "variance" || fn == "var_pop" || fn == "var_samp" ||
+         fn == "percentile" || fn == "approx_percentile") &&
+        !input_column.empty()) {
+        for (const auto& c : source.columns) {
+            if (c.name == input_column && !is_arith_type(*c.type) &&
+                !arrow::is_temporal(c.type->id())) {
+                bind_error(fn + "(" + input_column + ") needs a numeric column, and " +
+                               input_column + " is " + arrow_to_sql_type_string(*c.type) +
+                               "; CAST it to a number in a derived table first",
+                           0);
+            }
+        }
+    }
     if (fn == "count")
         return arrow::int64();
     if (fn == "string_agg")
@@ -1977,13 +1996,19 @@ std::shared_ptr<arrow::DataType> aggregate_output_type(const std::string& fn,
     for (const auto& c : source.columns) {
         if (c.name == input_column) {
             if (fn == "sum") {
-                // SUM widens int -> int64, float -> float64; reuse the
-                // source type otherwise.
+                // SUM widens int -> int64, float -> float64, and a DECIMAL to
+                // the widest precision at its scale, since a total outgrows its
+                // column's digits (a DECIMAL(10, 2) column holds 100000004.48
+                // as NULL); reuse the source type otherwise.
                 if (c.type->Equals(*arrow::int32()) || c.type->Equals(*arrow::int16())) {
                     return arrow::int64();
                 }
                 if (c.type->Equals(*arrow::float32()))
                     return arrow::float64();
+                if (is_decimal_type(c.type)) {
+                    return make_decimal(38,
+                                        static_cast<const arrow::Decimal128Type&>(*c.type).scale());
+                }
                 return c.type;
             }
             if (fn == "array_agg")
