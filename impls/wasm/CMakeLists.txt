@@ -60,13 +60,13 @@ else()
     endif()
 
     include(FetchContent)
+    # A prebuilt C API, fetched only: the SOURCE_SUBDIR does not exist, so
+    # FetchContent_MakeAvailable adds nothing to the build.
     FetchContent_Declare(wasmtime_capi
         URL "https://github.com/bytecodealliance/wasmtime/releases/download/v${_wt_ver}/${_wt_pkg}.tar.xz"
-        URL_HASH SHA256=${_wt_hash})
-    FetchContent_GetProperties(wasmtime_capi)
-    if(NOT wasmtime_capi_POPULATED)
-        FetchContent_Populate(wasmtime_capi)
-    endif()
+        URL_HASH SHA256=${_wt_hash}
+        SOURCE_SUBDIR clink-fetch-only)
+    FetchContent_MakeAvailable(wasmtime_capi)
 
     set(_wt_root "${wasmtime_capi_SOURCE_DIR}")
     if(NOT EXISTS "${_wt_root}/include/wasmtime.h")

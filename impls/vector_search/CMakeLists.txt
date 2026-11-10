@@ -31,11 +31,11 @@ FetchContent_Declare(simsimd
     # drift the checkout off the pinned tag (observed: v6.5.16 -> v7.7.0,
     # which renames the headers and breaks the build).
     UPDATE_DISCONNECTED TRUE
-    SYSTEM)
-FetchContent_GetProperties(simsimd)
-if(NOT simsimd_POPULATED)
-    FetchContent_Populate(simsimd)
-endif()
+    SYSTEM
+    # Headers only: a SOURCE_SUBDIR that does not exist makes
+    # FetchContent_MakeAvailable fetch the sources without adding the project.
+    SOURCE_SUBDIR clink-fetch-only)
+FetchContent_MakeAvailable(simsimd)
 if(EXISTS "${simsimd_SOURCE_DIR}/include")
     set(_vs_simd ON)
 endif()
@@ -44,13 +44,11 @@ FetchContent_Declare(usearch
     GIT_REPOSITORY https://github.com/unum-cloud/usearch.git
     GIT_TAG ${CLINK_USEARCH_TAG}
     GIT_SHALLOW TRUE
-    # See simsimd above: no update step on reconfigure.
+    # See simsimd above: no update step on reconfigure, and fetched only.
     UPDATE_DISCONNECTED TRUE
-    SYSTEM)
-FetchContent_GetProperties(usearch)
-if(NOT usearch_POPULATED)
-    FetchContent_Populate(usearch)
-endif()
+    SYSTEM
+    SOURCE_SUBDIR clink-fetch-only)
+FetchContent_MakeAvailable(usearch)
 if(EXISTS "${usearch_SOURCE_DIR}/include")
     set(_vs_hnsw ON)
 endif()

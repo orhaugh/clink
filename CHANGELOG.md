@@ -40,6 +40,18 @@ carried from an earlier restore. `tests/test_state_backend_factory.cpp` covers a
 that still receives its peer's offsets, and a caller that names no operators
 and keeps every row.
 
+**A source build keeps the pinned Arrow, and configures without warnings.**
+CMake prepends the pinned prefix (`~/.clink-deps`), but `find_package()` goes
+straight to a cached `Arrow_DIR`, so a build directory first configured before
+the prefix existed, an IDE's included, kept Homebrew's Arrow and Parquet while
+taking Arrow compute from the prefix, and linked two Arrow installations; the
+version check could not tell, the versions being equal. A cached directory
+outside the prefix, for a package the prefix provides, is now dropped so the
+package is found there. The configure is also free of CMake 4.3's deprecation
+warnings: the dependencies that are fetched but not built use
+`FetchContent_MakeAvailable` with a `SOURCE_SUBDIR` that does not exist, and
+the iceberg targets link `SQLite3::SQLite3`.
+
 **Destination reconciliation: whether ClickHouse holds exactly what a
 checkpoint owed it.** Offline verification reads no destination, so nothing
 said whether a table held what a job wrote. With the flight recorder armed

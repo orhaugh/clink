@@ -352,11 +352,11 @@ FetchContent_Declare(
     GIT_TAG ${CLINK_SIMDJSON_TAG}
     GIT_SHALLOW TRUE
     SYSTEM
+    # A directory that does not exist, so FetchContent_MakeAvailable fetches the
+    # sources without adding simdjson as a subproject (see above).
+    SOURCE_SUBDIR clink-fetch-only
 )
-FetchContent_GetProperties(simdjson_src)
-if(NOT simdjson_src_POPULATED)
-    FetchContent_Populate(simdjson_src)
-endif()
+FetchContent_MakeAvailable(simdjson_src)
 set(CLINK_SIMDJSON_AMALGAMATED_DIR "${simdjson_src_SOURCE_DIR}/singleheader")
 
 # ---------------------------------------------------------------------------
@@ -654,6 +654,24 @@ endif()
 if(_clink_deps_prefix AND IS_DIRECTORY "${_clink_deps_prefix}")
     list(PREPEND CMAKE_PREFIX_PATH "${_clink_deps_prefix}")
     message(STATUS "clink::core - pinned toolchain prefix: ${_clink_deps_prefix}")
+    # find_package() goes straight to a cached <Pkg>_DIR, past the prefix above,
+    # so a build directory first configured before the prefix existed kept the
+    # Homebrew or system copy it found then. The version check below cannot see
+    # it when the versions match, and a package first looked up later came from
+    # the prefix: one build linked Homebrew's Arrow with the pinned Arrow
+    # compute. A cached directory outside the prefix, for a package the prefix
+    # has, is dropped so the package is found in the prefix.
+    foreach(_clink_pkg IN ITEMS Arrow ArrowCompute ArrowAcero ArrowDataset Parquet iceberg)
+        if(DEFINED CACHE{${_clink_pkg}_DIR} AND
+           IS_DIRECTORY "${_clink_deps_prefix}/lib/cmake/${_clink_pkg}")
+            cmake_path(IS_PREFIX _clink_deps_prefix "${${_clink_pkg}_DIR}" NORMALIZE _clink_in)
+            if(NOT _clink_in)
+                message(STATUS "clink::core - ${_clink_pkg}_DIR was ${${_clink_pkg}_DIR}, "
+                               "outside the pinned prefix; finding ${_clink_pkg} there")
+                unset(${_clink_pkg}_DIR CACHE)
+            endif()
+        endif()
+    endforeach()
 endif()
 
 # Apache Arrow - required (the wire format, state snapshots and the Parquet/

@@ -78,8 +78,10 @@ Arrow, Parquet, and iceberg-cpp are pinned at the exact versions in
 `scripts/versions.env` and installed into `CLINK_DEPS_PREFIX` (host default
 `~/.clink-deps`), so the host and the Debian image link byte-for-byte identical
 libraries. CMake auto-prepends that prefix and asserts the Arrow version, so any
-`cmake` invocation finds it once it exists. Bootstrap it once on a fresh checkout;
-idempotent afterwards:
+`cmake` invocation finds it once it exists, and drops a cached `Arrow_DIR`,
+`Parquet_DIR` (and the like) that points outside it, so a build directory
+configured before the prefix existed, CLion's included, switches to it. Bootstrap
+it once on a fresh checkout; idempotent afterwards:
 
 ```bash
 scripts/build-arrow.sh && scripts/build-iceberg-cpp.sh   # -> ~/.clink-deps

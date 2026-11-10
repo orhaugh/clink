@@ -62,13 +62,13 @@ else()
     endif()
 
     include(FetchContent)
+    # A prebuilt runtime, fetched only: the SOURCE_SUBDIR does not exist, so
+    # FetchContent_MakeAvailable adds nothing to the build.
     FetchContent_Declare(onnxruntime
         URL "https://github.com/microsoft/onnxruntime/releases/download/v${_ort_ver}/${_ort_pkg}.tgz"
-        URL_HASH SHA256=${_ort_hash})
-    FetchContent_GetProperties(onnxruntime)
-    if(NOT onnxruntime_POPULATED)
-        FetchContent_Populate(onnxruntime)
-    endif()
+        URL_HASH SHA256=${_ort_hash}
+        SOURCE_SUBDIR clink-fetch-only)
+    FetchContent_MakeAvailable(onnxruntime)
 
     # ExternalProject strips a single leading directory, so the runtime usually lands
     # directly in SOURCE_DIR; fall back to a globbed subdir if not.

@@ -80,13 +80,25 @@ foreach(_ice_tgt IN ITEMS iceberg::iceberg_static iceberg::iceberg_data_static
                           iceberg::iceberg_bundle_static)
     if(TARGET ${_ice_tgt})
         get_target_property(_ice_link ${_ice_tgt} INTERFACE_LINK_LIBRARIES)
-        # Under CLINK_STATIC_ARROW clink_core itself links the static Arrow, so the
-        # static interface is already the process's one runtime; leave it.
-        if(_ice_link AND NOT CLINK_STATIC_ARROW)
-            string(REPLACE "Arrow::arrow_static" "Arrow::arrow_shared" _ice_link "${_ice_link}")
-            string(REPLACE "Parquet::parquet_static" "Parquet::parquet_shared" _ice_link
-                           "${_ice_link}")
-            set_target_properties(${_ice_tgt} PROPERTIES INTERFACE_LINK_LIBRARIES "${_ice_link}")
+        if(_ice_link)
+            set(_ice_link_was "${_ice_link}")
+            # Under CLINK_STATIC_ARROW clink_core itself links the static Arrow, so
+            # the static interface is already the process's one runtime; leave it.
+            if(NOT CLINK_STATIC_ARROW)
+                string(REPLACE "Arrow::arrow_static" "Arrow::arrow_shared" _ice_link
+                               "${_ice_link}")
+                string(REPLACE "Parquet::parquet_static" "Parquet::parquet_shared" _ice_link
+                               "${_ice_link}")
+            endif()
+            # iceberg-cpp links SQLite::SQLite3, which CMake 4.3's FindSQLite3 keeps
+            # only as a deprecated name for SQLite3::SQLite3.
+            if(TARGET SQLite3::SQLite3)
+                string(REPLACE "SQLite::SQLite3" "SQLite3::SQLite3" _ice_link "${_ice_link}")
+            endif()
+            if(NOT _ice_link STREQUAL _ice_link_was)
+                set_target_properties(${_ice_tgt} PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                             "${_ice_link}")
+            endif()
         endif()
     endif()
 endforeach()
