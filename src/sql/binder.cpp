@@ -114,6 +114,12 @@ clink::config::JsonValue lower_predicate(const ast::Expression& expr, const Tabl
 // pick element_at (array) vs map_get (map) at bind time.
 std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
                                                  const TableDef& source);
+// Defined below with the decimal helpers; COALESCE, GREATEST and LEAST cast
+// their arguments to their common type as they are lowered.
+std::shared_ptr<arrow::DataType> common_argument_type(const ast::FunctionCall& fc,
+                                                      const TableDef& source);
+bool needs_numeric_cast(const arrow::DataType& from, const arrow::DataType& to);
+clink::config::JsonValue cast_value_to(clink::config::JsonValue lowered, const arrow::DataType& to);
 
 const char* arith_op_name(ast::ArithKind k) {
     switch (k) {
@@ -324,7 +330,8 @@ clink::config::JsonValue lower_value_expr(const ast::Expression& expr,
                 0);
         }
         JsonObject obj;
-        if (ScalarFunctionRegistry::global().lookup(fc.name).has_value()) {
+        const bool udf = ScalarFunctionRegistry::global().lookup(fc.name).has_value();
+        if (udf) {
             // A user-defined function shadows a built-in of the same name
             // (design record 011): the plan names the call as a UDF explicitly,
             // so the evaluator never routes it to a built-in that a later
@@ -338,6 +345,21 @@ clink::config::JsonValue lower_value_expr(const ast::Expression& expr,
         JsonArray args;
         for (const auto& sub : fc.args) {
             args.emplace_back(lower_value_expr(sub, source, source_alias));
+        }
+        // COALESCE, GREATEST and LEAST return the argument they choose as it
+        // is, so an argument of another numeric type is cast to the type the
+        // result is declared as before it can be chosen. Without the cast,
+        // COALESCE(bigint_col, 0.5) gave a DECIMAL where the plan declared
+        // BIGINT whenever the column was NULL.
+        if (!udf && !fc.args.empty() &&
+            (fc.name == "coalesce" || fc.name == "greatest" || fc.name == "least")) {
+            const auto result = common_argument_type(fc, source);
+            for (std::size_t i = 0; i < fc.args.size(); ++i) {
+                if (!std::holds_alternative<ast::NullLiteral>(fc.args[i]) &&
+                    needs_numeric_cast(*infer_expr_type(fc.args[i], source), *result)) {
+                    args[i] = cast_value_to(std::move(args[i]), *result);
+                }
+            }
         }
         obj["args"] = JsonValue{std::move(args)};
         return JsonValue{std::move(obj)};
@@ -519,13 +541,105 @@ std::shared_ptr<arrow::DataType> arith_decimal_type(ast::ArithKind op,
             p = p1 + s2 + s;
             break;
         case ast::ArithKind::Mod:
+            // |a % b| < |b|, and has a's sign: the integer digits are the
+            // fewer of the two, at the larger scale. min(p1, p2) left too few
+            // digits for the scale, which make_decimal then cut, so 2.0000 % 2.5
+            // was declared at scale 2 and a DECIMAL column re-rounded it.
             s = std::max(s1, s2);
-            p = std::min(p1, p2);
+            p = std::min(p1 - s1, p2 - s2) + s;
             break;
         default:
             return nullptr;
     }
     return make_decimal(p, s);
+}
+
+bool is_float_type(const arrow::DataType& t) {
+    return t.id() == arrow::Type::DOUBLE || t.id() == arrow::Type::FLOAT;
+}
+
+bool is_integer_id(const arrow::DataType& t) {
+    return t.id() == arrow::Type::INT64 || t.id() == arrow::Type::INT32 ||
+           t.id() == arrow::Type::INT16 || t.id() == arrow::Type::INT8;
+}
+
+bool is_arith_type(const arrow::DataType& t) {
+    return is_integer_id(t) || is_float_type(t) || t.id() == arrow::Type::DECIMAL128;
+}
+
+// The type COALESCE, GREATEST and LEAST declare for their result. Numeric
+// arguments take their common type: DOUBLE when any is a float, else a DECIMAL
+// wide enough for every DECIMAL and integer among them, else BIGINT. Arguments
+// that are not all numeric keep the first argument's type, as before. A NULL
+// literal takes no part.
+std::shared_ptr<arrow::DataType> common_argument_type(const ast::FunctionCall& fc,
+                                                      const TableDef& source) {
+    std::vector<std::shared_ptr<arrow::DataType>> types;
+    for (const auto& a : fc.args) {
+        if (!std::holds_alternative<ast::NullLiteral>(a)) {
+            types.push_back(infer_expr_type(a, source));
+        }
+    }
+    if (types.empty()) {
+        return infer_expr_type(fc.args.at(0), source);
+    }
+    const auto all = [&](auto pred) { return std::all_of(types.begin(), types.end(), pred); };
+    if (all([&](const auto& t) { return t->Equals(*types.front()); })) {
+        return types.front();
+    }
+    if (!all([](const auto& t) { return is_arith_type(*t); })) {
+        return infer_expr_type(fc.args.at(0), source);
+    }
+    if (std::any_of(types.begin(), types.end(), [](const auto& t) { return is_float_type(*t); })) {
+        return arrow::float64();
+    }
+    if (all([](const auto& t) { return is_integer_id(*t); })) {
+        return arrow::int64();
+    }
+    int scale = 0;
+    int digits = 0;
+    for (const auto& t : types) {
+        const auto [p, s] = *decimal_ps_of(t);
+        scale = std::max(scale, s);
+        digits = std::max(digits, p - s);
+    }
+    return make_decimal(digits + scale, scale);
+}
+
+// Whether a value of numeric type `from` takes a cast to be a value of numeric
+// type `to`. One integer width for another takes none, and nor does one float
+// width for another: every integer is an exact int64 at runtime, and every
+// float a double.
+bool needs_numeric_cast(const arrow::DataType& from, const arrow::DataType& to) {
+    if (!is_arith_type(from) || !is_arith_type(to) || from.Equals(to)) {
+        return false;
+    }
+    return !(is_integer_id(from) && is_integer_id(to)) &&
+           !(is_float_type(from) && is_float_type(to));
+}
+
+// CAST(<lowered> AS <to>) in the lowered form the evaluator's casts read, for a
+// numeric `to`.
+clink::config::JsonValue cast_value_to(clink::config::JsonValue lowered,
+                                       const arrow::DataType& to) {
+    using clink::config::JsonArray;
+    using clink::config::JsonObject;
+    using clink::config::JsonValue;
+    JsonObject obj;
+    if (to.id() == arrow::Type::DECIMAL128) {
+        const auto& d = static_cast<const arrow::Decimal128Type&>(to);
+        obj["op"] = JsonValue{std::string{"cast_decimal"}};
+        obj["precision"] = JsonValue{static_cast<std::int64_t>(d.precision())};
+        obj["scale"] = JsonValue{static_cast<std::int64_t>(d.scale())};
+    } else if (is_float_type(to)) {
+        obj["op"] = JsonValue{std::string{"cast_float"}};
+    } else {
+        obj["op"] = JsonValue{std::string{"cast_int"}};
+    }
+    JsonArray args;
+    args.emplace_back(std::move(lowered));
+    obj["args"] = JsonValue{std::move(args)};
+    return JsonValue{std::move(obj)};
 }
 
 // Decimal type of a fractional literal: scale = fractional digit count,
@@ -637,19 +751,35 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
             }
             return t;
         }
-        if (fc.name == "abs" || fc.name == "mod") {
-            // Type-preserving on integers: ABS(BIGINT) is BIGINT and
-            // MOD(BIGINT, n) is BIGINT (ISO; Postgres and DuckDB agree).
-            // These were typed float64 alongside sqrt/exp, which is not a
-            // cosmetic difference - beyond 2^53 a double silently loses
-            // int64 exactness, and a typed BIGINT sink rejects the INSERT
-            // outright. Found by the differential oracle. Non-integer
-            // arguments keep the double typing below.
+        if (fc.name == "abs") {
+            // Type-preserving: ABS of an integer is an exact BIGINT, as
+            // negation is, and ABS of a DECIMAL keeps its precision and scale
+            // (ISO; Postgres and DuckDB agree). These were typed float64
+            // alongside sqrt/exp, which is not a cosmetic difference - beyond
+            // 2^53 a double silently loses int64 exactness, and a typed BIGINT
+            // sink rejects the INSERT outright. Found by the differential
+            // oracle. Anything else is a double. The evaluator follows the same
+            // rule.
             if (!fc.args.empty()) {
                 auto t = infer_expr_type(fc.args[0], source);
-                if (t->id() == arrow::Type::INT64 || t->id() == arrow::Type::DECIMAL128) {
+                if (is_integer_type(t)) {
+                    return arrow::int64();
+                }
+                if (is_decimal_type(t)) {
                     return t;
                 }
+            }
+            return arrow::float64();
+        }
+        if (fc.name == "mod" && fc.args.size() == 2) {
+            // MOD(a, b) evaluates as a % b, so it is typed as the operator is.
+            auto lt = infer_expr_type(fc.args[0], source);
+            auto rt = infer_expr_type(fc.args[1], source);
+            if (auto dt = arith_decimal_type(ast::ArithKind::Mod, lt, rt)) {
+                return dt;
+            }
+            if (is_integer_type(lt) && is_integer_type(rt)) {
+                return arrow::int64();
             }
             return arrow::float64();
         }
@@ -665,15 +795,18 @@ std::shared_ptr<arrow::DataType> infer_expr_type(const ast::Expression& expr,
             fc.name == "split_index") {
             return arrow::utf8();
         }
-        if ((fc.name == "nullif" || fc.name == "greatest" || fc.name == "least" ||
-             fc.name == "coalesce") &&
+        if ((fc.name == "greatest" || fc.name == "least" || fc.name == "coalesce") &&
             !fc.args.empty()) {
-            // Result type follows the first argument; binder does no
-            // type unification across siblings. coalesce belongs here and
+            // The arguments' common type (common_argument_type), to which
+            // the lowering casts each argument. coalesce belongs here and
             // used to fall through to the utf8 default, so COALESCE(v, -99)
             // over BIGINTs typed as VARCHAR - and an enclosing arithmetic
             // expression widened to DOUBLE. Found by the differential
             // oracle.
+            return common_argument_type(fc, source);
+        }
+        if (fc.name == "nullif" && !fc.args.empty()) {
+            // NULLIF(a, b) is a or NULL.
             return infer_expr_type(fc.args[0], source);
         }
         // Date/time: EXTRACT / DATE_TRUNC / TO_TIMESTAMP return epoch-
@@ -1249,12 +1382,15 @@ void check_sink_compatibility(const TableDef& sink, const arrow::Schema& source_
         // elements must match). A composite into a non-matching column falls to
         // the generic mismatch message, which renders both sides in SQL terms.
         // Implicit numeric assignment coercions. A DECIMAL source is assignable
-        // to a DECIMAL sink column of ANY precision/scale (the value keeps its
-        // own scale in v1; no sink-side re-quantise) or to a DOUBLE/FLOAT column
-        // (lossy). An INTEGER source is assignable to a DECIMAL column and - now
-        // that integer arithmetic yields exact int64 (F3) - to a DOUBLE/FLOAT
-        // column (widening), so `CREATE TABLE t (x DOUBLE); INSERT ... SELECT
-        // a + b` keeps working. Everything else stays strict.
+        // to a DECIMAL sink column of ANY precision/scale (re-quantised to the
+        // column's scale, HALF_UP) or to a DOUBLE/FLOAT column (lossy). An
+        // INTEGER source is assignable to a DECIMAL column and - now that
+        // integer arithmetic yields exact int64 (F3) - to a DOUBLE/FLOAT column
+        // (widening), so `CREATE TABLE t (x DOUBLE); INSERT ... SELECT a + b`
+        // keeps working. An INTEGER source is assignable to an INTEGER column at
+        // least as wide, and a REAL source to a DOUBLE column: each is the same
+        // value at runtime. assign_to_sink casts what these assign. Everything
+        // else stays strict.
         auto is_dec = [](const arrow::DataType& t) { return t.id() == arrow::Type::DECIMAL128; };
         auto is_real = [](const arrow::DataType& t) {
             return t.id() == arrow::Type::DOUBLE || t.id() == arrow::Type::FLOAT;
@@ -1263,8 +1399,17 @@ void check_sink_compatibility(const TableDef& sink, const arrow::Schema& source_
             return t.id() == arrow::Type::INT64 || t.id() == arrow::Type::INT32 ||
                    t.id() == arrow::Type::INT16 || t.id() == arrow::Type::INT8;
         };
-        const bool numeric_assignable = (is_dec(*src) && (is_dec(*dst) || is_real(*dst))) ||
-                                        (is_integral(*src) && (is_dec(*dst) || is_real(*dst)));
+        const auto width = [](const arrow::DataType& t) {
+            return t.id() == arrow::Type::INT64   ? 8
+                   : t.id() == arrow::Type::INT32 ? 4
+                   : t.id() == arrow::Type::INT16 ? 2
+                                                  : 1;
+        };
+        const bool numeric_assignable =
+            (is_dec(*src) && (is_dec(*dst) || is_real(*dst))) ||
+            (is_integral(*src) && (is_dec(*dst) || is_real(*dst))) ||
+            (is_integral(*src) && is_integral(*dst) && width(*src) <= width(*dst)) ||
+            (src->id() == arrow::Type::FLOAT && dst->id() == arrow::Type::DOUBLE);
         if (!src->Equals(*dst) && !numeric_assignable) {
             std::ostringstream msg;
             msg << "INSERT INTO " << sink.name << " column " << i << " ("
@@ -1274,6 +1419,54 @@ void check_sink_compatibility(const TableDef& sink, const arrow::Schema& source_
             bind_error(msg.str(), loc);
         }
     }
+}
+
+// The plan an INSERT writes to `sink`: `plan`, checked by
+// check_sink_compatibility, with every column of a type that is assignable to
+// its sink column's but is not that type cast to it where the value changes
+// (needs_numeric_cast) and declared as the column's type, so the sink receives
+// values of the types it declares. A DECIMAL written to a DOUBLE column used to
+// arrive as the decimal, which a columnar carrier then wrote as NULL. A
+// projection is rewritten in place; any other plan gets one on top.
+std::unique_ptr<LogicalPlan> assign_to_sink(std::unique_ptr<LogicalPlan> plan,
+                                            const TableDef& sink,
+                                            int loc) {
+    check_sink_compatibility(sink, *plan->schema(), loc);
+    const auto schema = plan->schema();
+    std::vector<std::size_t> assigned;
+    for (int i = 0; i < schema->num_fields(); ++i) {
+        const auto k = static_cast<std::size_t>(i);
+        if (!schema->field(i)->type()->Equals(*sink.columns[k].type)) {
+            assigned.push_back(k);
+        }
+    }
+    if (assigned.empty()) {
+        return plan;
+    }
+    std::vector<ProjectOutput> outs;
+    std::unique_ptr<LogicalPlan> input;
+    if (plan->kind() == "Project") {
+        auto& project = static_cast<LogicalProject&>(*plan);
+        outs = project.outputs();
+        input = std::move(project.input_mut());
+    } else {
+        for (const auto& f : schema->fields()) {
+            clink::config::JsonObject ref;
+            ref["col"] = clink::config::JsonValue{f->name()};
+            outs.push_back(ProjectOutput{
+                f->name(), clink::config::JsonValue{std::move(ref)}.serialize(0), f->type()});
+        }
+        input = std::move(plan);
+    }
+    for (const auto k : assigned) {
+        const auto& to = sink.columns[k].type;
+        if (needs_numeric_cast(*outs[k].type, *to)) {
+            outs[k].expr_json =
+                cast_value_to(clink::config::parse(outs[k].expr_json), *to).serialize(0);
+        }
+        outs[k].type = to;
+    }
+    return std::make_unique<LogicalProject>(std::move(input), std::move(outs));
 }
 
 // The event-time column a derived table's plan carries through unchanged, so
@@ -5403,7 +5596,7 @@ std::unique_ptr<LogicalPlan> Binder::bind_insert(const ast::InsertStmt& stmt) co
         select_plan = std::make_unique<LogicalProject>(std::move(select_plan), std::move(outs));
     }
 
-    check_sink_compatibility(sink, *select_plan->schema(), stmt.loc.pos);
+    select_plan = assign_to_sink(std::move(select_plan), sink, stmt.loc.pos);
 
     // delivery_guarantee='exactly_once' enables a 2PC
     // sink at runtime. Only the connectors that have a 2PC variant
@@ -5541,6 +5734,12 @@ std::shared_ptr<arrow::DataType> aggregate_type(const std::string& fn,
 
 void check_sink(const TableDef& sink, const arrow::Schema& source_schema, int loc) {
     check_sink_compatibility(sink, source_schema, loc);
+}
+
+std::unique_ptr<LogicalPlan> assign_sink(std::unique_ptr<LogicalPlan> plan,
+                                         const TableDef& sink,
+                                         int loc) {
+    return assign_to_sink(std::move(plan), sink, loc);
 }
 
 std::shared_ptr<arrow::Schema> build_group_output_schema(

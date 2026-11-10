@@ -20,7 +20,7 @@ It needs Docker, Python 3 (standard library only), and `clink_node` and `clink` 
 INSERT INTO payments
 SELECT event_id, account, kind, amount,
        CAST(amount * 100 AS BIGINT) AS amount_cents,
-       CAST(CAST(amount * 100 AS BIGINT) AS DOUBLE PRECISION) * CAST(0.029 AS DOUBLE PRECISION) AS fee,
+       CAST(CAST(amount * 100 AS BIGINT) AS DOUBLE PRECISION) * 0.029 AS fee,
        CASE WHEN amount >= 1000 THEN TRUE ELSE FALSE END AS flagged,
        note, ts AS occurred_at
 FROM events

@@ -52,6 +52,13 @@ std::shared_ptr<arrow::DataType> aggregate_type(const std::string& fn,
 // coercions). Throws TranslationError with the same message as the SQL path.
 void check_sink(const TableDef& sink, const arrow::Schema& source_schema, int loc);
 
+// The plan an INSERT writes to `sink`: check_sink, then every column of a type
+// assignable to its sink column's but not that type cast to it, so the sink
+// receives values of the types it declares. The SQL path's own step.
+std::unique_ptr<LogicalPlan> assign_sink(std::unique_ptr<LogicalPlan> plan,
+                                         const TableDef& sink,
+                                         int loc);
+
 // One output column of a GROUP BY result, in SELECT/agg() order: either a
 // passthrough group key (resolved source column -> output field name) or an
 // aggregate identified by its index into the parallel `aggregates` vector.

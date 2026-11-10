@@ -161,6 +161,19 @@ inline bool double_fits_float(double d) noexcept {
            std::fabs(d) <= static_cast<double>(std::numeric_limits<float>::max());
 }
 
+// A DECIMAL value (a dec-string) as the nearest double, or nothing for any other
+// value.
+inline std::optional<double> decimal_as_double(const clink::config::JsonValue& v) {
+    if (!clink::config::is_dec_string(v)) {
+        return std::nullopt;
+    }
+    const auto d = clink::config::dec_parse(v.as_string());
+    if (!d) {
+        return std::nullopt;
+    }
+    return clink::config::dec_to_double(*d);
+}
+
 // An empty typed builder for one effective column type. Pairs with
 // append_json_cell below: whatever builder this hands back, that function knows
 // how to append to.
@@ -199,7 +212,10 @@ inline std::unique_ptr<arrow::ArrayBuilder> make_cell_builder(
 // agree by construction rather than by a test that has to notice they drifted.
 //
 // A value of the wrong JSON kind for the column appends a null, which is the
-// long-standing behaviour of the row path and so is preserved deliberately.
+// long-standing behaviour of the row path and so is preserved deliberately. The
+// one exception is a DECIMAL in a DOUBLE or REAL column, which is converted as
+// SQL assigns a DECIMAL to a float: a NULL there lost a value the plan declared
+// assignable.
 inline void append_json_cell(arrow::ArrayBuilder& builder,
                              const arrow::DataType& eff,
                              const clink::config::JsonValue* v) {
@@ -238,6 +254,8 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
             auto& b = static_cast<arrow::DoubleBuilder&>(builder);
             if (v && v->is_number())
                 (void)b.Append(v->as_number());
+            else if (const auto d = v ? decimal_as_double(*v) : std::nullopt)
+                (void)b.Append(*d);
             else
                 (void)b.AppendNull();
             break;
@@ -246,8 +264,11 @@ inline void append_json_cell(arrow::ArrayBuilder& builder,
             // A finite double beyond float's range is null: the narrowing
             // conversion is undefined for it, and in practice gave infinity.
             auto& b = static_cast<arrow::FloatBuilder&>(builder);
-            if (v && v->is_number() && double_fits_float(v->as_number()))
-                (void)b.Append(static_cast<float>(v->as_number()));
+            const auto d = v == nullptr     ? std::nullopt
+                           : v->is_number() ? std::optional<double>{v->as_number()}
+                                            : decimal_as_double(*v);
+            if (d && double_fits_float(*d))
+                (void)b.Append(static_cast<float>(*d));
             else
                 (void)b.AppendNull();
             break;

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+**A SQL value is of the type its expression is declared, so a DOUBLE column
+no longer receives a DECIMAL as NULL.** The binder types an expression from
+its operands' types, but the evaluator chose its arithmetic from their values
+and read a whole double such as 2.0 as an exact decimal: `DOUBLE PRECISION *
+0.029` gave a DECIMAL where the plan declared DOUBLE, a columnar carrier wrote
+it into the DOUBLE column as NULL, and a sink whose column takes no NULL
+refused the row until the job's restart budget ran out. A new suite,
+`tests/test_sql_type_conformance.cpp`, binds about 1,400 expressions over every
+numeric type and literal and evaluates each over every combination of its
+operands' values; 306 of them produced a value of another type than declared.
+Now any double operand computes in double; `ABS` keeps its argument's type and
+`SIGN` returns the double it is declared as; `MOD` is typed as `%`, and a
+DECIMAL `%` is declared at the scale it computes at instead of one cut to fit
+too small a precision; `COALESCE`, `GREATEST` and `LEAST` take their numeric
+arguments' common type and cast each argument to it, where they declared the
+first argument's type and returned whichever they chose; and `INSERT` casts
+each value to its column's type where SQL assigns one to the other, and now
+also takes an integer into a wider integer column and `REAL` into `DOUBLE
+PRECISION`. The suite requires every value to be of its declared type, and of
+its column's after an `INSERT`. A DECIMAL that still reaches a DOUBLE or REAL
+column on a columnar carrier is converted rather than written as NULL. One
+query that bound before is refused now: `COALESCE(bigint_col, 0.5)` is a
+DECIMAL, so inserting it into a BIGINT column needs a `CAST`.
+
 **Destination reconciliation: whether ClickHouse holds exactly what a
 checkpoint owed it.** Offline verification reads no destination, so nothing
 said whether a table held what a job wrote. With the flight recorder armed

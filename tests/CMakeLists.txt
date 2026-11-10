@@ -829,6 +829,7 @@ if(CLINK_BUILD_SQL)
         test_delta_sink.cpp
         test_sql_catalog.cpp
         test_sql_binder.cpp
+        test_sql_type_conformance.cpp
         test_sql_cardinality.cpp
         test_sql_physical.cpp
         test_column_lineage.cpp

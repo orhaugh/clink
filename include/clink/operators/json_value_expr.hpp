@@ -661,7 +661,7 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
     // --- Arithmetic (exact DECIMAL path #56) ---
     // #56: when an operand is a dec-string, compute EXACTLY in fixed point.
     // Returns nullopt to fall through to the double path (no decimal operand,
-    // or a decimal mixed with a non-integral double -> documented demote).
+    // or a decimal mixed with a double -> documented demote).
     auto decimal_binop = [&]() -> std::optional<JsonValue> {
         if (args.size() != 2)
             return std::nullopt;
@@ -669,10 +669,18 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
             return std::nullopt;
         if (args[0].is_null() || args[1].is_null())
             return value_expr_detail::null_value();
+        // A double operand takes the double path whatever its value. The
+        // binder types DECIMAL op DOUBLE as DOUBLE; reading a whole double
+        // such as 2.0 as a decimal gave a DECIMAL the plan does not declare,
+        // and a DOUBLE column then received it as NULL.
+        for (const auto& v : args) {
+            if (v.is_number() && !v.is_integral_number())
+                return std::nullopt;
+        }
         auto a = clink::config::as_decimal(args[0]);
         auto b = clink::config::as_decimal(args[1]);
         if (!a || !b)
-            return std::nullopt;  // decimal + non-integral double -> double path (lossy)
+            return std::nullopt;
         std::optional<clink::config::Decimal> r;
         if (op == ValueOp::Add)
             r = clink::config::dec_add(*a, *b);
@@ -1264,16 +1272,32 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
             ++cur;
         }
     }
-    // abs/floor/ceil/round accept a #56 dec-string operand via the double
-    // value (the binder types these float64, so the result is a double).
+    // ABS keeps its operand's type, as the binder declares it: an integer
+    // stays an exact integer (|INT64_MIN| overflows, so NULL, as negation
+    // does), a DECIMAL an exact DECIMAL, and anything else is a double.
     if (op == ValueOp::Abs) {
         if (args.size() != 1)
             throw std::runtime_error("json_value_expr: 'abs' takes one arg");
+        if (args[0].is_null())
+            return value_expr_detail::null_value();
+        if (clink::config::is_dec_string(args[0])) {
+            if (auto d = clink::config::as_decimal(args[0]))
+                return clink::config::make_dec_value(clink::config::dec_abs(*d));
+            return value_expr_detail::null_value();
+        }
+        if (args[0].is_integral_number()) {
+            const std::int64_t v = args[0].as_int();
+            if (v == INT64_MIN)
+                return value_expr_detail::null_value();
+            return JsonValue{v < 0 ? -v : v};
+        }
         auto n = value_expr_detail::numeric_as_double(args[0]);
         if (!n)
             return value_expr_detail::null_value();
         return JsonValue{std::fabs(*n)};
     }
+    // floor/ceil/round accept a #56 dec-string operand via the double value
+    // (the binder types these float64, so the result is a double).
     if (op == ValueOp::Floor) {
         if (args.size() != 1)
             throw std::runtime_error("json_value_expr: 'floor' takes one arg");
@@ -1500,7 +1524,7 @@ inline clink::config::JsonValue eval_value_op(ValueOp op,
     if (op == ValueOp::Log10)
         return unary_double([](double x) { return std::log10(x); });
     if (op == ValueOp::Sign)
-        return unary_double([](double x) { return (x > 0) - (x < 0); });
+        return unary_double([](double x) { return static_cast<double>((x > 0) - (x < 0)); });
     if (op == ValueOp::Power) {
         require_args(2);
         auto base = value_expr_detail::numeric_as_double(args[0]);

@@ -274,10 +274,11 @@ cluster::JobGraphSpec Table::insert_into(const std::string& sink_table) && {
     if (sink == nullptr) {
         throw clink::sql::TranslationError("INSERT INTO unknown table: " + sink_table, 0);
     }
-    // Validate the projected schema against the sink (same check + message as
-    // the SQL frontend), then build the sink node, optimise, and lower.
-    clink::sql::lowering::check_sink(*sink, *plan_->schema(), 0);
-    auto sink_node = std::make_unique<clink::sql::LogicalSink>(std::move(plan_), sink);
+    // Validate the projected schema against the sink and cast what it assigns
+    // (the SQL frontend's own step), then build the sink node, optimise, and
+    // lower.
+    auto sink_node = std::make_unique<clink::sql::LogicalSink>(
+        clink::sql::lowering::assign_sink(std::move(plan_), *sink, 0), sink);
     auto optimized = clink::sql::optimize(std::move(sink_node));
     clink::sql::PhysicalPlanner planner;
     return planner.compile(static_cast<const clink::sql::LogicalSink&>(*optimized));

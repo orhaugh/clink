@@ -399,6 +399,30 @@ Supported targets are integer (`BIGINT`/`INT`/`SMALLINT`), float
 through), text (`TEXT`/`VARCHAR`) and `BOOLEAN`. Casting to date, timestamp or
 `BYTEA` is not supported.
 
+### Result types
+
+An expression has one type, decided from its operands' types, and every value
+it produces is of that type:
+
+| Expression | Type |
+|---|---|
+| integer `+ - * / %` integer | `BIGINT` (integer division truncates toward zero) |
+| `DECIMAL` with `DECIMAL` or integer | `DECIMAL`, exact |
+| anything with `DOUBLE PRECISION` or `REAL` | `DOUBLE PRECISION`, whatever the values |
+| `ABS(x)` | the type of `x` (`BIGINT` for any integer) |
+| `MOD(a, b)` | as `a % b` |
+| `SIGN`, `FLOOR`, `CEIL`, `ROUND`, `TRUNC`, `SQRT`, `EXP`, `LN`, `LOG10`, `POWER` | `DOUBLE PRECISION` |
+| `COALESCE`, `GREATEST`, `LEAST` over numbers | their common type: `DOUBLE PRECISION` if any is a float, else a `DECIMAL` that holds every argument, else `BIGINT` |
+| `NULLIF(a, b)` | the type of `a` |
+| `CASE` | the branches' type, which they must share |
+
+`INSERT` converts each value to its column's type where SQL assigns one to the
+other: a `DECIMAL` or an integer into `DOUBLE PRECISION` or `REAL`, an integer or
+a `DECIMAL` into a `DECIMAL` column (rounded half up to the column's scale, NULL
+past its precision), an integer into a wider integer column, and `REAL` into
+`DOUBLE PRECISION`. Any other pairing is refused when the statement is compiled;
+`CAST` the value to say which conversion you want.
+
 ### JSON and collections
 
 | Form | Purpose |
