@@ -116,7 +116,7 @@ Rows of keys outside the scope are not attributable to it, and are not read.
 - **Exit 3**: none failed and one is unavailable or unsupported. The result is partial.
 - **Exit 2**: bad usage or a refused request.
 
-The checks are the bundle's integrity (`bundle.*`), `reconcile.scope`, `reconcile.destination` and `reconcile.rows`, in a versioned JSON report (`clink-reconcile-report`, version 1). The report records the observation's times on both clocks, the scope with its source ranges, the method, the assumptions, any mutations, and the first discrepancies.
+The checks are the bundle's integrity (`bundle.*`), `reconcile.scope`, `reconcile.destination` and `reconcile.rows`, in a versioned JSON report (`clink-reconcile-report`, version 1). The report records the observation's times on both clocks, the scope with its source ranges and the log they belong to (the topic, the cluster's id and the topic's id, which the Kafka source records beside its positions), the method, the assumptions, any mutations, and the first discrepancies.
 
 ## Three kinds of assurance
 
@@ -136,7 +136,6 @@ The following are not supported:
 - replicated, shared, distributed or row-rewriting tables, and tables with a TTL;
 - jobs that are not record-wise, where they need source positions or a key that repeats;
 - an embedded `clink run`, whose sinks the flight recorder does not record;
-- the Kafka cluster and topic ids, which the source does not checkpoint;
 - reading `system.query_log` as acknowledgement evidence;
 - continuous reconciliation, repair, signing.
 

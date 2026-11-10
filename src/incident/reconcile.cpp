@@ -748,13 +748,54 @@ std::string completed_marker_path(JobId job, std::uint64_t checkpoint) {
 namespace {
 
 constexpr std::string_view kKafkaOffsetPrefix = "__kafka_off__:";
+// The log the positions belong to, which the source records beside them
+// (KafkaSource::encode_identity in impls/kafka).
+constexpr std::string_view kKafkaIdentityKey = "__kafka_identity__";
+
+std::optional<SourceLog> parse_source_log(std::string_view bytes) {
+    try {
+        const auto v = config::parse(bytes);
+        if (!v.is_object() || !v.contains("version") || !v.at("version").is_integral_number() ||
+            v.at("version").as_int() != 1) {
+            return std::nullopt;
+        }
+        SourceLog log;
+        for (const auto& [field, out] : {std::pair{"topic", &log.topic},
+                                         std::pair{"cluster_id", &log.cluster_id},
+                                         std::pair{"topic_id", &log.topic_id}}) {
+            if (!v.contains(field) || !v.at(field).is_string()) {
+                return std::nullopt;
+            }
+            *out = v.at(field).as_string();
+        }
+        if (log.topic.empty()) {
+            return std::nullopt;
+        }
+        return log;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::string describe_log(const SourceLog& log) {
+    return "topic '" + log.topic + "' on cluster " +
+           (log.cluster_id.empty() ? std::string{"(id not recorded)"} : log.cluster_id) +
+           ", topic id " + (log.topic_id.empty() ? std::string{"(not recorded)"} : log.topic_id);
+}
 
 // Every Kafka source position in the bundle's snapshots of `checkpoint`:
-// (operator, partition) -> next offset to read. `complete` when every
-// participant the checkpoint's marker names had its snapshot read.
+// (operator, partition) -> next offset to read, and into `logs` each source's
+// log as it recorded it. `complete` when every participant the checkpoint's
+// marker names had its snapshot read.
 std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> kafka_positions(
-    const Bundle& b, std::uint64_t checkpoint, bool& complete, std::vector<std::string>& notes) {
+    const Bundle& b,
+    std::uint64_t checkpoint,
+    bool& complete,
+    std::vector<std::string>& notes,
+    std::map<std::uint64_t, SourceLog>& logs) {
     std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> out;
+    std::set<std::uint64_t> unreadable_logs;
+    std::set<std::uint64_t> disagreeing_logs;
     complete = false;
     const std::string suffix = "/checkpoint-" + std::to_string(checkpoint) + ".snap";
     const std::string prefix = "checkpoint/_state/" + std::to_string(b.job()) + "/";
@@ -775,6 +816,18 @@ std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> kafka_positions(
             for (const auto op : backend.operator_ids()) {
                 backend.scan_operator_state(
                     op, [&](StateBackend::KeyView key, StateBackend::ValueView value) {
+                        if (key == kKafkaIdentityKey) {
+                            const auto log = parse_source_log(value);
+                            if (!log) {
+                                unreadable_logs.insert(op.value());
+                                return;
+                            }
+                            const auto [it, fresh] = logs.emplace(op.value(), *log);
+                            if (!fresh && it->second != *log) {
+                                disagreeing_logs.insert(op.value());
+                            }
+                            return;
+                        }
                         if (!key.starts_with(kKafkaOffsetPrefix) || value.size() < 8) {
                             return;
                         }
@@ -813,6 +866,16 @@ std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> kafka_positions(
         } catch (const std::exception& e) {
             notes.push_back(a.path + " could not be read for source positions: " + e.what());
         }
+    }
+    for (const auto op : unreadable_logs) {
+        notes.push_back("checkpoint " + std::to_string(checkpoint) + ": the source (operator " +
+                        std::to_string(op) +
+                        ") recorded its log in a form this release does not read");
+    }
+    for (const auto op : disagreeing_logs) {
+        notes.push_back("checkpoint " + std::to_string(checkpoint) +
+                        ": the snapshots record different logs for the source (operator " +
+                        std::to_string(op) + "); the first read is reported");
     }
     if (stale > 0) {
         notes.push_back("checkpoint " + std::to_string(checkpoint) + ": " + std::to_string(stale) +
@@ -869,6 +932,17 @@ void describe_sources(const Bundle& b, SourcePositions& sp) {
 }
 
 }  // namespace
+
+std::optional<bool> SourceIdentity::same_log() const {
+    if (!start || !end) {
+        return std::nullopt;
+    }
+    const auto agree = [](const std::string& a, const std::string& b) {
+        return a.empty() || b.empty() || a == b;
+    };
+    return start->topic == end->topic && agree(start->cluster_id, end->cluster_id) &&
+           agree(start->topic_id, end->topic_id);
+}
 
 Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_op) {
     Scope sc;
@@ -1167,12 +1241,16 @@ Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_o
     // Where the sources stood at the checkpoints bounding the scope.
     describe_sources(b, sc.source);
     std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> from;
+    std::map<std::uint64_t, SourceLog> logs_from;
+    std::map<std::uint64_t, SourceLog> logs_to;
     if (sc.starts_after > 0) {
-        from = kafka_positions(b, sc.starts_after, sc.source.from_complete, sc.source.notes);
+        from = kafka_positions(
+            b, sc.starts_after, sc.source.from_complete, sc.source.notes, logs_from);
     } else {
         sc.source.from_complete = sc.starts_at_run_start;
     }
-    const auto to = kafka_positions(b, sc.checkpoint, sc.source.to_complete, sc.source.notes);
+    const auto to =
+        kafka_positions(b, sc.checkpoint, sc.source.to_complete, sc.source.notes, logs_to);
     std::set<std::pair<std::uint64_t, std::int32_t>> parts;
     for (const auto& [k, _] : from) {
         parts.insert(k);
@@ -1196,6 +1274,48 @@ Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_o
         sc.source.notes.push_back(
             "no Kafka source position is in the bundle's snapshots of the bounding checkpoints "
             "(collect with --include-state)");
+    }
+    // The log each source's positions belong to. A range is a range of one
+    // log only when the source recorded the same one at both ends: a topic
+    // deleted and created again restarts its offsets at 0.
+    std::set<std::uint64_t> source_ops;
+    for (const auto& k : parts) {
+        source_ops.insert(k.first);
+    }
+    for (const auto* logs : {&logs_from, &logs_to}) {
+        for (const auto& [op, _] : *logs) {
+            source_ops.insert(op);
+        }
+    }
+    for (const auto op : source_ops) {
+        SourceIdentity id;
+        id.op = op;
+        if (const auto it = logs_from.find(op); it != logs_from.end()) {
+            id.start = it->second;
+        }
+        if (const auto it = logs_to.find(op); it != logs_to.end()) {
+            id.end = it->second;
+        }
+        if (id.same_log() == std::optional<bool>{false}) {
+            sc.source.notes.push_back(
+                "the source (operator " + std::to_string(op) + ") recorded " +
+                describe_log(*id.start) + " at checkpoint " + std::to_string(sc.starts_after) +
+                ", and " + describe_log(*id.end) + " at checkpoint " +
+                std::to_string(sc.checkpoint) +
+                ": the scope's offsets of that source are not a range of one log");
+        } else if (sc.starts_after > 0 && !id.start && id.end) {
+            sc.source.notes.push_back("checkpoint " + std::to_string(sc.starts_after) +
+                                      " records no log for the source (operator " +
+                                      std::to_string(op) +
+                                      "), so whether the scope's offsets are of one log is "
+                                      "not known");
+        }
+        sc.source.identities.push_back(std::move(id));
+    }
+    if (!parts.empty() && logs_from.empty() && logs_to.empty()) {
+        sc.source.notes.push_back(
+            "the bounding checkpoints record no log for the sources' positions (their topic, "
+            "cluster and topic ids): a release before identities were recorded took them");
     }
     if (b.manifest.contains("delivery")) {
         sc.delivery = b.manifest.at("delivery");
@@ -1947,6 +2067,14 @@ std::string Report::render_text() const {
         if (!scope.source.from_complete || !scope.source.to_complete) {
             out << "             (positions from part of the participants' snapshots only)\n";
         }
+        for (const auto& id : scope.source.identities) {
+            out << "             op " << id.op << ": "
+                << (id.end ? describe_log(*id.end) : std::string{"no log recorded"});
+            if (id.start && id.same_log() == std::optional<bool>{false}) {
+                out << "; at the scope's start " << describe_log(*id.start);
+            }
+            out << "\n";
+        }
     }
     out << "\n";
     for (const auto& c : checks) {
@@ -2097,8 +2225,30 @@ std::string Report::render_json() const {
         src_notes.emplace_back(n);
     }
     src["notes"] = config::JsonValue{std::move(src_notes)};
-    src["cluster_and_topic_ids"] = config::JsonValue{std::string{
-        "not recorded: the Kafka source keeps no cluster or topic id in its checkpoint"}};
+    const auto log_json = [](const std::optional<SourceLog>& log) {
+        if (!log) {
+            return config::JsonValue{};
+        }
+        const auto id_or_null = [](const std::string& id) {
+            return id.empty() ? config::JsonValue{} : config::JsonValue{id};
+        };
+        config::JsonObject lj;
+        lj["topic"] = config::JsonValue{log->topic};
+        lj["cluster_id"] = id_or_null(log->cluster_id);
+        lj["topic_id"] = id_or_null(log->topic_id);
+        return config::JsonValue{std::move(lj)};
+    };
+    config::JsonArray identities;
+    for (const auto& id : scope.source.identities) {
+        config::JsonObject ij;
+        ij["op"] = config::JsonValue{std::to_string(id.op)};
+        ij["start"] = log_json(id.start);
+        ij["end"] = log_json(id.end);
+        const auto same = id.same_log();
+        ij["same_log"] = same ? config::JsonValue{*same} : config::JsonValue{};
+        identities.emplace_back(std::move(ij));
+    }
+    src["identities"] = config::JsonValue{std::move(identities)};
     scope_o["source"] = config::JsonValue{std::move(src)};
     o["scope"] = config::JsonValue{std::move(scope_o)};
     o["delivery"] = scope.delivery;

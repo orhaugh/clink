@@ -17,9 +17,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1243,6 +1246,332 @@ TEST(Kafka, SnapshotPrunesUnownedPartitionRowsAfterAssignment) {
     EXPECT_FALSE(
         backend.get_operator_state(op_id, StateBackend::KeyView{"__kafka_off__:2", 15}).has_value())
         << "non-owned partition 2 must be pruned";
+}
+
+// ---------------------------------------------------------------------------
+// The log a checkpoint's positions belong to (KafkaSource::Identity).
+
+namespace {
+
+constexpr std::string_view kIdentityRow = "__kafka_identity__";
+
+// The cluster id the brokers at `brokers` report, read on a handle of its own,
+// so what a source recorded is checked against a second reading.
+std::string cluster_id_at(const std::string& brokers) {
+    char err[512] = {};
+    rd_kafka_conf_t* conf = rd_kafka_conf_new();
+    rd_kafka_conf_set(conf, "bootstrap.servers", brokers.c_str(), err, sizeof(err));
+    rd_kafka_conf_set(conf, "log_level", "0", err, sizeof(err));
+    rd_kafka_t* rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, err, sizeof(err));
+    if (rk == nullptr) {
+        return "";
+    }
+    char* id = rd_kafka_clusterid(rk, 5'000);
+    std::string out = id != nullptr ? std::string{id} : std::string{};
+    if (id != nullptr) {
+        rd_kafka_mem_free(rk, id);
+    }
+    rd_kafka_destroy(rk);
+    return out;
+}
+
+std::optional<KafkaSource::Identity> recorded_identity(const InMemoryStateBackend& backend,
+                                                       OperatorId op) {
+    const auto row = backend.get_operator_state(op, kIdentityRow);
+    if (!row.has_value()) {
+        return std::nullopt;
+    }
+    return KafkaSource::decode_identity(
+        std::string_view{reinterpret_cast<const char*>(row->data()), row->size()});
+}
+
+void produce_payloads(const std::string& brokers, const std::string& topic, int count) {
+    KafkaSink::Options sink_opts;
+    sink_opts.brokers = brokers;
+    sink_opts.topic = topic;
+    SinkHarness sink_h(sink_opts);
+    Batch<KafkaMessage> batch;
+    for (int i = 0; i < count; ++i) {
+        batch.emplace(KafkaMessage{"payload-" + std::to_string(i)});
+    }
+    sink_h.sink->on_data(batch);
+    sink_h.sink->flush();
+}
+
+// One record per produce(), manual commit and the earliest reset, so a
+// restored source that resumed from its checkpoint is told apart from one
+// that started again at the beginning.
+KafkaSource::Options replay_options(const std::string& brokers,
+                                    const std::string& topic,
+                                    const std::string& group) {
+    KafkaSource::Options o;
+    o.brokers = brokers;
+    o.topic = topic;
+    o.group_id = group;
+    o.auto_offset_reset = "earliest";
+    o.commit_mode = KafkaSource::CommitMode::Manual;
+    o.max_batch_size = 1;
+    return o;
+}
+
+// Reads `n` records with a fresh source, then snapshots it. Returns how many
+// it read.
+std::size_t consume_and_snapshot(const std::string& brokers,
+                                 const std::string& topic,
+                                 std::size_t n,
+                                 InMemoryStateBackend& backend,
+                                 OperatorId op) {
+    SourceHarness a(replay_options(brokers, topic, "identity-first"));
+    const auto got = drain(*a.source, n, 5s).size();
+    a.source->snapshot_offset(backend, op, CheckpointId{1});
+    return got;
+}
+
+// The refusal a restored source's open() throws, or empty when it opened.
+std::string open_refusal(KafkaSource& source) {
+    try {
+        source.open();
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    source.close();
+    return "";
+}
+
+}  // namespace
+
+// The identity row is JSON, so a reader of the snapshots sees text, and is
+// never exactly 8 bytes: a restore's merge compares 8-byte operator rows as
+// offsets and keeps the greater. Bytes this source did not write, or a version
+// it does not know, are not an identity.
+TEST(Kafka, TheIdentityRowRoundTripsAndIsNeverReadAsAnOffset) {
+    const KafkaSource::Identity bare{.topic = "t", .cluster_id = "", .topic_id = ""};
+    const KafkaSource::Identity full{.topic = "orders",
+                                     .cluster_id = "5L6g3nShT-eMCtK--X86sw",
+                                     .topic_id = "GvDNfajHQH-CpHyoVE2vjw"};
+    for (const auto& id : {bare, full}) {
+        const auto row = KafkaSource::encode_identity(id);
+        EXPECT_NE(row.size(), 8U) << row;
+        EXPECT_TRUE(KafkaSource::decode_identity(row) == id) << row;
+    }
+    for (const std::string_view other :
+         {std::string_view{},
+          std::string_view{"12345678"},
+          std::string_view{"{}"},
+          std::string_view{"[1]"},
+          std::string_view{R"({"version":2,"topic":"t","cluster_id":"","topic_id":""})"},
+          std::string_view{R"({"version":1,"topic":"","cluster_id":"","topic_id":""})"},
+          std::string_view{R"({"version":1,"topic":"t","cluster_id":""})"},
+          std::string_view{R"({"version":1,"topic":"t","cluster_id":7,"topic_id":""})"}}) {
+        EXPECT_FALSE(KafkaSource::decode_identity(other).has_value()) << other;
+    }
+}
+
+// Kafka prints a topic or KRaft cluster id as its 16 bytes in URL-safe base64
+// without padding, as kafka-topics.sh --describe shows it; librdkafka's own
+// text form is standard base64, which differs wherever a '+' or '/' falls.
+// The first vector is a topic id Apache Kafka 3.9.1 assigned, the second one
+// librdkafka's mock cluster assigned.
+TEST(Kafka, AnIdReadsAsKafkaPrintsIt) {
+    EXPECT_EQ(KafkaSource::uuid_text(1941277378982920319LL, -9032957890187645041LL),
+              "GvDNfajHQH-CpHyoVE2vjw");
+    EXPECT_EQ(KafkaSource::uuid_text(4713850691145843899LL, -7263580189222546423LL),
+              "QWr2OoH6RLubMpRNT9NUCQ");
+    EXPECT_EQ(KafkaSource::uuid_text(283686952306183LL, 579005069656919567LL),
+              "AAECAwQFBgcICQoLDA0ODw");
+    EXPECT_EQ(KafkaSource::uuid_text(0, 0), "AAAAAAAAAAAAAAAAAAAAAA");
+    EXPECT_EQ(KafkaSource::uuid_text(-1, -1), "_____________________w");
+}
+
+// The rule a restore applies before any restored position is seeked: another
+// topic, another cluster, or the topic deleted and created again is refused,
+// naming both sides. An id either side lacks is not compared: a broker that
+// reports no topic id, as Redpanda 24.2 does not, or a checkpoint that
+// recorded none.
+TEST(Kafka, ARestoreRefusesPositionsRecordedForAnotherLog) {
+    const KafkaSource::Identity recorded{
+        .topic = "orders", .cluster_id = "cluster-1", .topic_id = "topic-id-1"};
+    EXPECT_FALSE(KafkaSource::identity_refusal(recorded, recorded).has_value());
+
+    const auto refused = [&](const KafkaSource::Identity& current,
+                             std::initializer_list<std::string_view> named) {
+        const auto r = KafkaSource::identity_refusal(recorded, current);
+        if (!r.has_value()) {
+            ADD_FAILURE() << "not refused";
+            return;
+        }
+        for (const auto n : named) {
+            EXPECT_NE(r->find(n), std::string::npos) << "'" << n << "' not in: " << *r;
+        }
+    };
+    auto other = recorded;
+    other.topic = "payments";
+    refused(other, {"'orders'", "'payments'"});
+    other = recorded;
+    other.cluster_id = "cluster-2";
+    refused(other, {"cluster-1", "cluster-2", "cluster that wrote it"});
+    other = recorded;
+    other.topic_id = "topic-id-2";
+    refused(other, {"topic-id-1", "topic-id-2", "deleted and created again"});
+
+    other = recorded;
+    other.topic_id.clear();
+    EXPECT_FALSE(KafkaSource::identity_refusal(recorded, other).has_value());
+    other = recorded;
+    other.cluster_id.clear();
+    EXPECT_FALSE(KafkaSource::identity_refusal(recorded, other).has_value());
+    auto bare = recorded;
+    bare.cluster_id.clear();
+    bare.topic_id.clear();
+    EXPECT_FALSE(KafkaSource::identity_refusal(bare, recorded).has_value());
+}
+
+// A snapshot records the log its positions belong to: the topic, the cluster's
+// id as the brokers report it, and the topic's id. Read again on the same
+// cluster it is the same; another cluster with a topic of that name is
+// another log.
+TEST(Kafka, ASnapshotRecordsTheLogItsPositionsBelongTo) {
+    MockCluster here;
+    MockCluster elsewhere;
+    const std::string topic = "identity-snapshot";
+    here.create_topic(topic);
+    elsewhere.create_topic(topic);
+    produce_payloads(here.brokers(), topic, 3);
+    produce_payloads(elsewhere.brokers(), topic, 3);
+
+    const OperatorId op{40};
+    InMemoryStateBackend first;
+    InMemoryStateBackend again;
+    InMemoryStateBackend other;
+    ASSERT_EQ(consume_and_snapshot(here.brokers(), topic, 2, first, op), 2U);
+    ASSERT_EQ(consume_and_snapshot(here.brokers(), topic, 1, again, op), 1U);
+    ASSERT_EQ(consume_and_snapshot(elsewhere.brokers(), topic, 2, other, op), 2U);
+
+    const auto id = recorded_identity(first, op);
+    ASSERT_TRUE(id.has_value());
+    EXPECT_EQ(id->topic, topic);
+    EXPECT_FALSE(id->cluster_id.empty());
+    EXPECT_EQ(id->cluster_id, cluster_id_at(here.brokers()));
+    EXPECT_EQ(id->topic_id.size(), 22U) << id->topic_id;  // 16 bytes, unpadded base64
+    EXPECT_TRUE(recorded_identity(again, op) == id);
+    const auto there = recorded_identity(other, op);
+    ASSERT_TRUE(there.has_value());
+    EXPECT_NE(there->cluster_id, id->cluster_id);
+    EXPECT_FALSE(KafkaSource::identity_refusal(*id, *id).has_value());
+    EXPECT_TRUE(KafkaSource::identity_refusal(*id, *there).has_value());
+}
+
+// Positions recorded on one cluster are refused on another, at open(), before
+// any is seeked: an offset names a record only in the cluster that wrote it.
+TEST(Kafka, ARestoreOntoAnotherClusterIsRefused) {
+    MockCluster recorded_on;
+    MockCluster restored_on;
+    const std::string topic = "identity-cluster";
+    recorded_on.create_topic(topic);
+    restored_on.create_topic(topic);
+    produce_payloads(recorded_on.brokers(), topic, 10);
+    produce_payloads(restored_on.brokers(), topic, 10);
+    InMemoryStateBackend backend;
+    const OperatorId op{41};
+    ASSERT_EQ(consume_and_snapshot(recorded_on.brokers(), topic, 6, backend, op), 6U);
+
+    MetricsRegistry metrics;
+    RuntimeContext ctx{op, "kafka_source", nullptr, &metrics};
+    KafkaSource restored(replay_options(restored_on.brokers(), topic, "identity-restored"));
+    restored.attach_runtime(&ctx);
+    ASSERT_TRUE(restored.restore_offset(backend, op));
+    const std::string refusal = open_refusal(restored);
+    ASSERT_FALSE(refusal.empty()) << "a restore onto another cluster opened";
+    EXPECT_NE(refusal.find(cluster_id_at(recorded_on.brokers())), std::string::npos) << refusal;
+    EXPECT_NE(refusal.find(cluster_id_at(restored_on.brokers())), std::string::npos) << refusal;
+}
+
+// A topic deleted and created again under its name gets a new id, and
+// positions recorded for the old one are refused. The mock cluster cannot
+// delete a topic, so this checkpoint records another id for the topic on this
+// cluster, which is what one taken before the topic was created again holds.
+// KafkaSourceIdentityLive deletes and creates a real one.
+TEST(Kafka, ARestoreOntoTheTopicCreatedAgainIsRefused) {
+    MockCluster mock;
+    const std::string topic = "identity-recreated";
+    mock.create_topic(topic);
+    produce_payloads(mock.brokers(), topic, 10);
+    InMemoryStateBackend backend;
+    const OperatorId op{42};
+    ASSERT_EQ(consume_and_snapshot(mock.brokers(), topic, 6, backend, op), 6U);
+    auto id = recorded_identity(backend, op);
+    ASSERT_TRUE(id.has_value());
+    const std::string current_id = id->topic_id;
+    id->topic_id = "AAAAAAAAAAAAAAAAAAAAAQ";
+    backend.put_operator_state(op, kIdentityRow, KafkaSource::encode_identity(*id));
+
+    MetricsRegistry metrics;
+    RuntimeContext ctx{op, "kafka_source", nullptr, &metrics};
+    KafkaSource restored(replay_options(mock.brokers(), topic, "identity-recreated-restored"));
+    restored.attach_runtime(&ctx);
+    ASSERT_TRUE(restored.restore_offset(backend, op));
+    const std::string refusal = open_refusal(restored);
+    ASSERT_FALSE(refusal.empty()) << "positions of the topic before it was created again opened";
+    for (const auto& named : {std::string{"deleted and created again"},
+                              std::string{"AAAAAAAAAAAAAAAAAAAAAQ"},
+                              current_id}) {
+        EXPECT_NE(refusal.find(named), std::string::npos) << named << " not in: " << refusal;
+    }
+}
+
+// A checkpoint written before identities were recorded has none: its positions
+// restore as they always did, and the restored source's next snapshot records
+// the log.
+TEST(Kafka, ACheckpointWithoutAnIdentityRestoresAsBefore) {
+    MockCluster mock;
+    const std::string topic = "identity-absent";
+    mock.create_topic(topic);
+    produce_payloads(mock.brokers(), topic, 10);
+    InMemoryStateBackend backend;
+    const OperatorId op{43};
+    ASSERT_EQ(consume_and_snapshot(mock.brokers(), topic, 6, backend, op), 6U);
+    backend.erase_operator_state(op, kIdentityRow);
+    ASSERT_FALSE(recorded_identity(backend, op).has_value());
+
+    MetricsRegistry metrics;
+    RuntimeContext ctx{op, "kafka_source", nullptr, &metrics};
+    KafkaSource restored(replay_options(mock.brokers(), topic, "identity-absent-restored"));
+    restored.attach_runtime(&ctx);
+    ASSERT_TRUE(restored.restore_offset(backend, op));
+    restored.open();
+    const auto resumed = drain(restored, 4, 5s);
+    restored.snapshot_offset(backend, op, CheckpointId{2});
+    restored.close();
+    ASSERT_EQ(resumed.size(), 4U);
+    EXPECT_EQ(resumed.front().payload, "payload-6");
+    const auto id = recorded_identity(backend, op);
+    ASSERT_TRUE(id.has_value());
+    EXPECT_EQ(id->topic, topic);
+    EXPECT_EQ(id->cluster_id, cluster_id_at(mock.brokers()));
+}
+
+// A snapshot taken between a restore and open() records the identity the
+// restore brought, as it records the restored positions; and an identity row
+// this release cannot read is refused at restore, since the log its positions
+// belong to is then unknown.
+TEST(Kafka, TheRestoredIdentityIsKeptUntilOpenAndAnUnreadableOneIsRefused) {
+    const OperatorId op{44};
+    const KafkaSource::Identity id{.topic = "kept", .cluster_id = "c", .topic_id = "i"};
+    InMemoryStateBackend restored_from;
+    restored_from.put_operator_state(op, kIdentityRow, KafkaSource::encode_identity(id));
+    KafkaSource::Options opts;
+    opts.brokers = "localhost:1";  // never contacted: open() is not called
+    opts.topic = "kept";
+    KafkaSource src(opts);
+    (void)src.restore_offset(restored_from, op);
+    InMemoryStateBackend snapshot;
+    src.snapshot_offset(snapshot, op, CheckpointId{1});
+    EXPECT_TRUE(recorded_identity(snapshot, op) == id);
+
+    InMemoryStateBackend unreadable;
+    unreadable.put_operator_state(op, kIdentityRow, R"({"version":2,"topic":"kept"})");
+    KafkaSource other(opts);
+    EXPECT_THROW((void)other.restore_offset(unreadable, op), std::runtime_error);
 }
 
 // A source whose group has never committed must consume even when the

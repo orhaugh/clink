@@ -11,18 +11,19 @@
 # job in a cluster of a coordinator and workers, kill processes or take the
 # server away at the points they name, and check the output exactly. The Kafka
 # connector's live suites (transaction resume, with and without SASL, the
-# end-of-input commit and the registry formats), the embedded resume, the
-# Kafka source's ownership, the PostgreSQL pipeline and sink, and the
-# PostgreSQL transport refusals run against servers of their own too.
+# end-of-input commit, the registry formats, and the source's identity check on
+# Apache Kafka and Redpanda), the embedded resume, the Kafka source's
+# ownership, the PostgreSQL pipeline and sink, and the PostgreSQL transport
+# refusals run against servers of their own too.
 #
-# The servers are a Kafka broker (tests/integration/docker_kafka.hpp),
-# PostgreSQL (docker_postgres.hpp) and SILO, the S3 store (docker_minio.hpp),
-# each on a free host port. Needs a Docker daemon, curl, openssl, and a build
-# with CLINK_INTEGRATION_TESTS and the Kafka, PostgreSQL, S3 and schema
-# registry connectors (clink_integration_tests, clink_kafka_tests, clink_node,
-# clink_submit_job, clink_submit_sql, the clink CLI and the three 2PC job
-# plugins). Each suite runs in a process of its own and shares one server
-# across its cases. With CLINK_TEST_S3_TRACE=1 the S3 store's trace of every
+# The servers are a Kafka broker (tests/integration/docker_kafka.hpp: Redpanda,
+# and Apache Kafka for the identity check), PostgreSQL (docker_postgres.hpp)
+# and SILO, the S3 store (docker_minio.hpp), each on a free host port. Needs a
+# Docker daemon, curl, openssl, and a build with CLINK_INTEGRATION_TESTS and the
+# Kafka, PostgreSQL, S3 and schema registry connectors (clink_integration_tests,
+# clink_kafka_tests, clink_node, clink_submit_job, clink_submit_sql, the clink
+# CLI and the three 2PC job plugins). Each suite runs in a process of its own
+# and shares one server across its cases. With CLINK_TEST_S3_TRACE=1 the S3 store's trace of every
 # call goes to a file in the temporary directory, its path printed on stderr.
 # Reports land in REPORT_DIR (default <build-dir>/docker-suites-reports). This
 # is what the docker-suites CI workflow runs.
@@ -63,6 +64,7 @@ run postgres-transport "${IT}" --gtest_filter='Qual12PgTransportLive.*'
 run kafka-txn-resume "${KT}" --gtest_filter='TxnResumeLive.*:TxnResumeSaslLive.*'
 run kafka-end-of-input "${KT}" --gtest_filter='KafkaTxnEndOfInputLive.*'
 run kafka-registry-formats "${KT}" --gtest_filter='KafkaRegistryFormatsLive.*'
+run kafka-source-identity "${KT}" --gtest_filter='KafkaSourceIdentityLive.*'
 
 python3 scripts/check-gtest-reports.py \
     --expect 'PostgresExactlyOnceTest.*=5' \
@@ -79,5 +81,6 @@ python3 scripts/check-gtest-reports.py \
     --expect 'TxnResumeSaslLive.*=4' \
     --expect 'KafkaTxnEndOfInputLive.*=3' \
     --expect 'KafkaRegistryFormatsLive.*=3' \
+    --expect 'KafkaSourceIdentityLive.*=2' \
     "${reports[@]}" || rc=1
 exit "${rc}"

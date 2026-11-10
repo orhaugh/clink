@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -147,8 +148,10 @@ public:
     // subtask the union of all subtasks' operator rows, which is what a
     // rescale needs and what deterministic ownership makes safe), and open()
     // assigns each owned partition at its restored offset. The clink
-    // checkpoint is the source of truth on recovery. Runs on the
-    // source-runner thread between produce() calls.
+    // checkpoint is the source of truth on recovery. Each snapshot also
+    // records the Identity of the log the positions belong to, and open()
+    // refuses restored positions recorded for another (identity_refusal).
+    // Runs on the source-runner thread between produce() calls.
     void snapshot_offset(StateBackend& backend, OperatorId op_id, CheckpointId ckpt_id) override;
     bool restore_offset(StateBackend& backend, OperatorId op_id) override;
 
@@ -163,6 +166,39 @@ public:
     static bool owns_partition(std::int32_t partition,
                                std::uint32_t source_parallelism,
                                std::uint32_t subtask_index) noexcept;
+
+    // The log the checkpointed positions belong to. An offset names a record
+    // only in one topic of one cluster, and only until the topic is deleted:
+    // Kafka gives a topic a new id when it is created again under its name,
+    // and the new topic's offsets start again at 0. open() reads the
+    // cluster's id and the topic's from the brokers, every snapshot records
+    // them beside the positions, and a restore refuses positions recorded for
+    // another log. An id the brokers do not report is left empty and not
+    // compared: Redpanda 24.2 reports no topic ids, a broker before Kafka 2.8
+    // neither.
+    struct Identity {
+        std::string topic;
+        std::string cluster_id;
+        std::string topic_id;  // as Kafka's tools print it
+        bool operator==(const Identity&) const = default;
+    };
+
+    // The identity's checkpoint row (a JSON object, never exactly 8 bytes,
+    // which a restore's merge would compare as an offset) and back. nullopt
+    // for bytes this source did not write.
+    static std::string encode_identity(const Identity& identity);
+    static std::optional<Identity> decode_identity(std::string_view bytes);
+
+    // Why a source that reads `current` must not resume from positions
+    // recorded for `recorded`: another topic, another cluster, or the topic
+    // deleted and created again. nullopt when it may. An id either side lacks
+    // is not compared.
+    static std::optional<std::string> identity_refusal(const Identity& recorded,
+                                                       const Identity& current);
+
+    // A Kafka UUID (a topic or KRaft cluster id) as Kafka prints it: its 16
+    // bytes, most significant first, in URL-safe base64 without padding.
+    static std::string uuid_text(std::int64_t most_significant, std::int64_t least_significant);
 
     std::string name() const override { return "kafka_source"; }
 

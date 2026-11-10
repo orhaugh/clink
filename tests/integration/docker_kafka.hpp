@@ -40,6 +40,12 @@ struct DockerKafkaOptions {
     // default: the extra readiness probe is only worth paying when a test
     // speaks the registry.
     bool schema_registry{false};
+    // Run Apache Kafka (the apache/kafka:3.9.1 image the destination
+    // reconciliation example runs, one KRaft node) instead of Redpanda, for a
+    // test that needs what Redpanda 24.2 does not report: a topic's id, which
+    // Kafka assigns again when a topic is deleted and created under its name.
+    // Not with sasl or schema_registry.
+    bool apache_kafka{false};
 };
 
 class DockerKafka {
@@ -57,6 +63,14 @@ public:
                           : "";
         const std::string registry_flags =
             options_.schema_registry ? " --schema-registry-addr 0.0.0.0:8081" : "";
+        if (options_.apache_kafka) {
+            if (options_.sasl || options_.schema_registry) {
+                throw std::invalid_argument(
+                    "DockerKafka: apache_kafka runs without SASL and without a registry");
+            }
+            start_apache_kafka_();
+            return;
+        }
         const auto started = start_on_free_ports(
             "DockerKafka",
             options_.schema_registry ? 2 : 1,
@@ -150,12 +164,55 @@ public:
     // Create a topic explicitly (1 partition unless asked otherwise), so a
     // test does not depend on auto-creation racing the first produce.
     void create_topic(const std::string& name, int partitions = 1) const {
-        const std::string cmd = "docker exec " + container_name_ + " rpk topic create " + name +
-                                " -p " + std::to_string(partitions) + rpk_auth_() +
-                                " > /dev/null 2>&1";
+        const std::string cmd =
+            options_.apache_kafka
+                ? "docker exec " + container_name_ + " " + kKafkaTopics_ + " --create --topic " +
+                      name + " --partitions " + std::to_string(partitions) +
+                      " --replication-factor 1 > /dev/null 2>&1"
+                : "docker exec " + container_name_ + " rpk topic create " + name + " -p " +
+                      std::to_string(partitions) + rpk_auth_() + " > /dev/null 2>&1";
         if (std::system(cmd.c_str()) != 0) {
-            throw std::runtime_error("DockerKafka: rpk topic create " + name + " failed");
+            throw std::runtime_error("DockerKafka: creating topic " + name + " failed");
         }
+    }
+
+    // Delete a topic, then create it again under its name with `partitions`
+    // partitions. Deletion completes in the background, so the create is
+    // retried while the broker still holds the old topic.
+    void recreate_topic(const std::string& name, int partitions = 1) const {
+        const std::string del = options_.apache_kafka
+                                    ? "docker exec " + container_name_ + " " + kKafkaTopics_ +
+                                          " --delete --topic " + name + " > /dev/null 2>&1"
+                                    : "docker exec " + container_name_ + " rpk topic delete " +
+                                          name + rpk_auth_() + " > /dev/null 2>&1";
+        if (std::system(del.c_str()) != 0) {
+            throw std::runtime_error("DockerKafka: deleting topic " + name + " failed");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        for (;;) {
+            try {
+                create_topic(name, partitions);
+                return;
+            } catch (const std::runtime_error&) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    throw;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        }
+    }
+
+    // The topic's id as Kafka's own tool prints it (`kafka-topics.sh
+    // --describe`), or empty when it prints none. Apache Kafka only.
+    [[nodiscard]] std::string topic_id(const std::string& name) const {
+        const auto r = run_docker_command("docker exec " + container_name_ + " " + kKafkaTopics_ +
+                                          " --describe --topic " + name);
+        const auto at = r.out.find("TopicId: ");
+        if (r.status != 0 || at == std::string::npos) {
+            return "";
+        }
+        const auto from = at + 9;
+        return r.out.substr(from, r.out.find_first_of(" \t\n", from) - from);
     }
 
     static bool docker_available() { return std::system("docker info > /dev/null 2>&1") == 0; }
@@ -189,6 +246,52 @@ public:
     }
 
 private:
+    static constexpr const char* kKafkaTopics_ =
+        "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092";
+
+    // One KRaft node that is broker and controller: `PLAINTEXT` on 9092 for
+    // the tools inside the container, `HOST` on 19092 advertised at the
+    // mapped host port for the test's clients.
+    void start_apache_kafka_() {
+        const auto started = start_on_free_ports(
+            "DockerKafka",
+            1,
+            named_by_port("clink_test_ak_"),
+            [&](const std::vector<std::uint16_t>& ports, const std::string& name) {
+                const std::string port = std::to_string(ports[0]);
+                return "docker run -d --rm -p " + port + ":19092 --name " + name +
+                       " -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller"
+                       " -e KAFKA_LISTENERS=PLAINTEXT://:9092,HOST://:19092,CONTROLLER://:9093"
+                       " -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092,"
+                       "HOST://127.0.0.1:" +
+                       port +
+                       " -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER"
+                       " -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP="
+                       "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT"
+                       " -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093"
+                       " -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1"
+                       " -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1"
+                       " -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1"
+                       " -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0"
+                       " -e KAFKA_AUTO_CREATE_TOPICS_ENABLE=false"
+                       " apache/kafka:3.9.1";
+            });
+        port_ = started.ports[0];
+        container_name_ = started.name;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+        const std::string probe =
+            "docker exec " + container_name_ +
+            " /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+            " > /dev/null 2>&1";
+        while (std::system(probe.c_str()) != 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                stop();
+                throw std::runtime_error("DockerKafka: Apache Kafka never became ready");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    }
+
     // rpk credentials for a SASL broker; empty when unauthenticated. The
     // broker speaks SCRAM only (see DockerKafkaOptions).
     [[nodiscard]] std::string rpk_auth_() const {

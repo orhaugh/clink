@@ -276,6 +276,76 @@ def expired_history(demo):
                  "exit 1 (the corruption above), not unavailable", "exit %d" % code, code == 1)
 
 
+def recreated_topic(demo):
+    """The topic deleted and created again under its name while no Worker
+    runs the job. The reconciliation reads no source and keeps its verdict;
+    the independent check finds another log than the one the source recorded
+    and does not read it; and the job, restoring on a Worker started after,
+    refuses to seek the old topic's positions in the new one, so none of the
+    new topic's events reaches the table through them."""
+    name = "recreated-topic"
+    topic, table = "payments-recreated", "payments_recreated"
+    demo.services.create_topic(topic)
+    demo.create_table(table)
+    cluster = Cluster(demo, name, defer_worker2=True)
+    cluster.start(topic, table, demo.services.ch_port)
+    feeder = Feeder(demo, topic, 1, 200_000, demo.feed_rate).start()
+    try:
+        cluster.await_completed(6, timeout=180)
+        bundle = demo.work / "bundles" / name
+        n = cluster.collect(bundle)["checkpoint"]
+        feeder.stop()
+        code, report, _ = demo.reconcile(name + "-before", bundle, n)
+        demo.outcome(name, "checkpoint %d, before the topic is created again" % n, "exit 0",
+                     "exit %d" % code, code == 0)
+        if report is not None and code in (0, 1):
+            demo.agree(name, "checkpoint %d" % n, code, report,
+                       demo.independent(name + "-before", topic, table, report))
+
+        w1 = cluster.procs["worker-1"]
+        w1.kill()
+        w1.wait(timeout=60)
+        old = demo.services.topic_log(topic)
+        demo.services.recreate_topic(topic)
+        new = demo.services.topic_log(topic)
+        demo.outcome(name, "the topic deleted and created again under its name", "another topic id",
+                     "%s, then %s" % (old and old["topic_id"], new and new["topic_id"]),
+                     old is not None and new is not None and new["topic_id"] != old["topic_id"])
+        demo.services.produce(topic, range(1_000_001, 1_002_001))
+
+        code, report, _ = demo.reconcile(name + "-after", bundle, n)
+        demo.outcome(name, "incident-reconcile, which reads only the bundle and the destination",
+                     "exit 0", "exit %d" % code, code == 0)
+        ind = demo.independent(name + "-after", topic, table, report)
+        demo.outcome(name, "the independent check on the topic created again",
+                     "unavailable: another log", ind["verdict"],
+                     ind["verdict"] == "unavailable" and "Kafka now has" in ind.get("why", ""),
+                     ind.get("why", ""))
+
+        cluster.worker(2)
+        log = cluster.dir / "logs" / "worker-2.log"
+        deadline = time.time() + 120
+        refusal = ""
+        while time.time() < deadline and not refusal:
+            text = log.read_text(errors="replace") if log.exists() else ""
+            refusal = next((line for line in text.splitlines()
+                            if "deleted and created again" in line), "")
+            time.sleep(0.5)
+        refusal = refusal[refusal.find("KafkaSource:"):] if "KafkaSource:" in refusal else refusal
+        named = bool(refusal) and old["topic_id"] in refusal and new["topic_id"] in refusal
+        demo.outcome(name, "the job restoring on worker-2", "refuses the old topic's positions, "
+                     "naming both topic ids", "refused" if refusal else "not refused", named,
+                     refusal[:400])
+        time.sleep(5)
+        leaked = int(demo.services.ch("SELECT count() FROM demo.%s WHERE event_id > 1000000"
+                                      % table).strip())
+        demo.outcome(name, "rows from the new topic's events in the table", "0", str(leaked),
+                     leaked == 0)
+    finally:
+        feeder.stop()
+        cluster.stop()
+
+
 def restore_scenario(demo, name, faults, window=1000):
     """worker-1 runs the job alone and dies at a fault point; the job restores
     on worker-2. The completed checkpoint before the death, the restored
@@ -526,6 +596,7 @@ ALL = [
     ("limits", limits),
     ("corruption", corruption),
     ("expired-history", expired_history),
+    ("recreated-topic", recreated_topic),
     ("truncated", truncated),
     ("crash-after-publish", crash_after_publish),
     ("crash-before-publish", crash_before_publish),

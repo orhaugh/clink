@@ -173,7 +173,7 @@ The ClickHouse native sink adds its own account through the Internal `IntervalEv
 
 `incident-collect --include-captures` takes these files. With `--include-state` it also takes the snapshots of the checkpoints that bound each interval, where the Kafka positions are. A sink's captures are left out of the replay checks, which see a bundle as before.
 
-**The scope** of completed checkpoint N is every interval it completed: back through each interval's previous barrier to the previous completed checkpoint, or to the start of the run. When the run began at a restore, it starts at the restore point. Every sink subtask's evidence for each interval must be there, whole and untruncated. The expected rows are the sink's recorded input over those intervals. For a record-wise job, they are the transformation of the source records between the bounding checkpoints' positions, which the report gives per partition. Kafka positions are the next offset to read, so a scope consumed `[from, to)`.
+**The scope** of completed checkpoint N is every interval it completed: back through each interval's previous barrier to the previous completed checkpoint, or to the start of the run. When the run began at a restore, it starts at the restore point. Every sink subtask's evidence for each interval must be there, whole and untruncated. The expected rows are the sink's recorded input over those intervals. For a record-wise job, they are the transformation of the source records between the bounding checkpoints' positions, which the report gives per partition. Kafka positions are the next offset to read, so a scope consumed `[from, to)`. Beside its positions the source records the log they belong to, the topic, the cluster's id and the topic's id (see the [Kafka connector](../connectors/kafka.md#delivery-semantics)), and the report gives it for both ends of the scope. When the ends name different logs, a topic deleted and created again between them, the report says so: the offsets are then not a range of one log. The verdict does not change, since it compares the destination with the sink's own record of its input.
 
 **The read.**
 
@@ -218,7 +218,7 @@ The result is:
 - **Exit 3**: none failed, but one is unavailable or unsupported. Examples are evidence missing, truncated or disarmed; a sink ledger that does not account for exactly the rows its recorded input holds; a scope whose intervals held no rows, which establishes nothing; a bound or timeout hit; a mutation in progress or begun during the read; a key read differently twice; or an unsupported table, column type or key.
 - **Exit 2**: refused. That is another job (`--job`), a checkpoint the bundle does not hold as completed, or another database, table, server or table UUID than the evidence's.
 
-`--json` and `--report` write the versioned report (`"format": "clink-reconcile-report"`, `"version": 1`). It holds the observation's times on both clocks, the scope with its source ranges and each interval's INSERT ledger, the destination as recorded and as observed, the method, the assumptions, mutations done before the read, each check, and the first discrepancies (`--list`). `--expected-out` writes the expected rows as canonical cells, one JSON object per line, for an independent check of the expectation. [`examples/destination-reconciliation/`](https://github.com/orhaugh/clink/tree/main/examples/destination-reconciliation) does that check: it reads each scope's source range back from Kafka and runs every scenario the contract covers.
+`--json` and `--report` write the versioned report (`"format": "clink-reconcile-report"`, `"version": 1`). It holds the observation's times on both clocks, the scope with its source ranges, the log they belong to and each interval's INSERT ledger, the destination as recorded and as observed, the method, the assumptions, mutations done before the read, each check, and the first discrepancies (`--list`). `--expected-out` writes the expected rows as canonical cells, one JSON object per line, for an independent check of the expectation. [`examples/destination-reconciliation/`](https://github.com/orhaugh/clink/tree/main/examples/destination-reconciliation) does that check: it confirms the topic is still the log the source recorded, reads each scope's source range back from it, and runs every scenario the contract covers.
 
 **Three kinds of assurance.** None implies the next:
 
@@ -254,7 +254,6 @@ Destination reconciliation does not support:
 - column types beyond those above;
 - jobs that are not record-wise, where a key repeats;
 - sinks of an embedded `clink run`, which the recorder does not record;
-- the Kafka cluster and topic ids, which the source does not checkpoint;
 - `system.query_log` as acknowledgement evidence.
 
 ## Source

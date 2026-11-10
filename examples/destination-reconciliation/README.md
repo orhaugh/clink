@@ -1,6 +1,6 @@
 # Destination reconciliation: Kafka to ClickHouse
 
-A record-wise SQL job reads payments from Kafka, filters and projects them, and writes them to ClickHouse through the native sink. For a completed checkpoint, `clink incident-reconcile` reads ClickHouse and says whether it holds exactly the rows the job's sink received in that checkpoint's intervals. An independent check reads the checkpoint's source range back from Kafka, derives the rows the job owes, and must agree with every verdict.
+A record-wise SQL job reads payments from Kafka, filters and projects them, and writes them to ClickHouse through the native sink. For a completed checkpoint, `clink incident-reconcile` reads ClickHouse and says whether it holds exactly the rows the job's sink received in that checkpoint's intervals. An independent check confirms the topic is still the log the job read, reads the checkpoint's source range back from it, derives the rows the job owes, and must agree with every verdict.
 
 `run.sh` runs every scenario below and keeps what it produced as a qualification bundle. The workflow is described in [incident verification](../../docs/internals/incident-verification.md#destination-reconciliation) and the decisions behind it in [design record 015](../../docs/design/015-destination-reconciliation.md).
 
@@ -36,12 +36,13 @@ Each scenario runs a Coordinator and two Workers from the build with the flight 
 For every reconciliation whose result is satisfied or failed, `reconcile_demo.py`:
 
 1. takes the scope's source range from the report: for each partition, the offsets between the Kafka positions in the snapshots of the checkpoints that bound the scope;
-2. reads exactly those offsets back from Kafka with the console consumer, and derives the rows the job owes with `reference_row()`;
-3. requires them to equal the rows `incident-reconcile` expected (its `--expected-out` export), cell for cell;
-4. reads the destination for the same keys with its own client and query, and counts missing, changed, unexpected and duplicated rows;
-5. requires those counts to equal the reconciliation's.
+2. requires the log the source recorded beside them (the topic, the cluster's id and the topic's id) to be the one Kafka's own tools report now, since a topic deleted and created again holds other records at the same offsets;
+3. reads exactly those offsets back from Kafka with the console consumer, and derives the rows the job owes with `reference_row()`;
+4. requires them to equal the rows `incident-reconcile` expected (its `--expected-out` export), cell for cell;
+5. reads the destination for the same keys with its own client and query, and counts missing, changed, unexpected and duplicated rows;
+6. requires those counts to equal the reconciliation's.
 
-Step 3 shows that the expectation, which comes from the sink's own record of its input, is the transformation of the source range and not something derived from the destination. Step 5 shows the verdict matches a second reading of the destination.
+Step 4 shows that the expectation, which comes from the sink's own record of its input, is the transformation of the source range and not something derived from the destination. Step 6 shows the verdict matches a second reading of the destination.
 
 ## Scenarios
 
@@ -53,6 +54,7 @@ Step 3 shows that the expectation, which comes from the sink's own record of its
 | `limits` | `--max-rows-per-query=1`; a server that stops answering (a proxy forwards nothing) with `--query-timeout-ms=1000` | exit 3 each time |
 | `corruption` | On the disposable table, one after another: two amounts changed so the scope's count and total stay equal; a row written twice; an extra row for a key of the scope; a row deleted; a float changed in its last bits | exit 1 with exactly the cumulative missing, changed, unexpected and duplicated counts; the independent check agrees each time, and confirms the swap left count and total unchanged |
 | `expired-history` | Kafka deletes the first half of the scope's range on one partition | the independent check is unavailable; the reconciliation, which reads only the bundle and the destination, still gives its verdict |
+| `recreated-topic` | worker-1 runs the job alone and is killed; the topic is deleted and created again under its name, and new events written to it; worker-2 starts, and the job restores there | the checkpoint before: exit 0, and still exit 0 after, as the reconciliation reads no source; the independent check is unavailable, as the topic is another log; the restored job refuses the old topic's positions, naming both topic ids, and none of the new events reaches the table |
 | `truncated` | The job records at most five rows per interval (`--capture-records=5`) | exit 3: the scope is unavailable |
 | `crash-after-publish`, `crash-before-publish` | worker-1 runs the job alone and exits at its 40th snapshot publish (after it, or before it); the job restores on worker-2 | the checkpoint before the crash: exit 0. The restored run's first: exit 0 or 1, whichever the destination shows, with duplicates put down to the restore. A later one: exit 0. The independent check agrees with all three |
 | `crash-after-ack` | worker-1 exits right after ClickHouse acknowledged its 60th INSERT, before the sink took the acknowledgement | as above |

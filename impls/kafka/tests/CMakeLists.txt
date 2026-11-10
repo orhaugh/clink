@@ -17,6 +17,7 @@ add_executable(clink_kafka_tests
     test_typed_helpers.cpp
     test_registry_formats.cpp
     test_registry_formats_live.cpp
+    test_source_identity_live.cpp
 )
 target_link_libraries(clink_kafka_tests PRIVATE
     clink::core
@@ -41,13 +42,14 @@ if(TARGET clink::schema_registry)
     endif()
 endif()
 clink_set_warnings(clink_kafka_tests)
-# The live suites start a Redpanda container each (tests/integration/
-# docker_kafka.hpp) and skip without Docker. Under ctest --parallel several
+# The live suites start a broker container each (tests/integration/
+# docker_kafka.hpp: Redpanda, or Apache Kafka where a test needs topic ids) and
+# skip without Docker. Under ctest --parallel several
 # started at once and ran past the 30 s the other cases get, so they hold one
 # lock and the time a container start takes. scripts/docker-suites-live.sh
 # runs them from the binary, outside ctest.
 set(_kafka_live_suites
-    "TxnResumeLive.*:TxnResumeSaslLive.*:KafkaTxnEndOfInputLive.*:KafkaRegistryFormatsLive.*")
+    "TxnResumeLive.*:TxnResumeSaslLive.*:KafkaTxnEndOfInputLive.*:KafkaRegistryFormatsLive.*:KafkaSourceIdentityLive.*")
 gtest_discover_tests(clink_kafka_tests
     DISCOVERY_MODE PRE_TEST
     TEST_FILTER "-${_kafka_live_suites}"

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**A restored Kafka source no longer seeks its offsets in a log they do not
+describe.** The source checkpointed one offset per partition and nothing of
+which topic or cluster they were for, so a job restored after its topic was
+deleted and created again under its name, or pointed at another topic or
+cluster, seeked the old offsets in the new log: it skipped the first records
+of a topic created again, or read others, with nothing to show for it. Every
+snapshot now records beside the offsets the topic, the cluster's id and the
+topic's id, which Kafka assigns again when a topic is created again, read from
+the brokers at `open()`; a restore refuses positions recorded for another
+topic, another cluster or the topic before it was created again, naming both
+sides, before any is seeked. An id the brokers do not report is not compared:
+Redpanda 24.2 reports no topic ids, so there a topic created again is still
+not told apart. A checkpoint an earlier release wrote restores as before. `clink
+incident-reconcile` reports each source's log at both ends of a scope, where it
+said the ids were not recorded, and notes when they differ; the
+destination-reconciliation example's independent check confirms the topic is
+still that log before reading the range back, and its new `recreated-topic`
+scenario requires the restored job to refuse. `KafkaSourceIdentityLive`
+deletes and recreates a topic on Apache Kafka 3.9.1 in the Docker suites gate.
+
 **Every aggregate is of the type its query declares.** The type conformance
 suite now runs every aggregate over every column type through the operators a
 `GROUP BY`, each window and `OVER` compile to, with the columnar decoder and

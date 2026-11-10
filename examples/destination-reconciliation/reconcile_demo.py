@@ -4,8 +4,9 @@
 Each scenario runs the example job on a fresh local cluster from the build,
 against the compose stack's Kafka and ClickHouse, collects a bundle, and
 reconciles a completed checkpoint with `clink incident-reconcile`. An
-independent check then reads the checkpoint's source range back from Kafka,
-derives the rows the job owes the destination with workload.reference_row(),
+independent check then confirms the topic is still the log the source recorded,
+reads the checkpoint's source range back from Kafka, derives the rows the job
+owes the destination with workload.reference_row(),
 and compares them with what `incident-reconcile` expected and with what
 ClickHouse holds, read by this script on its own path. A scenario passes when
 the reconciliation's verdict is the one the scenario requires and the
@@ -17,6 +18,7 @@ import argparse
 import decimal
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -97,6 +99,39 @@ class Services:
                    "--topic=%s" % topic, "--partitions=%d" % workload.TOPIC_PARTITIONS,
                    "--replication-factor=1")
 
+    def topic_log(self, topic):
+        """The log the topic is now, as Kafka's own tools print it: the
+        cluster's id and the topic's id, or None when Kafka has no such
+        topic."""
+        r = self.kafka("/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server=kafka:9092",
+                       "--describe", "--topic=%s" % topic, check=False)
+        topic_id = re.search(r"TopicId:\s*(\S+)", r.stdout)
+        if r.returncode != 0 or topic_id is None:
+            return None
+        c = self.kafka("/opt/kafka/bin/kafka-cluster.sh", "cluster-id",
+                       "--bootstrap-server=kafka:9092", check=False)
+        cluster_id = re.search(r"Cluster ID:\s*(\S+)", c.stdout)
+        return {"topic": topic, "cluster_id": cluster_id.group(1) if cluster_id else None,
+                "topic_id": topic_id.group(1)}
+
+    def recreate_topic(self, topic):
+        """Deletes the topic and creates it again under its name: another
+        topic, with another id, whose offsets start again at 0. Kafka deletes
+        in the background, so the create is retried until the name is free."""
+        self.kafka("/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server=kafka:9092", "--delete",
+                   "--topic=%s" % topic)
+        deadline = time.time() + 60
+        while True:
+            r = self.kafka("/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server=kafka:9092",
+                           "--create", "--topic=%s" % topic,
+                           "--partitions=%d" % workload.TOPIC_PARTITIONS,
+                           "--replication-factor=1", check=False)
+            if r.returncode == 0:
+                return
+            if time.time() > deadline:
+                raise Failed("topic %s was not created again: %s" % (topic, r.stderr[-500:]))
+            time.sleep(0.5)
+
     def produce(self, topic, ids):
         lines = "".join("%s\t%s\n" % workload.record(i) for i in ids)
         self.kafka("/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server=kafka:9092",
@@ -149,7 +184,7 @@ class Cluster:
     """A Coordinator and two Workers from the build, for one scenario."""
 
     def __init__(self, demo, name, worker1_faults="", worker2_late=False, capture=True,
-                 capture_records=100000, interval_ms=1000):
+                 capture_records=100000, interval_ms=1000, defer_worker2=False):
         self.demo = demo
         self.name = name
         self.dir = demo.work / name
@@ -160,6 +195,9 @@ class Cluster:
         self.procs = {}
         self.worker1_faults = worker1_faults
         self.worker2_late = worker2_late
+        # worker-2 is left to the scenario to start (worker(2)), when it wants
+        # the job to restore there.
+        self.defer_worker2 = defer_worker2
         self.capture = capture
         self.capture_records = capture_records
         self.interval_ms = interval_ms
@@ -203,7 +241,7 @@ class Cluster:
                                     "--ha-dir=%s" % (self.dir / "ha")])
         self._await_http(self.coord_http, "the Coordinator")
         self.worker(1, self.worker1_faults)
-        if not self.worker2_late:
+        if not self.worker2_late and not self.defer_worker2:
             self.worker(2)
         sql = (HERE / "job.sql.in").read_text()
         for k, v in {"@BROKERS@": "127.0.0.1:%d" % self.demo.services.kafka_port, "@TOPIC@": topic,
@@ -222,7 +260,7 @@ class Cluster:
         (self.dir / "logs" / "submit.log").write_text(r.stdout + r.stderr)
         if r.returncode != 0 or '"ok":true' not in r.stdout:
             raise Failed("the submission was refused: %s" % (r.stdout + r.stderr)[-1500:])
-        if self.worker2_late:
+        if self.worker2_late and not self.defer_worker2:
             self.worker(2)
 
     @property
@@ -381,14 +419,29 @@ class Demo:
         return rows
 
     def independent(self, label, topic, table, report):
-        """Reads the scope's source range from Kafka and derives the rows the
-        job owes the destination; compares them with incident-reconcile's
-        expectation and with the destination. Returns its verdict: exact,
-        differs (with counts) or unavailable (with why)."""
+        """Confirms the topic is still the log the source recorded, reads the
+        scope's source range from it and derives the rows the job owes the
+        destination; compares them with incident-reconcile's expectation and
+        with the destination. Returns its verdict: exact, differs (with counts)
+        or unavailable (with why)."""
         ranges = report["scope"]["source"]["ranges"]
         if not ranges or not report["scope"]["source"]["from_complete"] or \
                 not report["scope"]["source"]["to_complete"]:
             return {"verdict": "unavailable", "why": "the report names no complete source range"}
+        # An offset names a record only in the log it was read from: a topic
+        # deleted and created again under its name holds other records at the
+        # same offsets.
+        recorded = [i["end"] for i in report["scope"]["source"].get("identities", []) if i.get("end")]
+        if not recorded:
+            return {"verdict": "unavailable", "why": "the report names no log for the source's positions"}
+        live = self.services.topic_log(topic)
+        for log in recorded:
+            if live is None or log != live:
+                return {"verdict": "unavailable",
+                        "why": "the source read topic %s (cluster %s, topic id %s), and Kafka now has %s"
+                               % (log["topic"], log["cluster_id"], log["topic_id"],
+                                  "no such topic" if live is None else
+                                  "topic id %s on cluster %s" % (live["topic_id"], live["cluster_id"]))}
         reference = {}
         for r in ranges:
             start = r["from"] if r["from"] is not None else 0
@@ -433,6 +486,7 @@ class Demo:
         result = {"verdict": "exact" if missing + duplicated + changed + unexpected == 0 else "differs",
                   "rows": rows, "missing": missing, "duplicated": duplicated, "changed": changed,
                   "unexpected": unexpected, "same_expectation": same_expectation,
+                  "same_log": True, "log": live,
                   "count_reference": rows, "count_observed": count_obs,
                   "sum_cents_reference": sum_ref, "sum_cents_observed": sum_obs,
                   "duplicated_ids": sorted(int(k[1:]) for k, v in by_id.items()
@@ -442,19 +496,26 @@ class Demo:
 
     def agree(self, scenario, label, code, report, ind):
         """The reconciliation and the independent check tell the same story."""
+        if ind["verdict"] == "unavailable":
+            self.outcome(scenario, label + " agrees with the independent check", "a verdict to agree with",
+                         "unavailable", False, ind.get("why", ""))
+            return False
         if code == 0:
-            ok = ind["verdict"] == "exact" and ind["same_expectation"]
-            self.outcome(scenario, label + " agrees with the independent check", "exact, same expectation",
-                         "%s, same expectation %s" % (ind["verdict"], ind["same_expectation"]), ok)
+            ok = ind["verdict"] == "exact" and ind["same_expectation"] and ind["same_log"]
+            self.outcome(scenario, label + " agrees with the independent check",
+                         "exact, same expectation, same log",
+                         "%s, same expectation %s, same log %s"
+                         % (ind["verdict"], ind["same_expectation"], ind["same_log"]), ok)
             return ok
         if code == 1:
             cmp = next(c for c in report["checks"] if c["id"] == "reconcile.rows")["counts"]
             mine = (cmp["missing"], cmp["changed"], cmp["unexpected"], cmp["duplicated"])
             theirs = (ind["missing"], ind["changed"], ind["unexpected"], ind["duplicated"])
-            ok = ind["verdict"] == "differs" and mine == theirs and ind["same_expectation"]
+            ok = ind["verdict"] == "differs" and mine == theirs and ind["same_expectation"] and ind["same_log"]
             self.outcome(scenario, label + " agrees with the independent check",
-                         "missing/changed/unexpected/duplicated %s" % (mine,),
-                         "%s %s, same expectation %s" % (ind["verdict"], theirs, ind["same_expectation"]), ok)
+                         "missing/changed/unexpected/duplicated %s, same log" % (mine,),
+                         "%s %s, same expectation %s, same log %s"
+                         % (ind["verdict"], theirs, ind["same_expectation"], ind["same_log"]), ok)
             return ok
         return True
 

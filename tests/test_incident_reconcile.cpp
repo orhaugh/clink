@@ -561,14 +561,19 @@ protected:
 
     // A checkpoint whose participants hold Kafka source positions as the
     // source writes them: one operator-state row per partition, the next
-    // offset to read as eight little-endian bytes.
+    // offset to read as eight little-endian bytes, and, when `log` is given,
+    // the row naming the log they belong to.
     void write_checkpoint_with_offsets(
         std::uint64_t id,
-        const std::map<std::uint32_t, std::map<int, std::int64_t>>& rows_by_sub) const {
+        const std::map<std::uint32_t, std::map<int, std::int64_t>>& rows_by_sub,
+        const std::string& log = "") const {
         std::set<std::uint32_t> subs;
         for (const auto& [sub, rows] : rows_by_sub) {
             subs.insert(sub);
             clink::InMemoryStateBackend be;
+            if (!log.empty()) {
+                be.put_operator_state(clink::OperatorId{4242}, "__kafka_identity__", log);
+            }
             for (const auto& [partition, offset] : rows) {
                 std::string value(8, '\0');
                 for (int i = 0; i < 8; ++i) {
@@ -1005,6 +1010,92 @@ TEST_F(ReconcileBundle, SourcePositionsAreTheSourcesOwnNotACopyARestoreLeftElsew
         noted = noted || n.find("set aside") != std::string::npos;
     }
     EXPECT_TRUE(noted);
+}
+
+// The log a source's positions belong to, as the source records it beside
+// them: the topic, the cluster's id and the topic's. The scope names it, and
+// says when the two ends recorded different logs, since a topic deleted and
+// created again starts its offsets at 0 and the scope's offsets are then not
+// one range. Either way the verdict is the destination's against the sink's
+// evidence, which the source's log does not change.
+std::string reconcile_source_log(const std::string& topic_id) {
+    return R"({"version":1,"topic":"events","cluster_id":"5L6g3nShT-eMCtK--X86sw","topic_id":")" +
+           topic_id + R"("})";
+}
+
+TEST_F(ReconcileBundle, TheScopeNamesTheLogItsSourcePositionsBelongTo) {
+    write_checkpoint_with_offsets(
+        1, {{0, {{0, 10}}}}, reconcile_source_log("GvDNfajHQH-CpHyoVE2vjw"));
+    write_checkpoint_with_offsets(
+        2, {{0, {{0, 50}}}}, reconcile_source_log("GvDNfajHQH-CpHyoVE2vjw"));
+    write_interval(2, 1, 0, 1, {row_json(1, "1.00")});
+    dest.rows = {observed_row(1, "D100@2")};
+    const auto r = reconcile(collect_bundle(2, 2));
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    ASSERT_EQ(r.scope.source.identities.size(), 1U);
+    const auto& id = r.scope.source.identities.front();
+    EXPECT_EQ(id.op, 4242U);
+    ASSERT_TRUE(id.start.has_value() && id.end.has_value());
+    EXPECT_EQ(id.end->topic, "events");
+    EXPECT_EQ(id.end->cluster_id, "5L6g3nShT-eMCtK--X86sw");
+    EXPECT_EQ(id.end->topic_id, "GvDNfajHQH-CpHyoVE2vjw");
+    EXPECT_EQ(id.same_log(), std::optional<bool>{true});
+
+    const auto json = clink::config::parse(r.render_json());
+    const auto& identities = json.at("scope").at("source").at("identities").as_array();
+    ASSERT_EQ(identities.size(), 1U);
+    EXPECT_EQ(identities.front().at("op").as_string(), "4242");
+    EXPECT_EQ(identities.front().at("end").at("topic_id").as_string(), "GvDNfajHQH-CpHyoVE2vjw");
+    EXPECT_TRUE(identities.front().at("same_log").as_bool());
+    EXPECT_NE(r.render_text().find("topic 'events' on cluster 5L6g3nShT-eMCtK--X86sw, topic id "
+                                   "GvDNfajHQH-CpHyoVE2vjw"),
+              std::string::npos)
+        << r.render_text();
+}
+
+TEST_F(ReconcileBundle, PositionsOfTwoLogsAreNotOneRange) {
+    write_checkpoint_with_offsets(
+        1, {{0, {{0, 10}}}}, reconcile_source_log("GvDNfajHQH-CpHyoVE2vjw"));
+    write_checkpoint_with_offsets(
+        2, {{0, {{0, 5}}}}, reconcile_source_log("ONi0POJbSLG7hFMOFT2-cg"));
+    write_interval(2, 1, 0, 1, {row_json(1, "1.00")});
+    dest.rows = {observed_row(1, "D100@2")};
+    const auto r = reconcile(collect_bundle(2, 2));
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    ASSERT_EQ(r.scope.source.identities.size(), 1U);
+    EXPECT_EQ(r.scope.source.identities.front().same_log(), std::optional<bool>{false});
+    bool noted = false;
+    for (const auto& n : r.scope.source.notes) {
+        noted = noted || (n.find("GvDNfajHQH-CpHyoVE2vjw") != std::string::npos &&
+                          n.find("ONi0POJbSLG7hFMOFT2-cg") != std::string::npos &&
+                          n.find("not a range of one log") != std::string::npos);
+    }
+    EXPECT_TRUE(noted) << r.render_text();
+    EXPECT_FALSE(clink::config::parse(r.render_json())
+                     .at("scope")
+                     .at("source")
+                     .at("identities")
+                     .as_array()
+                     .front()
+                     .at("same_log")
+                     .as_bool());
+}
+
+TEST_F(ReconcileBundle, CheckpointsThatRecordNoSourceLogSaySo) {
+    write_checkpoint_with_offsets(1, {{0, {{0, 10}}}});
+    write_checkpoint_with_offsets(2, {{0, {{0, 50}}}});
+    write_interval(2, 1, 0, 1, {row_json(1, "1.00")});
+    dest.rows = {observed_row(1, "D100@2")};
+    const auto r = reconcile(collect_bundle(2, 2));
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    ASSERT_EQ(r.scope.source.identities.size(), 1U);
+    EXPECT_FALSE(r.scope.source.identities.front().start.has_value());
+    EXPECT_FALSE(r.scope.source.identities.front().end.has_value());
+    bool noted = false;
+    for (const auto& n : r.scope.source.notes) {
+        noted = noted || n.find("record no log for the sources' positions") != std::string::npos;
+    }
+    EXPECT_TRUE(noted) << r.render_text();
 }
 
 // The command: its usage refusals, a request the bundle does not fit, and a

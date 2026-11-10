@@ -194,8 +194,31 @@ struct SourceRange {
     std::optional<std::int64_t> to;
 };
 
+// The log a Kafka source's positions belong to, as the source recorded it
+// beside them: the topic, the cluster's id and the topic's id, each empty
+// where the brokers reported none.
+struct SourceLog {
+    std::string topic;
+    std::string cluster_id;
+    std::string topic_id;
+    bool operator==(const SourceLog&) const = default;
+};
+
+// One source's log at the checkpoints bounding the scope. `start` is none
+// when the scope starts at the run's start or the checkpoint recorded none
+// (a release before identities were recorded); likewise `end`.
+struct SourceIdentity {
+    std::uint64_t op{0};
+    std::optional<SourceLog> start;
+    std::optional<SourceLog> end;
+    // Whether start and end name one log, comparing what both recorded; none
+    // when either is missing.
+    [[nodiscard]] std::optional<bool> same_log() const;
+};
+
 struct SourcePositions {
     std::vector<SourceRange> ranges;
+    std::vector<SourceIdentity> identities;
     // Every participant's snapshot of the bounding checkpoint was read: a
     // source subtask's partitions are not missing for want of its snapshot.
     bool from_complete{false};

@@ -1,11 +1,13 @@
 #include "clink/connectors/kafka_source.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -14,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "clink/config/json.hpp"
 #include "clink/metrics/connector_metrics.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/logging.hpp"
@@ -109,6 +112,93 @@ std::map<std::int32_t, std::int64_t> KafkaSource::decode_offsets(std::string_vie
     return out;
 }
 
+// The identity row: a JSON object, so a reader of the snapshots (state-cat,
+// incident-reconcile) sees it as text. Pure and defined in both builds, like
+// the offset encoding.
+std::string KafkaSource::encode_identity(const Identity& identity) {
+    config::JsonObject o;
+    o["version"] = config::JsonValue{std::int64_t{1}};
+    o["topic"] = config::JsonValue{identity.topic};
+    o["cluster_id"] = config::JsonValue{identity.cluster_id};
+    o["topic_id"] = config::JsonValue{identity.topic_id};
+    return config::JsonValue{std::move(o)}.serialize();
+}
+
+std::optional<KafkaSource::Identity> KafkaSource::decode_identity(std::string_view bytes) {
+    try {
+        const auto v = config::parse(bytes);
+        if (!v.is_object() || !v.contains("version") || !v.at("version").is_integral_number() ||
+            v.at("version").as_int() != 1) {
+            return std::nullopt;
+        }
+        Identity id;
+        for (const auto& [field, out] : {std::pair{"topic", &id.topic},
+                                         std::pair{"cluster_id", &id.cluster_id},
+                                         std::pair{"topic_id", &id.topic_id}}) {
+            if (!v.contains(field) || !v.at(field).is_string()) {
+                return std::nullopt;
+            }
+            *out = v.at(field).as_string();
+        }
+        if (id.topic.empty()) {
+            return std::nullopt;
+        }
+        return id;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::string> KafkaSource::identity_refusal(const Identity& recorded,
+                                                         const Identity& current) {
+    const std::string fix =
+        " To read it, start the job afresh, or restore a checkpoint recorded on this topic.";
+    if (!recorded.topic.empty() && !current.topic.empty() && recorded.topic != current.topic) {
+        return "KafkaSource: the checkpoint's positions are for topic '" + recorded.topic +
+               "', and this source reads topic '" + current.topic + "'." + fix;
+    }
+    if (!recorded.cluster_id.empty() && !current.cluster_id.empty() &&
+        recorded.cluster_id != current.cluster_id) {
+        return "KafkaSource: the checkpoint's positions for topic '" + current.topic +
+               "' were recorded on Kafka cluster " + recorded.cluster_id +
+               ", and the brokers this source reads are cluster " + current.cluster_id +
+               ": an offset names a record only in the cluster that wrote it." + fix;
+    }
+    if (!recorded.topic_id.empty() && !current.topic_id.empty() &&
+        recorded.topic_id != current.topic_id) {
+        return "KafkaSource: the checkpoint's positions are for topic '" + current.topic +
+               "' with id " + recorded.topic_id + ", and the topic of that name now has id " +
+               current.topic_id +
+               ": it was deleted and created again, and its offsets name other records." + fix;
+    }
+    return std::nullopt;
+}
+
+std::string KafkaSource::uuid_text(std::int64_t most_significant, std::int64_t least_significant) {
+    static constexpr std::string_view kUrlSafe =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::array<std::uint8_t, 16> b{};
+    const auto msb = static_cast<std::uint64_t>(most_significant);
+    const auto lsb = static_cast<std::uint64_t>(least_significant);
+    for (std::size_t i = 0; i < 8; ++i) {
+        b[i] = static_cast<std::uint8_t>(msb >> (56 - 8 * i));
+        b[8 + i] = static_cast<std::uint8_t>(lsb >> (56 - 8 * i));
+    }
+    std::string out;
+    out.reserve(22);
+    const auto put = [&out](std::uint32_t v, int chars) {
+        for (int c = 0; c < chars; ++c) {
+            out.push_back(kUrlSafe[(v >> (18 - 6 * c)) & 63U]);
+        }
+    };
+    std::size_t i = 0;
+    for (; i + 3 <= b.size(); i += 3) {
+        put((std::uint32_t{b[i]} << 16) | (std::uint32_t{b[i + 1]} << 8) | b[i + 2], 4);
+    }
+    put(std::uint32_t{b[i]} << 16, 2);  // 16 bytes: one left over, two characters, no padding
+    return out;
+}
+
 #ifdef CLINK_HAS_KAFKA
 
 namespace {
@@ -166,6 +256,85 @@ constexpr const char* kOffsetKey = "__kafka_source_offsets__";
 // Distinct keys mean a multi-parent rescale merge unions partitions instead
 // of colliding on a single whole-map key.
 constexpr const char* kOffsetPartPrefix = "__kafka_off__:";
+// The identity row (KafkaSource::Identity): one per source operator, the same
+// in every subtask, beside the per-partition rows. incident-reconcile reads it
+// under this name.
+constexpr std::string_view kIdentityKey = "__kafka_identity__";
+
+// The cluster's id and the topic's, or empty where the brokers report none.
+// The topic's id comes from DescribeTopics, sent to the broker that answered
+// the metadata rather than to the controller, the admin API's default target:
+// any broker answers for a topic's metadata, and librdkafka's mock cluster
+// names a controller it does not run, so a request waiting for one times out
+// there. Each call is bounded by `timeout`, and the topic id is asked for at
+// most three times; a broker that answers with the zero id reports none.
+KafkaSource::Identity read_identity(RdKafka::KafkaConsumer& consumer,
+                                    const std::string& topic,
+                                    std::chrono::milliseconds timeout,
+                                    const std::atomic<bool>& cancelled) {
+    KafkaSource::Identity id;
+    id.topic = topic;
+    const int timeout_ms = static_cast<int>(timeout.count());
+    id.cluster_id = consumer.clusterid(timeout_ms);
+    rd_kafka_t* rk = consumer.c_ptr();
+    for (int attempt = 0; attempt < 3 && !cancelled.load(std::memory_order_acquire); ++attempt) {
+        if (attempt > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{250});
+        }
+        std::int32_t broker = -1;
+        {
+            RdKafka::Metadata* md_raw = nullptr;
+            if (consumer.metadata(false, nullptr, &md_raw, timeout_ms) == RdKafka::ERR_NO_ERROR) {
+                const std::unique_ptr<RdKafka::Metadata> md(md_raw);
+                broker = md->orig_broker_id();
+                if (broker < 0 && !md->brokers()->empty()) {
+                    broker = md->brokers()->front()->id();
+                }
+            }
+        }
+        const std::unique_ptr<rd_kafka_queue_t, decltype(&rd_kafka_queue_destroy)> queue(
+            rd_kafka_queue_new(rk), &rd_kafka_queue_destroy);
+        const char* names[] = {topic.c_str()};
+        const std::unique_ptr<rd_kafka_TopicCollection_t,
+                              decltype(&rd_kafka_TopicCollection_destroy)>
+            topics(rd_kafka_TopicCollection_of_topic_names(names, 1),
+                   &rd_kafka_TopicCollection_destroy);
+        const std::unique_ptr<rd_kafka_AdminOptions_t, decltype(&rd_kafka_AdminOptions_destroy)>
+            options(rd_kafka_AdminOptions_new(rk, RD_KAFKA_ADMIN_OP_DESCRIBETOPICS),
+                    &rd_kafka_AdminOptions_destroy);
+        std::array<char, 256> err{};
+        rd_kafka_AdminOptions_set_request_timeout(
+            options.get(), timeout_ms, err.data(), err.size());
+        if (broker >= 0) {
+            rd_kafka_AdminOptions_set_broker(options.get(), broker, err.data(), err.size());
+        }
+        rd_kafka_DescribeTopics(rk, topics.get(), options.get(), queue.get());
+        const std::unique_ptr<rd_kafka_event_t, decltype(&rd_kafka_event_destroy)> event(
+            rd_kafka_queue_poll(queue.get(), timeout_ms + 1'000), &rd_kafka_event_destroy);
+        if (event == nullptr || rd_kafka_event_error(event.get()) != RD_KAFKA_RESP_ERR_NO_ERROR) {
+            continue;  // no answer in time, or the request failed: ask again
+        }
+        std::size_t n = 0;
+        const auto* const* described = rd_kafka_DescribeTopics_result_topics(
+            rd_kafka_event_DescribeTopics_result(event.get()), &n);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (rd_kafka_TopicDescription_name(described[i]) != topic ||
+                rd_kafka_TopicDescription_error(described[i]) != nullptr) {
+                continue;
+            }
+            const rd_kafka_Uuid_t* uuid = rd_kafka_TopicDescription_topic_id(described[i]);
+            const std::int64_t most =
+                uuid != nullptr ? rd_kafka_Uuid_most_significant_bits(uuid) : 0;
+            const std::int64_t least =
+                uuid != nullptr ? rd_kafka_Uuid_least_significant_bits(uuid) : 0;
+            if (most != 0 || least != 0) {
+                id.topic_id = KafkaSource::uuid_text(most, least);
+            }
+        }
+        break;  // answered: with the topic's id, or with none to report
+    }
+    return id;
+}
 
 // The partition count of one topic, or 0 when the topic is not (yet) known
 // to the cluster. Manual-assignment sources derive their owned set from
@@ -297,6 +466,12 @@ struct KafkaSource::Impl {
     // repartitioned topic.
     std::vector<std::int32_t> owned_partitions;
     std::chrono::steady_clock::time_point last_discovery{};
+    // The log the positions belong to: the one open() found, or the one a
+    // restore recorded until open() has compared it. Persisted with every
+    // snapshot that has one.
+    Identity identity;
+    // What the restored checkpoint recorded, for open() to compare.
+    std::optional<Identity> restored_identity;
 };
 
 bool KafkaSource::is_real_implementation() {
@@ -385,6 +560,45 @@ void KafkaSource::open() {
         throw std::runtime_error("KafkaSource: topic '" + impl_->opts.topic +
                                  "' has no visible partitions after 30s; cannot assign");
     }
+
+    // Which log this is, before any restored position is applied to it. An
+    // offset names a record only in one topic of one cluster, and only until
+    // the topic is deleted: restored positions recorded for another topic,
+    // another cluster, or the topic before it was created again would be
+    // seeked in a log they do not describe, skipping records or reading
+    // others, with nothing to show for it.
+    Identity current = read_identity(
+        *impl_->consumer, impl_->opts.topic, std::chrono::milliseconds{5'000}, impl_->cancelled);
+    if (impl_->restored_identity) {
+        if (auto refusal = identity_refusal(*impl_->restored_identity, current)) {
+            impl_->consumer->close();
+            impl_->consumer.reset();
+            throw std::runtime_error(*refusal);
+        }
+        // An id the brokers did not report this time keeps the one the
+        // checkpoint recorded: nothing showed the log changed, and dropping it
+        // would leave a later restore nothing to compare.
+        for (const auto& [now, recorded, what] :
+             {std::tuple{&current.cluster_id, &impl_->restored_identity->cluster_id, "cluster"},
+              std::tuple{&current.topic_id, &impl_->restored_identity->topic_id, "topic"}}) {
+            if (now->empty() && !recorded->empty()) {
+                *now = *recorded;
+                clink::log::warn("kafka.source",
+                                 "topic '" + impl_->opts.topic + "': the brokers reported no " +
+                                     what + " id, so the checkpoint's (" + *recorded +
+                                     ") could not be compared and is kept");
+            }
+        }
+    }
+    impl_->identity = current;
+    clink::log::info(
+        "kafka.source",
+        "topic '" + current.topic + "' on cluster " +
+            (current.cluster_id.empty() ? std::string{"(id not reported)"} : current.cluster_id) +
+            ", topic id " +
+            (current.topic_id.empty() ? std::string{"(not reported)"} : current.topic_id) +
+            (impl_->restored_identity ? ", as the restored checkpoint recorded" : ""));
+
     assign_owned_(partitions);
     impl_->last_discovery = std::chrono::steady_clock::now();
 
@@ -746,6 +960,12 @@ void KafkaSource::snapshot_offset(StateBackend& backend,
             key,
             StateBackend::ValueView{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
     }
+    // The log those positions belong to, so a restore can tell whether it is
+    // still the one it reads.
+    if (!impl_->identity.topic.empty()) {
+        const std::string row = encode_identity(impl_->identity);
+        backend.put_operator_state(op_id, kIdentityKey, StateBackend::ValueView{row});
+    }
 
     // This subtask owns exactly the partitions the deterministic rule gives
     // it, so drop any per-partition row it does NOT track - the restored
@@ -783,6 +1003,23 @@ void KafkaSource::snapshot_offset(StateBackend& backend,
 }
 
 bool KafkaSource::restore_offset(StateBackend& backend, OperatorId op_id) {
+    // The log the positions were recorded for, which open() compares with the
+    // one it finds. A checkpoint from before identities were recorded has
+    // none, and its positions restore as they always did; a row this source
+    // cannot read is refused, as its positions cannot be placed.
+    if (const auto row = backend.get_operator_state(op_id, kIdentityKey); row.has_value()) {
+        const std::string_view bytes{reinterpret_cast<const char*>(row->data()), row->size()};
+        impl_->restored_identity = decode_identity(bytes);
+        if (!impl_->restored_identity) {
+            throw std::runtime_error(
+                "KafkaSource: the checkpoint's source identity row is not one this release "
+                "reads (" +
+                std::string{bytes.substr(0, 120)} +
+                "), so the log its positions belong to is unknown. Restore it with the release "
+                "that wrote it, or start the job afresh.");
+        }
+        impl_->identity = *impl_->restored_identity;
+    }
     std::map<std::int32_t, std::int64_t> restored;
     const std::string_view part_prefix{kOffsetPartPrefix};
     backend.scan_operator_state(
