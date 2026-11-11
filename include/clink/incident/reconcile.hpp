@@ -332,6 +332,11 @@ struct Scope {
     std::optional<std::string> window_unsupported;
     std::vector<LineageCheckpoint> lineage;
     std::vector<LineageRestore> restores;
+    // An increment of a windowed job's lineage (load_scope's `since`): the
+    // earlier checkpoint it starts at, where the source stood there and the
+    // watermark the sink recorded at its barrier. The lineage then holds the
+    // completed checkpoints after it.
+    std::optional<LineageCheckpoint> base;
     // When the scope could not be established whole: why, and whether the
     // gap is evidence that is missing (unavailable) or a case this release
     // does not handle (unsupported).
@@ -357,11 +362,17 @@ struct ScopeRefused : std::runtime_error {
 // computed from) asks for it, spans the job's whole lineage instead: back
 // through every restore the bundle records to a run that began with no state,
 // with each completed checkpoint's source positions and recorded watermark.
+// With `since`, a windowed job's scope is the increment after that earlier
+// completed checkpoint of the lineage: back through the completed checkpoints
+// and the restores between to it, and no further. It is refused when the
+// checkpoint is not on the lineage, naming the restore point the walk reached
+// instead, or when the job is record-wise.
 [[nodiscard]] Scope load_scope(const Bundle& bundle,
                                std::uint64_t checkpoint,
                                std::uint64_t sink_op,
                                bool whole_run = false,
-                               bool for_audit = false);
+                               bool for_audit = false,
+                               std::optional<std::uint64_t> since = std::nullopt);
 
 // ---- the comparison ----------------------------------------------------------
 
@@ -415,6 +426,9 @@ struct Options {
     // The scope from the run's start through the checkpoint (load_scope's
     // whole_run).
     bool from_run_start{false};
+    // A windowed job's increment after this completed checkpoint (load_scope's
+    // since).
+    std::optional<std::uint64_t> since;
     // A reference artifact (reference.hpp) to audit against; empty: none.
     std::string reference;
     std::uint64_t max_reference_bytes{std::uint64_t{1} << 30};

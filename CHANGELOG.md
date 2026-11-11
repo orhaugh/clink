@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**A windowed job's results are audited one increment at a time.**
+`incident-scope --since=M` writes one increment of a windowed job's lineage
+(scope version 3): from an earlier completed checkpoint of the lineage, with
+where the source stood there and the watermark the sink recorded, to the
+audited checkpoint. It owes the windows that close after the base's
+watermark and by the checkpoint's, which are exactly the rows the sink
+received in between. `incident-reconcile --since=M` audits it against a
+version 3 reference, which names the state it started from and the state it
+left; the base must be on the lineage, and a row an earlier increment owed
+fails finality. A whole lineage needs every checkpoint's state, which the
+Workers do not keep, so on a running job this is how a windowed result can
+be audited at all.
+
 **A restored run keeps its restore point among the retained checkpoints.**
 A Worker keeps the newest `--checkpoint-num-retained` completed checkpoints
 of a job and sweeps older state, judging what is old from the newest id it

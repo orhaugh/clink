@@ -167,6 +167,8 @@ A window's row does not come from the records between two checkpoints. It holds 
 
 **Recovery.** The lineage excludes the runs restores discarded. Their writes after the restored checkpoint are in the destination beside the restored run's, and are reported as duplicates (or a changed row) and put down to the restore, never collapsed.
 
+**Increments.** A whole lineage needs every lineage checkpoint's state for its source positions, and a Worker keeps only its newest few, so on a running job the whole-lineage audit stops being possible after the first checkpoints, whatever it costs. A window's row reaches the sink when the watermark passes its end plus lateness, so the windows received by checkpoint M are exactly those whose end plus lateness is at or below the watermark recorded at M. An increment after M (scope version 3, `--since=M`) therefore owes the windows that close after that watermark and by its own checkpoint, and nothing before M changes a decision after it except each partition's greatest event time and the windows still open, which the reference carries in its own state. The reference starts from its state at M and leaves one at the checkpoint (artifact version 3, `state_in` and `state_out`); the audit binds the state's checkpoint to the increment's base and records the hashes, and the chain of states is the caller's to keep. A base the lineage does not pass through is refused, naming the restore point it does pass. The state is the reference's, computed from the records it read, never the job's, so the audit is as independent as before.
+
 ## Unsupported in this release
 
 The following are not supported:

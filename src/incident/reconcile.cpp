@@ -1018,13 +1018,28 @@ Scope load_scope(const Bundle& b,
                  std::uint64_t checkpoint,
                  std::uint64_t sink_op,
                  bool whole_run,
-                 bool for_audit) {
+                 bool for_audit,
+                 std::optional<std::uint64_t> since) {
     Scope sc;
     // A window's output depends on every record before it, so an audit of a
     // windowed job spans its whole lineage, through the restores the bundle
-    // records, back to a start with no state.
+    // records, back to a start with no state; or, with `since`, the
+    // increment after an earlier checkpoint of that lineage, which a
+    // reference computes from its own state there.
     const WindowAnalysis analysis = analyse_window(b);
-    const bool lineage = analysis.windowed && (whole_run || for_audit);
+    if (since) {
+        if (!analysis.windowed) {
+            throw ScopeRefused(
+                "--since names the start of an increment of a windowed job's lineage, and this "
+                "job is record-wise: its scope already starts at the previous completed "
+                "checkpoint");
+        }
+        if (*since == 0) {
+            throw ScopeRefused("--since names a completed checkpoint, not 0");
+        }
+        whole_run = false;
+    }
+    const bool lineage = analysis.windowed && (whole_run || for_audit || since.has_value());
     if (analysis.windowed) {
         if (analysis.semantics) {
             sc.window = analysis.semantics;
@@ -1032,7 +1047,8 @@ Scope load_scope(const Bundle& b,
             sc.window_unsupported = analysis.unsupported;
         }
     }
-    whole_run = whole_run || lineage;
+    // A lineage spans the run from its start; an increment, from its base.
+    whole_run = whole_run || (lineage && !since);
     sc.whole_run = whole_run;
     if (b.find("job/manifest.json") == nullptr) {
         sc.notes.push_back(
@@ -1047,6 +1063,11 @@ Scope load_scope(const Bundle& b,
         throw ScopeRefused("checkpoint " + std::to_string(n) + " of job " + std::to_string(sc.job) +
                            " is not a completed checkpoint in this bundle; only a completed "
                            "checkpoint's effects are owed to the destination");
+    }
+    if (since && (*since >= n || b.find(completed_marker_path(sc.job, *since)) == nullptr)) {
+        throw ScopeRefused("--since=" + std::to_string(*since) +
+                           " is not a completed checkpoint before " + std::to_string(n) +
+                           " in this bundle");
     }
     std::set<std::uint64_t> ops;
     for (const auto& iv : b.sink_intervals) {
@@ -1163,13 +1184,14 @@ Scope load_scope(const Bundle& b,
     std::uint64_t epoch = n;
     std::size_t segment = 0;  // runs walked back through, for the attempt check
     std::map<std::uint64_t, std::size_t> segment_of;
-    const std::size_t walk_bound = whole_run ? kMaxLineageIntervals : kMaxIntervalsWalked;
+    const std::size_t walk_bound = whole_run || since ? kMaxLineageIntervals : kMaxIntervalsWalked;
     std::optional<std::vector<cluster::RestoredRecord>> restores_seen;
     while (true) {
         if (sc.epochs.size() >= walk_bound) {
             return gap("more than " + std::to_string(walk_bound) + " intervals " +
-                       (whole_run ? std::string{"since the run's start"}
-                                  : std::string{"since the previous completed checkpoint"}));
+                       (since       ? "since checkpoint " + std::to_string(*since)
+                        : whole_run ? std::string{"since the run's start"}
+                                    : std::string{"since the previous completed checkpoint"}));
         }
         auto got = load_epoch(epoch);
         if (!got) {
@@ -1180,6 +1202,69 @@ Scope load_scope(const Bundle& b,
         const std::uint64_t prev = got->front().previous_barrier;
         for (auto& e : *got) {
             sc.intervals.push_back(std::move(e));
+        }
+        if (since) {
+            // An increment: back through the completed checkpoints and the
+            // restores between to the base, which must be on the lineage.
+            const auto not_on = [&](const std::string& why) {
+                throw ScopeRefused("checkpoint " + std::to_string(*since) +
+                                   " is not on checkpoint " + std::to_string(n) +
+                                   "'s lineage: " + why);
+            };
+            if (prev == *since) {
+                sc.starts_after = prev;
+                break;
+            }
+            if (prev == 0) {
+                if (!restores_seen) {
+                    try {
+                        restores_seen = recorded_restores(b);
+                    } catch (const std::exception& e) {
+                        return gap(std::string{"the job's restore record cannot be read: "} +
+                                   e.what());
+                    }
+                }
+                const auto start = epoch_start(b, *restores_seen, epoch);
+                if (!start.known) {
+                    return gap("the run that began at barrier " + std::to_string(epoch) +
+                                   " cannot be placed in the job's lineage: " + start.reason,
+                               start.unsupported);
+                }
+                if (start.checkpoint == *since) {
+                    sc.restores.insert(sc.restores.begin(),
+                                       LineageRestore{start.checkpoint, epoch});
+                    sc.starts_after = *since;
+                    break;
+                }
+                if (start.checkpoint > *since) {
+                    if (!completed.contains(start.checkpoint)) {
+                        return gap("the run that began at barrier " + std::to_string(epoch) +
+                                   " restored from checkpoint " + std::to_string(start.checkpoint) +
+                                   ", which the bundle does not hold");
+                    }
+                    sc.restores.insert(sc.restores.begin(),
+                                       LineageRestore{start.checkpoint, epoch});
+                    ++segment;
+                    epoch = start.checkpoint;
+                    continue;
+                }
+                not_on(start.checkpoint == 0
+                           ? "the run that began at barrier " + std::to_string(epoch) +
+                                 " began with no state"
+                           : "the run that began at barrier " + std::to_string(epoch) +
+                                 " restored from checkpoint " + std::to_string(start.checkpoint) +
+                                 "; an increment can start there");
+            }
+            if (prev >= epoch) {
+                return gap("interval evidence names barrier " + std::to_string(prev) +
+                           " as the one before " + std::to_string(epoch));
+            }
+            if (prev < *since) {
+                not_on("the run's barriers go from " + std::to_string(prev) + " to " +
+                       std::to_string(epoch) + " without it");
+            }
+            epoch = prev;
+            continue;
         }
         if (prev == 0 && lineage) {
             if (!restores_seen) {
@@ -1455,6 +1540,55 @@ Scope load_scope(const Bundle& b,
             "the bounding checkpoints record no log for the sources' positions (their topic, "
             "cluster and topic ids): a release before identities were recorded took them");
     }
+    // An increment's base: where the source stood there (the scope's start)
+    // and the watermark the sink recorded at its barrier, from its interval
+    // evidence, which the bundle must hold.
+    if (since) {
+        LineageCheckpoint base;
+        base.checkpoint = *since;
+        if (!sc.source.from_complete || from.empty()) {
+            return gap("checkpoint " + std::to_string(*since) +
+                       "'s snapshots are not all in the bundle, so where the source stood at the "
+                       "increment's base is not known (collect with --include-state)");
+        }
+        for (const auto& [k, offset] : from) {
+            base.positions.push_back(SourceRange{k.first, k.second, std::nullopt, offset});
+        }
+        std::uint64_t subtasks = 0;
+        std::uint64_t parallelism = 0;
+        bool every = true;
+        for (const auto& iv : b.sink_intervals) {
+            if (iv.op != sc.sink_op || iv.epoch != *since) {
+                continue;
+            }
+            IntervalEvidence e;
+            try {
+                e = read_interval(b, iv);
+            } catch (const std::exception& ex) {
+                return gap(iv.path + " cannot be read: " + ex.what());
+            }
+            ++subtasks;
+            parallelism = e.parallelism;
+            if (!e.watermark_ms) {
+                every = false;
+            } else if (!base.watermark_ms || *e.watermark_ms < *base.watermark_ms) {
+                base.watermark_ms = e.watermark_ms;
+            }
+        }
+        if (subtasks == 0 || subtasks != parallelism) {
+            return gap(
+                "the bundle holds the sink's interval evidence for the increment's base, "
+                "checkpoint " +
+                std::to_string(*since) + ", from " + std::to_string(subtasks) + " of " +
+                std::to_string(parallelism) +
+                " subtasks, so the watermark recorded there is not known (collect with "
+                "--epochs reaching back to it)");
+        }
+        if (!every) {
+            base.watermark_ms.reset();
+        }
+        sc.base = std::move(base);
+    }
     // A windowed lineage: every completed checkpoint it passes, with where the
     // source stood (from that checkpoint's own snapshots) and the watermark
     // the sink had at its barrier, the least over its subtasks.
@@ -1532,7 +1666,11 @@ Scope load_scope(const Bundle& b,
                 // one that wrote none did not hold. A record that names
                 // partitions must name every one its subtask owned there.
                 std::string why;
-                for (const auto& lc : sc.lineage) {
+                std::vector<LineageCheckpoint> held = sc.lineage;
+                if (sc.base) {
+                    held.insert(held.begin(), *sc.base);
+                }
+                for (const auto& lc : held) {
                     const auto declared = declared_partitions(b, lc.checkpoint);
                     for (const auto& [sub, _] : owned_by) {
                         const auto it = declared.find(static_cast<std::uint32_t>(sub));
@@ -1998,11 +2136,21 @@ WindowJudgement judge_windows(const Scope& sc,
         sc.lineage.empty() ? std::nullopt : sc.lineage.back().watermark_ms;
     std::uint64_t not_final = 0;
     std::string first_not_final;
+    // An increment owes only the windows that closed after its base: one the
+    // base's recorded watermark had closed was owed, and received, before.
+    const std::optional<std::int64_t> base_wm =
+        sc.base ? sc.base->watermark_ms : std::optional<std::int64_t>{};
+    std::uint64_t earlier = 0;
+    std::string first_earlier;
     for (const auto& row : ref.rows) {
         const auto end = end_at < row.size() ? integer_cell(row[end_at]) : std::nullopt;
         if (!end || !final_wm || *end + w.allowed_lateness_ms > *final_wm) {
             if (not_final++ == 0) {
                 first_not_final = key_text(key_cells(row, key), key, sc.columns);
+            }
+        } else if (base_wm && *end + w.allowed_lateness_ms <= *base_wm) {
+            if (earlier++ == 0) {
+                first_earlier = key_text(key_cells(row, key), key, sc.columns);
             }
         }
     }
@@ -2033,6 +2181,17 @@ WindowJudgement judge_windows(const Scope& sc,
         j.finality.next_action =
             "a window is open only while the recorded watermark is short of its end plus the "
             "allowed lateness; correct the reference";
+    } else if (earlier > 0) {
+        j.finality.verdict = Verdict::Failed;
+        j.finality.reason = "the reference gives " + std::to_string(earlier) +
+                            " row(s) for windows the watermark recorded at the increment's base, "
+                            "checkpoint " +
+                            std::to_string(sc.base->checkpoint) + " (" + ms_text(base_wm) +
+                            "), had already closed, such as " + first_earlier +
+                            ": an earlier increment owed them";
+        j.finality.next_action =
+            "an increment owes the windows that close after its base and by its checkpoint; "
+            "correct the reference, or the state it started from";
     } else if (not_final > 0) {
         j.finality.verdict = Verdict::Failed;
         j.finality.reason = "the reference gives " + std::to_string(not_final) +
@@ -2063,8 +2222,11 @@ WindowJudgement judge_windows(const Scope& sc,
         j.finality.reason =
             "every window the reference computed from the scope's records is decided: " +
             std::to_string(ref.rows.size()) + " final by the watermark recorded at checkpoint " +
-            std::to_string(sc.checkpoint) + " (" + ms_text(final_wm) + "), " +
-            std::to_string(a.open_windows) + " open and owed nothing yet";
+            std::to_string(sc.checkpoint) + " (" + ms_text(final_wm) + ")" +
+            (sc.base ? " and not by the increment's base, checkpoint " +
+                           std::to_string(sc.base->checkpoint) + " (" + ms_text(base_wm) + ")"
+                     : std::string{}) +
+            ", " + std::to_string(a.open_windows) + " open and owed nothing yet";
     }
     return j;
 }
@@ -2376,11 +2538,17 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
         return finish();
     }
     try {
+        if (o.since && complete_table) {
+            throw ScopeRefused(
+                "an increment (--since) is of a job that is still writing its table, which "
+                "--coverage=complete-table cannot read whole; read the increment's keys");
+        }
         r.scope = load_scope(b,
                              o.checkpoint,
                              o.sink_op,
-                             o.from_run_start || complete_table,
-                             auditing || complete_table);
+                             (o.from_run_start || complete_table) && !o.since,
+                             auditing || complete_table,
+                             o.since);
     } catch (const ScopeRefused& e) {
         r.refused = e.what();
         return r;

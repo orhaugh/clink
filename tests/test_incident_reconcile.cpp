@@ -1829,24 +1829,41 @@ struct WindowLine {
 };
 
 // A version 2 reference artifact, written as its format says.
+// A window state named in an artifact: its checkpoint and sha256.
+using StateRef = std::optional<std::pair<std::uint64_t, std::string>>;
+
+JsonValue state_json(const std::pair<std::uint64_t, std::string>& s) {
+    return JsonValue{
+        clink::config::JsonObject{{"checkpoint", JsonValue{static_cast<std::int64_t>(s.first)}},
+                                  {"sha256", JsonValue{s.second}}}};
+}
+
 void write_window_reference(
     const fs::path& path,
     const JsonValue& doc,
     const std::vector<Row>& rows,
     const std::vector<WindowLine>& windows,
     const std::vector<std::pair<std::uint64_t, std::optional<std::int64_t>>>& bounds,
-    const JsonValue& semantics = window_semantics()) {
+    const JsonValue& semantics = window_semantics(),
+    const StateRef& state_in = std::nullopt,
+    const StateRef& state_out = std::nullopt,
+    std::optional<std::int64_t> version = std::nullopt) {
     using clink::config::JsonArray;
     using clink::config::JsonObject;
     static const std::vector<std::string> kCols{
         "account", "window_start", "window_end", "events", "net"};
     JsonObject h{{"format", JsonValue{std::string{kReferenceFormat}}},
-                 {"version", JsonValue{kWindowReferenceVersion}},
+                 {"version",
+                  JsonValue{version.value_or(doc.contains("base") ? kWindowIncrementReferenceVersion
+                                                                  : kWindowReferenceVersion)}},
                  {"scope", doc},
                  {"implementation",
                   JsonValue{JsonObject{{"name", JsonValue{std::string{"test-windows"}}},
                                        {"version", JsonValue{std::string{"1"}}}}}},
                  {"semantics", semantics}};
+    if (state_in) {
+        h["state_in"] = state_json(*state_in);
+    }
     const std::string header = JsonValue{std::move(h)}.serialize(0) + "\n";
     std::string body;
     clink::Sha256 rows_hash;
@@ -1892,6 +1909,9 @@ void write_window_reference(
                    {"source_bounds", JsonValue{std::move(sb)}},
                    {"complete", JsonValue{true}},
                    {"incomplete", JsonValue{JsonArray{}}}};
+    if (state_out) {
+        end["state_out"] = state_json(*state_out);
+    }
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out << header << body << JsonValue{JsonObject{{"end", JsonValue{std::move(end)}}}}.serialize(0)
         << "\n";
@@ -1991,6 +2011,48 @@ protected:
                                bounds,
                                semantics);
         o.reference = path.string();
+        return window_run(bundle, o);
+    }
+
+    static JsonValue increment_scope_of(const fs::path& bundle,
+                                        std::uint64_t checkpoint,
+                                        std::uint64_t since) {
+        const Bundle b = read_bundle(bundle);
+        return scope_document(b, load_scope(b, checkpoint, 0, false, true, since));
+    }
+
+    // An increment's audit against a version 3 reference that started from
+    // its own state at `since` and left one at `checkpoint`.
+    reconcile::Report increment_audit(
+        const fs::path& bundle,
+        std::uint64_t checkpoint,
+        std::uint64_t since,
+        const std::vector<Row>& rows,
+        const std::vector<WindowLine>& windows,
+        const std::vector<std::pair<std::uint64_t, std::optional<std::int64_t>>>& bounds,
+        const StateRef& state_in = std::pair<std::uint64_t, std::string>{0, ""},
+        const StateRef& state_out = std::pair<std::uint64_t, std::string>{0, ""},
+        Options o = {},
+        std::optional<std::int64_t> version = std::nullopt) {
+        const auto in = state_in && state_in->second.empty()
+                            ? StateRef{{since, std::string(64, 'a')}}
+                            : state_in;
+        const auto out = state_out && state_out->second.empty()
+                             ? StateRef{{checkpoint, std::string(64, 'b')}}
+                             : state_out;
+        const auto path = root / "increment.ndjson";
+        write_window_reference(path,
+                               increment_scope_of(bundle, checkpoint, since),
+                               rows,
+                               windows,
+                               bounds,
+                               window_semantics(),
+                               in,
+                               out,
+                               version);
+        o.reference = path.string();
+        o.checkpoint = checkpoint;
+        o.since = since;
         return window_run(bundle, o);
     }
 
@@ -2304,6 +2366,214 @@ TEST_F(ReconcileWindow, TheScopeCommandWritesAWindowedScopeOrRefusesOne) {
         << out;
     EXPECT_NE(out.find("does not support"), std::string::npos) << out;
     EXPECT_FALSE(fs::exists(other)) << "no document is written for a job the audit cannot model";
+}
+
+// ---- increments of a windowed job's lineage --------------------------------------
+
+TEST_F(ReconcileWindow, AnIncrementStartsAtItsBaseAndOwesTheWindowsThatCloseAfterIt) {
+    const auto bundle = windowed();
+    const auto doc = increment_scope_of(bundle, 2, 1);
+    EXPECT_EQ(doc.at("version").as_int(), kWindowIncrementScopeVersion);
+    EXPECT_EQ(doc.at("base").at("checkpoint").as_int(), 1);
+    EXPECT_TRUE(doc.at("base").at("watermark_ms").is_null()) << "no watermark had reached the sink";
+    EXPECT_EQ(doc.at("base").at("positions").as_array().size(), 2u);
+    EXPECT_EQ(doc.at("starts_after").as_int(), 1);
+    EXPECT_FALSE(doc.at("from_run_start").as_bool());
+    const auto& ckpts = doc.at("lineage").at("checkpoints").as_array();
+    ASSERT_EQ(ckpts.size(), 1u) << "the lineage holds the checkpoints after the base";
+    EXPECT_EQ(ckpts[0].at("checkpoint").as_int(), 2);
+    for (const auto& src : doc.at("sources").as_array()) {
+        for (const auto& p : src.at("partitions").as_array()) {
+            EXPECT_FALSE(p.at("from").is_null()) << "an increment starts at its base's positions";
+        }
+    }
+    EXPECT_TRUE(doc.at("sources_complete").as_bool());
+    EXPECT_EQ(doc.at("scope_sha256").as_string(), scope_fingerprint(doc));
+
+    const auto r = increment_audit(bundle, 2, 1, owed_windows(), open_window(), {{2, 12000}});
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    for (const char* id : {"reference.semantics",
+                           "reference.watermark",
+                           "reference.finality",
+                           "reference.capture",
+                           "reconcile.rows",
+                           "reference.destination"}) {
+        EXPECT_EQ(check_of(r, id).verdict, Verdict::Passed) << id << ": " << check_of(r, id).reason;
+    }
+    const auto json = r.render_json();
+    EXPECT_NE(json.find("started from window state"), std::string::npos) << json;
+    EXPECT_NE(json.find("left window state"), std::string::npos) << json;
+
+    // The next increment, after the windows closed: it owes none, and a row
+    // for one the base's watermark had closed was an earlier increment's.
+    const auto later = increment_scope_of(bundle, 3, 2);
+    EXPECT_EQ(later.at("base").at("watermark_ms").as_int(), 12000);
+    const auto r2 = increment_audit(bundle, 3, 2, {wcells("a", 0, 3, 150)}, {}, {{3, 12000}});
+    EXPECT_EQ(r2.exit_code(), 1) << r2.render_text();
+    EXPECT_EQ(check_of(r2, "reference.finality").verdict, Verdict::Failed);
+    EXPECT_NE(check_of(r2, "reference.finality").reason.find("an earlier increment owed them"),
+              std::string::npos)
+        << check_of(r2, "reference.finality").reason;
+}
+
+TEST_F(ReconcileWindow, AnIncrementCanSpanSeveralCheckpoints) {
+    const auto bundle = windowed();
+    const Bundle b = read_bundle(bundle);
+    const auto sc = load_scope(b, 4, 0, false, true, 1);
+    ASSERT_FALSE(sc.gap.has_value()) << *sc.gap;
+    EXPECT_EQ(sc.epochs, (std::vector<std::uint64_t>{2, 3, 4}));
+    EXPECT_EQ(sc.lineage.size(), 3u);
+    EXPECT_EQ(sc.expected.size(), 2u);
+    const auto r = increment_audit(
+        bundle, 4, 1, owed_windows(), open_window(), {{2, 12000}, {3, 12000}, {4, 12000}});
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+}
+
+TEST_F(ReconcileWindow, AWindowEmittedAgainAfterItClosedFailsTheIncrementsCapture) {
+    write_manifest();
+    write_checkpoint_with_offsets(1, {{0, {{0, 10}}}, {1, {{1, 20}}}}, kLog);
+    write_checkpoint_with_offsets(2, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+    write_checkpoint_with_offsets(3, {{0, {{0, 16}}}, {1, {{1, 25}}}}, kLog);
+    winterval(1, 0, 0, {}, std::nullopt);
+    winterval(1, 0, 1, {}, std::nullopt);
+    winterval(2, 1, 0, {wrow("a", 0, 3, "1.50")}, 12000);
+    winterval(2, 1, 1, {}, 12000);
+    // Window [0, 10000) of a, which closed by checkpoint 2, sent again.
+    winterval(3, 2, 0, {wrow("a", 0, 4, "2.50")}, 12000);
+    winterval(3, 2, 1, {}, 12000);
+    dest.rows = {wcells("a", 0, 3, 150), wcells("a", 0, 4, 250)};
+    const auto bundle = collect_bundle(1, 3);
+    const auto r = increment_audit(bundle, 3, 2, {}, {}, {{3, 12000}});
+    EXPECT_EQ(r.exit_code(), 1) << r.render_text();
+    EXPECT_EQ(check_of(r, "reference.capture").verdict, Verdict::Failed)
+        << check_of(r, "reference.capture").reason;
+}
+
+TEST_F(ReconcileWindow, AnIncrementsBaseMustBeOnTheLineage) {
+    write_manifest();
+    write_checkpoint_with_offsets(1, {{0, {{0, 10}}}, {1, {{1, 20}}}}, kLog);
+    write_checkpoint_with_offsets(2, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+    write_checkpoint_with_offsets(3, {{0, {{0, 17}}}, {1, {{1, 25}}}}, kLog);
+    winterval(1, 0, 0, {}, std::nullopt);
+    winterval(1, 0, 1, {}, std::nullopt);
+    winterval(2, 1, 0, {}, 8000);
+    winterval(2, 1, 1, {}, 8000);
+    // The first run completed checkpoint 3 too, and the job then restored from 2.
+    winterval(3, 2, 0, {wrow("a", 0, 3, "1.50")}, 12000);
+    winterval(3, 2, 1, {}, 12000);
+    ASSERT_TRUE(clink::cluster::record_restore_point(
+        ckpt.string(), kReconcileJob, 1, {.restore = 2, .next = 4}));
+    write_checkpoint_with_offsets(4, {{0, {{0, 18}}}, {1, {{1, 26}}}}, kLog);
+    write_checkpoint_with_offsets(5, {{0, {{0, 18}}}, {1, {{1, 26}}}}, kLog);
+    winterval(4, 0, 0, {wrow("a", 0, 3, "1.50")}, 12000, "00000000000000bb");
+    winterval(4, 0, 1, {}, 12000, "00000000000000bb");
+    winterval(5, 4, 0, {}, 12000, "00000000000000bb");
+    winterval(5, 4, 1, {}, 12000, "00000000000000bb");
+    const auto bundle = collect_bundle(1, 5);
+    const Bundle b = read_bundle(bundle);
+    try {
+        (void)load_scope(b, 5, 0, false, true, 3);
+        FAIL() << "a base the restore passed over was accepted";
+    } catch (const ScopeRefused& e) {
+        EXPECT_NE(std::string{e.what()}.find("restored from checkpoint 2"), std::string::npos)
+            << e.what();
+    }
+    // At the restore point itself, and before it, through the restore.
+    const auto at = load_scope(b, 5, 0, false, true, 2);
+    ASSERT_FALSE(at.gap.has_value()) << *at.gap;
+    EXPECT_EQ(at.epochs, (std::vector<std::uint64_t>{4, 5}));
+    ASSERT_EQ(at.restores.size(), 1u);
+    EXPECT_EQ(at.restores.front().restored_from, 2u);
+    EXPECT_EQ(at.base->watermark_ms, std::optional<std::int64_t>{8000});
+    const auto before = load_scope(b, 5, 0, false, true, 1);
+    ASSERT_FALSE(before.gap.has_value()) << *before.gap;
+    EXPECT_EQ(before.epochs, (std::vector<std::uint64_t>{2, 4, 5}));
+    EXPECT_EQ(before.expected.size(), 1u) << "the discarded run's interval is not in it";
+}
+
+TEST_F(ReconcileWindow, AnIncrementsReferenceStartsFromItsOwnStateAtTheBase) {
+    const auto bundle = windowed();
+    const std::vector<std::pair<std::uint64_t, std::optional<std::int64_t>>> b2{{2, 12000}};
+    auto r = increment_audit(
+        bundle, 2, 1, owed_windows(), open_window(), b2, StateRef{{7, std::string(64, 'a')}});
+    ASSERT_TRUE(r.refused.has_value()) << r.render_text();
+    EXPECT_NE(r.refused->find("state_in"), std::string::npos) << *r.refused;
+    r = increment_audit(bundle, 2, 1, owed_windows(), open_window(), b2, std::nullopt);
+    ASSERT_TRUE(r.refused.has_value());
+    EXPECT_NE(r.refused->find("names no state it started from"), std::string::npos) << *r.refused;
+    r = increment_audit(bundle,
+                        2,
+                        1,
+                        owed_windows(),
+                        open_window(),
+                        b2,
+                        std::pair<std::uint64_t, std::string>{0, ""},
+                        std::nullopt);
+    ASSERT_TRUE(r.refused.has_value());
+    EXPECT_NE(r.refused->find("names no state it left"), std::string::npos) << *r.refused;
+    r = increment_audit(bundle,
+                        2,
+                        1,
+                        owed_windows(),
+                        open_window(),
+                        b2,
+                        std::pair<std::uint64_t, std::string>{0, ""},
+                        std::pair<std::uint64_t, std::string>{0, ""},
+                        {},
+                        kWindowReferenceVersion);
+    ASSERT_TRUE(r.refused.has_value());
+    EXPECT_NE(r.refused->find("version 3"), std::string::npos) << *r.refused;
+}
+
+TEST_F(ReconcileWindow, AnIncrementIsRefusedWhereItMeansNothing) {
+    // A record-wise job's scope starts at its previous checkpoint already.
+    const auto plain = healthy();
+    try {
+        (void)load_scope(read_bundle(plain), 2, 0, false, true, 1);
+        FAIL() << "an increment of a record-wise job was accepted";
+    } catch (const ScopeRefused& e) {
+        EXPECT_NE(std::string{e.what()}.find("record-wise"), std::string::npos) << e.what();
+    }
+    // A table still being written is not read whole.
+    const auto bundle = windowed(WindowGraph{}, "windowed");
+    Options o;
+    o.coverage = Options::Coverage::CompleteTable;
+    const auto r = increment_audit(bundle,
+                                   2,
+                                   1,
+                                   owed_windows(),
+                                   open_window(),
+                                   {{2, 12000}},
+                                   std::pair<std::uint64_t, std::string>{0, ""},
+                                   std::pair<std::uint64_t, std::string>{0, ""},
+                                   o);
+    ASSERT_TRUE(r.refused.has_value());
+    EXPECT_NE(r.refused->find("complete-table"), std::string::npos) << *r.refused;
+    // A base the bundle holds no evidence of leaves the scope unavailable.
+    const auto from2 = collect_bundle(2, 4, "from-2");
+    const auto sc = load_scope(read_bundle(from2), 3, 0, false, true, 1);
+    ASSERT_TRUE(sc.gap.has_value());
+    EXPECT_NE(sc.gap->find("checkpoint 1"), std::string::npos) << *sc.gap;
+}
+
+TEST_F(ReconcileWindow, TheScopeCommandWritesAnIncrementOrRefusesABaseOffTheLineage) {
+    const auto bundle = windowed();
+    std::string out;
+    const auto doc_path = root / "increment.json";
+    EXPECT_EQ(
+        scope_cli(bundle.string() + " --checkpoint=2 --since=1 --out=" + doc_path.string(), &out),
+        0)
+        << out;
+    EXPECT_NE(out.find("an increment"), std::string::npos) << out;
+    EXPECT_EQ(clink::config::parse(reconcile_slurp(doc_path)).at("version").as_int(),
+              kWindowIncrementScopeVersion);
+    out.clear();
+    EXPECT_EQ(scope_cli(bundle.string() +
+                            " --checkpoint=2 --since=3 --out=" + (root / "no.json").string(),
+                        &out),
+              2)
+        << out;
+    EXPECT_FALSE(fs::exists(root / "no.json"));
 }
 
 }  // namespace

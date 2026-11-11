@@ -47,11 +47,11 @@ echo "==> The replay suite"
     --gtest_output="json:${out}/sql.json" >"${out}/sql.log" 2>&1
 set -e
 python3 "${here}/scripts/check-gtest-reports.py" \
-    --expect 'IncidentBundleTest.*=35' --expect 'IncidentEpochs.*=1' \
+    --expect 'IncidentBundleTest.*=36' --expect 'IncidentEpochs.*=1' \
     --expect 'IncidentSelection.*=3' --expect 'ResolutionFixture.TheRestorePointOnDisk*=1' \
     --expect 'ReconcileCanon.*=8' --expect 'ReconcileCompare.*=5' \
     --expect 'ReconcileSinkRunner.*=3' --expect 'ReconcileBundle.*=30' \
-    --expect 'ReconcileMultiset.*=3' --expect 'ReconcileWindow.*=12' \
+    --expect 'ReconcileMultiset.*=3' --expect 'ReconcileWindow.*=19' \
     --expect 'IncidentReplayTest.*=20' \
     "${out}/core.json" "${out}/sql.json"
 

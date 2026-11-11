@@ -76,11 +76,31 @@
 // over the row lines), "source_bounds" [{checkpoint, watermark_ms}], the
 // watermark the source's records allow at each lineage checkpoint as the
 // reference computed it, and "records", its account of the records it read.
+//
+// One increment of a windowed job's lineage (`incident-scope --since=M`) is
+// version 3: version 2's fields, with
+//
+//   base         {checkpoint, positions [{op, partition, next_offset}],
+//                watermark_ms}: the earlier checkpoint of the lineage it
+//                starts at, where the source stood there and the watermark the
+//                sink recorded at its barrier
+//
+// the sources' ranges from the base's positions, and a lineage of the
+// completed checkpoints after the base. It owes the windows whose end plus
+// the allowed lateness is above the base's watermark and at or below the
+// finality's. Its reference is version 3: the header adds "state_in"
+// {checkpoint, sha256}, the reference's own window state it started from,
+// which must be at the base; the end line adds "state_out" {checkpoint,
+// sha256}, the state it left at the scope's checkpoint, which a version 2
+// reference may give too. Both are recorded, not verified: the state is the
+// reference's word, and its hash only shows it was not changed.
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "clink/config/json.hpp"
@@ -98,6 +118,9 @@ inline constexpr const char* kCanonicalSemantics = "clink-canonical-cells-v1";
 // a record-wise job's stay version 1, unchanged.
 inline constexpr std::int64_t kWindowScopeVersion = 2;
 inline constexpr std::int64_t kWindowReferenceVersion = 2;
+// One increment of a windowed job's lineage, and its reference.
+inline constexpr std::int64_t kWindowIncrementScopeVersion = 3;
+inline constexpr std::int64_t kWindowIncrementReferenceVersion = 3;
 inline constexpr const char* kTumblingWindowKind = "tumbling-window";
 inline constexpr const char* kWatermarkStrategy = "per-partition bounded out-of-orderness";
 
@@ -140,6 +163,10 @@ struct Reference {
     std::string windows_sha256;
     std::vector<SourceBound> source_bounds;
     config::JsonValue records;
+    // The reference's own window state it started from (version 3) and left
+    // at the scope's checkpoint (version 2 or 3): checkpoint and sha256.
+    std::optional<std::pair<std::uint64_t, std::string>> state_in;
+    std::optional<std::pair<std::uint64_t, std::string>> state_out;
     bool complete{false};
     std::vector<std::string> incomplete;  // why not, as the artifact says
     std::string rows_sha256;

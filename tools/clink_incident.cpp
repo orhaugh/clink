@@ -187,7 +187,7 @@ void reconcile_usage() {
               << "         [--database=<db>] [--table=<table>]\n"
               << "         [--query-timeout-ms=N] [--max-rows-per-query=N] [--keys-per-query=N]\n"
               << "         [--settle-ms=N] [--list=N] [--expected-out=<ndjson>] [--json]\n"
-              << "         [--report=<file>] [--from-run-start]\n"
+              << "         [--report=<file>] [--from-run-start] [--since=<checkpoint>]\n"
               << "         [--reference=<artifact>] [--max-reference-bytes=N]\n"
               << "         [--coverage=selected-keys|complete-table] [--max-table-rows=N]\n"
               << "\n"
@@ -223,6 +223,10 @@ void reconcile_usage() {
               << "operator declares the table holds this one bounded run's writes and nothing\n"
               << "else, and the scope then spans the run from its start (as --from-run-start).\n"
               << "\n"
+              << "--since=M audits one increment of a windowed job's lineage: the windows that\n"
+              << "closed after the earlier checkpoint M and by this one, against a version 3\n"
+              << "reference computed from the reference's own state at M (see incident-scope).\n"
+              << "\n"
               << "Exit status: 0 the destination holds the scope exactly, 1 it does not (or the\n"
               << "bundle's integrity failed, or the job's output differs from the reference), 3\n"
               << "the comparison could not be made whole or stable (partial), 2 bad usage or a\n"
@@ -232,7 +236,7 @@ void reconcile_usage() {
 void scope_usage() {
     std::cerr
         << "Usage: clink incident-scope <bundle> --out=<file> [--checkpoint=<id>]\n"
-        << "         [--sink-op=<id>] [--job=<id>] [--from-run-start]\n"
+        << "         [--sink-op=<id>] [--job=<id>] [--from-run-start] [--since=<checkpoint>]\n"
         << "\n"
         << "Writes the scope document of one completed checkpoint (--checkpoint, default the\n"
         << "bundle's), from the bundle alone: the run, its job graph's fingerprint, the\n"
@@ -246,6 +250,13 @@ void scope_usage() {
         << "with no state through every restore the bundle records, and adds the window's\n"
         << "rules, each completed checkpoint's source positions and the watermark the sink\n"
         << "recorded at its barrier, by which a window is final.\n"
+        << "\n"
+        << "--since=M writes one increment of that lineage instead (version 3): from the\n"
+        << "earlier completed checkpoint M, with where the source stood there and the\n"
+        << "watermark the sink recorded, to this one. It owes the windows that close after\n"
+        << "M and by this checkpoint, and a reference computes it from its own state at M.\n"
+        << "Refused when M is not on this checkpoint's lineage, naming the restore point\n"
+        << "the lineage passes instead.\n"
         << "\n"
         << "Exit status: 0 written, 3 for a scope whose evidence or source positions are\n"
         << "not whole (written once its columns are known; no reference can be complete\n"
@@ -556,7 +567,8 @@ int clink_cmd_incident_reconcile(int argc, char** argv) {
                                "reference",
                                "max-reference-bytes",
                                "coverage",
-                               "max-table-rows"},
+                               "max-table-rows",
+                               "since"},
                               {"json", "help", "secure", "from-run-start"});
     if (a.switches.contains("help")) {
         reconcile_usage();
@@ -643,6 +655,16 @@ int clink_cmd_incident_reconcile(int argc, char** argv) {
         o.max_table_rows = *v;
     }
     o.from_run_start = a.switches.contains("from-run-start");
+    if (a.has("since")) {
+        const auto v = parse_u64(a.get("since"));
+        if (!v || *v == 0) {
+            error = "--since takes a completed checkpoint, a whole number above 0";
+        } else if (o.from_run_start) {
+            error = "--since and --from-run-start name different starts";
+        } else {
+            o.since = *v;
+        }
+    }
     o.reference = a.get("reference");
     if (a.has("coverage")) {
         const auto c = a.get("coverage");
@@ -706,8 +728,8 @@ int clink_cmd_incident_reconcile(int argc, char** argv) {
 }
 
 int clink_cmd_incident_scope(int argc, char** argv) {
-    const auto a =
-        parse_args(argc, argv, {"out", "checkpoint", "sink-op", "job"}, {"help", "from-run-start"});
+    const auto a = parse_args(
+        argc, argv, {"out", "checkpoint", "sink-op", "job", "since"}, {"help", "from-run-start"});
     if (a.switches.contains("help")) {
         scope_usage();
         return 0;
@@ -739,6 +761,15 @@ int clink_cmd_incident_scope(int argc, char** argv) {
             error = "--job takes a whole number";
         }
     }
+    std::optional<std::uint64_t> since;
+    if (error.empty() && a.has("since")) {
+        since = parse_u64(a.get("since"));
+        if (!since || *since == 0) {
+            error = "--since takes a completed checkpoint, a whole number above 0";
+        } else if (a.switches.contains("from-run-start")) {
+            error = "--since and --from-run-start name different starts";
+        }
+    }
     if (!error.empty()) {
         std::cerr << "incident-scope: " << error << "\n\n";
         scope_usage();
@@ -768,7 +799,8 @@ int clink_cmd_incident_scope(int argc, char** argv) {
     }
     rc::Scope sc;
     try {
-        sc = rc::load_scope(b, checkpoint, sink_op, a.switches.contains("from-run-start"), true);
+        sc = rc::load_scope(
+            b, checkpoint, sink_op, a.switches.contains("from-run-start"), true, since);
     } catch (const rc::ScopeRefused& e) {
         std::cerr << "incident-scope: " << e.what() << "\n";
         return 2;
@@ -796,7 +828,19 @@ int clink_cmd_incident_scope(int argc, char** argv) {
     std::cout << "scope " << doc.string_or("scope_sha256", "") << ": job " << sc.job
               << ", checkpoint " << sc.checkpoint << ", " << sc.expected.size()
               << " captured row(s), written to " << a.get("out") << "\n";
-    if (sc.window) {
+    if (sc.window && sc.base) {
+        std::cout << "an increment of a windowed job's lineage: after checkpoint "
+                  << sc.base->checkpoint << " (watermark recorded there: "
+                  << (sc.base->watermark_ms ? std::to_string(*sc.base->watermark_ms) + " ms"
+                                            : std::string{"none"})
+                  << "), " << sc.lineage.size() << " completed checkpoint(s), "
+                  << sc.restores.size() << " restore(s); it owes the windows that close after the "
+                  << "base and by checkpoint " << sc.checkpoint << " ("
+                  << (sc.lineage.empty() || !sc.lineage.back().watermark_ms
+                          ? std::string{"none"}
+                          : std::to_string(*sc.lineage.back().watermark_ms) + " ms")
+                  << ")\n";
+    } else if (sc.window) {
         std::cout << "a windowed scope: the job's lineage from a start with no state, "
                   << sc.lineage.size() << " completed checkpoint(s), " << sc.restores.size()
                   << " restore(s); windows are final at checkpoint " << sc.checkpoint

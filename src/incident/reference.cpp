@@ -358,8 +358,25 @@ config::JsonValue scope_document(const Bundle& b, const Scope& sc) {
         d["output"] = config::JsonValue{std::move(out)};
     }
     if (sc.window) {
-        d["version"] = config::JsonValue{kWindowScopeVersion};
+        d["version"] =
+            config::JsonValue{sc.base ? kWindowIncrementScopeVersion : kWindowScopeVersion};
         d["transform"] = transform_document(*sc.window);
+        if (sc.base) {
+            config::JsonObject base;
+            base["checkpoint"] = config::JsonValue{static_cast<std::int64_t>(sc.base->checkpoint)};
+            config::JsonArray positions;
+            for (const auto& p : sc.base->positions) {
+                config::JsonObject po;
+                po["op"] = config::JsonValue{std::to_string(p.op)};
+                po["partition"] = config::JsonValue{static_cast<std::int64_t>(p.partition)};
+                po["next_offset"] = p.to ? config::JsonValue{*p.to} : config::JsonValue{};
+                positions.emplace_back(std::move(po));
+            }
+            base["positions"] = config::JsonValue{std::move(positions)};
+            base["watermark_ms"] = sc.base->watermark_ms ? config::JsonValue{*sc.base->watermark_ms}
+                                                         : config::JsonValue{};
+            d["base"] = config::JsonValue{std::move(base)};
+        }
         config::JsonObject lineage;
         config::JsonArray restores;
         for (const auto& r : sc.restores) {
@@ -397,8 +414,11 @@ config::JsonValue scope_document(const Bundle& b, const Scope& sc) {
         finality["watermark_ms"] =
             final_watermark ? config::JsonValue{*final_watermark} : config::JsonValue{};
         d["finality"] = config::JsonValue{std::move(finality)};
-        if (sc.lineage.empty() || sc.lineage.back().checkpoint != sc.checkpoint ||
-            !(sc.starts_at_run_start && sc.starts_after == 0)) {
+        // A lineage from a start with no state, or an increment from its base.
+        // (A base with no recorded watermark is one no window had closed by.)
+        const bool starts = sc.base ? sc.starts_after == sc.base->checkpoint
+                                    : sc.starts_at_run_start && sc.starts_after == 0;
+        if (sc.lineage.empty() || sc.lineage.back().checkpoint != sc.checkpoint || !starts) {
             d["sources_complete"] = config::JsonValue{false};
         }
     }
@@ -540,14 +560,20 @@ Reference read_reference(const fs::path& path,
         throw ReferenceRefused("the reference's first line is not a " +
                                std::string{kReferenceFormat} + " header");
     }
-    // A record-wise scope's reference is version 1, a windowed scope's 2.
+    // A record-wise scope's reference is version 1, a windowed scope's 2, an
+    // increment's 3.
     const bool windowed = document.contains("transform");
-    const std::int64_t want_version = windowed ? kWindowReferenceVersion : kReferenceVersion;
+    const bool increment = document.contains("base");
+    const std::int64_t want_version = increment  ? kWindowIncrementReferenceVersion
+                                      : windowed ? kWindowReferenceVersion
+                                                 : kReferenceVersion;
     if (!header.contains("version") || !header.at("version").is_integral_number() ||
         header.at("version").as_int() != want_version) {
         throw ReferenceRefused("the reference is not version " + std::to_string(want_version) +
                                " of its format, which this release reads for a " +
-                               (windowed ? std::string{"windowed"} : std::string{"record-wise"}) +
+                               (increment  ? std::string{"windowed increment's"}
+                                : windowed ? std::string{"windowed"}
+                                           : std::string{"record-wise"}) +
                                " scope");
     }
     ref.version = want_version;
@@ -594,6 +620,42 @@ Reference read_reference(const fs::path& path,
                 "semantics)");
         }
         ref.semantics = header.at("semantics");
+    }
+    // The window state an increment's reference started from: its own, at the
+    // increment's base. Whether it is the state the last increment left is the
+    // chain's to show, by its hash; this reader binds it to the base.
+    const auto state_of = [&](const config::JsonValue& v,
+                              const std::string& where,
+                              std::uint64_t at) -> std::pair<std::uint64_t, std::string> {
+        if (!v.is_object() || !v.contains("checkpoint") ||
+            !v.at("checkpoint").is_integral_number() || v.string_or("sha256", "").size() != 64) {
+            throw ReferenceRefused("the reference's " + where +
+                                   " is not {checkpoint, sha256} of a window state");
+        }
+        const auto c = static_cast<std::uint64_t>(v.at("checkpoint").as_int());
+        if (c != at) {
+            throw ReferenceRefused("the reference's " + where + " is the state at checkpoint " +
+                                   std::to_string(c) + ", and the scope needs checkpoint " +
+                                   std::to_string(at));
+        }
+        return {c, v.string_or("sha256", "")};
+    };
+    if (increment) {
+        if (!header.contains("state_in")) {
+            throw ReferenceRefused(
+                "the reference to an increment names no state it started from (its header's "
+                "state_in)");
+        }
+        ref.state_in =
+            state_of(header.at("state_in"),
+                     "state_in",
+                     static_cast<std::uint64_t>(document.at("base").at("checkpoint").as_int()));
+        ref.verified.push_back(
+            "it says it started from its own window state at the increment's "
+            "base, checkpoint " +
+            std::to_string(ref.state_in->first));
+        ref.recorded.push_back("started from window state " + ref.state_in->second +
+                               " at checkpoint " + std::to_string(ref.state_in->first));
     }
     // The identity columns a window line names, in the transform's order.
     std::vector<std::string> identity;
@@ -718,6 +780,19 @@ Reference read_reference(const fs::path& path,
         }
         ref.source_bounds = source_bounds_of(*end, document);
         ref.records = end->contains("records") ? end->at("records") : config::JsonValue{};
+        if (end->contains("state_out")) {
+            ref.state_out =
+                state_of(end->at("state_out"),
+                         "state_out",
+                         static_cast<std::uint64_t>(document.at("checkpoint").as_int()));
+            ref.recorded.push_back("left window state " + ref.state_out->second +
+                                   " at checkpoint " + std::to_string(ref.state_out->first));
+        } else if (increment && ref.complete) {
+            // An incomplete reference computed no windows, and leaves no state.
+            throw ReferenceRefused(
+                "the reference to an increment names no state it left (its end line's "
+                "state_out)");
+        }
     }
     ref.writer_verified = strings_of(*end, "verified");
     for (auto& r : strings_of(*end, "recorded")) {

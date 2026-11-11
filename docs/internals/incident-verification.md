@@ -364,6 +364,21 @@ The lineage runs back through every restore the bundle records, its `RESTORED` r
 
 **Recovery.** The lineage holds what the surviving runs processed. A run the restore discarded may have written windows to the destination after the restored checkpoint. The restored run then writes them again, under fresh INSERTs, and the destination holds them twice. The comparisons count those copies, `reconcile.rows` and `reference.destination` fail with them, and the report puts them down to the restore. Nothing is collapsed with `DISTINCT` to make a run pass. A discarded run that decided an undetermined record otherwise leaves a changed row, and the report shows that too.
 
+**Increments.** A whole lineage needs every lineage checkpoint's snapshots, and a Worker keeps only its newest `--checkpoint-num-retained`, so on a running job it cannot be audited for long. `incident-scope --since=M` writes one increment of the lineage instead (version 3): from an earlier completed checkpoint M of the lineage to the audited one.
+
+```bash
+clink incident-scope incident-42 --checkpoint=42 --since=41 --out=scope.json
+python3 reference_windows.py --scope=scope.json --bootstrap=kafka.internal:9092 \
+    --state-in=state-41.json --state-out=state-42.json --out=reference.ndjson
+CH_PASSWORD=... clink incident-reconcile incident-42 --checkpoint=42 --since=41 \
+    --reference=reference.ndjson --host=clickhouse.internal --user=reconciler --password-env=CH_PASSWORD
+```
+
+- *The scope* adds `base`: M, where the source stood there and the watermark the sink recorded at its barrier, from M's own interval evidence, which the bundle must hold (collect with `--epochs` reaching back to M). Its ranges start at M's positions, and its lineage holds the completed checkpoints after M, through the restores between. When M is not on the lineage, because a restore went back past it, the scope is refused (exit 2), naming the restore point the lineage does pass.
+- *What it owes.* A window's row reaches the sink when the watermark passes its end plus lateness: the windows received by M are those whose end plus lateness is at or below the watermark recorded at M. The increment owes the windows that close after it and by the audited checkpoint, and the sink's rows of the intervals after M. A record after M whose window had closed by M is dropped, whatever arrived when.
+- *The reference's state.* Nothing before M changes a decision after it but each partition's greatest event time and the windows still open. The reference carries both in its own state (`WindowState` in `python/clink-reference`): the version 3 artifact names the state it started from (`state_in`, which must be at M) and the one it left (`state_out`). The audit binds `state_in` to the base and records both hashes; whether they chain is the caller's to keep, and the state is the reference's own, computed from the records it read.
+- *Finality.* A row of a window the base's watermark had closed fails `reference.finality`: an earlier increment owed it. A window the sink received again after M fails `reference.capture` as unexpected, and a restore in the lineage explains it as before. `--coverage=complete-table` is refused for an increment.
+
 **Coverage.** A selected-key read selects the identities of the reference's final windows and of the captured rows. `--coverage=complete-table` compares the whole table with the final windows, on the same conditions as for a record-wise job. Rows of undetermined windows are counted and left out, and a row of an open window, or of an identity neither side names, fails.
 
 **What a passing windowed audit establishes.** The job's declared window rules are the reference's. Its recorded watermark never ran ahead of what the source's records allowed, and no window closed early. Every window final at the audited checkpoint holds exactly the reference's value, computed outside the job from the job's whole lineage. That holds in the sink's captured input and in the destination for the identities read, or the whole table under `complete-table`, with copies counted. It establishes nothing about windows still open at the checkpoint, nor records after it. Like the record-wise audit, it is only as independent as the reference.
