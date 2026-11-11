@@ -1,6 +1,6 @@
 # Incident verification
 
-> How `clink incident-collect`, `clink incident-verify` and `clink incident-regress` turn a job's checkpoints, flight-recorder captures and protocol traces into a portable bundle, check it offline, and freeze a reproduced epoch as a regression test; and how `clink incident-reconcile` reads a ClickHouse destination, explicitly and read-only, to say whether it holds exactly what one completed checkpoint owed it. The design records are [014](../design/014-incident-evidence-bundles.md) and [015](../design/015-destination-reconciliation.md).
+> How `clink incident-collect`, `clink incident-verify` and `clink incident-regress` turn a job's checkpoints, flight-recorder captures and protocol traces into a portable bundle, check it offline, and freeze a reproduced epoch as a regression test; and how `clink incident-reconcile` reads a ClickHouse destination, explicitly and read-only, to say whether it holds exactly what one completed checkpoint owed it. `clink-audit` runs the audit repeatedly against a running job. The design records are [014](../design/014-incident-evidence-bundles.md), [015](../design/015-destination-reconciliation.md) and [016](../design/016-repeated-audits.md).
 
 An incident leaves its evidence spread across a job's directories: the checkpoint markers that say which checkpoint a restore chooses, the participants' snapshots and their integrity sidecars, the flight recorder's epochs, the protocol traces of each process, and the coordinator's job manifest. Each of them already has a reader in the engine. A bundle gathers them into one directory with a manifest, so the same readers can run anywhere else, with no cluster and no services, and say what the evidence does and does not establish.
 
@@ -368,6 +368,46 @@ The lineage runs back through every restore the bundle records, its `RESTORED` r
 
 **What a passing windowed audit establishes.** The job's declared window rules are the reference's. Its recorded watermark never ran ahead of what the source's records allowed, and no window closed early. Every window final at the audited checkpoint holds exactly the reference's value, computed outside the job from the job's whole lineage. That holds in the sink's captured input and in the destination for the identities read, or the whole table under `complete-table`, with copies counted. It establishes nothing about windows still open at the checkpoint, nor records after it. Like the record-wise audit, it is only as independent as the reference.
 
+## Repeated audits of a running job
+
+[`python/clink-audit`](https://github.com/orhaugh/clink/tree/main/python/clink-audit) runs the record-wise audit again and again against a running job, within bounds the operator sets, and keeps an account of what was verified. It adds no check: each audit is `incident-collect`, `incident-scope`, the operator's reference, `incident-verify` under the proven network isolation described above, and `incident-reconcile --reference` on the scope's keys. [Record 016](../design/016-repeated-audits.md) sets out the contract and why.
+
+```bash
+clink-audit run --config=audit.json       # one cycle, for cron or another scheduler
+clink-audit poll --config=audit.json      # cycles in the foreground
+clink-audit status --config=audit.json --json
+clink-audit acknowledge --config=audit.json --audit=<id> --note="..."
+```
+
+**Supported.** Record-wise jobs from one Kafka SQL source into the ClickHouse native sink, as above, read for the scope's keys only. A windowed job is refused as unsupported: its scope is its whole lineage, and auditing it repeatedly would read the job's whole history each time.
+
+**Selection.** `sequential` audits every completed checkpoint in order; `latest-only` audits the newest and records each one it passed over as skipped. Nothing samples records or keys. A cycle audits what was eligible when it began. A checkpoint completing during it is collected at once and audited by the next cycle, because a scope's bundle needs the snapshots of the checkpoints that bound it, and a Worker keeps only its newest `--checkpoint-num-retained`. The runner looks for new checkpoints between every step. One whose state was purged before collection is a gap, recorded as expired.
+
+**Collection refusals.** `incident-collect --json` writes a refusal with its kind: `changed` (the job moved on during the copy), `missing` (no completion marker), `bound`, `timeout` or `other`. The runner collects again on `changed`, records `missing` as a gap, and reads no refusal's text.
+
+**Results.** Each audit publishes one report (`clink-audit-report` version 1) under an id made from the checkpoint, the job and the configuration's fingerprint. The outcome is one of:
+
+| Outcome | Means | Coverage |
+| --- | --- | --- |
+| `passed` | every required check passed, for the selected keys | verified |
+| `empty` | the scope's complete source range held no record the job turns into a row: the reference computed none, and the sink received none | verified |
+| `discrepancy` | reconciliation or verification failed; the findings name the relationship (transformation, delivery, reference-destination, evidence) | a gap until acknowledged |
+| `partial` | a check could not be completed: a dependency down, a bound reached, history expired, isolation not enforced | a gap |
+| `error` | a step failed, refused or ran out of time | a gap |
+| `unsupported`, `expired`, `skipped` | the job's shape, the purged state, the latest-only selection | a gap |
+
+A partial result or an error is tried again in a later cycle, once its backoff is spent, up to `max_attempts`; an audit has at most one attempt per cycle, so a dependency that is down costs one attempt per audit per cycle. A discrepancy is never tried again. Every failed attempt is kept in the report. Coverage comes only from results that passed or were empty, per log and partition, as merged offset ranges.
+
+**Restarts.** One runner holds a state directory at a time (`flock`). Each step's result is recorded once its output is in place, and each child runs in its own process group, which the runner records. After a crash, the runner stops the orphan, publishes an audit whose report was written but not recorded, and resumes the rest at the step that was running. Unfinished work is never counted as verified, and a discrepancy already found is never read again.
+
+**Status.** `status` reads the state directory alone. It gives the last attempted and last verified scope and its age, coverage and its gaps, the backlog, discrepancies and checks that could not finish, and the runner's resource use. The state is the most severe of `discrepancy` (exit 1), `stopped`, `incomplete`, `behind`, `stale` (exit 3), `no-eligible-scope` (exit 5) and `healthy` (exit 0). A later pass never clears a discrepancy or a gap. An operator acknowledges one, with a note, and it stays listed. `events.ndjson` holds one JSON object per event for whatever monitors the host; the runner sends nothing anywhere.
+
+**Bounds and evidence.** Every child has a time limit. The bundle, the reference's artifact, rows and source records, and the destination's queries are bounded. A bound that is reached makes the audit partial, never a pass. Evidence of audits that did not pass is kept; that of passed audits is kept for the newest `retain_passed`. Retention deletes only directories the runner created and marked, inside its state directory. When the disk budget would be passed, the runner stops starting audits, says so, and deletes nothing. Retained bundles hold the job's records and state.
+
+**Credentials.** The configuration names environment variables, never values. The reference receives its own, reconciliation the destination's, and collection, scope export and verification none. The reference is an argument array the operator configures, with fixed placeholders, run without a shell. Nothing a bundle, scope, artifact or job manifest names is run.
+
+`examples/audit-runner/` qualifies it against Kafka and ClickHouse while the job keeps producing, and measures it.
+
 ## What passing does not mean
 
 The digests establish that nothing in a bundle changed after it was collected. They do not establish who collected it: anyone who can replace the bundle can replace its manifest too, and signing is out of scope. A passing bundle is evidence about the files in it, checked by this build's readers. It is not a proof that the implementation is correct, that the job's business logic is right, or that any external system holds what the job wrote: nothing offline reads a destination. A passing reconciliation establishes one checkpoint's effects in one table at one observation time, against what the job's own sink received. It does not establish that the transformation is right, which the replay checks and an independent reference address, nor that the rows survive the server's host losing power, nor anything about the table after the read. A passing audit adds that the job's output, and the destination over the keys read, equal what a reference computed outside the job, from the same records. That is only as independent as the reference is, and the audit cannot establish that. With selected keys, it establishes nothing about rows of other keys.
@@ -411,4 +451,5 @@ Destination reconciliation does not support:
 | The independent reference audit | `include/clink/incident/reference.hpp`, `src/incident/reference.cpp` (the scope document, the artifact's reader, the multiset comparison); a windowed job's shape and lineage in `src/incident/window_scope.cpp` and `load_scope`, its checks in `src/incident/reconcile.cpp`; the reference library `python/clink-reference/` (`windows.py` for windows) |
 | Tests | `tests/test_incident_bundle.cpp` (collection, the reader, the core checks), `tests/test_incident_replay.cpp` (replay on a real captured run), `tests/test_incident_reconcile.cpp` (the cells, the comparison, the sink's interval evidence, whole reconciliations, `ReconcileWindow.*` for windowed jobs), `impls/clickhouse/tests/test_reconcile_destination_live.cpp` (the reader against a real server, in `scripts/clickhouse-live.sh`), `python/clink-reference/tests/`, and the examples `examples/destination-reconciliation/` and `examples/window-audit/` |
 | The example and gate | `examples/incident-verification/`; `scripts/incident-gate.sh` runs both suites, requires every case to have run, then the example |
+| Repeated audits | `python/clink-audit/` (`runner.py`: selection, steps, resume, publication and retention; `status.py`; `isolation.py`; `proc.py`), its tests `python/clink-audit/tests/`, and `examples/audit-runner/` |
 | Network isolation, proven before verification relies on it | `scripts/network-isolation.sh`, tested by `scripts/tests/test_network_isolation.py` |

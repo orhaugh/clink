@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clink-audit"
+version = "0.1.0"
+description = "Audit a running clink job's completed checkpoints repeatedly, within explicit bounds: collect, reference, verify offline and reconcile each scope, and keep coverage, gaps and discrepancies"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Ross Haugh", email = "orhaugh@gmail.com" }]
+requires-python = ">=3.10"
+# The standard library only: it runs `clink` and the operator's reference.
+dependencies = []
+
+[project.scripts]
+clink-audit = "clink_audit.cli:main"
+
+[project.urls]
+Repository = "https://github.com/orhaugh/clink"
+Documentation = "https://orhaugh.github.io/clink/internals/incident-verification/#repeated-audits-of-a-running-job"
+
+[tool.setuptools.packages.find]
+include = ["clink_audit*"]

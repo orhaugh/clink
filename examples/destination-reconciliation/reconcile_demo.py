@@ -206,6 +206,9 @@ class Cluster:
     job_template = HERE / "job.sql.in"
     parallelism = 2
     variants = JOB_VARIANTS
+    # The completed checkpoints each Worker keeps; another example lowers it
+    # to have the Workers purge state before it is collected.
+    retained = 100000
 
     def __init__(self, demo, name, worker1_faults="", worker2_late=False, capture=True,
                  capture_records=100000, interval_ms=1000, defer_worker2=False, variant=None):
@@ -258,7 +261,7 @@ class Cluster:
                     ["--role=worker", "--id=worker-%d" % n, "--coordinator-host=127.0.0.1",
                      "--coordinator-port=%d" % self.coord_port, "--port=%d" % port,
                      "--data-host=127.0.0.1", "--slots=16", "--http-port=%d" % http,
-                     "--checkpoint-num-retained=100000"], env)
+                     "--checkpoint-num-retained=%d" % self.retained], env)
         self._await_http(http, "worker-%d" % n)
 
     def start(self, topic, table, ch_port):
@@ -343,6 +346,9 @@ class Cluster:
 
 
 class Demo:
+    # The module of scenarios beside the driver; another example names its own.
+    scenario_module = "scenarios"
+
     def __init__(self, args):
         self.bin = Path(args.bin_dir).resolve()
         self.work = Path(args.work).resolve()
@@ -601,7 +607,8 @@ class Demo:
         }
         (self.results / "versions.json").write_text(json.dumps(versions, indent=2))
         self.note("ClickHouse %s, clink %s" % (versions["clickhouse"], versions["clink"]))
-        import scenarios  # noqa: E402  (beside this file)
+        import importlib
+        scenarios = importlib.import_module(self.scenario_module)
         for name, fn in scenarios.ALL:
             if not self.want(name):
                 continue

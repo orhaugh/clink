@@ -55,7 +55,7 @@ open in pyarrow, DuckDB or Polars, and a running job's state answers point
 lookups and scans over HTTP. A flight recorder can replay an incident
 deterministically and freeze it into a regression test, and, for a Kafka to
 ClickHouse job, say whether the table holds exactly what a completed
-checkpoint owed it.
+checkpoint owed it, once or for every checkpoint of a running job.
 
 clink is young and pre-1.0, written by one maintainer with extensive AI
 assistance. The specification, the qualification campaigns and the

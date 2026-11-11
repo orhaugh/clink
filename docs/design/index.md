@@ -26,3 +26,4 @@ subsystems work today, and take precedence wherever detail has evolved.
 | [013](013-state-namespaced-by-job.md) | State is namespaced by job |
 | [014](014-incident-evidence-bundles.md) | Incident evidence bundles |
 | [015](015-destination-reconciliation.md) | Destination reconciliation |
+| [016](016-repeated-audits.md) | Repeated, bounded audits of a running job |

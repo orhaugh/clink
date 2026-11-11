@@ -528,6 +528,21 @@ jobs:
         # runner allows it. No build, no toolchain.
         run: python3 -m unittest discover -s scripts/tests -v
 
+  audit-runner:
+    name: The audit runner keeps an honest account
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clink-audit tests
+        # python/clink-audit against a scripted clink and reference: crashes
+        # inside each step and after the report, concurrent runners, purged
+        # checkpoints, expired history, outages, timeouts, malformed and
+        # oversized references, bounds, latest-only gaps, a discrepancy
+        # surviving later passes, retention that keeps failure evidence and
+        # touches nothing it does not own, and the isolation proof. No build;
+        # examples/audit-runner/ is its qualification against real services.
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s python/clink-audit/tests -v
+
   formal:
     name: Exactly-once specification model-checks
     runs-on: ubuntu-24.04

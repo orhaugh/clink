@@ -200,6 +200,7 @@ nav:
       - design/013-state-namespaced-by-job.md
       - design/014-incident-evidence-bundles.md
       - design/015-destination-reconciliation.md
+      - design/016-repeated-audits.md
   - Examples:
       - consumer-examples/README.md
       - consumer-examples/fetchcontent/README.md

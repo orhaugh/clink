@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**Repeated, bounded audits of a running job.** `clink-audit`
+(`python/clink-audit`) runs the record-wise independent audit against a
+running Kafka to ClickHouse job, again and again: `run` for a scheduler, or
+`poll` in the foreground. It collects each completed checkpoint before the
+Workers purge the state its scope reads, then exports the scope, runs the
+operator's reference, verifies the bundle under proven network isolation and
+reconciles the destination for the scope's keys, each step a bounded child
+process. Every scope gets one published result under an identity that a
+restart keeps; a crashed runner stops the child it left and resumes at the
+step it was in; a discrepancy is never tried again, and a partial result is,
+within its attempts. The status gives the coverage verified, per log and
+partition, every gap and discrepancy until an operator acknowledges it, the
+backlog and the cost, and exits accordingly. Sequential selection audits
+every checkpoint; latest-only audits the newest and records each one it
+passes over. Windowed jobs are refused: their scope is their whole lineage.
+It is repeated auditing of the selected scopes, not a continuous proof.
+`examples/audit-runner/` qualifies it against Kafka and ClickHouse while the
+job keeps producing (design record 016).
+
 **`incident-collect` says which kind of refusal it made.** With `--json`, a
 refusal is also written to standard output with its kind: `changed` (the job
 moved on while the bundle was copied: collect again), `missing` (no
