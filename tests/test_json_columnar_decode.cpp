@@ -1873,3 +1873,29 @@ TEST(JsonRowBridge, BothFactoriesTakeTheTablesPolicy) {
         }
     }
 }
+
+// The partitions the Kafka source subtask declares on its batches ride through
+// the bridge, on the columnar path and the row path, to the watermark assigner
+// behind it, which holds its watermark for one that has delivered nothing.
+TEST(JsonColumnarDecode, TheSourcesDeclaredPartitionsRideThroughTheBridge) {
+    const auto owned =
+        std::make_shared<const std::vector<std::int32_t>>(std::vector<std::int32_t>{0, 3});
+    const auto declared = [&] {
+        Batch<std::string> in;
+        Record<std::string> r(std::string(R"({"a":1,"b":1.5,"c":"x","d":true})"),
+                              clink::EventTime{100});
+        r.set_source_partition(0);
+        in.push(std::move(r));
+        in.set_source_partitions(owned);
+        return in;
+    };
+    JsonStringToRowColumnarOperator col_op(demo_schema());
+    const auto col = run_one(col_op, declared());
+    ASSERT_TRUE(col.is_data());
+    EXPECT_TRUE(col.as_data().is_columnar());
+    EXPECT_EQ(col.as_data().source_partitions(), owned);
+    auto oracle = make_row_oracle();
+    const auto row = run_one(oracle, declared());
+    ASSERT_TRUE(row.is_data());
+    EXPECT_EQ(row.as_data().source_partitions(), owned);
+}

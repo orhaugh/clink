@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -502,4 +503,136 @@ TEST(WatermarkAssignerRestore, ARestoredPartitionThatStaysQuietGoesIdle) {
                             .count());
     EXPECT_EQ(greatest_watermark(ch), 96'000)
         << "partitions 0 and 1, quiet since the restore, no longer hold the min";
+}
+
+// ---- partitions a source declares -----------------------------------------------
+//
+// A Kafka source subtask that owns several partitions declares them on its
+// batches. A declared partition that has not delivered holds the watermark:
+// learning partitions from records alone, the first one to deliver carried the
+// watermark past the others' records, which then arrived late.
+
+namespace {
+
+Batch<int> declared_batch(std::vector<std::tuple<int, std::int64_t, std::int32_t>> recs,
+                          std::vector<std::int32_t> owned) {
+    Batch<int> b;
+    for (auto [v, ts, partition] : recs) {
+        Record<int> r{v, EventTime{ts}};
+        r.set_source_partition(partition);
+        b.push(std::move(r));
+    }
+    if (!owned.empty()) {
+        b.set_source_partitions(
+            std::make_shared<const std::vector<std::int32_t>>(std::move(owned)));
+    }
+    return b;
+}
+
+std::int64_t max_active_watermark(BoundedChannel<StreamElement<int>>& ch) {
+    std::int64_t mx = -1;
+    while (auto e = ch.try_pop()) {
+        if (e->is_watermark() && !e->as_watermark().is_idle()) {
+            mx = std::max(mx, e->as_watermark().timestamp().millis());
+        }
+    }
+    return mx;
+}
+
+}  // namespace
+
+TEST(WatermarkAssignerDeclared, ADeclaredPartitionHoldsTheWatermarkUntilItDelivers) {
+    for (const bool declared : {false, true}) {
+        BoundedChannel<StreamElement<int>> out_ch(64);
+        Emitter<int> em(&out_ch);
+        // Event times stamped on the records: the all-timestamped fast path.
+        WatermarkAssignerOperator<int> op(
+            [](const int& v) { return EventTime{v}; },
+            std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<int>>(0ms));
+        RuntimeContext ctx(OperatorId{1}, "assigner", nullptr, nullptr);
+        op.attach_runtime(&ctx);
+        op.open();
+        const std::vector<std::int32_t> owned =
+            declared ? std::vector<std::int32_t>{0, 1} : std::vector<std::int32_t>{};
+        // Partition 0's backlog is read first, an hour ahead of partition 1's.
+        op.process(StreamElement<int>::data(declared_batch({{1, 3'600'000, 0}}, owned)), em);
+        const auto first = max_active_watermark(out_ch);
+        op.process(StreamElement<int>::data(declared_batch({{2, 1'000, 1}}, owned)), em);
+        const auto second = max_active_watermark(out_ch);
+        if (declared) {
+            EXPECT_EQ(first, -1) << "partition 1 was declared and had delivered nothing";
+            EXPECT_EQ(second, 1'000) << "the slowest partition, once it delivered";
+        } else {
+            // Without a declaration the first partition sets the watermark
+            // alone, and partition 1's record is an hour behind it.
+            EXPECT_EQ(first, 3'600'000);
+        }
+    }
+}
+
+TEST(WatermarkAssignerDeclared, TheStampingPathDeclaresToo) {
+    BoundedChannel<StreamElement<int>> out_ch(64);
+    Emitter<int> em(&out_ch);
+    WatermarkAssignerOperator<int> op(
+        [](const int& v) { return EventTime{v}; },
+        std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<int>>(0ms));
+    RuntimeContext ctx(OperatorId{1}, "assigner", nullptr, nullptr);
+    op.attach_runtime(&ctx);
+    op.open();
+    // Records without an event time: the assigner stamps them from the value.
+    Batch<int> b;
+    Record<int> r{5'000};
+    r.set_source_partition(0);
+    b.push(std::move(r));
+    b.set_source_partitions(
+        std::make_shared<const std::vector<std::int32_t>>(std::vector<std::int32_t>{0, 1}));
+    op.process(StreamElement<int>::data(std::move(b)), em);
+    EXPECT_EQ(max_active_watermark(out_ch), -1);
+}
+
+TEST(WatermarkAssignerDeclared, IdlenessReleasesADeclaredPartitionThatStaysEmpty) {
+    BoundedChannel<StreamElement<int>> out_ch(64);
+    Emitter<int> em(&out_ch);
+    WatermarkAssignerOperator<int> op(
+        [](const int& v) { return EventTime{v}; },
+        std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<int>>(0ms));
+    op.with_idleness(50ms);
+    RuntimeContext ctx(OperatorId{1}, "assigner", nullptr, nullptr);
+    op.attach_runtime(&ctx);
+    op.open();
+    op.process(StreamElement<int>::data(declared_batch({{1, 300, 0}}, {0, 1})), em);
+    EXPECT_EQ(max_active_watermark(out_ch), -1);
+    std::this_thread::sleep_for(80ms);
+    op.process(StreamElement<int>::data(declared_batch({{2, 400, 0}}, {0, 1})), em);
+    op.fire_due_timers(em,
+                       std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count());
+    EXPECT_EQ(max_active_watermark(out_ch), 400)
+        << "partition 1, declared and empty past the idleness window, no longer holds it";
+}
+
+TEST(WatermarkAssignerDeclared, TheDeclaredPartitionsAreCheckpointed) {
+    BoundedChannel<StreamElement<int>> out_ch(64);
+    Emitter<int> em(&out_ch);
+    WatermarkAssignerOperator<int> op(
+        [](const int& v) { return EventTime{v}; },
+        std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<int>>(0ms));
+    op.with_subtask_index(2);
+    RuntimeContext ctx(OperatorId{1}, "assigner", nullptr, nullptr);
+    op.attach_runtime(&ctx);
+    op.open();
+    // Before any batch, the row is there and empty: this assigner holds for
+    // declared partitions, and none has been declared yet.
+    InMemoryStateBackend before;
+    op.snapshot_timers(before, OperatorId{7});
+    const auto empty = before.get_operator_state(OperatorId{7}, "__clink_wm_declared:2");
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->empty());
+    op.process(StreamElement<int>::data(declared_batch({{1, 300, 2}}, {2, 5})), em);
+    InMemoryStateBackend backend;
+    op.snapshot_timers(backend, OperatorId{7});
+    const auto row = backend.get_operator_state(OperatorId{7}, "__clink_wm_declared:2");
+    ASSERT_TRUE(row.has_value());
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(row->data()), row->size()), "2,5");
 }

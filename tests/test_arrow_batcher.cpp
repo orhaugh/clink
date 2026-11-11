@@ -139,6 +139,45 @@ TEST(ArrowBatcherContract, StringFramesCarryTheirSourcePartitionsAcrossTheWire) 
     }
 }
 
+// The partitions the source subtask owns ride beside the records' own: the
+// assigner past the decoder holds its watermark for one that has delivered
+// nothing, which the records alone cannot show it. A batch that declares none
+// arrives declaring none; text that is not a list of partitions is ignored.
+TEST(ArrowBatcherContract, StringFramesCarryTheirSourcesOwnedPartitions) {
+    Batch<std::string> b;
+    Record<std::string> r{std::string{"a"}, EventTime{10}};
+    r.set_source_partition(3);
+    b.push(std::move(r));
+    b.set_source_partitions(
+        std::make_shared<const std::vector<std::int32_t>>(std::vector<std::int32_t>{0, 3, 6}));
+    const auto batcher = string_arrow_batcher();
+    const auto built = batcher.build(b);
+    ASSERT_NE(built, nullptr);
+    EXPECT_TRUE(built->schema()->Equals(*batcher.schema(), /*check_metadata=*/false));
+    const auto ipc = arrow_batch_to_ipc(*built);
+    const auto parsed = batcher.parse(*arrow_batch_from_ipc(ipc.data(), ipc.size()));
+    ASSERT_TRUE(parsed.has_value());
+    ASSERT_NE(parsed->source_partitions(), nullptr);
+    EXPECT_EQ(*parsed->source_partitions(), (std::vector<std::int32_t>{0, 3, 6}));
+    EXPECT_EQ((*parsed)[0].source_partition(), 3) << "the record's own partition still rides";
+
+    Batch<std::string> plain;
+    plain.emplace(std::string{"x"}, EventTime{1});
+    const auto undeclared = batcher.parse(*batcher.build(plain));
+    ASSERT_TRUE(undeclared.has_value());
+    EXPECT_EQ(undeclared->source_partitions(), nullptr);
+    for (const char* text : {"0,,1", "x", "-1", "1,"}) {
+        const auto tagged =
+            arrow::RecordBatch::Make(built->schema()->WithMetadata(arrow::key_value_metadata(
+                                         {std::string{kSourcePartitionsKey}}, {text})),
+                                     built->num_rows(),
+                                     built->columns());
+        const auto got = batcher.parse(*tagged);
+        ASSERT_TRUE(got.has_value()) << text;
+        EXPECT_EQ(got->source_partitions(), nullptr) << text;
+    }
+}
+
 TEST(ArrowBatcherContract, AStringFrameWithoutPartitionsIsUnchanged) {
     Batch<std::string> b;
     b.emplace(std::string{"x"}, EventTime{1});

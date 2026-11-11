@@ -46,6 +46,14 @@ public:
     // the full idle set each probe.
     virtual void set_idle_partitions(const std::vector<std::int32_t>& /*idle*/) {}
 
+    // The partitions the source subtask upstream owns, as it declares them on
+    // its batches (Batch::source_partitions). A partition-aware strategy holds
+    // its watermark for a declared partition until that partition delivers a
+    // record or goes idle: it cannot know a partition it has not heard from,
+    // and without the declaration the first partition to deliver would set the
+    // watermark alone. The full set each time; it only grows. Default no-op.
+    virtual void declare_partitions(const std::vector<std::int32_t>& /*owned*/) {}
+
     // The per-partition progress a partition-aware strategy derives its
     // watermark from: the greatest event time seen in each source partition.
     // The assigner checkpoints it, so a restored stream knows which partitions
@@ -147,6 +155,16 @@ private:
 // partition. A partition re-activates the instant it produces again
 // (`on_record` clears it). This is the per-partition mirror of the assigner's
 // stream-level idleness.
+//
+// Partitions that have not delivered: a source subtask can own a partition
+// before any of its records arrive (a backlog read unevenly, a partition
+// with nothing in it yet, one discovery just assigned). Learning partitions
+// from records alone, the min would leave such a partition out, and the
+// first partition to deliver would carry the watermark past the others'
+// records. A source that knows its partitions declares them
+// (`declare_partitions`, from Batch::source_partitions), and a declared
+// partition that has delivered nothing holds the watermark until it does,
+// or goes idle. Without a declaration, partitions are learnt from records.
 template <typename T>
 class PartitionAwareBoundedOutOfOrdernessStrategy final : public WatermarkStrategy<T> {
 public:
@@ -187,6 +205,19 @@ public:
         }
     }
 
+    // The source subtask's owned partitions. One that has delivered nothing
+    // and is not idle holds the watermark (current_watermark), so the first
+    // partition to deliver cannot set it alone.
+    void declare_partitions(const std::vector<std::int32_t>& owned) override {
+        bool grew = false;
+        for (const auto p : owned) {
+            grew = declared_.insert(p).second || grew;
+        }
+        if (grew) {
+            dirty_ = true;
+        }
+    }
+
     std::map<std::int32_t, EventTime> partition_progress() const override { return part_max_; }
 
     void restore_partition_progress(const std::map<std::int32_t, EventTime>& progress) override {
@@ -208,6 +239,13 @@ public:
             return std::nullopt;
         }
         dirty_ = false;
+        // A declared partition that has delivered nothing, and is not idle,
+        // holds the watermark where it is.
+        for (const auto p : declared_) {
+            if (!part_max_.contains(p) && !idle_partitions_.contains(p)) {
+                return std::nullopt;
+            }
+        }
         std::optional<EventTime> base;
         for (const auto& [part, mx] : part_max_) {
             if (idle_partitions_.count(part) != 0) {
@@ -234,6 +272,7 @@ public:
 private:
     std::chrono::milliseconds bound_;
     std::map<std::int32_t, EventTime> part_max_;
+    std::set<std::int32_t> declared_;  // the owned partitions the source declared
     std::set<std::int32_t> idle_partitions_;
     EventTime global_max_{};
     bool global_seen_{false};

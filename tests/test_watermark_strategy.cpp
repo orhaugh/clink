@@ -1,4 +1,5 @@
 #include <chrono>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -183,6 +184,56 @@ TEST(WatermarkStrategy, PartitionAwareIdlePartitionReactivatesOnRecord) {
     auto wm = s.current_watermark();
     ASSERT_TRUE(wm.has_value());
     EXPECT_EQ(wm->timestamp(), EventTime{1500}) << "re-activated p1 constrains the min";
+}
+
+// A source subtask that owns several partitions declares them. A declared
+// partition that has delivered nothing holds the watermark: without that, the
+// first partition to deliver sets the watermark alone, and the others' records
+// arrive late.
+TEST(WatermarkStrategy, PartitionAwareDeclaredPartitionHoldsUntilItDelivers) {
+    PartitionAwareBoundedOutOfOrdernessStrategy<int> s(std::chrono::milliseconds{0});
+    s.declare_partitions({0, 2});
+    s.on_record(part_rec(1, 5000, 0));
+    EXPECT_FALSE(s.current_watermark().has_value())
+        << "partition 2 is declared and has delivered nothing, so it holds the watermark";
+    s.on_record(part_rec(2, 300, 2));
+    auto wm = s.current_watermark();
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(wm->timestamp(), EventTime{300})
+        << "the slowest declared partition, once it delivers";
+}
+
+TEST(WatermarkStrategy, PartitionAwareIdleDeclaredPartitionIsReleased) {
+    PartitionAwareBoundedOutOfOrdernessStrategy<int> s(std::chrono::milliseconds{0});
+    s.declare_partitions({0, 2});
+    s.on_record(part_rec(1, 5000, 0));
+    EXPECT_FALSE(s.current_watermark().has_value());
+    s.set_idle_partitions({2});
+    auto wm = s.current_watermark();
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(wm->timestamp(), EventTime{5000}) << "idleness releases an empty declared partition";
+}
+
+TEST(WatermarkStrategy, PartitionAwareGrownDeclarationHoldsWithoutRegressing) {
+    PartitionAwareBoundedOutOfOrdernessStrategy<int> s(std::chrono::milliseconds{0});
+    s.declare_partitions({0});
+    s.on_record(part_rec(1, 1000, 0));
+    ASSERT_EQ(s.current_watermark()->timestamp(), EventTime{1000});
+    // Discovery gives the subtask partition 4: no further advance until it
+    // delivers, and no watermark below the one already emitted.
+    s.declare_partitions({0, 4});
+    s.on_record(part_rec(2, 3000, 0));
+    EXPECT_FALSE(s.current_watermark().has_value());
+    s.on_record(part_rec(3, 500, 4));
+    EXPECT_FALSE(s.current_watermark().has_value()) << "the min (500) is below what was emitted";
+    s.on_record(part_rec(4, 2000, 4));
+    ASSERT_EQ(s.current_watermark()->timestamp(), EventTime{2000});
+    // Declaring the same set again changes nothing.
+    s.declare_partitions({0, 4});
+    EXPECT_FALSE(s.current_watermark().has_value());
+    // The progress the assigner checkpoints is still only what was delivered.
+    EXPECT_EQ(s.partition_progress(),
+              (std::map<std::int32_t, EventTime>{{0, EventTime{3000}}, {4, EventTime{2000}}}));
 }
 
 TEST(WatermarkAssigner, EmitsProgressingWatermarkInline) {

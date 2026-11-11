@@ -624,6 +624,10 @@ void KafkaSource::open() {
     }
 }
 
+const std::vector<std::int32_t>& KafkaSource::owned_partitions() const noexcept {
+    return impl_->owned_partitions;
+}
+
 void KafkaSource::assign_owned_(std::int32_t partition_count) {
     const auto& opts = impl_->opts;
     std::vector<std::int32_t> owned;

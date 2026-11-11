@@ -161,6 +161,12 @@ public:
     static std::string encode_offsets(const std::map<std::int32_t, std::int64_t>& offsets);
     static std::map<std::int32_t, std::int64_t> decode_offsets(std::string_view bytes);
 
+    // The partitions this subtask owns now: set in open() from the topic's
+    // metadata by owns_partition, and grown by partition discovery, never
+    // shrunk. A downstream watermark holds for each until it delivers, so the
+    // SQL source declares them on its batches (Batch::source_partitions).
+    [[nodiscard]] const std::vector<std::int32_t>& owned_partitions() const noexcept;
+
     // Deterministic partition ownership rule shared by open(), restore_offset
     // and the snapshot prune. Pure and broker-independent for unit testing.
     static bool owns_partition(std::int32_t partition,

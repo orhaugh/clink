@@ -120,6 +120,8 @@ public:
                 }
                 rows.push(std::move(out_rec));
             }
+            // The partitions the source declared ride on, to the assigner.
+            rows.set_source_partitions(in.source_partitions());
             out.emit_data(std::move(rows));
         } else if (element.is_watermark()) {
             this->on_watermark(element.as_watermark(), out);
@@ -218,6 +220,7 @@ public:
             if (attempt) {
                 if (auto fast = build_columnar_ondemand_(in); fast.has_value()) {
                     consecutive_fallbacks_ = 0;
+                    fast->set_source_partitions(in.source_partitions());
                     out.emit_data(std::move(*fast));
                     return;
                 }
@@ -225,6 +228,7 @@ public:
                     clink::detail::json_columnar_dom_arm_counter().fetch_add(
                         1, std::memory_order_relaxed);
                     consecutive_fallbacks_ = 0;
+                    columnar->set_source_partitions(in.source_partitions());
                     out.emit_data(std::move(*columnar));
                     return;
                 }
@@ -255,6 +259,8 @@ public:
                 }
                 rows.push(std::move(out_rec));
             }
+            // The partitions the source declared ride on, to the assigner.
+            rows.set_source_partitions(in.source_partitions());
             out.emit_data(std::move(rows));
         } else if (element.is_watermark()) {
             this->on_watermark(element.as_watermark(), out);

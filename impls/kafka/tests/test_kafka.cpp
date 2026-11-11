@@ -35,8 +35,11 @@
 #include "clink/connectors/kafka_sink.hpp"
 #include "clink/connectors/kafka_source.hpp"
 #include "clink/metrics/metrics_registry.hpp"
+#include "clink/operators/watermark_assigner_operator.hpp"
+#include "clink/runtime/multi_input_alignment.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/time/watermark_strategy.hpp"
 
 using namespace clink;
 using namespace std::chrono_literals;
@@ -1646,6 +1649,161 @@ TEST(Kafka, SourceConsumesWhenTheGroupCoordinatorIsNotReadyYet) {
     // the resolver never regresses the path that already worked.
     source_consumes_through_group_coordinator_outage(
         RD_KAFKA_RESP_ERR_COORDINATOR_LOAD_IN_PROGRESS);
+}
+
+// ---- the watermark of a source subtask that owns several partitions ----------
+//
+// The SQL source declares the partitions its subtask owns on every batch, and
+// the watermark assigner holds for one that has delivered nothing. Without it,
+// the first partition to deliver set the watermark alone: a subtask reading a
+// backlog unevenly, or a partition written later, had the other partitions'
+// in-window records arrive behind the watermark, and windows dropped them.
+
+namespace {
+
+// The SQL Kafka source (kafka_source_string) as a subtask of a job at
+// `parallelism`, built through the registry as the planner builds it.
+std::shared_ptr<Source<std::string>> sql_kafka_source(const std::string& brokers,
+                                                      const std::string& topic,
+                                                      std::uint32_t subtask,
+                                                      std::uint32_t parallelism) {
+    const auto* factory = clink::cluster::OperatorRegistry::default_instance().find_source(
+        "kafka_source_string", clink::cluster::ChannelType{"string"});
+    if (factory == nullptr) {
+        return nullptr;
+    }
+    clink::cluster::OperatorBuildContext ctx;
+    ctx.params = {{"brokers", brokers},
+                  {"topic", topic},
+                  {"group_id", topic + "-group"},
+                  {"auto_offset_reset", "earliest"}};
+    ctx.subtask_idx = subtask;
+    ctx.parallelism = parallelism;
+    return std::static_pointer_cast<Source<std::string>>(factory->build(ctx));
+}
+
+void produce_to(const std::string& brokers,
+                const std::string& topic,
+                std::int32_t partition,
+                const std::vector<std::int64_t>& times) {
+    KafkaSink::Options o;
+    o.brokers = brokers;
+    o.topic = topic;
+    SinkHarness h(o);
+    Batch<KafkaMessage> batch;
+    for (const auto ts : times) {
+        KafkaMessage m{std::to_string(ts)};
+        m.partition = partition;
+        batch.emplace(std::move(m));
+    }
+    h.sink->on_data(batch);
+    h.sink->flush();
+}
+
+// Pumps the source until `records` more records have come through, feeding
+// each batch to the assigner, and returns the greatest active watermark the
+// assigner emitted (-1 for none) and the batches' declared partition sets.
+struct Pumped {
+    std::int64_t watermark{-1};
+    std::vector<std::vector<std::int32_t>> declared;
+    bool idle{false};
+};
+
+Pumped pump(Source<std::string>& src,
+            WatermarkAssignerOperator<std::string>& assigner,
+            std::size_t records,
+            std::chrono::milliseconds deadline) {
+    Pumped out;
+    BoundedChannel<StreamElement<std::string>> from_source(256);
+    Emitter<std::string> source_em(&from_source);
+    BoundedChannel<StreamElement<std::string>> from_assigner(256);
+    Emitter<std::string> assigner_em(&from_assigner);
+    std::size_t seen = 0;
+    const auto end = std::chrono::steady_clock::now() + deadline;
+    while (std::chrono::steady_clock::now() < end && (seen < records || records == 0)) {
+        src.produce(source_em);
+        while (auto el = from_source.try_pop()) {
+            if (el->is_data()) {
+                seen += el->as_data().size();
+                if (const auto& owned = el->as_data().source_partitions(); owned) {
+                    out.declared.push_back(*owned);
+                }
+            } else if (el->is_watermark() && el->as_watermark().is_idle()) {
+                out.idle = true;
+            }
+            assigner.process(*el, assigner_em);
+        }
+        if (records == 0) {
+            break;
+        }
+    }
+    while (auto el = from_assigner.try_pop()) {
+        if (el->is_watermark() && !el->as_watermark().is_idle()) {
+            out.watermark = std::max(out.watermark, el->as_watermark().timestamp().millis());
+        }
+    }
+    return out;
+}
+
+std::unique_ptr<WatermarkAssignerOperator<std::string>> ts_assigner() {
+    return std::make_unique<WatermarkAssignerOperator<std::string>>(
+        [](const std::string& v) { return EventTime{std::stoll(v)}; },
+        std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<std::string>>(
+            std::chrono::milliseconds{0}));
+}
+
+}  // namespace
+
+TEST(KafkaWatermark, APartitionThatHasNotDeliveredHoldsItsSubtasksWatermark) {
+    MockCluster mock;
+    const std::string topic = "held-by-the-slow-partition";
+    mock.create_topic(topic, 2);
+    // Partition 0's records are an hour ahead; partition 1 has none yet.
+    produce_to(mock.brokers(), topic, 0, {3'600'000, 3'600'001, 3'600'002});
+    auto src = sql_kafka_source(mock.brokers(), topic, 0, 1);  // owns 0 and 1
+    ASSERT_NE(src, nullptr);
+    src->open();
+    auto assigner = ts_assigner();
+    const auto first = pump(*src, *assigner, 3, 10s);
+    ASSERT_FALSE(first.declared.empty());
+    EXPECT_EQ(first.declared.front(), (std::vector<std::int32_t>{0, 1}))
+        << "the subtask declares both partitions it owns";
+    EXPECT_EQ(first.watermark, -1)
+        << "partition 1 has delivered nothing, so the watermark may not pass its records";
+    // Partition 1's records arrive: they are an hour behind partition 0, and
+    // the watermark now follows them instead of having passed them.
+    produce_to(mock.brokers(), topic, 1, {1'000});
+    const auto second = pump(*src, *assigner, 1, 10s);
+    EXPECT_EQ(second.watermark, 1'000);
+    src->close();
+}
+
+TEST(KafkaWatermark, ASubtaskThatOwnsNoPartitionSaysItIsIdle) {
+    MockCluster mock;
+    const std::string topic = "more-subtasks-than-partitions";
+    mock.create_topic(topic, 1);
+    produce_to(mock.brokers(), topic, 0, {5'000});
+    // Subtask 1 of 2 owns no partition of a one-partition topic. It used to
+    // emit nothing, and every window downstream waited on it for good.
+    auto spare = sql_kafka_source(mock.brokers(), topic, 1, 2);
+    ASSERT_NE(spare, nullptr);
+    spare->open();
+    auto spare_assigner = ts_assigner();
+    const auto quiet = pump(*spare, *spare_assigner, 0, 1s);
+    EXPECT_TRUE(quiet.idle) << "a subtask that owns no partition marks its output idle";
+    auto owner = sql_kafka_source(mock.brokers(), topic, 0, 2);
+    owner->open();
+    auto owner_assigner = ts_assigner();
+    const auto read = pump(*owner, *owner_assigner, 1, 10s);
+    EXPECT_EQ(read.watermark, 5'000);
+    // Downstream, the idle input does not hold the other's watermark.
+    MultiInputAlignment align(2);
+    align.on_watermark(1, Watermark::idle());
+    const auto adv = align.on_watermark(0, Watermark{EventTime{read.watermark}});
+    EXPECT_TRUE(adv.forward);
+    EXPECT_EQ(adv.watermark.timestamp().millis(), 5'000);
+    spare->close();
+    owner->close();
 }
 
 #else  // !CLINK_HAS_KAFKA || !CLINK_HAS_KAFKA_MOCK

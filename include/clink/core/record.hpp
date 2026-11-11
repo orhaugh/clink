@@ -171,6 +171,22 @@ public:
     // closure to reuse ArrowBatcher<T>::parse without an extra copy.
     std::vector<value_type> take_records() { return std::move(records_); }
 
+    // The partitions the source subtask that produced this batch owns, as of
+    // the batch, when a partitioned source (Kafka's) declares them; null
+    // otherwise. Engine-only metadata, like Record::source_partition: a
+    // watermark assigner holds its watermark for an owned partition that has
+    // delivered nothing yet, which records alone cannot tell it about. Shared,
+    // since a source stamps the same set on every batch until it changes. An
+    // operator that builds new batches from these passes it on only if it is
+    // between a source and its assigner (the JSON bridge does).
+    using PartitionSet = std::shared_ptr<const std::vector<std::int32_t>>;
+    [[nodiscard]] const PartitionSet& source_partitions() const noexcept {
+        return source_partitions_;
+    }
+    void set_source_partitions(PartitionSet owned) noexcept {
+        source_partitions_ = std::move(owned);
+    }
+
     // Create a sibling columnar batch over a DIFFERENT RecordBatch (e.g. a
     // partition gather or a filter/project result) reusing THIS batch's lazy
     // row-materialization closure. Lets the columnar shuffle split a columnar
@@ -179,7 +195,9 @@ public:
     // closure is schema-self-describing for the Row channel, so it decodes the
     // new (same-schema) RecordBatch correctly.
     [[nodiscard]] Batch with_arrow(std::shared_ptr<arrow::RecordBatch> rb, std::size_t rows) const {
-        return Batch{std::move(rb), rows, materialize_};
+        Batch out{std::move(rb), rows, materialize_};
+        out.source_partitions_ = source_partitions_;
+        return out;
     }
 
 private:
@@ -198,6 +216,7 @@ private:
     std::shared_ptr<arrow::RecordBatch> arrow_{};
     std::size_t arrow_rows_{0};
     MaterializeFn materialize_{};
+    PartitionSet source_partitions_{};
 };
 
 }  // namespace clink

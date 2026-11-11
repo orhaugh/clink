@@ -452,6 +452,11 @@ inline ArrowBatcher<std::uint64_t> uint64_arrow_batcher() {
 // assigner can hold the watermark at its slowest partition, not its fastest.
 inline constexpr const char* kSourcePartitionRunsKey = "clink.source_partition_runs";
 
+// The partitions the producing source subtask owns (Batch::source_partitions),
+// as schema metadata under this key: comma-separated, ascending. Absent when
+// the source declared none, which a reader takes as no declaration.
+inline constexpr const char* kSourcePartitionsKey = "clink.source_partitions";
+
 namespace detail {
 
 // The batch's source partitions as runs, or "" when no record carries one.
@@ -493,6 +498,39 @@ inline std::string source_partition_runs(const Batch<T>& batch) {
     }
     flush();
     return out;
+}
+
+// A declared partition set as kSourcePartitionsKey's text, and back; nothing
+// when the text is not a list of partitions.
+inline std::string source_partitions_text(const std::vector<std::int32_t>& owned) {
+    std::string out;
+    for (const auto p : owned) {
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += std::to_string(p);
+    }
+    return out;
+}
+
+inline std::shared_ptr<const std::vector<std::int32_t>> parse_source_partitions(
+    std::string_view text) {
+    std::vector<std::int32_t> out;
+    if (!text.empty() && text.back() == ',') {
+        return nullptr;
+    }
+    while (!text.empty()) {
+        const auto comma = text.find(',');
+        const auto item = text.substr(0, comma);
+        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+        std::int32_t v = 0;
+        const auto [ptr, ec] = std::from_chars(item.data(), item.data() + item.size(), v);
+        if (item.empty() || ec != std::errc{} || ptr != item.data() + item.size() || v < 0) {
+            return nullptr;
+        }
+        out.push_back(v);
+    }
+    return std::make_shared<const std::vector<std::int32_t>>(std::move(out));
 }
 
 // Each record's source partition from runs written by source_partition_runs,
@@ -546,7 +584,9 @@ inline std::optional<std::vector<std::optional<std::int32_t>>> parse_source_part
 // rather than the fastest. Metadata leaves the fields as they were, so a reader
 // that checks the schema (the network channel, with metadata ignored) and an
 // older reader both accept the frame, and a batch with no partition carries no
-// metadata.
+// metadata. The partitions the source subtask owns ride beside them
+// (kSourcePartitionsKey), so the assigner can hold its watermark for one that
+// has delivered nothing yet.
 inline ArrowBatcher<std::string> string_arrow_batcher() {
     auto schema_fn = [] {
         return arrow::schema({
@@ -576,9 +616,18 @@ inline ArrowBatcher<std::string> string_arrow_batcher() {
         if (auto s = v_b.Finish(&v_arr); !s.ok())
             return nullptr;
         auto schema = schema_fn();
+        std::vector<std::string> keys;
+        std::vector<std::string> values;
         if (auto runs = detail::source_partition_runs(batch); !runs.empty()) {
-            schema = schema->WithMetadata(arrow::key_value_metadata(
-                {std::string{kSourcePartitionRunsKey}}, {std::move(runs)}));
+            keys.emplace_back(kSourcePartitionRunsKey);
+            values.push_back(std::move(runs));
+        }
+        if (const auto& owned = batch.source_partitions(); owned) {
+            keys.emplace_back(kSourcePartitionsKey);
+            values.push_back(detail::source_partitions_text(*owned));
+        }
+        if (!keys.empty()) {
+            schema = schema->WithMetadata(arrow::key_value_metadata(keys, values));
         }
         return arrow::RecordBatch::Make(std::move(schema), n, {t_arr, v_arr});
     };
@@ -588,12 +637,17 @@ inline ArrowBatcher<std::string> string_arrow_batcher() {
         const auto* t_arr = static_cast<const arrow::Int64Array*>(batch.column(0).get());
         const auto* v_arr = static_cast<const arrow::StringArray*>(batch.column(1).get());
         std::optional<std::vector<std::optional<std::int32_t>>> partitions;
+        std::shared_ptr<const std::vector<std::int32_t>> owned;
         if (const auto& md = batch.schema()->metadata(); md != nullptr) {
             if (const int at = md->FindKey(kSourcePartitionRunsKey); at >= 0) {
                 partitions = detail::parse_source_partition_runs(md->value(at), batch.num_rows());
             }
+            if (const int at = md->FindKey(kSourcePartitionsKey); at >= 0) {
+                owned = detail::parse_source_partitions(md->value(at));
+            }
         }
         Batch<std::string> out;
+        out.set_source_partitions(std::move(owned));
         out.reserve(static_cast<std::size_t>(batch.num_rows()));
         for (int64_t i = 0; i < batch.num_rows(); ++i) {
             int32_t vlen = 0;

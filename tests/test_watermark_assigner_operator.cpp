@@ -326,6 +326,31 @@ TEST(WatermarkAssignerOperator, ColumnarPerPartitionWatermarkIsMinAcrossPartitio
               mat_before);
 }
 
+// The columnar path reads the source's declared partitions too: a batch of
+// partition 0 alone, declared with partition 1, holds the watermark.
+TEST(WatermarkAssignerOperator, ColumnarDeclaredPartitionHoldsTheWatermark) {
+    BoundedChannel<StreamElement<int>> ch(64);
+    Emitter<int> em(&ch);
+    WatermarkAssignerOperator<int> op(
+        [](const int&) { return EventTime{0}; },
+        std::make_unique<PartitionAwareBoundedOutOfOrdernessStrategy<int>>(0ms));
+    op.with_columnar_event_times(read_columnar_event_times)
+        .with_columnar_partitions(read_columnar_partitions);
+    auto batch = make_partitioned_columnar_batch({{100, 0}, {5000, 0}});
+    batch.set_source_partitions(
+        std::make_shared<const std::vector<std::int32_t>>(std::vector<std::int32_t>{0, 1}));
+    ASSERT_TRUE(op.process_columnar(StreamElement<int>::data(std::move(batch)), em));
+    EXPECT_FALSE(last_watermark(drain(ch)).has_value())
+        << "partition 1 was declared and had delivered nothing";
+    auto second = make_partitioned_columnar_batch({{700, 1}});
+    second.set_source_partitions(
+        std::make_shared<const std::vector<std::int32_t>>(std::vector<std::int32_t>{0, 1}));
+    ASSERT_TRUE(op.process_columnar(StreamElement<int>::data(std::move(second)), em));
+    auto wm = last_watermark(drain(ch));
+    ASSERT_TRUE(wm.has_value());
+    EXPECT_EQ(*wm, 700);
+}
+
 // Control: without the partition reader, the same columnar batch collapses to a
 // single global watermark (the fastest partition wins) - confirming the
 // partition reader is what keeps per-partition semantics, and that a

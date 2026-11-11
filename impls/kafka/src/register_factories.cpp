@@ -260,10 +260,23 @@ public:
     }
 
     bool produce(Emitter<std::string>& out) override {
+        // The partitions this subtask owns, declared on every batch so the
+        // watermark downstream holds for one that has delivered nothing yet.
+        // One that owns none says so with an idle marker, or every window
+        // downstream would wait on it for good.
+        if (inner_.owned_partitions().empty()) {
+            if (!idle_said_) {
+                idle_said_ = true;
+                out.emit_watermark(Watermark::idle());
+            }
+        } else if (!owned_ || *owned_ != inner_.owned_partitions()) {
+            owned_ = std::make_shared<const std::vector<std::int32_t>>(inner_.owned_partitions());
+        }
         Emitter<KafkaMessage> forwarder(
             Emitter<KafkaMessage>::Forward([this, &out](StreamElement<KafkaMessage> e) -> bool {
                 if (e.is_data()) {
                     Batch<std::string> b;
+                    b.set_source_partitions(owned_);
                     // The batch is ours - the emitter moved it here and nothing
                     // else observes it - so take each payload rather than copying
                     // it. Copying was a second full copy of every record's bytes,
@@ -336,6 +349,10 @@ private:
     KafkaSource inner_;
     ValueDecoderPtr decoder_;
     bool skip_undecodable_{false};
+    // The owned partitions as last declared, shared by the batches that carry
+    // them; and whether a subtask owning none has said so downstream.
+    Batch<std::string>::PartitionSet owned_;
+    bool idle_said_{false};
     std::uint64_t skipped_{0};
 };
 

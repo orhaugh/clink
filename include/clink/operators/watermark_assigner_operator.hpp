@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -204,6 +205,7 @@ public:
         // partition-unset = a single global watermark, matching a non-partitioned
         // source's row path. read_partitions returns false when the column is
         // absent (e.g. a Parquet source), which is the global-watermark case.
+        declare_from_(batch);
         std::vector<std::optional<std::int32_t>> parts;
         const bool have_parts = columnar_partitions_ && columnar_partitions_(*rb, parts) &&
                                 parts.size() == times.size();
@@ -227,6 +229,14 @@ public:
                 }
             }
         }
+        if (have_parts && !undelivered_.empty()) {
+            for (const auto& p : parts) {
+                if (p.has_value()) {
+                    undelivered_.erase(*p);
+                }
+            }
+        }
+        warn_held_();
         is_idle_ = false;
         // Stamp the extracted event times into the sidecar's event_time column
         // (column 0 of the standard Row-channel layout) before forwarding.
@@ -332,6 +342,22 @@ public:
             backend.put_operator_state(
                 op_id, progress_key_(slot, part), StateBackend::ValueView{bytes, sizeof(bytes)});
         }
+        // The partitions the source declared, which the watermark waited for:
+        // a record for an audit, and for whoever asks why a watermark held.
+        // Written at every barrier, empty until a source declares any, so the
+        // record shows this assigner holds for declared partitions even
+        // before data arrives; one that did not never wrote the key. Not
+        // read back: the next batch declares them again.
+        {
+            std::string list;
+            for (const auto p : declared_) {
+                list += (list.empty() ? "" : ",") + std::to_string(p);
+            }
+            const std::string key =
+                std::string(kDeclaredKey) + slot + ":" + std::to_string(*subtask_index_);
+            backend.put_operator_state(
+                op_id, key, StateBackend::ValueView{list.data(), list.size()});
+        }
     }
 
     // A restore hands every subtask the operator state of every subtask of the
@@ -406,6 +432,7 @@ public:
 
         if (element.is_data()) {
             const Batch<T>& in_batch = element.as_data();
+            declare_from_(in_batch);
             // Fast path: if every record already carries an
             // event_time (the common case for sources that set
             // timestamps inline - e.g. the bench's
@@ -431,6 +458,7 @@ public:
                 }
                 last_record_time_ms_ = now_ms_();
                 track_row_partitions_(in_batch, last_record_time_ms_);
+                note_delivered_(in_batch);
                 is_idle_ = false;
                 out.emit_data(std::move(const_cast<Batch<T>&>(in_batch)));
                 if (auto wm = strategy_->current_watermark(); wm.has_value()) {
@@ -454,6 +482,8 @@ public:
             }
             last_record_time_ms_ = now_ms_();
             track_row_partitions_(out_batch, last_record_time_ms_);
+            note_delivered_(out_batch);
+            out_batch.set_source_partitions(in_batch.source_partitions());
             is_idle_ = false;
             if (!out_batch.empty()) {
                 out.emit_data(std::move(out_batch));
@@ -526,6 +556,10 @@ public:
 
 private:
     static constexpr const char* kIdleProbeKey = "__idle_probe__";
+    // Operator-state key prefix of the checkpointed declared partitions.
+    static constexpr const char* kDeclaredKey = "__clink_wm_declared";
+    // How long a declared partition may hold the watermark before it is said.
+    static constexpr std::int64_t kHeldWarningMs = 60'000;
     // Operator-state key prefix of the checkpointed per-partition progress.
     static constexpr const char* kProgressKey = "__clink_wm_progress";
 
@@ -537,6 +571,72 @@ private:
     // Stamp the batch's wall-clock against each partition it carries, so the
     // idle probe can tell which partitions have gone quiet. No-op (and no
     // per-record partition read) unless idleness is enabled.
+    // The partitions the source declared on this batch. The strategy holds
+    // its watermark for one that has not delivered; idleness, when on, times
+    // it from now, so a partition that stays empty is released after the
+    // idleness window rather than holding every window for good.
+    void declare_from_(const Batch<T>& batch) {
+        const auto& owned = batch.source_partitions();
+        if (!owned) {
+            return;
+        }
+        std::vector<std::int32_t> fresh;
+        for (const auto p : *owned) {
+            if (declared_.insert(p).second) {
+                fresh.push_back(p);
+            }
+        }
+        if (fresh.empty()) {
+            return;
+        }
+        strategy_->declare_partitions(*owned);
+        const auto now = now_ms_();
+        const auto progress = strategy_->partition_progress();
+        for (const auto p : fresh) {
+            if (!progress.contains(p)) {
+                undelivered_.emplace(p, now);
+            }
+            if (idleness_.count() > 0) {
+                part_last_ms_.try_emplace(p, now);
+            }
+        }
+    }
+
+    // Partitions of the batch's records have delivered.
+    void note_delivered_(const Batch<T>& batch) {
+        if (!undelivered_.empty()) {
+            for (const auto& r : batch) {
+                if (auto p = r.source_partition(); p.has_value()) {
+                    undelivered_.erase(*p);
+                }
+            }
+        }
+        warn_held_();
+    }
+
+    // With idleness off, a declared partition that never delivers holds the
+    // watermark, and every window downstream, for good. That is correct for a
+    // partition still to be written, and a stall for one that stays empty, so
+    // it is said once per partition rather than left silent.
+    void warn_held_() {
+        if (undelivered_.empty() || idleness_.count() > 0) {
+            return;
+        }
+        const auto now = now_ms_();
+        for (auto& [p, since] : undelivered_) {
+            if (since >= 0 && now - since >= kHeldWarningMs) {
+                if (auto* rt = this->runtime(); rt != nullptr) {
+                    rt->log_warn("source partition " + std::to_string(p) +
+                                 " has delivered nothing for " +
+                                 std::to_string((now - since) / 1000) +
+                                 " s and holds the watermark, and every window downstream of "
+                                 "it; set idle_timeout_ms on the source if it is to stay empty");
+                }
+                since = -1;  // said once
+            }
+        }
+    }
+
     void track_row_partitions_(const Batch<T>& batch, std::int64_t now) {
         if (idleness_.count() <= 0) {
             return;
@@ -590,6 +690,10 @@ private:
     std::vector<std::int32_t> restored_partitions_;
     // The subtask this assigner runs as, which tags its checkpointed progress.
     std::optional<std::uint32_t> subtask_index_;
+    // The partitions the source declared, and those of them that have not
+    // delivered, with when they were declared (-1 once the hold was said).
+    std::set<std::int32_t> declared_;
+    std::map<std::int32_t, std::int64_t> undelivered_;
 
     // Watermark alignment state (withWatermarkAlignment).
     std::shared_ptr<AlignmentGroup> alignment_group_;

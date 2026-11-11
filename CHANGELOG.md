@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**A Kafka source subtask's watermark waits for every partition it owns.**
+The partition-aware watermark took the least over the partitions a subtask
+had read records from, so it knew nothing of an owned partition that had not
+delivered yet. A subtask reading several partitions moved its watermark on
+whichever delivered first: a job started on a backlog read unevenly, or a
+partition written to later, had the other partitions' in-window records
+arrive behind the watermark, and windows dropped them. A subtask that owned
+no partition, because there were more subtasks than partitions, emitted no
+watermark, and every window downstream waited on it for good. The Kafka SQL
+source now declares the partitions its subtask owns on every batch it emits,
+through the JSON bridge and across the network. The watermark holds for a
+declared partition until it delivers or `idle_timeout_ms` marks it idle, and
+a subtask that owns none marks its output idle. This changes behaviour for a
+job with a partition that is never written to: it now holds every window
+until the table sets `idle_timeout_ms`, and the assigner logs a warning
+naming the partition after a minute. The assigner records the partitions it
+was declared in its checkpointed state.
+
 **Auditing windowed results.** The independent reference audit now covers a
 job of one keyed tumbling window (`COUNT` and exact `SUM`) from Kafka into
 ClickHouse. A window holds records from every earlier interval and is owed
