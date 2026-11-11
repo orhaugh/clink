@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**`incident-collect` says which kind of refusal it made.** With `--json`, a
+refusal is also written to standard output with its kind: `changed` (the job
+moved on while the bundle was copied: collect again), `missing` (no
+completion marker for the job or the checkpoint), `bound`, `timeout` or
+`other`, so a caller acts on the refusal without reading its text.
+
 **A Kafka source subtask's watermark waits for every partition it owns.**
 The partition-aware watermark took the least over the partitions a subtask
 had read records from, so it knew nothing of an owned partition that had not

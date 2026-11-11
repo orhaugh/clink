@@ -138,7 +138,10 @@ void collect_usage() {
               << "whose names suggest a credential are redacted from the job manifest.\n"
               << "\n"
               << "Refuses, leaving nothing at --out, when the evidence changes while it is\n"
-              << "copied, a required file is past a bound, or the time runs out.\n"
+              << "copied, a required file is past a bound, or the time runs out. With --json a\n"
+              << "refusal is also written to standard output, with its kind: changed (the job\n"
+              << "moved on during the copy: collect again), missing (no completion marker for\n"
+              << "the job or the checkpoint), bound, timeout or other.\n"
               << "\n"
               << "Exit status: 0 published, 1 refused, 2 bad usage.\n";
 }
@@ -400,6 +403,14 @@ int clink_cmd_incident_collect(int argc, char** argv) {
         return 0;
     } catch (const CollectError& e) {
         std::cerr << "incident-collect: refused: " << e.what() << "\n";
+        if (a.switches.contains("json")) {
+            // A caller that acts on the refusal reads its kind, not its text.
+            clink::config::JsonObject out;
+            out["refused"] = clink::config::JsonValue{true};
+            out["kind"] = clink::config::JsonValue{std::string{collect_error_kind_name(e.kind)}};
+            out["reason"] = clink::config::JsonValue{std::string{e.what()}};
+            std::cout << clink::config::JsonValue{std::move(out)}.serialize(0) << "\n";
+        }
         return 1;
     } catch (const std::exception& e) {
         std::cerr << "incident-collect: " << e.what() << "\n";

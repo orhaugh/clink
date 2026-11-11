@@ -283,9 +283,21 @@ struct CollectResult {
 // evidence changed or vanished while it was copied, a required piece is past
 // a bound, the time ran out, or the inputs do not say which restore rule
 // applies. Nothing is left behind at `out`.
+//
+// `kind` says which, for a caller that acts on the refusal rather than reads
+// it: `changed` (the job moved on while it was copied: collect again),
+// `missing` (the job or the checkpoint has no completion marker), `bound` (a
+// required piece is past --max-files or --max-bytes), `timeout` (past
+// --timeout-s), and `other`.
 struct CollectError : std::runtime_error {
-    using std::runtime_error::runtime_error;
+    enum class Kind : std::uint8_t { Changed, Missing, Bound, Timeout, Other };
+    explicit CollectError(const std::string& what, Kind k = Kind::Other)
+        : std::runtime_error(what), kind(k) {}
+    Kind kind;
 };
+
+// The kind's name, as `incident-collect --json` writes it.
+[[nodiscard]] const char* collect_error_kind_name(CollectError::Kind kind) noexcept;
 
 [[nodiscard]] CollectResult collect(const CollectOptions& options);
 

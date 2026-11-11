@@ -300,6 +300,39 @@ TEST_F(IncidentBundleTest, CollectionRefusesToGuessTheRestoreRule) {
     EXPECT_EQ(collect(o).checkpoint, 1u);
 }
 
+TEST_F(IncidentBundleTest, ARefusalSaysWhichKindItIs) {
+    write_checkpoint(1);
+    auto o = options();
+    o.checkpoint = 7;  // completed nowhere
+    try {
+        (void)collect(o);
+        FAIL() << "a checkpoint without its marker was collected";
+    } catch (const CollectError& e) {
+        EXPECT_EQ(e.kind, CollectError::Kind::Missing) << e.what();
+        EXPECT_STREQ(collect_error_kind_name(e.kind), "missing");
+    }
+    EXPECT_TRUE(leftovers().empty());
+    o.checkpoint.reset();
+    o.job = 99;  // a job with no markers at all
+    try {
+        (void)collect(o);
+        FAIL() << "a job without markers was collected";
+    } catch (const CollectError& e) {
+        EXPECT_EQ(e.kind, CollectError::Kind::Missing) << e.what();
+    }
+    o.job = options().job;
+    o.timeout = std::chrono::seconds{0};
+    try {
+        (void)collect(o);
+        FAIL() << "a collection past its time was published";
+    } catch (const CollectError& e) {
+        EXPECT_EQ(e.kind, CollectError::Kind::Timeout) << e.what();
+        EXPECT_STREQ(collect_error_kind_name(e.kind), "timeout");
+    }
+    EXPECT_STREQ(collect_error_kind_name(CollectError::Kind::Other), "other");
+    EXPECT_EQ(CollectError{"why"}.kind, CollectError::Kind::Other);
+}
+
 TEST_F(IncidentBundleTest, CollectionNeverWritesOverAnExistingDirectory) {
     write_checkpoint(1);
     spill(root / "bundle" / "keep.txt", "mine");
@@ -323,6 +356,8 @@ TEST_F(IncidentBundleTest, AFileRewrittenWhileItIsCopiedRefusesTheWholeBundle) {
     } catch (const CollectError& e) {
         EXPECT_NE(std::string{e.what()}.find(target.filename().string()), std::string::npos)
             << e.what();
+        EXPECT_EQ(e.kind, CollectError::Kind::Changed);
+        EXPECT_STREQ(collect_error_kind_name(e.kind), "changed");
     }
     EXPECT_FALSE(fs::exists(root / "bundle"));
     EXPECT_TRUE(leftovers().empty());
@@ -357,6 +392,7 @@ TEST_F(IncidentBundleTest, ACheckpointCompletingDuringCollectionRefusesTheBundle
         FAIL() << "a bundle mixing two marker sets was published";
     } catch (const CollectError& e) {
         EXPECT_NE(std::string{e.what()}.find("marker"), std::string::npos) << e.what();
+        EXPECT_EQ(e.kind, CollectError::Kind::Changed);
     }
     EXPECT_FALSE(fs::exists(root / "bundle"));
     EXPECT_TRUE(leftovers().empty());
@@ -366,7 +402,13 @@ TEST_F(IncidentBundleTest, RequiredEvidencePastABoundRefusesAndOptionalEvidenceI
     write_checkpoint(1);
     auto o = options();
     o.max_files = 2;
-    EXPECT_THROW((void)collect(o), CollectError);
+    try {
+        (void)collect(o);
+        FAIL() << "required evidence past a bound was published";
+    } catch (const CollectError& e) {
+        EXPECT_EQ(e.kind, CollectError::Kind::Bound) << e.what();
+        EXPECT_STREQ(collect_error_kind_name(e.kind), "bound");
+    }
     EXPECT_FALSE(fs::exists(root / "bundle"));
 
     // Captures are optional: past the bound they are left out and listed.

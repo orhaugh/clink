@@ -144,9 +144,10 @@ std::string utc_now() {
 void Collector::check_deadline() const {
     if (Clock::now() - started_ > o_.timeout) {
         throw CollectError("collection ran past --timeout-s (" +
-                           std::to_string(o_.timeout.count()) +
-                           " s); nothing was published. Narrow it with --op and --epochs, or "
-                           "raise the bound.");
+                               std::to_string(o_.timeout.count()) +
+                               " s); nothing was published. Narrow it with --op and --epochs, or "
+                               "raise the bound.",
+                           CollectError::Kind::Timeout);
     }
 }
 
@@ -176,15 +177,17 @@ void Collector::copy(const fs::path& source,
     const auto mtime_before = fs::last_write_time(source, ec);
     if (ec) {
         throw CollectError(source.string() + " vanished before it could be copied: " +
-                           ec.message() + ". Nothing was published; collect again.");
+                               ec.message() + ". Nothing was published; collect again.",
+                           CollectError::Kind::Changed);
     }
     if (files_ + 1 > o_.max_files || bytes_ + size_before > o_.max_bytes) {
         if (required) {
             throw CollectError("the evidence the selected checkpoint needs passes --max-files (" +
-                               std::to_string(o_.max_files) + ") or --max-bytes (" +
-                               std::to_string(o_.max_bytes) +
-                               "); nothing was published. Raise "
-                               "the bound.");
+                                   std::to_string(o_.max_files) + ") or --max-bytes (" +
+                                   std::to_string(o_.max_bytes) +
+                                   "); nothing was published. Raise "
+                                   "the bound.",
+                               CollectError::Kind::Bound);
         }
         excluded_.push_back(config::JsonValue{rel + ": past --max-files or --max-bytes"});
         return;
@@ -220,16 +223,19 @@ void Collector::copy(const fs::path& source,
     // bundle would mix two states of the job.
     const auto still = fs::symlink_status(source, ec);
     if (ec || !fs::exists(still)) {
-        throw CollectError(source.string() +
-                           " disappeared while the bundle was collected; nothing was published. "
-                           "Collect again, or stop the job first.");
+        throw CollectError(
+            source.string() +
+                " disappeared while the bundle was collected; nothing was published. "
+                "Collect again, or stop the job first.",
+            CollectError::Kind::Changed);
     }
     const auto size_after = fs::file_size(source, ec);
     const auto mtime_after = fs::last_write_time(source, ec);
     if (ec || size_after != size_before || mtime_after != mtime_before || copied != size_before) {
         throw CollectError(source.string() +
-                           " changed while the bundle was collected; nothing was published. "
-                           "Collect again, or stop the job first.");
+                               " changed while the bundle was collected; nothing was published. "
+                               "Collect again, or stop the job first.",
+                           CollectError::Kind::Changed);
     }
     ++files_;
     bytes_ += copied;
@@ -862,7 +868,8 @@ CollectResult Collector::run() {
     }
     if (!fs::is_directory(cluster::completed_marker_dir_for(o_.checkpoint_dir, o_.job), ec)) {
         throw CollectError("no markers for job " + std::to_string(o_.job) + " under " +
-                           o_.checkpoint_dir + "/_jobs/");
+                               o_.checkpoint_dir + "/_jobs/",
+                           CollectError::Kind::Missing);
     }
     std::random_device rd;
     tmp_ = out.parent_path() /
@@ -891,11 +898,13 @@ CollectResult Collector::run() {
         if (checkpoint_ == 0) {
             throw CollectError(
                 "the job has no checkpoint a restore could choose; nothing was "
-                "published");
+                "published",
+                CollectError::Kind::Missing);
         }
         if (!markers_before.count("COMPLETED-" + std::to_string(checkpoint_))) {
             throw CollectError("checkpoint " + std::to_string(checkpoint_) +
-                               " has no COMPLETED marker; nothing was published");
+                                   " has no COMPLETED marker; nothing was published",
+                               CollectError::Kind::Missing);
         }
         collect_checkpoint();
         if (o_.include_captures && !o_.capture_dir.empty()) {
@@ -914,7 +923,8 @@ CollectResult Collector::run() {
             throw CollectError(
                 "the job's markers changed while the bundle was collected (a "
                 "checkpoint completed or a restart was recorded); nothing was "
-                "published. Collect again, or stop the job first.");
+                "published. Collect again, or stop the job first.",
+                CollectError::Kind::Changed);
         }
         {
             std::ofstream mf(tmp_ / "manifest.json", std::ios::binary | std::ios::trunc);
@@ -947,6 +957,22 @@ CollectResult Collector::run() {
 }
 
 }  // namespace
+
+const char* collect_error_kind_name(CollectError::Kind kind) noexcept {
+    switch (kind) {
+        case CollectError::Kind::Changed:
+            return "changed";
+        case CollectError::Kind::Missing:
+            return "missing";
+        case CollectError::Kind::Bound:
+            return "bound";
+        case CollectError::Kind::Timeout:
+            return "timeout";
+        case CollectError::Kind::Other:
+            break;
+    }
+    return "other";
+}
 
 CollectResult collect(const CollectOptions& options) {
     try {
