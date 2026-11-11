@@ -394,7 +394,13 @@ clink-audit status --config=audit.json --json
 clink-audit acknowledge --config=audit.json --audit=<id> --note="..."
 ```
 
-**Supported.** Record-wise jobs from one Kafka SQL source into the ClickHouse native sink, as above, read for the scope's keys only. A windowed job is refused as unsupported: its scope is its whole lineage, and auditing it repeatedly would read the job's whole history each time.
+**Supported.** Record-wise jobs from one Kafka SQL source into the ClickHouse native sink, as above, and the windowed shape above, audited one increment at a time; each read for the scope's keys only.
+
+**Windowed jobs.** The runner learns from the first scope that the job is windowed. Its first audit, at the job's first checkpoint, is the whole lineage, cheap there, and seeds a chain: every audit after it is the increment from the newest checkpoint whose reference state the runner holds, normally the one before. The reference command takes `{state_out}`, and `reference.with_state_in` holds the arguments that give it the state to start from (`{state_in}`). The runner checks that the artifact says it started from that state, by its hash, and holds the state it leaves (`states/<checkpoint>.json`, the newest `retain_states`) only from a complete reference.
+
+- *Collection* reaches back to the newest held state, at most eight completed checkpoints, so an increment can span one whose audit did not finish. After a restore it collects again from the restore point when no held state is of the restored run yet. A Worker keeps the restore point among its retained checkpoints until the restored run has completed as many of its own.
+- *A restore* below a held state is refused by `incident-scope`, and the runner tries the next older held state, so the chain resumes at the restore point's state.
+- *A broken chain.* When no held state on the lineage is in the bundle (the runner fell behind the Workers' retention), the audit is partial, the status says the chain is broken and where, and every later windowed audit stays partial until a new run starts from no state. A windowed job is audited from its first checkpoint on (`start_at: earliest`), since a chain starts only there.
 
 **Selection.** `sequential` audits every completed checkpoint in order; `latest-only` audits the newest and records each one it passed over as skipped. Nothing samples records or keys. A cycle audits what was eligible when it began. A checkpoint completing during it is collected at once and audited by the next cycle, because a scope's bundle needs the snapshots of the checkpoints that bound it, and a Worker keeps only its newest `--checkpoint-num-retained`. The runner looks for new checkpoints between every step. One whose state was purged before collection is a gap, recorded as expired.
 

@@ -50,6 +50,9 @@ EXPIRED, SKIPPED = "expired", "skipped"
 VERIFIED = (PASSED, EMPTY)
 
 RECENT_KEPT = 50
+# How many completed checkpoints back a windowed bundle reaches, at most, for
+# an increment to span a failed one.
+REACH_BACK = 8
 
 
 def fault(point):
@@ -144,6 +147,7 @@ class Runner:
             "last_verified": None, "last_attempted": None, "last_discrepancy": None,
             "graph": None, "graph_history": [], "commit_confirmation": None,
             "retained_passed": [], "passed_reports": [], "stopped": None,
+            "kind": None, "window": {"states": {}, "broken": None},
             "last_cycle": None, "totals": {"audits": 0, "cpu_s": 0.0, "wall_s": 0.0,
                                            "reference_records": 0, "destination_queries": 0,
                                            "bundle_bytes": 0},
@@ -164,6 +168,8 @@ class Runner:
         self.st = st
         st["limits"] = self.cfg.limits
         st["selection"] = self.cfg.selection
+        st.setdefault("kind", None)
+        st.setdefault("window", {"states": {}, "broken": None})
 
     # -- the cycle ----------------------------------------------------------------------------
     def cycle(self):
@@ -396,6 +402,12 @@ class Runner:
             self._step_collect(a)
             if a.get("outcome"):
                 self._publish(a)
+            elif self.st["kind"] is None and "collect" in a["steps"]:
+                # Whether the job is windowed decides how far back the next
+                # bundles must reach, so learn it from the first one now.
+                self._step_scope(a)
+                if a.get("outcome"):
+                    self._publish(a)
 
     def _note_backlog(self, why):
         if self.st.get("backlog_note") != why:
@@ -476,7 +488,26 @@ class Runner:
         if bundle.exists() and not bundle.is_symlink():
             shutil.rmtree(bundle)
         self._clear_leftovers(d)
-        lo = self._previous_completed(a["checkpoint"]) + 1
+        prev = self._previous_completed(a["checkpoint"])
+        lo = prev + 1
+        a["start"] = prev
+        if self.st["kind"] == "windowed":
+            # An increment starts at the newest state the runner holds when it
+            # is audited, which is usually this checkpoint's predecessor's,
+            # held by then though not yet now: the bundle reaches back to the
+            # newest held, so a failed increment can be spanned, by at most
+            # REACH_BACK completed checkpoints, and with none held yet to the
+            # job's start, for the seed. Each increment reads its base's own
+            # interval evidence, the watermark recorded there.
+            held = [c for c in self._held_states() if c < a["checkpoint"]]
+            before = [c for c in self.completed if c < a["checkpoint"]]
+            floor = before[-REACH_BACK] if len(before) >= REACH_BACK else 1
+            base = max(held) if held else 0
+            lo = max(1, base, floor) if held else 1
+            lo = min(lo, prev) if prev else lo
+            a["start"] = None  # decided by the scope, from what is held then
+        lo = max(1, min(lo, a["checkpoint"]))
+        a["lo"] = lo
         argv = [self.cfg.clink, "incident-collect", "--checkpoint-dir=%s" % self.cfg.checkpoint_dir,
                 "--job=%d" % self.cfg.job_id, "--checkpoint=%d" % a["checkpoint"],
                 "--capture-dir=%s" % self.cfg.capture_dir, "--include-state", "--include-captures",
@@ -497,6 +528,29 @@ class Runner:
             out = _json_line(r.stdout)
             if r.exit == 0 and out and out.get("bundle"):
                 manifest = read_json(bundle / "manifest.json") or {}
+                # A windowed job's run that restored from a checkpoint before
+                # the bundle reaches starts its next increment there: collect
+                # again from it, when the reference's state there is held (the
+                # restore point's own state the Workers keep).
+                rest = (manifest.get("selection") or {}).get("restored") or {}
+                back = rest.get("restore")
+                newest = max((c for c in self._held_states() if c < a["checkpoint"]), default=0)
+                # Only when no held state is of the restored run already: once
+                # one is, the chain runs on from it.
+                if (self.st["kind"] == "windowed" and isinstance(back, int) and 0 < back < lo
+                        and int(rest.get("next") or 0) <= a["checkpoint"]
+                        and newest < int(rest.get("next") or 0) and newest != back
+                        and str(back) in self.st["window"]["states"] and not a.get("reached_back")):
+                    a["reached_back"] = back
+                    a["start"] = back
+                    lo = back
+                    a["lo"] = lo
+                    shutil.rmtree(bundle)
+                    argv = [x if not str(x).startswith("--epochs=") else
+                            "--epochs=%d-%d" % (lo, a["checkpoint"]) for x in argv]
+                    self.dir.event("collect-reach-back", audit=a["id"], checkpoint=a["checkpoint"],
+                                   restored_from=back)
+                    continue
                 a["steps"]["collect"] = self._rec(r, bytes=out.get("bytes"), files=out.get("files"),
                                                   tries=tries)
                 self.cycle_stats["collected"] += 1
@@ -529,10 +583,18 @@ class Runner:
                          "engine_choice": sel.get("engine_choice"),
                          "collector": manifest.get("collector", {})}
         # A checkpoint whose state the Workers already purged: the bundle has
-        # its marker and none of what its scope's positions are read from.
+        # its marker and none of what its scope's positions are read from. Only
+        # the checkpoints the scope reads count: the audited one and the one it
+        # starts from; an older one a reach-back collected beside them may be
+        # gone without consequence.
+        # A windowed audit's start is decided when it is audited; only the
+        # checkpoint's own state counts here.
+        needed = {a["checkpoint"]} if a.get("start") is None else {
+            a["checkpoint"], a.get("start", self._previous_completed(a["checkpoint"]))}
         gone = [x for x in manifest.get("absent", [])
                 if x.get("role") in ("snapshot_meta", "interval_state")
-                and "not present in the job's state directory" in x.get("reason", "")]
+                and "not present in the job's state directory" in x.get("reason", "")
+                and _checkpoint_of(x.get("path", "")) in needed]
         if gone:
             self._finish(a, EXPIRED, "the checkpoint's state was purged before it was collected "
                          "(%d file(s) absent, such as %s); the Workers keep only their newest "
@@ -579,18 +641,26 @@ class Runner:
         d = self.dir.audit_dir(a["id"])
         out = d / "scope.json"
         out.unlink(missing_ok=True)
-        argv = [self.cfg.clink, "incident-scope", str(d / "bundle"), "--checkpoint=%d" % a["checkpoint"],
-                "--job=%d" % self.cfg.job_id, "--out=%s" % out]
-        r = self._run(a, "scope", argv, self.cfg.limits["scope_timeout_s"])
+        base = ["--checkpoint=%d" % a["checkpoint"], "--job=%d" % self.cfg.job_id, "--out=%s" % out]
+        if self.st["kind"] == "windowed" and any(c < a["checkpoint"] for c in self._held_states()):
+            self._step_window_scope(a, base, None, None)
+            return
+        r = self._run(a, "scope", [self.cfg.clink, "incident-scope", str(d / "bundle")] + base,
+                      self.cfg.limits["scope_timeout_s"])
         if r.stopped.startswith("interrupted"):
             return
         doc = read_json(out) if out.exists() else None
+        windowed = isinstance(doc, dict) and doc.get("transform") is not None
+        if r.exit == 0 and windowed or (r.exit == 3 and windowed):
+            self._learn_kind("windowed")
+            self._step_window_scope(a, base, r, doc)
+            return
         if r.exit == 0 and isinstance(doc, dict):
-            if doc.get("version") != 1 or doc.get("transform") is not None:
-                self._finish(a, UNSUPPORTED, "the job's scope is a windowed job's (version %s), which "
-                             "spans its whole lineage; this runner audits record-wise jobs only"
-                             % doc.get("version"))
+            if doc.get("version") != 1:
+                self._finish(a, UNSUPPORTED, "the job's scope is version %s, which this runner "
+                             "does not read" % doc.get("version"))
                 return
+            self._learn_kind("record-wise")
             a["steps"]["scope"] = self._rec(r, scope_sha256=doc.get("scope_sha256"))
             self._note_graph(a, doc)
             return
@@ -612,6 +682,75 @@ class Runner:
                                              "at": now_iso()})
             self.st["graph"] = sha
 
+    def _learn_kind(self, kind):
+        if self.st["kind"] != kind:
+            if self.st["kind"] is not None:
+                self.dir.event("job-kind-changed", old=self.st["kind"], new=kind)
+            self.st["kind"] = kind
+
+    def _held_states(self):
+        return sorted(int(c) for c in self.st["window"]["states"])
+
+    def _state_path(self, checkpoint):
+        return self.dir.path / "states" / ("%d.json" % checkpoint)
+
+    def _step_window_scope(self, a, args, seed_run, seed_doc):
+        """A windowed job's scope: an increment from the newest state the
+        runner holds on this checkpoint's lineage, or, with none held, the
+        whole lineage from the job's start, which seeds the chain. A held
+        state off the lineage (a restore went back past it) is refused by
+        incident-scope, and the next older one is tried."""
+        d = self.dir.audit_dir(a["id"])
+        out = d / "scope.json"
+        held = [c for c in self._held_states() if c < a["checkpoint"]]
+        tried = []
+        for m in sorted(held, reverse=True)[:8]:
+            out.unlink(missing_ok=True)
+            r = self._run(a, "scope", [self.cfg.clink, "incident-scope", str(d / "bundle"),
+                                       "--since=%d" % m] + args, self.cfg.limits["scope_timeout_s"])
+            if r.stopped.startswith("interrupted"):
+                return
+            doc = read_json(out) if out.exists() else None
+            if r.exit == 0 and isinstance(doc, dict) and doc.get("version") == 3:
+                a["since"] = m
+                a["steps"]["scope"] = self._rec(r, scope_sha256=doc.get("scope_sha256"), since=m)
+                self._note_graph(a, doc)
+                return
+            purged = [x.get("path") for x in (read_json(d / "bundle" / "manifest.json") or {}).get("absent", [])
+                      if x.get("role") in ("snapshot_meta", "interval_state")
+                      and _checkpoint_of(x.get("path", "")) == m]
+            if r.exit == 3 and m < int(a.get("lo") or 1):
+                tried.append("the state at checkpoint %d is further back than the bundle for checkpoint "
+                             "%d reaches (from %d): the runner fell behind" % (m, a["checkpoint"], a["lo"]))
+            elif r.exit == 3 and purged:
+                tried.append("the Workers purged checkpoint %d, where that state is, before checkpoint "
+                             "%d was collected (%s absent): the runner fell behind their retention"
+                             % (m, a["checkpoint"], purged[0]))
+            else:
+                tried.append("from checkpoint %d: %s" % (m, _first_line(r.stderr) or r.summary))
+            if r.exit != 2:
+                break  # on the lineage, and the bundle cannot give it: no older one helps
+        if not held:
+            # The seed: the job's whole lineage, from a start with no state.
+            if (seed_run is not None and seed_run.exit == 0 and isinstance(seed_doc, dict)
+                    and seed_doc.get("version") == 2):
+                a["since"] = None
+                a["steps"]["scope"] = self._rec(seed_run, scope_sha256=seed_doc.get("scope_sha256"),
+                                                since=None)
+                self._note_graph(a, seed_doc)
+                return
+            why = ("no state of the reference's is held yet, and the job's whole lineage is not in "
+                   "the bundle (%s): a windowed job is audited from its first checkpoint on, with "
+                   "start_at earliest" % ((_first_line(seed_run.stderr) or seed_run.summary)
+                                          if seed_run is not None else "not read"))
+        else:
+            why = ("no state the runner holds starts an increment to checkpoint %d (%s)"
+                   % (a["checkpoint"], "; ".join(tried) or "none tried"))
+        if self.st["window"].get("broken") is None:
+            self.st["window"]["broken"] = {"at": a["checkpoint"], "why": why[:500], "since": now_iso()}
+            self.dir.event("chain-broken", checkpoint=a["checkpoint"], reason=why[:500])
+        self._finish(a, PARTIAL, "the reference's window state chain is broken: " + why)
+
     def _step_reference(self, a):
         d = self.dir.audit_dir(a["id"])
         scope = read_json(d / "scope.json") or {}
@@ -624,9 +763,22 @@ class Runner:
                   "max_records": str(int(lim["reference_records"])),
                   "max_bytes": str(int(lim["reference_bytes"])),
                   "deadline_s": str(int(lim["reference_timeout_s"]))}
+        state_out = d / "state_out.json"
+        state_out.unlink(missing_ok=True)
+        windowed = scope.get("transform") is not None
+        if windowed:
+            values["state_out"] = str(state_out)
+            if a.get("since"):
+                values["state_in"] = str(self._state_path(a["since"]))
         argv = [_fill(arg, values) for arg in self.cfg.reference_command]
         if any(p.get("from") is None for s in scope.get("sources", []) for p in s.get("partitions", [])):
             argv += list(self.cfg.reference_when_run_start)
+        if windowed and a.get("since"):
+            argv += [_fill(arg, values) for arg in self.cfg.reference_with_state_in]
+        if windowed and "{state_out}" not in " ".join(self.cfg.reference_command):
+            self._finish(a, UNSUPPORTED, "the job is windowed, and the reference command takes no "
+                         "{state_out}, so no increment could follow this audit")
+            return
         r = self._run(a, "reference", argv, lim["reference_timeout_s"] + 30,
                       env_names=self.cfg.reference_env, watch=(partial, lim["reference_bytes"]))
         if r.stopped.startswith("interrupted"):
@@ -642,8 +794,11 @@ class Runner:
                 bound = "the reference holds %s rows, past its bound reference_rows (%d)" % (end.get("rows"), lim["reference_rows"])
             elif records > lim["reference_records"]:
                 bound = "the reference read %d records, past its bound reference_records (%d)" % (records, lim["reference_records"])
+            chain = self._check_chain(a, partial, end, state_out) if windowed else ""
             if bound:
                 rec.update(usable=False, why=bound)
+            elif chain:
+                rec.update(usable=False, why=chain)
             else:
                 os.replace(partial, final)
                 rec.update(usable=True, why="" if end.get("complete") else
@@ -656,6 +811,49 @@ class Runner:
                 why = "its output has no end line, so it is unfinished or malformed"
             rec.update(usable=False, why="the reference did not produce an artifact: " + why)
         a["steps"]["reference"] = rec
+
+    def _check_chain(self, a, artifact, end, state_out):
+        """A windowed reference must say it started from the state the runner
+        gave it, and, when complete, leave one that hashes to what it says;
+        that state is then held for the next increment."""
+        header = _first_json_line(artifact) or {}
+        if a.get("since"):
+            want = self.st["window"]["states"].get(str(a["since"]))
+            got = (header.get("state_in") or {}).get("sha256")
+            if got != want:
+                return ("the reference says it started from window state %s, and the runner gave "
+                        "it %s (the state at checkpoint %d)" % (got, want, a["since"]))
+        if not end.get("complete"):
+            return ""
+        out = end.get("state_out") or {}
+        if out.get("checkpoint") != a["checkpoint"] or not state_out.is_file():
+            return "the reference left no window state at checkpoint %d" % a["checkpoint"]
+        import hashlib
+        sha = hashlib.sha256(state_out.read_bytes()).hexdigest()
+        if sha != out.get("sha256"):
+            return ("the window state the reference left hashes to %s, not the %s its artifact "
+                    "names" % (sha, out.get("sha256")))
+        self._hold_state(a["checkpoint"], state_out, sha)
+        return ""
+
+    def _hold_state(self, checkpoint, path, sha):
+        dst = self._state_path(checkpoint)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(".%s.tmp-%d" % (dst.name, os.getpid()))
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, dst)
+        states = self.st["window"]["states"]
+        states[str(checkpoint)] = sha
+        keep = int(self.cfg.limits.get("retain_states", 50))
+        for c in sorted(int(x) for x in states)[:-keep] if len(states) > keep else []:
+            states.pop(str(c), None)
+            old = self._state_path(c)
+            if old.is_file() and not old.is_symlink() and old.parent == dst.parent:
+                old.unlink()
+        if self.st["window"].get("broken"):
+            self.dir.event("chain-resumed", checkpoint=checkpoint)
+            self.st["window"]["broken"] = None
+        self.save()
 
     def _step_verify(self, a):
         d = self.dir.audit_dir(a["id"])
@@ -707,6 +905,8 @@ class Runner:
         if ref.get("usable"):
             argv += ["--reference=%s" % (d / "reference.ndjson"),
                      "--max-reference-bytes=%d" % lim["reference_bytes"]]
+        if a.get("since"):
+            argv.append("--since=%d" % a["since"])
         env = [dest["password_env"]] if dest.get("password_env") else []
         r = self._run(a, "reconcile", argv, lim["reconcile_timeout_s"], env_names=env)
         if r.stopped.startswith("interrupted"):
@@ -846,6 +1046,11 @@ class Runner:
                     "implementation": (ref_header or {}).get("implementation"),
                 },
                 "runner": {"name": RUNNER_NAME, "version": RUNNER_VERSION},
+                "window": None if not (scope or {}).get("transform") else {
+                    "since": a.get("since"),
+                    "state_in": (ref_header or {}).get("state_in"),
+                    "state_out": self.st["window"]["states"].get(str(a["checkpoint"])),
+                },
             },
             "scope": None if scope is None else {
                 "starts_after": scope.get("starts_after"),
@@ -1009,7 +1214,12 @@ def _cpu():
 
 
 def _fill(arg, values):
-    return re.sub(r"\{([a-z_]+)\}", lambda m: values[m.group(1)], arg)
+    return re.sub(r"\{([a-z_]+)\}", lambda m: values.get(m.group(1), m.group(0)), arg)
+
+
+def _checkpoint_of(path):
+    m = re.search(r"checkpoint-(\d+)\.snap", path)
+    return int(m.group(1)) if m else None
 
 
 def _json_line(text):

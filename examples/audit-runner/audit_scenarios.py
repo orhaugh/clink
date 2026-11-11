@@ -11,6 +11,7 @@ import json
 import statistics
 import subprocess
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import workload
@@ -715,6 +716,449 @@ def cost(demo):
                  "audits per run with the runner: %s" % [r["audits_published"] for r in runs["runner"]],
                  all(r["audits_published"] for r in runs["runner"]))
 
+
+# -- windowed jobs: one increment at a time --------------------------------------------------
+#
+# The window-audit example's job (ten-second tumbling windows per account over
+# three partitions, two source subtasks), fed live: each event is produced as
+# its event time comes round, so windows close while the runner audits. The
+# Workers keep three checkpoints, so the job's whole lineage is not there to
+# audit: each audit is an increment, from the reference's own state at the
+# checkpoint before. The independent check is the windows the scenario
+# designed, from the events read back from Kafka, and the destination.
+
+import sys as _sys  # noqa: E402
+
+_WINDOW_AUDIT = Path(__file__).resolve().parent.parent / "window-audit"
+_sys.path.insert(0, str(_WINDOW_AUDIT))
+import window_demo  # noqa: E402
+import window_workload as wwork  # noqa: E402
+from window_demo import WindowCluster  # noqa: E402
+
+IDENTITY = ["account", "window_start", "window_end"]
+
+
+class LiveFeeder:
+    """Feeds events through one console producer as their event time comes
+    round: one second of event time per second of wall time."""
+
+    def __init__(self, demo, topic, events):
+        self.events = list(events)
+        self.stop_flag = False
+        self.paused = False
+        self.sent = 0
+        self.proc = subprocess.Popen(
+            ["docker", "compose", "--project-directory", str(_RECONCILE), "-f",
+             str(_RECONCILE / "docker-compose.yml"), "exec", "-T", "kafka",
+             "/opt/kafka/bin/kafka-console-producer.sh", "--bootstrap-server=kafka:9092",
+             "--topic=%s" % topic, "--property", "parse.key=true", "--property", "key.separator=\t"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+            env=demo.services.env)
+        import threading
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.t0 = time.time()
+        self.thread.start()
+        return self
+
+    def _run(self):
+        for e in self.events:
+            due = self.t0 + (e.ts - wwork.BASE_MS) / 1000.0
+            while not self.stop_flag and (self.paused or time.time() < due):
+                time.sleep(0.05)
+            if self.stop_flag:
+                return
+            self.proc.stdin.write(e.line())
+            self.proc.stdin.flush()
+            self.sent += 1
+
+    def pause(self, seconds):
+        """Holds the feed for `seconds`: event time does not wait, so the
+        events due meanwhile go out together when it resumes."""
+        self.paused = True
+        time.sleep(seconds)
+        self.paused = False
+
+    def done(self):
+        return not self.thread.is_alive()
+
+    def stop(self):
+        self.stop_flag = True
+        self.thread.join(timeout=30)
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+_RECONCILE = Path(__file__).resolve().parent.parent / "destination-reconciliation"
+
+
+def _wstart(demo, name, variant=None, retained=3, **kw):
+    topic, table = "wpay-%s" % name, "windows_%s" % name.replace("-", "_")
+    demo.services.create_topic(topic, wwork.PARTITIONS)
+    demo.services.ch(window_demo.TABLE_DDL.format(table=table, window=1000))
+    cluster = WindowCluster(demo, "runner-%s" % name, variant=variant, interval_ms=2000, **kw)
+    cluster.retained = retained
+    cluster.start(topic, table, demo.services.ch_port)
+    return cluster, topic, table
+
+
+def _wconfig(demo, cluster, name="audit", **over):
+    ref = {"command": [demo.reference_python, str(_WINDOW_AUDIT / "reference_windows.py"),
+                       "--scope={scope}", "--out={out}",
+                       "--bootstrap=127.0.0.1:%d" % demo.services.kafka_port,
+                       "--state-out={state_out}", "--max-records={max_records}",
+                       "--deadline-s={deadline_s}"],
+           "with_state_in": ["--state-in={state_in}"],
+           "when_run_start": ["--run-start-offset=ALL=0"]}
+    ref.update(over.pop("reference", {}))
+    return demo.runner_config(cluster, name=name, key=IDENTITY, reference=ref, **over)
+
+
+def _timeline(seed, seconds, flush_at):
+    """Steady events on every partition for `seconds` of event time, none of
+    them late whatever order the job reads the partitions in, then one event
+    per partition at `flush_at` seconds, which closes the windows before it."""
+    t = wwork.Timeline(seed=seed)
+    events = t.steady([0, 1, 2], 0, seconds * 1000, per_second=4)
+    events += [t.at(p, flush_at * 1000, kind="purchase") for p in (0, 1, 2)]
+    return events
+
+
+def _designed_and_landed(demo, topic, table, reports, events, state):
+    """The windows the scenario designed, from the events read back from
+    Kafka over the audited range, final by the last audited checkpoint's
+    recorded watermark; and what the destination holds for them."""
+    verified = [r for r in reports if r["outcome"] in ("passed", "empty")]
+    last = max(verified, key=lambda r: r["checkpoint"])
+    scope = json.loads((state / last["evidence"]["dir"] / "scope.json").read_text()) \
+        if last.get("evidence", {}).get("dir") else None
+    ends = {p["partition"]: p["to"] for s in last["scope"]["sources"] for p in s["partitions"]}
+    by_id = wwork.events_by_value(events)
+    got = []
+    for part, end in sorted(ends.items()):
+        records = demo.services.read_range(topic, part, 0, end)
+        if [o for o, _ in records] != list(range(0, end)):
+            raise Failed("%s[%d] [0, %d) could not be read back whole" % (topic, part, end))
+        got += [by_id[wwork.event_id_of(v)] for _, v in records if wwork.event_id_of(v) in by_id]
+    final_by = scope["finality"]["watermark_ms"] if scope else None
+    design = wwork.design_windows(got, final_by)
+    out = demo.services.ch(
+        "SELECT account, window_start, window_end, events, toInt64(net * 100), units FROM demo.%s "
+        "WHERE window_end <= %d ORDER BY account, window_start" % (table, final_by or 0), fmt="TSV")
+    landed = {}
+    for line in out.splitlines():
+        a, st, en, ev, cents, units = line.split("\t")
+        landed.setdefault((a, int(st), int(en)), []).append([int(ev), int(cents), int(units)])
+    return design, landed, final_by, len(got)
+
+
+def _restored(cluster):
+    """The job's RESTORED record (restore=, next= lines), or None."""
+    p = cluster.markers / "RESTORED"
+    if not p.exists():
+        return None
+    out = {}
+    for line in p.read_text().splitlines():
+        k, _, v = line.partition("=")
+        if v.strip().isdigit():
+            out[k.strip()] = int(v)
+    return out
+
+
+def _increment_rows(state, reports):
+    """Every final window the increments' references gave, from the artifacts
+    the runner kept."""
+    rows = {}
+    for r in reports:
+        ref = state / "audits" / r["id"] / "reference.ndjson"
+        if not ref.exists():
+            continue
+        for line in ref.read_text().splitlines():
+            o = json.loads(line)
+            if "row" in o:
+                k = (o["row"]["account"][1:], int(o["row"]["window_start"][1:]),
+                     int(o["row"]["window_end"][1:]))
+                rows.setdefault(k, []).append([int(o["row"]["events"][1:]),
+                                               int(Decimal(o["row"]["net"][1:].split("@")[0])),
+                                               int(o["row"]["units"][1:])])
+    return rows
+
+
+def windows_steady(demo):
+    """A windowed job fed live, its Workers keeping three checkpoints, the
+    runner polling: every checkpoint audited once, each an increment from the
+    reference's own state at the one before, and the windows they owe,
+    together, exactly the windows the scenario designed and the destination
+    holds, each once."""
+    name = "windows-steady"
+    cluster, topic, table = _wstart(demo, name)
+    config = _wconfig(demo, cluster, limits={"retain_passed": 100000})
+    state = _state(config)
+    events = _timeline(11, 60, 75)
+    poll = demo.audit_spawn(config, label="%s poll" % name)
+    feeder = LiveFeeder(demo, topic, events).start()
+    try:
+        _wait("the feed", feeder.done, 200, 0.5)
+        cluster.await_watermark(wwork.BASE_MS + 73_000, timeout=120)
+        cluster.await_more(2)
+        cluster.stop()
+        _wait("the runner to audit every completed checkpoint",
+              lambda: _all_audited(demo, cluster, config), 300)
+    finally:
+        feeder.stop()
+        cluster.stop()
+        demo.stop_poll(poll)
+    reports = demo.reports(state)
+    start = json.loads((state / "state.json").read_text())["start"]
+    completed = [c for c in cluster.completed() if c >= start]
+    by = _by_outcome(reports)
+    demo.outcome(name, "every completed checkpoint audited exactly once, each verified",
+                 "%d checkpoints, passed or empty" % len(completed),
+                 "%d reports, %s" % (len(reports), json.dumps({k: len(v) for k, v in by.items()})),
+                 sorted(r["checkpoint"] for r in reports) == completed and set(by) <= {"passed", "empty"}
+                 and by.get("passed"))
+    chain = [(r["checkpoint"], r["identity"]["window"]["since"]) for r in reports]
+    prev = [None] + [c for c, _ in chain[:-1]]
+    demo.outcome(name, "a seed, then an increment from each checkpoint's predecessor",
+                 "since = the previous checkpoint after the first",
+                 "%d chained of %d" % (sum(1 for (c, s), p in zip(chain, prev) if s == p), len(chain)),
+                 [s for _, s in chain] == prev)
+    scode, s = demo.status(config)
+    demo.outcome(name, "the status", "healthy, exit 0, the chain whole",
+                 "%s, exit %d, %s" % (s["state"], scode, json.dumps(s.get("window"))),
+                 scode == 0 and s["window"] and not s["window"]["chain_broken"])
+    design, landed, final_by, n = _designed_and_landed(demo, topic, table, reports, events, state)
+    have = _increment_rows(state, reports)
+    demo.outcome(name, "the increments' windows are the designed windows, each owed once",
+                 "%d designed windows" % len(design),
+                 "%d windows from %d increments, each once: %s" % (
+                     len(have), len(reports), all(len(v) == 1 for v in have.values())),
+                 {k: v[0] for k, v in have.items()} == design and all(len(v) == 1 for v in have.values()))
+    demo.outcome(name, "the destination holds the designed windows, each once",
+                 "%d windows" % len(design), "%d windows" % len(landed),
+                 {k: v for k, v in landed.items()} == {k: [v] for k, v in design.items()})
+    walls = [r["costs"]["wall_s"] for r in reports if r["outcome"] in ("passed", "empty")]
+    third = max(1, len(walls) // 3)
+    early, late = statistics.median(walls[:third]), statistics.median(walls[-third:])
+    reread = sum(int(r["costs"]["reference_records"] or 0) for r in reports)
+    measured = {"audits": len(reports), "increment_wall_s_median": statistics.median(walls),
+                "first_third_median_s": early, "last_third_median_s": late,
+                "records_reread": reread, "records_in_range": n, "final_by": final_by}
+    (demo.results / "measurements-windows-steady.json").write_text(json.dumps(measured, indent=2))
+    demo.note("increments: median %.2f s, first third %.2f s, last third %.2f s; %d records reread "
+              "for %d in the range" % (measured["increment_wall_s_median"], early, late, reread, n))
+    demo.outcome(name, "each source record read once, and an increment's cost does not grow",
+                 "records reread = records in range; last third's median within 1.5x the first's",
+                 "%d = %d; %.2f s vs %.2f s" % (reread, n, late, early), reread == n and late <= 1.5 * early)
+
+
+def windows_restore(demo):
+    """worker-1 runs the windowed job alone and is killed in a quiet stretch,
+    no window closing; the job restores on worker-2 and carries on. The
+    chain resumes from the reference's state at the restore point."""
+    name = "windows-restore"
+    cluster, topic, table = _wstart(demo, name, worker2_late=True, defer_worker2=True)
+    config = _wconfig(demo, cluster, limits={"retain_passed": 100000})
+    state = _state(config)
+    events = _timeline(12, 50, 65)
+    poll = demo.audit_spawn(config, label="%s poll" % name)
+    feeder = LiveFeeder(demo, topic, events).start()
+    try:
+        _wait("25 s of the feed", lambda: time.time() - feeder.t0 > 25, 60, 0.5)
+        feeder.paused = True
+        cluster.await_more(3)
+        w1 = cluster.procs["worker-1"]
+        w1.kill()
+        w1.wait()
+        demo.note("worker-1 killed in a quiet stretch")
+        cluster.worker(2)
+        _wait("the job to restore", lambda: (cluster.markers / "RESTORED").exists(), 120)
+        feeder.paused = False
+        _wait("the feed", feeder.done, 200, 0.5)
+        cluster.await_watermark(wwork.BASE_MS + 63_000, timeout=180)
+        cluster.await_more(2)
+        cluster.stop()
+        _wait("the runner to audit every completed checkpoint",
+              lambda: _all_audited(demo, cluster, config), 300)
+    finally:
+        feeder.stop()
+        cluster.stop()
+        demo.stop_poll(poll)
+    restored = _restored(cluster) or {"restore": None, "next": 1 << 62}
+    reports = demo.reports(state)
+    by = _by_outcome(reports)
+    after = [r for r in reports if r["checkpoint"] >= restored["next"]]
+    first = min(after, key=lambda r: r["checkpoint"]) if after else None
+    demo.outcome(name, "the chain resumes from the reference's state at the restore point",
+                 "the restored run's first audit an increment from checkpoint %d" % restored["restore"],
+                 "since %s" % (first and first["identity"]["window"]["since"]),
+                 first is not None and first["identity"]["window"]["since"] == restored["restore"])
+    demo.outcome(name, "every scope verified, the chain whole", "passed or empty, no break",
+                 json.dumps({k: len(v) for k, v in by.items()}),
+                 set(by) <= {"passed", "empty"} and not demo.status(config)[1]["window"]["chain_broken"])
+    design, landed, _, _ = _designed_and_landed(demo, topic, table, reports, events, state)
+    have = _increment_rows(state, reports)
+    demo.outcome(name, "the increments' windows and the destination are the designed windows",
+                 "%d windows, each once" % len(design), "%d from the increments, %d landed" % (len(have), len(landed)),
+                 {k: v[0] for k, v in have.items()} == design and all(len(v) == 1 for v in have.values())
+                 and landed == {k: [v] for k, v in design.items()})
+
+
+def windows_defect(demo):
+    """The job adds refunds to the net amount. Every increment that owes
+    windows is a transformation discrepancy, the delivery sound."""
+    name = "windows-defect"
+    cluster, topic, table = _wstart(demo, name, variant="wrong-sign")
+    config = _wconfig(demo, cluster, limits={"retain_passed": 100000})
+    events = _timeline(13, 30, 45)
+    poll = demo.audit_spawn(config, label="%s poll" % name)
+    feeder = LiveFeeder(demo, topic, events).start()
+    try:
+        _wait("the feed", feeder.done, 200, 0.5)
+        cluster.await_watermark(wwork.BASE_MS + 43_000, timeout=120)
+        cluster.await_more(2)
+        cluster.stop()
+        _wait("the runner to audit every completed checkpoint",
+              lambda: _all_audited(demo, cluster, config), 300)
+    finally:
+        feeder.stop()
+        cluster.stop()
+        demo.stop_poll(poll)
+    state = _state(config)
+    reports = demo.reports(state)
+    owing = [r for r in reports if (r["scope"] or {}).get("expected_rows")]
+    # The defect changes a window's net amount only where a refund was
+    # folded into it: exactly those increments are discrepancies.
+    refunds = {(e.account, (e.ts // wwork.SIZE_MS) * wwork.SIZE_MS) for e in events
+               if e.kind == "refund" and e.fate == "folded"}
+    wrong = []
+    rel = set()
+    for r in owing:
+        rel |= {f["relationship"] for f in r["findings"]}
+        ref = state / "audits" / r["id"] / "reference.ndjson"
+        keys = set()
+        for line in (ref.read_text().splitlines() if ref.exists() else []):
+            o = json.loads(line)
+            if "row" in o:
+                keys.add((o["row"]["account"][1:], int(o["row"]["window_start"][1:])))
+        has_refund = bool(keys & refunds)
+        if (r["outcome"] == "discrepancy") != has_refund:
+            wrong.append((r["checkpoint"], r["outcome"], has_refund))
+    scode, s = demo.status(config)
+    demo.outcome(name, "exactly the increments owing a window with a refund are discrepancies, in "
+                 "the transformation", "discrepancy where a refund was folded, passed elsewhere; "
+                 "findings not the delivery; status exit 1",
+                 "%d owing: %s; %d misjudged %s; relationships %s; status %s exit %d" % (
+                     len(owing), sorted({r["outcome"] for r in owing}), len(wrong), wrong[:3],
+                     sorted(rel), s["state"], scode),
+                 owing and not wrong and any(r["outcome"] == "discrepancy" for r in owing)
+                 and "transformation" in rel and "delivery" not in rel and scode == 1)
+
+
+def windows_behind(demo):
+    """The runner is stopped while the Workers, keeping two checkpoints, purge
+    the one its newest held state is at. Started again, it says the chain is
+    broken, by name, and verifies nothing after it."""
+    name = "windows-behind"
+    cluster, topic, table = _wstart(demo, name, retained=2)
+    config = _wconfig(demo, cluster)
+    state = _state(config)
+    events = _timeline(14, 50, 65)
+    feeder = LiveFeeder(demo, topic, events).start()
+    poll = demo.audit_spawn(config, label="%s poll" % name)
+    try:
+        _wait("two verified increments", lambda: sum(1 for r in demo.reports(state)
+                                                     if r["outcome"] in ("passed", "empty")) >= 3, 120, 0.5)
+        demo.stop_poll(poll)
+        held = json.loads((state / "state.json").read_text())["window"]["states"]
+        newest = max(int(c) for c in held)
+        cluster.await_more(6)
+        poll = demo.audit_spawn(config, label="%s poll again" % name)
+        _wait("the feed", feeder.done, 200, 0.5)
+        cluster.await_more(2)
+        cluster.stop()
+        _wait("the runner to reach every completed checkpoint",
+              lambda: _all_audited(demo, cluster, config), 300)
+    finally:
+        feeder.stop()
+        cluster.stop()
+        demo.stop_poll(poll)
+    reports = demo.reports(state)
+    first_break = min((r["checkpoint"] for r in reports if "chain is broken" in r["reason"]), default=None)
+    later = [r for r in reports if first_break is not None and r["checkpoint"] >= first_break]
+    scode, s = demo.status(config)
+    broken = (s.get("window") or {}).get("chain_broken")
+    demo.outcome(name, "after the runner fell behind, the chain is broken by name and nothing after "
+                 "it is verified", "from the first break, partial or expired; status incomplete, the "
+                 "break named (the runner's newest state was at checkpoint %d)" % newest,
+                 "%s; status %s exit %d; break %s" % (
+                     json.dumps({k: len(v) for k, v in _by_outcome(later).items()}), s["state"], scode,
+                     broken and broken["why"][:120]),
+                 later and all(r["outcome"] in ("partial", "expired") for r in later) and broken
+                 and "fell behind" in broken["why"] and scode == 3)
+
+
+def windows_cost(demo):
+    """The cost of an increment against the whole lineage's audit, on a job
+    whose Workers keep every checkpoint so the whole lineage can be audited
+    at the end: the increments' wall time stays flat while the whole
+    lineage's scope and reference grow with history."""
+    name = "windows-cost"
+    cluster, topic, table = _wstart(demo, name, retained=100000)
+    config = _wconfig(demo, cluster)
+    events = _timeline(15, 120, 135)
+    poll = demo.audit_spawn(config, label="%s poll" % name)
+    feeder = LiveFeeder(demo, topic, events).start()
+    try:
+        _wait("the feed", feeder.done, 300, 0.5)
+        cluster.await_watermark(wwork.BASE_MS + 133_000, timeout=120)
+        cluster.await_more(2)
+        cluster.stop()
+        _wait("the runner to audit every completed checkpoint",
+              lambda: _all_audited(demo, cluster, config), 300)
+    finally:
+        feeder.stop()
+        cluster.stop()
+        demo.stop_poll(poll)
+    reports = demo.reports(_state(config))
+    last = max(r["checkpoint"] for r in reports)
+    bundle = demo.work / "bundles" / name
+    cluster.collect(bundle)
+    t0 = time.time()
+    scope_path = demo.results / ("%s-whole.scope.json" % name)
+    r = subprocess.run([str(demo.bin / "clink"), "incident-scope", str(bundle), "--checkpoint=%d" % last,
+                        "--out=%s" % scope_path], capture_output=True, text=True, timeout=300)
+    scope_s = time.time() - t0
+    t0 = time.time()
+    ref_path = demo.results / ("%s-whole.reference.ndjson" % name)
+    rr = subprocess.run([demo.reference_python, str(_WINDOW_AUDIT / "reference_windows.py"),
+                         "--scope=%s" % scope_path, "--bootstrap=127.0.0.1:%d" % demo.services.kafka_port,
+                         "--out=%s" % ref_path, "--run-start-offset=ALL=0"],
+                        capture_output=True, text=True, timeout=900)
+    ref_s = time.time() - t0
+    walls = [x["costs"]["wall_s"] for x in reports if x["outcome"] == "passed"]
+    refs = [float(x["steps"]["reference"]["seconds"]) for x in reports if x["outcome"] == "passed"]
+    measured = {"increments": len(reports), "increment_wall_s_median": statistics.median(walls),
+                "increment_reference_s_median": statistics.median(refs),
+                "whole_lineage_checkpoints": last, "whole_scope_s": round(scope_s, 3),
+                "whole_reference_s": round(ref_s, 3), "whole_scope_exit": r.returncode,
+                "whole_reference_exit": rr.returncode, "events": len(events)}
+    (demo.results / "measurements-windows-cost.json").write_text(json.dumps(measured, indent=2))
+    demo.note("an increment: median %.2f s (its reference %.2f s); the whole lineage of %d checkpoints: "
+              "scope %.2f s, reference %.2f s" % (measured["increment_wall_s_median"],
+                                                   measured["increment_reference_s_median"], last,
+                                                   scope_s, ref_s))
+    demo.outcome(name, "the whole lineage can be audited here, for the comparison",
+                 "scope exit 0, reference exit 0", "scope exit %d, reference exit %d" % (r.returncode, rr.returncode),
+                 r.returncode == 0 and rr.returncode == 0, (r.stderr + rr.stderr)[-200:])
+
 ALL = [
     ("runner-steady", steady),
     ("runner-defect", defect),
@@ -726,4 +1170,9 @@ ALL = [
     ("runner-expired", expired),
     ("runner-history-expired", history_expired),
     ("runner-cost", cost),
+    ("runner-windows-steady", windows_steady),
+    ("runner-windows-restore", windows_restore),
+    ("runner-windows-defect", windows_defect),
+    ("runner-windows-behind", windows_behind),
+    ("runner-windows-cost", windows_cost),
 ]

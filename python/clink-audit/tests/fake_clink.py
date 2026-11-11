@@ -10,6 +10,7 @@ calls.ndjson beside it. It writes the files the real commands write, with
 the fields the runner reads, and nothing it does not need.
 """
 import fcntl
+import hashlib
 import json
 import os
 import signal
@@ -100,10 +101,12 @@ def collect(argv):
     if how == "expired":
         absent = [{"role": "interval_state", "path": "checkpoint/_state/1/v1/0/checkpoint-%d.snap" % (cp - 1),
                    "reason": "not present in the job's state directory"}]
+    lo, _, hi = f["epochs"].partition("-")
     manifest = {"format": "clink-incident-bundle", "version": 1,
                 "job": {"id": int(f["job"]), "commit_confirmation": False},
                 "selection": {"checkpoint": cp, "engine_choice": cp, "generation": 1,
                               "restored": p.get("restored")},
+                "fake_epochs": [int(lo), int(hi)],
                 "collector": {"clink_version": "fake"}, "absent": absent}
     (tmp / "manifest.json").write_text(json.dumps(manifest))
     os.rename(tmp, out)
@@ -123,6 +126,8 @@ def scope(argv):
     n = count("scope-%d" % cp)
     how = pick(p.get("scope", "ok"), n)
     out = Path(f["out"])
+    if PLAN.get("windowed"):
+        return window_scope(f, pos, cp, p, out)
     if how == "unsupported":
         print("incident-scope: the job keeps state across records in a form the audit does not support",
               file=sys.stderr)
@@ -146,6 +151,40 @@ def scope(argv):
     if how == "not-whole":
         print("incident-scope: the scope's source positions are not whole", file=sys.stderr)
         sys.exit(3)
+
+
+def window_scope(f, pos, cp, p, out):
+    """A windowed job's scope: version 2 from the job's start (the bundle must
+    reach back to epoch 1), or, with --since=M, the version 3 increment after
+    M, refused (exit 2) when M is off the checkpoint's lineage and partial
+    (exit 3) when the bundle does not reach back to M."""
+    lo = json.loads((Path(pos[0]) / "manifest.json").read_text())["fake_epochs"][0]
+    since = int(f["since"]) if "since" in f else None
+    doc = {"format": "clink-audit-scope", "version": 2 if since is None else 3, "checkpoint": cp,
+           "graph_sha256": p.get("graph", "g1"), "scope_sha256": "w%d-%s" % (cp, since),
+           "sink_op": "7", "attempts": ["a1"], "starts_after": since or 0,
+           "starts_at_run_start": since is None, "transform": {"kind": "tumbling-window"},
+           "sources": [{"topic": "payments", "cluster_id": "C1", "topic_id": "T1", "same_log": None,
+                        "partitions": [{"partition": 0, "from": None if since is None else since * 10,
+                                        "to": cp * 10}]}],
+           "sources_complete": True}
+    if since is not None:
+        doc["base"] = {"checkpoint": since}
+        if since in p.get("off_lineage", []):
+            print("incident-scope: checkpoint %d is not on checkpoint %d's lineage: restored from "
+                  "checkpoint %s" % (since, cp, p.get("restored_from", "?")), file=sys.stderr)
+            sys.exit(2)
+        if lo > since:
+            out.write_text(json.dumps(dict(doc, sources_complete=False)))
+            print("incident-scope: the scope is not whole: the base's evidence is not in the bundle",
+                  file=sys.stderr)
+            sys.exit(3)
+    elif lo > 1:
+        out.write_text(json.dumps(dict(doc, sources_complete=False)))
+        print("incident-scope: the scope is not whole: the lineage is not in the bundle",
+              file=sys.stderr)
+        sys.exit(3)
+    out.write_text(json.dumps(doc))
 
 
 def verify(argv):
@@ -262,9 +301,14 @@ def reference(argv):
     rows = int(p.get("rows", 10))
     records = int(p.get("records", rows))
     out = Path(f["out"])
+    header = {"format": "clink-reference-result", "version": sc.get("version", 1), "scope": sc,
+              "implementation": {"name": "fake-reference", "version": "1"}}
+    if "base" in sc:
+        data = Path(f["state-in"]).read_bytes()
+        header["state_in"] = {"checkpoint": sc["base"]["checkpoint"],
+                              "sha256": "0" * 64 if how == "bad-state-in" else hashlib.sha256(data).hexdigest()}
     with open(out, "w") as w:
-        w.write(json.dumps({"format": "clink-reference-result", "version": 1, "scope": sc,
-                            "implementation": {"name": "fake-reference", "version": "1"}}) + "\n")
+        w.write(json.dumps(header) + "\n")
         for i in range(rows if how != "huge" else 200000):
             w.write(json.dumps({"event_id": "I%d" % i, "pad": "p" * 40}) + "\n")
         if how == "malformed":
@@ -273,6 +317,10 @@ def reference(argv):
         end = {"rows": rows, "complete": complete,
                "incomplete": [] if complete else ["payments[0]: offsets [0, 10) are no longer in the topic: expired or deleted"],
                "read": [{"topic": "payments", "partition": 0, "records": records}]}
+        if sc.get("transform") and complete and f.get("state-out") and how != "no-state-out":
+            state = ("state at %d from %s" % (cp, header.get("state_in", {}).get("sha256"))).encode()
+            Path(f["state-out"]).write_bytes(state)
+            end["state_out"] = {"checkpoint": cp, "sha256": hashlib.sha256(state).hexdigest()}
         w.write(json.dumps({"end": end}) + "\n")
     sys.exit(0 if complete else 3)
 

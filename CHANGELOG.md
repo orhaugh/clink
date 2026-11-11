@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**`clink-audit` audits running windowed jobs.** The runner no longer
+refuses a windowed job: its first audit is the whole lineage at the job's
+first checkpoint, and each after it is the increment from the newest
+checkpoint whose reference state it holds. It keeps the reference's states
+between audits, checks each artifact names the state it was given, holds a
+new one only from a complete reference, collects far enough back for an
+increment to span one that did not finish, follows a restore to the restore
+point's state, and says the chain is broken when it fell behind the
+Workers' retention. `examples/audit-runner/` qualifies it on a windowed job
+fed live with Workers keeping three checkpoints.
+
 **A windowed reference carries its own state between increments.**
 `python/clink-reference` 0.3.0 reads an increment's scope and computes it
 from `WindowState`, the reference's own state at the base: each partition's

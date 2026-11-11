@@ -114,7 +114,8 @@ def compute(state_dir, now=None):
     if st.get("stopped"):
         conditions.append("stopped")
     # An audit waiting to be tried again could not finish its last attempt.
-    if open_gaps or retrying:
+    broken = (st.get("window") or {}).get("broken")
+    if open_gaps or retrying or broken:
         conditions.append("incomplete")
     if (len(waiting) > lim.get("backlog_warn", 10) or
             (oldest_wait_s is not None and oldest_wait_s > lim.get("stale_after_s", 900))):
@@ -150,6 +151,11 @@ def compute(state_dir, now=None):
                     "collected": len(collected), "retrying": retrying,
                     "note": st.get("backlog_note")},
         "stopped": st.get("stopped"),
+        "kind": st.get("kind"),
+        "window": None if st.get("kind") != "windowed" else {
+            "states_held": len((st.get("window") or {}).get("states", {})),
+            "newest_state": max((int(c) for c in (st.get("window") or {}).get("states", {})), default=None),
+            "chain_broken": broken},
         "resources": {"last_cycle": st.get("last_cycle"), "totals": st.get("totals"),
                       "disk_bytes": d.usage(), "disk_limit": lim.get("disk_bytes"),
                       "retained_passed": len(st.get("retained_passed", [])),
@@ -199,6 +205,12 @@ def render_text(s):
                                             if len(s["conditions"]) > 1 else ""))
     if s.get("stopped"):
         lines.append("stopped: %s: %s" % (s["stopped"].get("reason"), s["stopped"].get("detail", "")))
+    w = s.get("window")
+    if w:
+        lines.append("windowed: the reference's state held at %d checkpoint(s), the newest %s%s" % (
+            w["states_held"], w["newest_state"],
+            ("; the chain is BROKEN at checkpoint %s: %s" % (w["chain_broken"]["at"], w["chain_broken"]["why"][:200]))
+            if w.get("chain_broken") else ""))
     lv = s.get("last_verified")
     lines.append("last verified: %s" % ("checkpoint %d (%s), %s" % (lv["checkpoint"], lv["outcome"],
                                                                      _ago(s.get("last_verified_age_s")))

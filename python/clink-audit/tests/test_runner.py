@@ -405,14 +405,127 @@ class Partial(RunnerTest):
         self.assertEqual(self.w.calls("incident-verify"), [])
         self.assertEqual(len(self.w.calls("incident-reconcile")), 1)
 
-    def test_a_windowed_job_is_unsupported_by_name(self):
+
+class Windowed(RunnerTest):
+    """A windowed job, audited one increment at a time from the reference's
+    own state, which the runner holds between audits."""
+
+    def setUp(self):
+        super().setUp()
+        self.w.plan["windowed"] = True
+        self.w.write_plan()
+
+    def audit(self, *args, **cfg):
+        cfg.setdefault("reference", {})
+        cfg["reference"].setdefault("command", [str(self.w.bin / "reference"), "--scope={scope}",
+                                                "--out={out}", "--state-out={state_out}"])
+        cfg["reference"].setdefault("with_state_in", ["--state-in={state_in}"])
+        return self.w.run(*args, **cfg)
+
+    def sinces(self, kind):
+        out = {}
+        for c in self.w.calls(kind):
+            cp = next((int(a.split("=")[1]) for a in c["argv"] if a.startswith("--checkpoint=")), None)
+            since = next((int(a.split("=")[1]) for a in c["argv"] if a.startswith("--since=")), None)
+            out.setdefault(cp, []).append(since)
+        return out
+
+    def test_a_seed_then_an_increment_from_each_held_state(self):
+        self.w.complete(1, 2, 3, 4)
+        self.assertEqual(self.audit(), 0, self.w.last_output)
+        self.assertEqual(self.outcomes(), {1: "passed", 2: "passed", 3: "passed", 4: "passed"})
+        reconciled = self.sinces("incident-reconcile")
+        self.assertEqual({cp: v[-1] for cp, v in reconciled.items()}, {1: None, 2: 1, 3: 2, 4: 3})
+        reports = {r["checkpoint"]: r for r in self.w.reports()}
+        self.assertIsNone(reports[1]["identity"]["window"]["since"])
+        self.assertEqual(reports[3]["identity"]["window"]["since"], 2)
+        self.assertEqual(reports[3]["identity"]["window"]["state_in"]["sha256"],
+                         reports[2]["identity"]["window"]["state_out"])
+        s = self.w.status()
+        self.assertEqual(s["kind"], "windowed")
+        self.assertEqual(s["window"]["states_held"], 4)
+        self.assertIsNone(s["window"]["chain_broken"])
+        self.assertEqual(s["state"], "healthy")
+        # A bundle reaches back to the state it starts from.
+        epochs = {}
+        for c in self.w.calls("incident-collect"):
+            cp = next(int(a.split("=")[1]) for a in c["argv"] if a.startswith("--checkpoint="))
+            epochs[cp] = next(a.split("=")[1] for a in c["argv"] if a.startswith("--epochs="))
+        self.assertEqual(epochs[1], "1-1")
+        self.w.complete(5)
+        self.assertEqual(self.audit(), 0)
+        self.assertEqual(epochs.get(5), None)
+        last = [a for c in self.w.calls("incident-collect") for a in c["argv"]
+                if a.startswith("--epochs=")][-1]
+        self.assertEqual(last, "--epochs=4-5")
+
+    def test_after_a_restore_the_chain_resumes_from_the_restore_points_state(self):
+        self.w.complete(1, 2, 3)
+        self.assertEqual(self.audit(), 0)
+        self.w.complete(4)
+        # The job restored from 2 and its new run completed 4: the bundle for
+        # 4 reaches back to the restore point, and the chain resumes there.
+        self.w.at(4, off_lineage=[3], restored_from=2, restored={"restore": 2, "next": 4})
+        self.assertEqual(self.audit(), 0, self.w.last_output)
+        self.assertEqual(self.sinces("incident-scope")[4], [3, 2])
+        self.assertEqual(self.w.reports()[-1]["identity"]["window"]["since"], 2)
+        self.assertEqual(len(self.w.events("collect-reach-back")), 1)
+        self.assertIn("--epochs=2-4", [a for c in self.w.calls("incident-collect") for a in c["argv"]])
+        # The restored run's next checkpoint chains on from 4, not back to 2.
+        self.w.complete(5)
+        self.w.at(5, restored={"restore": 2, "next": 4})
+        self.assertEqual(self.audit(), 0, self.w.last_output)
+        self.assertEqual(len(self.w.events("collect-reach-back")), 1)
+        self.assertEqual(self.w.reports()[-1]["identity"]["window"]["since"], 4)
+
+    def test_after_a_failed_increment_the_next_spans_from_the_last_held_state(self):
+        self.w.complete(1, 2, 3)
+        self.w.at(2, reference="incomplete")
+        self.assertEqual(self.w.settle(reference={"command": [str(self.w.bin / "reference"),
+                                                              "--scope={scope}", "--out={out}",
+                                                              "--state-out={state_out}"],
+                                                  "with_state_in": ["--state-in={state_in}"]}), 3)
+        self.assertEqual(self.outcomes(), {1: "passed", 2: "partial", 3: "passed"})
+        self.assertEqual(self.w.reports()[-1]["identity"]["window"]["since"], 1)
+        self.assertIsNone(self.w.status()["window"]["chain_broken"])
+
+    def test_a_chain_with_no_state_on_the_lineage_is_broken_visibly_and_stays_so(self):
+        self.w.complete(1, 2)
+        self.assertEqual(self.audit(), 0)
+        self.w.complete(3, 4)
+        self.w.at(3, off_lineage=[1, 2], restored_from=0)
+        self.w.at(4, off_lineage=[1, 2], restored_from=0)
+        self.assertEqual(self.audit(), 3)
+        o = self.outcomes()
+        self.assertEqual((o[3], o[4]), ("partial", "partial"))
+        self.assertIn("chain is broken", self.w.reports()[-1]["reason"])
+        s = self.w.status()
+        self.assertEqual(s["state"], "incomplete")
+        self.assertEqual(s["window"]["chain_broken"]["at"], 3)
+        self.assertIn("BROKEN", status.render_text(s))
+
+    def test_a_reference_that_started_from_another_state_is_not_used(self):
+        self.w.complete(1, 2)
+        self.w.at(2, reference="bad-state-in")
+        self.assertEqual(self.audit(limits={"max_attempts": 1}), 3)
+        r = self.w.reports()[-1]
+        self.assertEqual(r["outcome"], "partial")
+        self.assertIn("started from window state", r["steps"]["reference"]["why"])
+        self.assertNotIn("2", self.w.status()["window"] and
+                         [str(c) for c in json.loads((self.w.state / "state.json").read_text())
+                          ["window"]["states"]])
+
+    def test_a_reference_command_that_leaves_no_state_cannot_audit_a_windowed_job(self):
         self.w.complete(1)
-        self.w.at(1, scope="windowed")
         self.assertEqual(self.w.run(), 3)
-        r = self.w.reports()[0]
-        self.assertEqual(r["outcome"], "unsupported")
-        self.assertIn("record-wise jobs only", r["reason"])
-        self.assertEqual(self.w.calls("reference"), [])
+        self.assertEqual(self.outcomes(), {1: "unsupported"})
+        self.assertIn("{state_out}", self.w.reports()[0]["reason"])
+
+    def test_held_states_are_bounded_and_kept_inside_the_state_directory(self):
+        self.w.complete(1, 2, 3, 4, 5)
+        self.assertEqual(self.audit(limits={"retain_states": 2}), 0)
+        files = sorted(p.name for p in (self.w.state / "states").iterdir())
+        self.assertEqual(files, ["4.json", "5.json"])
 
 
 class Collection(RunnerTest):

@@ -16,7 +16,7 @@ The runner adds the parts a person would otherwise do by hand: finding the check
 
 Record-wise jobs from one Kafka SQL source into the ClickHouse native sink, under the rules destination reconciliation already has (a plain `MergeTree`, a key that identifies one row the job writes; see [incident verification](../../docs/internals/incident-verification.md#destination-reconciliation)). The destination is always read for the scope's keys: rows of other keys are not established, and the runner never asks for a whole-table verdict on a table that is still being written.
 
-A windowed job is refused as unsupported. Its scope is its whole lineage, and auditing it repeatedly would read the job's whole history every time.
+A windowed job (record 015's one keyed tumbling window) is audited one increment at a time: the first audit is the whole lineage, at the job's first checkpoint, and every one after it is the increment from the reference's own state at the checkpoint before (`incident-scope --since`). The runner keeps the reference's state between audits, so each reads only its own range. Start the runner with the job (`start_at: earliest`): a chain starts only at the job's first checkpoint.
 
 ## Installing and running
 
@@ -69,7 +69,7 @@ One JSON file, which you own and the runner trusts. Credentials are never in it:
 }
 ```
 
-The reference command is an argument array, run without a shell. `{scope}`, `{out}`, `{max_records}`, `{max_bytes}` and `{deadline_s}` are the only placeholders, and anything else in braces is refused. `when_run_start` is appended only for a scope that starts at the run's own start, whose first offset the job's checkpoints do not record.
+The reference command is an argument array, run without a shell. `{scope}`, `{out}`, `{max_records}`, `{max_bytes}`, `{deadline_s}`, `{state_out}` and (in `with_state_in` only) `{state_in}` are the only placeholders, and anything else in braces is refused. `when_run_start` is appended only for a scope that starts at the run's own start, whose first offset the job's checkpoints do not record. For a windowed job the command takes `{state_out}`, where the reference writes its state at the scope's checkpoint, and `with_state_in` gives the arguments added for an increment, such as `["--state-in={state_in}"]`.
 
 Each step receives the base environment (`PATH`, `HOME`, the locale, `TMPDIR`, `TZ`) and only the variables it needs: the reference gets `reference.env`, reconciliation gets `destination.password_env`, and collection, scope export and verification get none. The runner refuses a configuration that passes the destination's credential to the reference. Credential values that a child prints are replaced in the logs it keeps. Nothing a bundle, a scope, a reference artifact or the job's metadata names is ever run or connected to.
 
@@ -90,6 +90,7 @@ Each step receives the base environment (`PATH`, `HOME`, the locale, `TMPDIR`, `
 | `max_pending` | 100 | collected bundles waiting for their audit |
 | `max_attempts`, `retry_backoff_s` | 3, [10, 60, 300] | attempts for a partial or failed audit, and the pause before each; an audit has at most one attempt per cycle |
 | `collect_retries` | 10 | collections refused because the job moved on during the copy |
+| `retain_states` | 50 | a windowed job's reference states kept, newest first (more than the Workers keep checkpoints, so a restore point's is held) |
 | `poll_interval_s` | 10 | the pause between `poll` cycles |
 | `stale_after_s`, `backlog_warn` | 900, 10 | when the status says stale or behind |
 
@@ -115,6 +116,7 @@ Coverage comes only from published results that passed or were empty, per log (t
 | `acks/` | your acknowledgements |
 | `audits/<id>/` | one audit's evidence: the bundle, scope, reference, reports, each step's output and the commands run |
 | `reports/<id>.json` | one audit's result (`clink-audit-report` version 1), published by rename |
+| `states/<checkpoint>.json` | a windowed job's reference state at that checkpoint, held for the next increment |
 
 An audit's id is the checkpoint and a hash of the job and the configuration's fingerprint, so a restart publishes the same result under the same id, and a changed reference, key, destination or verdict-changing bound gives new ids. Each step's result is recorded once its output is in place. After a crash the runner stops the child it left running, publishes any audit whose report was written but not recorded, and resumes the rest at the step that was running. A discrepancy is never retried away, and unfinished work is never counted as verified.
 
@@ -125,5 +127,7 @@ Retained bundles hold the job's records, its state and the reference's rows. Tre
 ## Sizing
 
 One audit costs a collection, a reference read of the scope's source range, an offline verification and two reads of the destination a second apart. In the example's steady run on an Apple M2 Pro, with checkpoints two seconds apart, a median audit took 2.3 s of wall time (95th percentile 3.1 s), 1.3 s of it the reconciliation, and 0.9 s of CPU in its child processes. An empty scope costs about the same as a small one, so the checkpoint interval sizes the runner, not the data rate. Sequential coverage keeps up when the interval is longer than an audit. When it is shorter, the backlog grows and the status says so: lengthen the interval, raise the Workers' `--checkpoint-num-retained` so that collection, which must happen before a checkpoint's successors purge what its scope reads, has room, or use `latest-only` and accept the recorded gaps.
+
+A windowed increment costs about the same as a record-wise audit, and stays flat as the job's history grows: in the example, a median of 2.0 s per increment over 42 checkpoints, its reference 0.14 s, where the whole lineage's reference at 72 checkpoints took 1.67 s and grows with every record. The chain also needs each checkpoint collected before the Workers purge the state at the newest held one: a runner that falls further behind than their retention breaks the chain.
 
 `examples/audit-runner/` qualifies the runner against Kafka and ClickHouse and measures its cost.

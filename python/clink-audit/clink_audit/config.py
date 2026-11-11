@@ -59,6 +59,9 @@ DEFAULT_LIMITS = {
     "retry_backoff_s": [10, 60, 300],
     # Collection refused because the job moved on during the copy.
     "collect_retries": 10,
+    # A windowed job's chain: the reference's states kept, newest first. More
+    # than the Workers keep checkpoints, so any restore point has its state.
+    "retain_states": 50,
     "poll_interval_s": 10,
     # Status: verification older than this is stale; more eligible
     # checkpoints than this waiting is behind.
@@ -72,7 +75,7 @@ FINGERPRINTED_LIMITS = ("bundle_bytes", "bundle_files", "reference_bytes", "refe
 
 # Placeholders a reference argument may hold; anything else in braces is a
 # configuration error, so a typo never reaches the child as text.
-PLACEHOLDERS = ("scope", "out", "max_records", "max_bytes", "deadline_s")
+PLACEHOLDERS = ("scope", "out", "max_records", "max_bytes", "deadline_s", "state_in", "state_out")
 _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 
 # The environment every child starts from. Nothing else of the runner's own
@@ -102,6 +105,7 @@ class Config:
     reference_command: list
     reference_env: list
     reference_when_run_start: list
+    reference_with_state_in: list
     verify_profile: str
     selection: str
     limits: dict = field(default_factory=dict)
@@ -120,7 +124,8 @@ class Config:
                             ("host", "port", "user", "password_env", "secure", "tls_ca_file",
                              "tls_verify", "database", "table")},
             "reference": {"command": self.reference_command, "env": self.reference_env,
-                          "when_run_start": self.reference_when_run_start},
+                          "when_run_start": self.reference_when_run_start,
+                          "with_state_in": self.reference_with_state_in},
             "verify": self.verify_profile,
             "limits": {k: self.limits[k] for k in FINGERPRINTED_LIMITS},
         }
@@ -239,7 +244,7 @@ def load(path, state_dir_override=None):
             _expect(isinstance(dest[b], bool), "destination.%s must be true or false" % b)
 
     ref = raw["reference"]
-    _keys(ref, "reference", ("command", "env", "when_run_start"), ("command",))
+    _keys(ref, "reference", ("command", "env", "when_run_start", "with_state_in"), ("command",))
     cmd = ref["command"]
     _expect(isinstance(cmd, list) and cmd and all(isinstance(a, str) for a in cmd),
             "reference.command must be a non-empty list of arguments (no shell)")
@@ -252,6 +257,16 @@ def load(path, state_dir_override=None):
                     % (name, ", ".join("{%s}" % p for p in PLACEHOLDERS)))
             used.add(name)
     _expect({"scope", "out"} <= used, "reference.command must take {scope} and {out}")
+    _expect("state_in" not in used, "reference.command must not take {state_in}: an increment's "
+            "arguments for it go in reference.with_state_in")
+    with_state_in = ref.get("with_state_in", [])
+    _expect(isinstance(with_state_in, list) and all(isinstance(a, str) for a in with_state_in),
+            "reference.with_state_in must be a list of arguments")
+    for a in with_state_in:
+        for name in _PLACEHOLDER.findall(a):
+            _expect(name in PLACEHOLDERS, "reference.with_state_in: {%s} is not a placeholder" % name)
+    _expect(not with_state_in or any("{state_in}" in a for a in with_state_in),
+            "reference.with_state_in must take {state_in}")
     ref_env = _env_names(ref.get("env", []), "reference.env")
     when = ref.get("when_run_start", [])
     _expect(isinstance(when, list) and all(isinstance(a, str) for a in when),
@@ -285,5 +300,6 @@ def load(path, state_dir_override=None):
                   checkpoint_dir=checkpoint_dir, ha_dir=ha_dir, capture_dir=capture_dir,
                   commit_confirmation=cc, start_at=start_at, key=list(key), destination=dict(dest),
                   reference_command=list(cmd), reference_env=ref_env,
-                  reference_when_run_start=list(when), verify_profile=profile,
+                  reference_when_run_start=list(when), reference_with_state_in=list(with_state_in),
+                  verify_profile=profile,
                   selection=selection, limits=limits, raw=raw)
