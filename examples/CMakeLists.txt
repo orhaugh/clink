@@ -97,6 +97,16 @@ if(TARGET clink::kafka)
         LINK clink::kafka)
 endif()
 
+# state_inspection_job: per-account keyed state from Kafka at parallelism 2,
+# the job examples/state-inspection/ exports, queries and compares checkpoints
+# of. Carries clink::kafka like kafka_2pc_job.
+if(TARGET clink::kafka)
+    clink_add_job_module(clink_state_inspection_job
+        SOURCES state-inspection/accounts_job.cpp
+        OUTPUT_NAME state_inspection_job
+        LINK clink::kafka)
+endif()
+
 # s3_2pc_job: the S3 arm - one NDJSON object per (subtask, checkpoint),
 # staged as a multipart upload at the barrier and completed at
 # CommitCheckpoint. Carries clink::s3 the same way.

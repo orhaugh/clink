@@ -1,0 +1,37 @@
+# Inspecting a distributed job's state at a checkpoint
+
+A runnable example of checkpoint datasets: one completed checkpoint of a whole job, exported while the job runs with `clink state-export --checkpoint-dir`, moved, read with pyarrow, DuckDB and `clink state-query`, and compared with another with `clink state-diff`. The contract is [Checkpoint datasets](../../docs/internals/state-snapshot-format.md#checkpoint-datasets).
+
+```bash
+examples/state-inspection/run.sh                         # every scenario: a qualification
+ONLY=inspect-running examples/state-inspection/run.sh    # one scenario
+```
+
+It needs Docker, Python 3.10 or later with pip (pyarrow and DuckDB are installed into a virtual environment under `WORK`), and `clink`, `clink_node`, `clink_submit_sql` and the example job module built (`CLINK_BIN_DIR`, default `build/`; the module is `build/examples/state_inspection_job.so`). Kafka runs from the image `../destination-reconciliation/docker-compose.yml` pins, on 127.0.0.1 only. Everything a run produces is under `WORK`, which is the qualification bundle: `results/` holds the summary, every check's verdict (`scenarios.json`), the commands run, the independent checks, the diffs, the queries and the costs; each scenario's directory holds its cluster's checkpoints, logs and datasets.
+
+## The job
+
+`accounts_job.cpp` reads `<account>,<kind>,<amount>` records from a two-partition topic at parallelism 2 and keeps two keyed-state slots per account, keyed by the account as an int64: `count`, the deposits and withdrawals it has seen, and `balance`, deposits less withdrawals. A `close` removes both. Its operators have uids (`si-source`, `si-accounts`), so its state restores and its operators are named in a dataset. Version 2 of the job (`CLINK_SI_SCHEMA=2`) keeps the balance in hundredths and migrates a version 1 balance on restore.
+
+## The independent check
+
+Every dataset the example relies on is checked against the state this example computes on its own. It decodes the dataset's `entries.parquet` with pyarrow and its own knowledge of the job's codecs (an 8-byte little-endian int64 key and value), reads the source positions the dataset records (the Kafka source's next offset per partition), reads exactly those records back from Kafka with its console consumer, and folds them with its own model of the job. The check passes only when the dataset is complete and every account's count and balance equal the fold. Restoring the files into a job is not the check.
+
+## Offline
+
+`state-export`, `state-diff` and `state-cat` over the exported datasets run under the platform's network isolation (`sandbox-exec` with the network denied on macOS, `unshare -rn` on Linux), proven first against a local control endpoint. `state-query` runs its SQL in an embedded engine whose Coordinator and Workers talk over loopback, which that isolation blocks, so it runs under a second mechanism that denies every address but loopback: a profile that allows loopback alone on macOS, and a new network namespace with only `lo` up on Linux. That one is proven too: a connection to 192.0.2.1 (TEST-NET-1, a documentation range nothing answers on) is attempted without it and denied under it before any packet leaves, and a loopback connection works under it.
+
+## Scenarios
+
+| Scenario | What happens | Required |
+| --- | --- | --- |
+| `inspect-running` | 300 accounts opened, then deposits fed in the background while the restore point is exported. Then a quiet checkpoint `a`; 20 accounts added, 15 closed and 50 changed; another quiet checkpoint `b`. `b` is moved to another directory. worker-1 is killed (SIGKILL) while a feed runs and the job restores; checkpoint `c`. The accounts operator is rescaled from 2 to 4 with nothing new to read; checkpoint `d`. | The export while the feed runs publishes a complete dataset, and every attempt either does or is refused. Each of the live export, `a`, `b`, `c` and `d` holds exactly the fold of its records. `a` to `b`: exactly 20 added, 15 removed, 50 changed and 235 unchanged in each slot, each subtask's position changed, samples hex with lengths, exit 1. The same checkpoint exported twice: exit 0. The moved dataset queries and compares the same; pyarrow decodes it to the expected state; DuckDB counts each slot's accounts; `state-query`'s balances decode to the expected ones. `c` is of the restored run (its RESTORED record) and the lineage of `b` to `c` names the restore. `c` to `d`: no keyed entry added, removed or changed, some relocated; operator state compared with no change or declared not comparable; never exit 1. |
+| `inspect-schema` | Version 1 of the job runs and is exported; the job stops at a final checkpoint; version 2 restores from it and is exported. | Version 2 holds the fold with balances in hundredths. `state-diff`: the balance slot not compared (schema changed, `balance v1` to `balance v2` named), the count slot compared with no change, exit 3. With `--raw-bytes`: the balance compared as raw bytes, every account changed, every sample labelled raw, exit 1. |
+| `inspect-faults` | The job stops at a final checkpoint, which is exported, and copies of its checkpoint directory are damaged. | Complete export of the original, holding the fold. One participant's snapshot removed: refused (exit 1, `incomplete`, naming participant 3), nothing published; with `--allow-partial`, published with `complete: false`; `state-query` refuses it (exit 3) unless `--allow-partial`, and then says it is partial; a comparison with it is not established (exit 3) and compares nothing. A snapshot corrupted: refused, the sidecar check named. A published dataset damaged: `state-query`, `state-diff` and `state-cat` exit 2 naming the hash. A dataset reached through a link: exit 2. `--max-entries` below the checkpoint: refused, or partial with `--allow-partial`; `--max-bytes` below it: refused, `bound`. A diff that reaches `--max-entries`: exit 3, never 0. |
+| `inspect-retention` | Workers keep two checkpoints, 300 ms apart, while a feed runs; the oldest retained checkpoints, and one long purged whose marker remains, are exported again and again. | Every attempt publishes a complete dataset or is refused. A purged checkpoint is refused as incomplete. Every published dataset holds exactly the fold of its own records: one checkpoint, never a mixture. |
+| `inspect-unsupported` | A SQL job (`GROUP BY account` into the blackhole sink) whose state backend is RocksDB, outside the checkpoint directory. | The export is refused as `unsupported`; with `--allow-partial` it is published with `complete: false` and the reason listed. |
+| `inspect-cost` | 100,000 accounts (150,000 records), then 10,000 of them changed (`CLINK_SI_COST_ACCOUNTS` sets the number). | The two exports, a diff and a query succeed; the diff finds exactly the accounts changed. Export and diff time, peak resident memory, and the dataset's size against the snapshots' are recorded in `results/costs.json`. |
+
+## What it shows, and what it does not
+
+A complete dataset is one completed checkpoint of the whole job: every participant its marker records, at its generation, each snapshot verified against its sidecar, with every entry's exact bytes. What it holds is the job's state at that checkpoint, which the independent check confirms against the source records the checkpoint had consumed. It says nothing about what a sink's destination holds, and it offers no typed reading of a value: the example decodes the entries because it knows its own job's codecs.
