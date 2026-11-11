@@ -15,22 +15,37 @@
 //     single-subtask flat layout); key groups are disjoint across subtasks
 //     so the merge is a clean union.
 //
-// Exit codes (diff): 0 = identical, 1 = differences found, 2 = error.
-// Exit codes (cat):  0 = ok, 2 = error.
+// The checkpoint-consistent forms read and write checkpoint datasets
+// (clink/state_processor/checkpoint_dataset.hpp): state-export
+// --checkpoint-dir exports one, state-diff --a/--b compares two directories
+// holding one, and state-cat --dataset lists one. They render bytes as hex
+// with their lengths and guess no type.
+//
+// Exit codes (diff): 0 = identical, 1 = differences found, 2 = error;
+//   for datasets, 3 = not established (a partial side, a slot not
+//   compared, a limit reached).
+// Exit codes (cat):  0 = ok, 2 = error; 3 = a partial dataset, refused.
+// Exit codes (export, dataset form): 0 = complete, 3 = published partial,
+//   1 = refused (nothing published), 2 = usage.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "clink/config/json.hpp"
 #include "clink/runtime/record_capture.hpp"
+#include "clink/state_processor/checkpoint_dataset.hpp"
 #include "clink/state_processor/parquet_export.hpp"
 #include "clink/state_processor/savepoint.hpp"
 #include "clink/state_processor/state_diff.hpp"
@@ -79,6 +94,48 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
         }
     }
     return false;
+}
+
+// Strict decimal: digits only, at most 20, and within 64 bits.
+bool parse_uint(const std::string& s, std::uint64_t& out) {
+    if (s.empty() || s.size() > 20 || s.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
+    try {
+        out = std::stoull(s);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+// Every argument is one of `allowed`, as --name=value or --name.
+bool only_flags(int argc, char** argv, std::initializer_list<std::string_view> allowed) {
+    for (int i = 1; i < argc; ++i) {
+        std::string_view a = argv[i];
+        if (!a.starts_with("--")) {
+            std::cerr << "unexpected argument '" << a << "'\n";
+            return false;
+        }
+        a.remove_prefix(2);
+        const auto name = a.substr(0, a.find('='));
+        if (std::find(allowed.begin(), allowed.end(), name) == allowed.end()) {
+            std::cerr << "unknown option --" << name << "\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+// A directory (not a link) holding a dataset.json: a checkpoint dataset.
+bool is_dataset_dir(const std::string& p) {
+    std::error_code ec;
+    return !p.empty() && fs::is_directory(fs::symlink_status(p, ec)) &&
+           fs::exists(fs::symlink_status(fs::path{p} / clink::state_processor::kDatasetFile, ec));
+}
+
+std::string json_text(const std::string& s) {
+    return clink::config::JsonValue{s}.serialize(0);
 }
 
 using clink_tools::canonical_bytes_for;
@@ -247,9 +304,32 @@ void print_diff_json(const LoadedSide& a, const LoadedSide& b, const StateDiffRe
 }
 
 void diff_usage() {
-    std::cerr << "Usage: clink state-diff --a=<f.snap> --b=<f.snap> [--json] [--max-rows=N]\n"
+    std::cerr << "Usage: clink state-diff --a=<dataset> --b=<dataset> [--raw-bytes] "
+                 "[--max-samples=N]\n"
+              << "           [--max-entries=N] [--timeout-s=N] [--allow-partial] [--json]\n"
+              << "       clink state-diff --a=<f.snap> --b=<f.snap> [--json] [--max-rows=N]\n"
               << "       clink state-diff --dir=<checkpoint-root> --from=N --to=M [--json] "
                  "[--max-rows=N]\n"
+              << "\n"
+              << "Two checkpoint datasets (clink state-export --checkpoint-dir): a streaming\n"
+              << "comparison of every slot, reporting entries added, removed, changed and\n"
+              << "unchanged, keyed entries relocated to another subtask (not a change), the\n"
+              << "lineage between the two, and every slot it could not compare and why. A\n"
+              << "slot whose schema stamps differ is not compared unless --raw-bytes, which\n"
+              << "compares its stored bytes and labels it raw. Operator state is compared\n"
+              << "only between the same subtasks. Bytes are shown as hex with their length.\n"
+              << "Exit codes: 0 no differences, 1 differences, 3 not established (a partial\n"
+              << "side, a slot not compared, a limit reached), 2 error.\n"
+              << "\n"
+              << "  --max-samples=N  differing entries shown per slot (default 20)\n"
+              << "  --max-entries=N  entries read across both sides (default 100000000)\n"
+              << "  --timeout-s=N    time limit (default 600)\n"
+              << "  --allow-partial  compare a partial dataset; the result is still not\n"
+              << "                   established\n"
+              << "\n"
+              << "The snapshot forms below read whatever snapshot files exist: they do not\n"
+              << "check a checkpoint's completion marker or participants, so they are not\n"
+              << "checkpoint-consistent, and they render 8-byte values as int64 by guess.\n"
               << "\n"
               << "Compares the keyed state of two snapshots (checkpoints or savepoints)\n"
               << "and reports added / removed / changed keys per operator state slot,\n"
@@ -263,15 +343,306 @@ void diff_usage() {
 }
 
 void cat_usage() {
-    std::cerr << "Usage: clink state-cat --file=<f.snap> [--json] [--max-rows=N]\n"
+    std::cerr << "Usage: clink state-cat --dataset=<dataset> [--json] [--max-rows=N] "
+                 "[--allow-partial]\n"
               << "       clink state-cat --dir=<checkpoint-root> --id=N [--json] [--max-rows=N]\n"
               << "\n"
               << "Dumps a snapshot's keyed state: operators, slots, and entries\n"
               << "(keys and values rendered as int64 / text / hex).\n"
+              << "--dataset lists a checkpoint dataset (clink state-export --checkpoint-dir)\n"
+              << "after verifying it: every slot, with its scope, schema stamps and entries,\n"
+              << "each as hex with its length and the participant holding it. A partial\n"
+              << "dataset is refused (exit 3) unless --allow-partial.\n"
               << "\n"
               << "  --max-rows=N   entries shown per slot (default 50, 0 = all)\n"
               << "\n"
               << "Exit codes: 0 = ok, 2 = error.\n";
+}
+
+}  // namespace
+
+// ---- checkpoint datasets ----------------------------------------------------
+
+namespace {
+
+namespace sp = clink::state_processor;
+
+int diff_datasets_cmd(int argc, char** argv) {
+    if (!only_flags(argc,
+                    argv,
+                    {"a",
+                     "b",
+                     "raw-bytes",
+                     "max-samples",
+                     "max-entries",
+                     "timeout-s",
+                     "allow-partial",
+                     "json"})) {
+        diff_usage();
+        return 2;
+    }
+    sp::StateDiffOptions o;
+    o.raw_bytes = has_flag(argc, argv, "raw-bytes");
+    o.allow_partial = has_flag(argc, argv, "allow-partial");
+    std::uint64_t v = 0;
+    if (const auto s = get_arg(argc, argv, "max-samples"); !s.empty()) {
+        if (!parse_uint(s, v)) {
+            diff_usage();
+            return 2;
+        }
+        o.max_samples = static_cast<std::size_t>(v);
+    }
+    if (const auto s = get_arg(argc, argv, "max-entries"); !s.empty()) {
+        if (!parse_uint(s, v)) {
+            diff_usage();
+            return 2;
+        }
+        o.max_entries = v;
+    }
+    if (const auto s = get_arg(argc, argv, "timeout-s"); !s.empty()) {
+        if (!parse_uint(s, v) || v == 0) {
+            diff_usage();
+            return 2;
+        }
+        o.timeout = std::chrono::seconds{static_cast<std::int64_t>(v)};
+    }
+    try {
+        const auto a = sp::open_dataset(get_arg(argc, argv, "a"));
+        const auto b = sp::open_dataset(get_arg(argc, argv, "b"));
+        const auto r = sp::diff_datasets(a, b, o);
+        std::cout << (has_flag(argc, argv, "json") ? r.render_json() : r.render_text());
+        return r.exit_code();
+    } catch (const std::exception& e) {
+        std::cerr << "clink state-diff: " << e.what() << "\n";
+        return 2;
+    }
+}
+
+int cat_dataset_cmd(int argc, char** argv) {
+    if (!only_flags(argc, argv, {"dataset", "json", "max-rows", "allow-partial"})) {
+        cat_usage();
+        return 2;
+    }
+    std::uint64_t max_rows = 50;
+    if (const auto s = get_arg(argc, argv, "max-rows"); !s.empty() && !parse_uint(s, max_rows)) {
+        cat_usage();
+        return 2;
+    }
+    const bool json = has_flag(argc, argv, "json");
+    try {
+        const auto d = sp::open_dataset(get_arg(argc, argv, "dataset"));
+        if (!d.complete && !has_flag(argc, argv, "allow-partial")) {
+            std::cerr << "clink state-cat: " << d.root.string()
+                      << " is a PARTIAL dataset (see incomplete and unsupported in its "
+                         "dataset.json); --allow-partial lists it anyway\n";
+            return 3;
+        }
+        struct Shown {
+            std::uint64_t rows{0};
+            std::vector<sp::DatasetEntry> entries;
+        };
+        std::map<sp::SlotKey, Shown> shown;
+        sp::for_each_entry(d, [&](const sp::DatasetEntry& e) {
+            auto& s = shown[sp::SlotKey{e.op, e.slot, e.scope}];
+            ++s.rows;
+            if (max_rows == 0 || s.entries.size() < max_rows) {
+                s.entries.push_back(e);
+            }
+            return true;
+        });
+        const auto schema_text = [&](std::uint64_t op, const std::string& slot) {
+            const auto it = d.schemas.find({op, slot});
+            if (it == d.schemas.end()) {
+                return std::string{"no stamps"};
+            }
+            std::string t = it->second.fingerprint ? "fingerprint " + *it->second.fingerprint
+                                                   : std::string{"no fingerprint"};
+            for (const auto& [type, ver] : it->second.versions) {
+                t += ", " + type + " v" + std::to_string(ver);
+            }
+            return t;
+        };
+        if (json) {
+            std::cout << "{\"dataset\":" << json_text(d.root.string()) << ",\"job\":" << d.job
+                      << ",\"checkpoint\":" << d.checkpoint << ",\"generation\":" << d.generation
+                      << ",\"complete\":" << (d.complete ? "true" : "false")
+                      << ",\"entries\":" << d.entries << ",\"slots\":[";
+            bool first = true;
+            for (const auto& [k, s] : shown) {
+                const auto& [op, slot, scope] = k;
+                std::cout << (first ? "" : ",") << "{\"op_id\":\"" << op
+                          << "\",\"slot\":" << json_text(slot) << ",\"scope\":\""
+                          << sp::scope_name(scope) << "\",\"rows\":" << s.rows
+                          << ",\"schema\":" << json_text(schema_text(op, slot)) << ",\"entries\":[";
+                first = false;
+                bool fe = true;
+                for (const auto& e : s.entries) {
+                    std::cout << (fe ? "" : ",") << "{\"key_group\":"
+                              << (e.key_group >= 0 ? std::to_string(e.key_group) : "null")
+                              << ",\"participant\":" << e.participant << ",\"user_key_hex\":\""
+                              << sp::hex_bytes(e.user_key)
+                              << "\",\"user_key_bytes\":" << e.user_key.size()
+                              << ",\"value_hex\":\"" << sp::hex_bytes(e.value)
+                              << "\",\"value_bytes\":" << e.value.size() << "}";
+                    fe = false;
+                }
+                std::cout << "],\"truncated\":" << (s.rows > s.entries.size() ? "true" : "false")
+                          << "}";
+            }
+            std::cout << "]}\n";
+            return 0;
+        }
+        std::cout << "state-cat: " << d.root.string() << " (job " << d.job << ", checkpoint "
+                  << d.checkpoint << ", generation " << d.generation << ", "
+                  << (d.complete ? "complete" : "PARTIAL") << ", " << d.entries << " entries)\n";
+        for (const auto& [k, s] : shown) {
+            const auto& [op, slot, scope] = k;
+            std::cout << "\nop " << op << " slot \"" << slot << "\" (" << sp::scope_name(scope)
+                      << ", " << s.rows << " entries, " << schema_text(op, slot) << ")\n";
+            for (const auto& e : s.entries) {
+                std::cout << "  ";
+                if (e.key_group >= 0) {
+                    std::cout << "kg=" << e.key_group << " ";
+                }
+                std::cout << "p=" << e.participant << " key " << sp::hex_bytes(e.user_key) << " ("
+                          << e.user_key.size() << " bytes) = " << sp::hex_bytes(e.value) << " ("
+                          << e.value.size() << " bytes)\n";
+            }
+            if (s.rows > s.entries.size()) {
+                std::cout << "  ... " << (s.rows - s.entries.size())
+                          << " more (raise --max-rows)\n";
+            }
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "clink state-cat: " << e.what() << "\n";
+        return 2;
+    }
+}
+
+void export_dataset_usage() {
+    std::cerr << "usage: clink state-export --checkpoint-dir=<dir> --job=<id>\n"
+              << "           (--checkpoint=<N> | --restore-point) --out=<dataset>\n"
+              << "           [--ha-dir=<dir>] [--commit-confirmation=yes|no] [--allow-partial]\n"
+              << "           [--max-bytes=N] [--max-files=N] [--max-entries=N] [--timeout-s=N] "
+                 "[--json]\n"
+              << "\n"
+              << "Export one completed checkpoint of a whole job as a verified dataset: the\n"
+              << "checkpoint's markers and every participant's snapshot and sidecar, collected\n"
+              << "under the engine's own rules and refused if anything changes meanwhile,\n"
+              << "plus entries.parquet (every stored entry, exact bytes) and dataset.json (what\n"
+              << "it holds, its provenance, and whether it is complete). Published by one\n"
+              << "rename; never written over. Read-only; local directories only.\n"
+              << "\n"
+              << "  --restore-point     the checkpoint a restore of the job would choose now,\n"
+              << "                      which needs --ha-dir or --commit-confirmation\n"
+              << "  --allow-partial     publish a dataset that is not complete, marked partial\n"
+              << "  --max-bytes/--max-files bound what is collected (default 1 GiB, 10000)\n"
+              << "  --max-entries       bound the entries decoded (default 100000000)\n"
+              << "\n"
+              << "Exit codes: 0 complete, 3 published partial, 1 refused (nothing published),\n"
+              << "2 usage.\n";
+}
+
+int export_dataset_cmd(int argc, char** argv) {
+    if (!only_flags(argc,
+                    argv,
+                    {"checkpoint-dir",
+                     "job",
+                     "checkpoint",
+                     "restore-point",
+                     "out",
+                     "ha-dir",
+                     "commit-confirmation",
+                     "allow-partial",
+                     "max-bytes",
+                     "max-files",
+                     "max-entries",
+                     "timeout-s",
+                     "json"})) {
+        export_dataset_usage();
+        return 2;
+    }
+    sp::DatasetOptions o;
+    o.checkpoint_dir = get_arg(argc, argv, "checkpoint-dir");
+    o.out = get_arg(argc, argv, "out");
+    o.ha_dir = get_arg(argc, argv, "ha-dir");
+    o.allow_partial = has_flag(argc, argv, "allow-partial");
+    const bool json = has_flag(argc, argv, "json");
+    const auto ckpt = get_arg(argc, argv, "checkpoint");
+    const bool restore_point = has_flag(argc, argv, "restore-point");
+    bool ok = parse_uint(get_arg(argc, argv, "job"), o.job) && o.job != 0 && !o.out.empty();
+    ok = ok && (ckpt.empty() != !restore_point);
+    std::uint64_t v = 0;
+    if (!ckpt.empty()) {
+        ok = ok && parse_uint(ckpt, v) && v != 0;
+        o.checkpoint = v;
+    }
+    if (const auto c = get_arg(argc, argv, "commit-confirmation"); !c.empty()) {
+        ok = ok && (c == "yes" || c == "no");
+        o.commit_confirmation = c == "yes";
+    }
+    const auto bound = [&](const char* name, std::uint64_t& into) {
+        if (const auto s = get_arg(argc, argv, name); !s.empty()) {
+            ok = ok && parse_uint(s, into) && into != 0;
+        }
+    };
+    bound("max-bytes", o.max_bytes);
+    bound("max-files", o.max_files);
+    bound("max-entries", o.max_entries);
+    std::uint64_t timeout = 600;
+    bound("timeout-s", timeout);
+    o.timeout = std::chrono::seconds{static_cast<std::int64_t>(timeout)};
+    if (!ok) {
+        export_dataset_usage();
+        return 2;
+    }
+    sp::DatasetResult r;
+    try {
+        r = sp::export_checkpoint_dataset(o);
+    } catch (const sp::DatasetRefused& e) {
+        if (json) {
+            std::cout << "{\"refused\":true,\"kind\":" << json_text(e.kind)
+                      << ",\"reason\":" << json_text(e.what()) << "}\n";
+        } else {
+            std::cerr << "state-export: refused (" << e.kind << "): " << e.what() << "\n";
+        }
+        return 1;
+    }
+    if (json) {
+        clink::config::JsonObject j;
+        j["refused"] = clink::config::JsonValue{false};
+        j["dataset"] = clink::config::JsonValue{r.dataset.string()};
+        j["checkpoint"] = clink::config::JsonValue{static_cast<std::int64_t>(r.checkpoint)};
+        j["complete"] = clink::config::JsonValue{r.complete};
+        clink::config::JsonArray inc;
+        for (const auto& s : r.incomplete) {
+            inc.push_back(clink::config::JsonValue{s});
+        }
+        j["incomplete"] = clink::config::JsonValue{std::move(inc)};
+        clink::config::JsonArray uns;
+        for (const auto& s : r.unsupported) {
+            uns.push_back(clink::config::JsonValue{s});
+        }
+        j["unsupported"] = clink::config::JsonValue{std::move(uns)};
+        j["participants"] = clink::config::JsonValue{static_cast<std::int64_t>(r.participants)};
+        j["entries"] = clink::config::JsonValue{static_cast<std::int64_t>(r.entries)};
+        j["bytes"] = clink::config::JsonValue{static_cast<std::int64_t>(r.bytes)};
+        j["seconds"] = clink::config::JsonValue{r.seconds};
+        std::cout << clink::config::JsonValue{std::move(j)}.serialize(0) << "\n";
+    } else {
+        std::cout << "state-export: checkpoint " << r.checkpoint << " of job " << o.job << " -> "
+                  << r.dataset.string() << " (" << (r.complete ? "complete" : "PARTIAL") << ", "
+                  << r.participants << " participants, " << r.entries << " entries, " << r.bytes
+                  << " bytes, " << r.seconds << " s)\n";
+        for (const auto& s : r.unsupported) {
+            std::cout << "  unsupported: " << s << "\n";
+        }
+        for (const auto& s : r.incomplete) {
+            std::cout << "  incomplete: " << s << "\n";
+        }
+    }
+    return r.complete ? 0 : 3;
 }
 
 }  // namespace
@@ -283,6 +654,13 @@ int clink_cmd_state_diff(int argc, char** argv) {
     }
     const auto file_a = get_arg(argc, argv, "a");
     const auto file_b = get_arg(argc, argv, "b");
+    if (is_dataset_dir(file_a) || is_dataset_dir(file_b)) {
+        if (!is_dataset_dir(file_a) || !is_dataset_dir(file_b)) {
+            std::cerr << "clink state-diff: a dataset is compared only with another dataset\n";
+            return 2;
+        }
+        return diff_datasets_cmd(argc, argv);
+    }
     const auto dir = get_arg(argc, argv, "dir");
     const auto from = get_arg(argc, argv, "from");
     const auto to = get_arg(argc, argv, "to");
@@ -344,6 +722,9 @@ int clink_cmd_state_cat(int argc, char** argv) {
     if (has_flag(argc, argv, "help")) {
         cat_usage();
         return 0;
+    }
+    if (!get_arg(argc, argv, "dataset").empty()) {
+        return cat_dataset_cmd(argc, argv);
     }
     const auto file = get_arg(argc, argv, "file");
     const auto dir = get_arg(argc, argv, "dir");
@@ -675,8 +1056,11 @@ void export_usage() {
               << "  --dir=<root> --id=N\n"
               << "                    instead of --from: merge every subtask's\n"
               << "                    <root>/<subtask>/checkpoint-N.snap (and the flat\n"
-              << "                    <root>/checkpoint-N.snap) into ONE export - key groups\n"
-              << "                    are disjoint across subtasks, so the union is exact\n"
+              << "                    <root>/checkpoint-N.snap) into ONE export. It reads the\n"
+              << "                    files it finds, without the checkpoint's marker or\n"
+              << "                    participants, and operator state of several subtasks\n"
+              << "                    collapses: not checkpoint-consistent; use\n"
+              << "                    --checkpoint-dir (below) for that\n"
               << "  --job=<id> [--coordinator=host:port]\n"
               << "                    instead of --from: fetch a RUNNING job's whole keyed\n"
               << "                    state from the coordinator's live-export route (per-subtask\n"
@@ -704,7 +1088,11 @@ void export_usage() {
 int clink_cmd_state_export(int argc, char** argv) {
     if (has_flag(argc, argv, "help")) {
         export_usage();
+        export_dataset_usage();
         return 0;
+    }
+    if (!get_arg(argc, argv, "checkpoint-dir").empty()) {
+        return export_dataset_cmd(argc, argv);
     }
     const auto from = get_arg(argc, argv, "from");
     const auto dir = get_arg(argc, argv, "dir");

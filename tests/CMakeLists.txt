@@ -18,6 +18,7 @@ add_executable(clink_core_tests
     test_in_doubt_resolution.cpp
     test_incident_bundle.cpp
     test_incident_reconcile.cpp
+    test_state_dataset.cpp
     test_state_location.cpp
     test_source_contract.cpp
     test_sink_contract.cpp

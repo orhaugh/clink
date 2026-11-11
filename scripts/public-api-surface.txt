@@ -207,6 +207,7 @@ include/clink/sql/catalog.hpp
 include/clink/sql/script_runner.hpp
 include/clink/sql/table_api.hpp
 include/clink/state/expiring_collection_state.hpp
+include/clink/state_processor/checkpoint_dataset.hpp
 include/clink/state_processor/parquet_export.hpp
 include/clink/state_processor/savepoint.hpp
 include/clink/state_processor/state_diff.hpp

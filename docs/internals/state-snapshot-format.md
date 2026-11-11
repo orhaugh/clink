@@ -119,10 +119,115 @@ print(t.num_rows, t.column("op_id")[0])
 SELECT slot, count(*) FROM 'state.parquet' GROUP BY slot;
 ```
 
+## Checkpoint datasets
+
+A snapshot is one participant's state. A **checkpoint dataset** is one completed checkpoint of a whole job, exported as a directory that can be moved, read without clink, queried and compared, and that states what it holds and whether it is complete (format `clink-state-dataset`, version 1; library `include/clink/state_processor/checkpoint_dataset.hpp`, `src/state/checkpoint_dataset.cpp`).
+
+```bash
+clink state-export --checkpoint-dir=<dir> --job=<id> (--checkpoint=<N> | --restore-point) \
+    --out=<dataset> [--ha-dir=<dir>] [--commit-confirmation=yes|no] [--allow-partial] \
+    [--max-bytes=N] [--max-files=N] [--max-entries=N] [--timeout-s=N] [--json]
+```
+
+### How one checkpoint is collected
+
+The export collects with the incident bundle collector (`clink::incident::collect`, [incident verification](incident-verification.md)) and the state only, so the rules that select and copy a checkpoint are the engine's own:
+
+1. The checkpoint is the one named, or with `--restore-point` the one the engine's restore rule chooses now (`restore_point_on_disk`), which needs `--ha-dir` or `--commit-confirmation` to say which rule applies.
+2. Its participants are the set its COMPLETED marker records, read under the state root and generation the marker names. Another subtask's file, or the same checkpoint id in another generation, is never read. A marker that records no participant set makes the dataset incomplete.
+3. Every snapshot and sidecar is copied and checked unchanged afterwards. A file that changes or vanishes during the copy (a retention purge, for one), or a marker set that changes (a checkpoint completed, a restore recorded), refuses the export with kind `changed`: nothing is published, and the export can be run again.
+4. The collector's consistency checks run over the copy (`verify_core`, profile `consistency`), each participant's snapshot is verified against its sidecar and decoded, and its entries are written as one row group.
+5. The dataset is published by renaming a completed temporary directory beside `--out`. It never writes over an existing path.
+
+Exit codes: 0 complete, 3 published partial (`--allow-partial`), 1 refused with nothing published, 2 usage. A refusal names its kind: `incomplete`, `unsupported`, or the collector's `changed`, `missing`, `bound`, `timeout` or `other`.
+
+### Layout
+
+| Path | Contents |
+| --- | --- |
+| `manifest.json` | The bundle manifest: job, selection, participants, every file's size and SHA-256, and what is absent and why |
+| `checkpoint/_jobs/<job>/` | The job's markers: `COMPLETED-<id>`, `CONFIRMED-<id>`, `RESTORED` |
+| `checkpoint/_state/<job>/v<gen>/<p>/checkpoint-<id>.snap` and `.meta` | Each participant's snapshot and sidecar, byte for byte |
+| `job/manifest.json` | The job manifest with credential-like graph parameters redacted, when `--ha-dir` holds it |
+| `entries.parquet` | Every stored entry, exact bytes |
+| `dataset.json` | The contract below |
+
+### entries.parquet
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `op_id` | `uint64` | The operator id the state is stored under |
+| `slot` | `utf8` | The slot name, or `<raw>` |
+| `scope` | `utf8` | `keyed`, `operator` or `raw` |
+| `key_group` | `int16`, nullable | The key group; keyed rows only |
+| `participant` | `uint32` | The job-global subtask index whose snapshot holds the row |
+| `user_key` | `binary` | The user key bytes |
+| `value` | `binary` | The stored value bytes |
+| `stored_key` | `binary` | The key exactly as the snapshot stores it |
+
+Scope follows the key layout above. A leading byte below 128 with a slot separator is keyed state. A leading `0xFF` is operator state: slot and user key when the key has a separator, and otherwise slot `<raw>` with the bytes after the prefix as the user key (source positions and watermark progress are stored that way). Anything else, including a slot name that is not UTF-8, is a raw row with the whole key as its user key.
+
+There is one row group per participant holding entries, sorted by `op_id`, `slot`, `scope`, `key_group`, `user_key`, with bytes compared unsigned. An entry's identity is (operator, slot, key group, user key) for keyed state: the key group is the key's own and does not depend on the parallelism, so a rescale moves an entry to another participant without changing its identity. Operator state and raw rows belong to the subtask that wrote them, so their identity is (operator, slot, participant, user key), and two participants' rows are never collapsed because their encoded keys match.
+
+No column reads a value as a type. Nothing in this build establishes a job's codecs, and an 8-byte value is not assumed to be an int64.
+
+### dataset.json
+
+| Field | Contents |
+| --- | --- |
+| `format`, `version`, `exporter` | `clink-state-dataset`, 1, and the exporting build |
+| `job` | `id`, `graph_sha256` (SHA-256 of the graph text the bundle holds), `commit_confirmation`, `rescaled` |
+| `checkpoint` | `id`, `generation`, `status` (`completed`, or `confirmed` when a CONFIRMED marker exists), `state_root` |
+| `selection` | `rule` (`named` or `restore-point`), `engine_choice`, and `restored`: the job's RESTORED record (`restore`, `next`), which marks the run |
+| `in_doubt` | `needs_resolution` (true for a completed, unconfirmed checkpoint of a job whose sinks need commit confirmation; null when unknown), a `statement`, and `external_outcomes`, which always says they are not verified |
+| `participants[]` | `index`, `snapshot`, `bytes`, `sha256`, `sidecar` verdict, `format_version`, `state_versions`, `state_fingerprints`, per operator its keyed, operator and raw row counts and the key groups held as ranges, `row_group`, `rows`, `exported` and the reason when not |
+| `operators[]` | `op_id` (decimal text), the graph's `graph_id`, `uid`, `type` and `parallelism` when it names the operator, the `participants` holding its rows, and its `slots[]` with `scope`, `rows` and `schema` (`fingerprint`, `versions`) |
+| `graph` | Whether the dataset holds the job graph, and its operators; an operator with a uid carries the `op_id` its state is stored under |
+| `entries` | `path`, `sha256`, `bytes`, `rows`, `row_groups`, and the columns, order and identity in words |
+| `bundle` | `manifest_sha256` |
+| `verification[]` | Each consistency check's verdict and reason |
+| `complete`, `incomplete[]`, `unsupported[]`, `notes[]`, `limits` | Whether the contract holds, and why not |
+| `represented[]`, `not_represented[]` | What the dataset holds, and what it does not |
+
+A dataset is **complete** only when the collection succeeded; the marker names the job, the checkpoint, its generation and its participants; every participant's snapshot and sidecar is present and verifies; every snapshot is the canonical stream at a readable format version and decodes; no participant holds an entry twice and each operator's key groups are held by one participant each; participants stamp each slot alike; nothing is unsupported; and no bound was reached. A dataset that is not complete is refused unless `--allow-partial`, and then published with `complete: false` and the reasons.
+
+**Unsupported**, never complete: state outside the checkpoint directory (a RocksDB or remote backend), state written before it was namespaced by job, a changelog snapshot whose materialisation is held elsewhere, and a backend whose checkpoint is not `checkpoint-<id>.snap` (the changelog backends' `changelog-<id>.snap`).
+
+**Represented**: keyed state in every slot; operator state (source positions, broadcast and union slots), each participant's own rows; timers, as the state rows operators write for them; SQL operators' internal slots, as stored bytes; in-flight records an older unaligned checkpoint kept, as the rows it stored; rows whose key follows no layout, whole. **Not represented**: the job's live state after the checkpoint; anything the checkpoint does not hold, such as pending asynchronous operations and buffers between operators; state held outside the checkpoint directory; what external systems received or committed; typed readings of keys and values.
+
+A completed checkpoint is not a statement about a sink's destination. For a job whose sinks need commit confirmation, a completed checkpoint that is not confirmed is one whose transactions a restore resolves in doubt first, and `in_doubt` says so.
+
+Operators are named from the job graph by uid (`operator_id_from_uid`). An operator without a uid has an id the runtime derives from its place in its chain, which the export does not recompute, so it is listed by id alone. A finished job's manifest is removed from the HA directory, so a dataset of its last checkpoint names no operator; export while the job runs, or keep an earlier dataset, to have the names.
+
+### Reading a dataset
+
+Every reader opens a dataset through `open_dataset`, which checks `dataset.json`'s form and version, that `entries.parquet` and `manifest.json` hash to what it records, that no link is on the path of either or of the dataset itself, and the bundle reader's own path rules. The snapshots are not hashed again there; `clink incident-verify <dataset>` verifies the whole bundle. A dataset damaged after export is refused with exit 2. `dataset.json` is the root: the hashes detect damage, not a deliberate rewrite of both a file and the hash recorded for it.
+
+- `clink state-cat --dataset=<d> [--max-rows=N] [--json]` lists every slot with its scope, schema stamps and entries, each as hex with its length and the participant holding it.
+- `clink state-query --dataset=<d> --sql="SELECT ..."` exposes the entries as the table `state`: `op_id TEXT`, `slot TEXT`, `scope TEXT`, `key_group BIGINT`, `participant BIGINT`, `user_key_hex TEXT`, `value_hex TEXT`, `user_key_len BIGINT`, `value_len BIGINT`. It states the dataset's completeness on stderr. Its embedded engine runs a Coordinator and Workers on loopback and opens no other connection.
+- Both refuse a partial dataset with exit 3 unless `--allow-partial`.
+- pyarrow, DuckDB or any Parquet reader reads `entries.parquet` directly.
+
+### Comparing two datasets
+
+`clink state-diff --a=<dataset> --b=<dataset> [--raw-bytes] [--max-samples=N] [--max-entries=N] [--timeout-s=N] [--allow-partial] [--json]` merges the two entry tables in identity order, a batch per participant at a time, and reports per (operator, slot, scope):
+
+- `added`, `removed`, `changed` and `unchanged` entries, and `relocated`: keyed entries whose participant changed, which is a rescale's or a restore's placement and not a logical change;
+- `status`: `compared`; `raw-compared`; `schema-changed` (the slot's fingerprint or version stamps differ, so its entries are not compared); `subtasks-changed` (operator state or raw rows of an operator whose participant set or graph parallelism changed, which are not comparable because each subtask's rows are its own); or `operator-only-in-a` / `operator-only-in-b`;
+- `--raw-bytes` compares a schema-changed slot's stored bytes, and every line and sample of it is labelled raw; a schema change still counts as a difference;
+- bounded samples: at most `--max-samples` per slot, each field as hex of at most 64 bytes with its whole length.
+
+The report states the lineage (same job, same graph, the generations, the restore between them) and whether the result is established. It is not established when either side is partial (nothing is compared unless `--allow-partial`), a slot was not compared, or `--max-entries` or `--timeout-s` was reached. Exit 0 means both sides are complete, every slot was compared and nothing differs; 1 means differences; 3 means not established, whatever was found; 2 an error. A limit never produces exit 0. `--json` writes `clink-state-diff` version 1: `a`, `b`, `lineage`, `established`, `reasons`, `limit_reached`, `entries_read`, `differences`, `exit`, `totals`, `max_samples`, `sample_bytes` and `slots[]`.
+
+The older forms (`state-diff --dir`, `state-export --dir/--id`, `state-query --dir`) read whatever snapshot files they find, without the marker or its participants, collapse operator state of several subtasks, and render 8-byte values as int64 by guess. They are kept for single snapshots and are not checkpoint-consistent.
+
+The runnable example is [`examples/state-inspection/`](https://github.com/orhaugh/clink/tree/main/examples/state-inspection): a job at parallelism 2 exported while it runs, checked against the state folded from its Kafka records, through a Worker crash, a rescale, a schema change, faults, a retention race and RocksDB state, with its costs measured.
+
 ## Related
 
 - [./state-and-backends.md](./state-and-backends.md) - the backends that produce and restore this format
 - [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md) - key groups, rescale filtering, and the state CLI verbs
+- [./incident-verification.md](./incident-verification.md) - the bundle collector and checks a checkpoint dataset is built on
 - [./checkpointing.md](./checkpointing.md) - when snapshots are taken and acknowledged
 
 ### Entry-level SQL partition state

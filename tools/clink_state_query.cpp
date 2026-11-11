@@ -16,12 +16,17 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <unistd.h>
 #include <variant>
 #include <vector>
+
+#include <arrow/api.h>
+#include <arrow/io/file.h>
+#include <parquet/arrow/writer.h>
 
 #include "clink/embed/embedded_engine.hpp"
 #include "clink/sql/ast.hpp"
@@ -30,6 +35,7 @@
 #include "clink/sql/parser.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/sql/type.hpp"
+#include "clink/state_processor/checkpoint_dataset.hpp"
 #include "clink/state_processor/parquet_export.hpp"
 #include "clink/state_processor/savepoint.hpp"
 #include "clink/state_processor/state_diff.hpp"
@@ -64,9 +70,88 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
     return false;
 }
 
+// A checkpoint dataset's entries as the `state` table: identity, scope and
+// participant as they are, and keys and values only as hex and lengths. No
+// column reads a value as a type: nothing in this build knows a job's codecs.
+void write_dataset_projection(const clink::state_processor::Dataset& d, const fs::path& path) {
+    namespace sp = clink::state_processor;
+    const auto schema = arrow::schema({arrow::field("op_id", arrow::utf8()),
+                                       arrow::field("slot", arrow::utf8()),
+                                       arrow::field("scope", arrow::utf8()),
+                                       arrow::field("key_group", arrow::int64()),
+                                       arrow::field("participant", arrow::int64()),
+                                       arrow::field("user_key_hex", arrow::utf8()),
+                                       arrow::field("value_hex", arrow::utf8()),
+                                       arrow::field("user_key_len", arrow::int64()),
+                                       arrow::field("value_len", arrow::int64())});
+    const auto ok = [](const arrow::Status& st) {
+        if (!st.ok()) {
+            throw std::runtime_error("cannot write the query projection: " + st.ToString());
+        }
+    };
+    auto sink = arrow::io::FileOutputStream::Open(path.string());
+    ok(sink.status());
+    auto opened = parquet::arrow::FileWriter::Open(*schema, arrow::default_memory_pool(), *sink);
+    ok(opened.status());
+    auto writer = std::move(*opened);
+    arrow::StringBuilder op, slot, scope, uk, val;
+    arrow::Int64Builder kg, part, uk_len, val_len;
+    std::int64_t pending = 0;
+    const auto flush = [&] {
+        if (pending == 0) {
+            return;
+        }
+        std::vector<std::shared_ptr<arrow::Array>> cols(9);
+        ok(op.Finish(&cols[0]));
+        ok(slot.Finish(&cols[1]));
+        ok(scope.Finish(&cols[2]));
+        ok(kg.Finish(&cols[3]));
+        ok(part.Finish(&cols[4]));
+        ok(uk.Finish(&cols[5]));
+        ok(val.Finish(&cols[6]));
+        ok(uk_len.Finish(&cols[7]));
+        ok(val_len.Finish(&cols[8]));
+        ok(writer->WriteTable(*arrow::Table::Make(schema, cols, pending), pending));
+        pending = 0;
+    };
+    sp::for_each_entry(d, [&](const sp::DatasetEntry& e) {
+        ok(op.Append(std::to_string(e.op)));
+        ok(slot.Append(e.slot));
+        ok(scope.Append(sp::scope_name(e.scope)));
+        ok(e.key_group >= 0 ? kg.Append(e.key_group) : kg.AppendNull());
+        ok(part.Append(e.participant));
+        ok(uk.Append(sp::hex_bytes(e.user_key)));
+        ok(val.Append(sp::hex_bytes(e.value)));
+        ok(uk_len.Append(static_cast<std::int64_t>(e.user_key.size())));
+        ok(val_len.Append(static_cast<std::int64_t>(e.value.size())));
+        if (++pending == 65536) {
+            flush();
+        }
+        return true;
+    });
+    flush();
+    ok(writer->Close());
+}
+
 void query_usage() {
     std::cout
-        << "usage: clink state-query (--from=<path> | --dir=<root> --id=N) --sql=\"SELECT ...\"\n"
+        << "usage: clink state-query --dataset=<dataset> --sql=\"SELECT ...\" [--allow-partial]\n"
+        << "       clink state-query (--from=<path> | --dir=<root> --id=N) --sql=\"SELECT ...\"\n"
+        << "\n"
+        << "--dataset queries a checkpoint dataset (clink state-export --checkpoint-dir)\n"
+        << "after verifying that its entry table and bundle manifest hash to what its\n"
+        << "dataset.json records. A partial dataset is refused (exit 3) unless\n"
+        << "--allow-partial; either way its completeness is stated on stderr. Its\n"
+        << "`state` table holds exact identities and no typed readings:\n"
+        << "\n"
+        << "  op_id TEXT (the operator id, decimal), slot TEXT,\n"
+        << "  scope TEXT (keyed | operator | raw), key_group BIGINT (keyed only),\n"
+        << "  participant BIGINT, user_key_hex TEXT, value_hex TEXT,\n"
+        << "  user_key_len BIGINT, value_len BIGINT\n"
+        << "\n"
+        << "The --from and --dir forms read snapshot files without the checkpoint's\n"
+        << "marker or participants (not checkpoint-consistent), and render keys and\n"
+        << "values by guess:\n"
         << "\n"
         << "Run SQL over a checkpoint/savepoint's keyed state, in-process. The\n"
         << "state is exposed as a table named `state`:\n"
@@ -100,9 +185,11 @@ int clink_cmd_state_query(int argc, char** argv) {
     const auto coordinator = get_arg(argc, argv, "coordinator");
     const auto mat_store_path = get_arg(argc, argv, "materialisation-store");
     const auto sql = get_arg(argc, argv, "sql");
+    const auto dataset_dir = get_arg(argc, argv, "dataset");
     const bool dir_form = !dir.empty() || !id_str.empty();
     const bool dir_form_complete = !dir.empty() && !id_str.empty();
-    const int input_forms = (!from.empty() ? 1 : 0) + (dir_form ? 1 : 0) + (!job.empty() ? 1 : 0);
+    const int input_forms = (!from.empty() ? 1 : 0) + (dir_form ? 1 : 0) + (!job.empty() ? 1 : 0) +
+                            (!dataset_dir.empty() ? 1 : 0);
     if (sql.empty() || input_forms != 1 || (dir_form && !dir_form_complete)) {
         query_usage();
         return 2;
@@ -111,26 +198,57 @@ int clink_cmd_state_query(int argc, char** argv) {
     const auto state_pq = fs::temp_directory_path() / ("clink_state_query_" + tag + ".parquet");
     const auto out_path = fs::temp_directory_path() / ("clink_state_query_out_" + tag + ".ndjson");
     try {
-        // 1. Snapshot -> decoded entries -> the query-projection Parquet.
-        auto resolved = clink_tools::resolve_state_input(
-            from,
-            dir,
-            id_str,
-            job,
-            coordinator,
-            clink_tools::materialisation_store_for(mat_store_path));
-        clink::Snapshot snap;
-        snap.bytes = std::move(resolved.bytes);
-        auto sp = clink::state_processor::Savepoint::load_from_snapshot(std::move(snap));
-        const auto entries = clink::state_processor::collect_entries(sp);
-        fs::remove(state_pq);
-        clink::state_processor::write_state_query_parquet(entries, state_pq);
-
-        const std::string state_ddl =
-            "CREATE TABLE state (op_id BIGINT, key_group BIGINT, slot TEXT, user_key TEXT, "
-            "key_int BIGINT, value TEXT, value_int BIGINT) WITH (connector='parquet', "
-            "format='json', path='" +
-            state_pq.string() + "')";
+        std::string label;
+        std::string state_ddl;
+        if (!dataset_dir.empty()) {
+            // 1. A verified dataset -> its hex projection.
+            std::optional<clink::state_processor::Dataset> d;
+            try {
+                d = clink::state_processor::open_dataset(dataset_dir);
+            } catch (const clink::state_processor::DatasetInvalid& e) {
+                std::cerr << "state-query: " << e.what() << "\n";
+                return 2;
+            }
+            label = d->root.string() + " (job " + std::to_string(d->job) + ", checkpoint " +
+                    std::to_string(d->checkpoint) + ", " + (d->complete ? "complete" : "PARTIAL") +
+                    ")";
+            if (!d->complete && !has_flag(argc, argv, "allow-partial")) {
+                std::cerr << "state-query: " << label
+                          << " is partial (see incomplete and unsupported in its dataset.json); "
+                             "--allow-partial queries it anyway, and the result is not the "
+                             "job's whole state\n";
+                return 3;
+            }
+            std::cerr << "state-query: dataset " << label << "\n";
+            fs::remove(state_pq);
+            write_dataset_projection(*d, state_pq);
+            state_ddl =
+                "CREATE TABLE state (op_id TEXT, slot TEXT, scope TEXT, key_group BIGINT, "
+                "participant BIGINT, user_key_hex TEXT, value_hex TEXT, user_key_len BIGINT, "
+                "value_len BIGINT) WITH (connector='parquet', format='json', path='" +
+                state_pq.string() + "')";
+        } else {
+            // 1. Snapshot -> decoded entries -> the query-projection Parquet.
+            auto resolved = clink_tools::resolve_state_input(
+                from,
+                dir,
+                id_str,
+                job,
+                coordinator,
+                clink_tools::materialisation_store_for(mat_store_path));
+            label = resolved.label;
+            clink::Snapshot snap;
+            snap.bytes = std::move(resolved.bytes);
+            auto sp = clink::state_processor::Savepoint::load_from_snapshot(std::move(snap));
+            const auto entries = clink::state_processor::collect_entries(sp);
+            fs::remove(state_pq);
+            clink::state_processor::write_state_query_parquet(entries, state_pq);
+            state_ddl =
+                "CREATE TABLE state (op_id BIGINT, key_group BIGINT, slot TEXT, user_key TEXT, "
+                "key_int BIGINT, value TEXT, value_int BIGINT) WITH (connector='parquet', "
+                "format='json', path='" +
+                state_pq.string() + "')";
+        }
 
         // 2. Derive the SELECT's output schema by binding it against a
         // catalog holding `state`, so the result table can be declared.
@@ -222,7 +340,7 @@ int clink_cmd_state_query(int argc, char** argv) {
                 }
             }
         }
-        std::cerr << "state-query: " << rows << " rows from " << resolved.label << "\n";
+        std::cerr << "state-query: " << rows << " rows from " << label << "\n";
         if (const char* keep = std::getenv("CLINK_STATE_QUERY_KEEP");
             keep == nullptr || keep[0] != '1') {
             fs::remove(state_pq);

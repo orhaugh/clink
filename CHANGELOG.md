@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**A completed checkpoint of a whole job exports as one verified dataset.**
+`clink state-export --checkpoint-dir=<dir> --job=<id> (--checkpoint=<N> |
+--restore-point) --out=<dataset>` collects the checkpoint through the
+incident collector, so the selection, the participants and the generation
+are the engine's own and a file that changes during the copy refuses the
+export. It writes every entry's exact bytes to `entries.parquet`, one row
+group per participant, and `dataset.json` records the job, the graph, the
+checkpoint and its status, the selection, every participant and operator
+with their schema stamps, the hashes, and whether the dataset is complete
+and why not. A dataset that is not complete is refused unless
+`--allow-partial`, and then marked partial. `state-query --dataset` and
+`state-cat --dataset` verify a dataset before reading it and show keys and
+values only as hex with their lengths. `state-diff` of two datasets streams
+both, counts entries added, removed, changed and unchanged per slot,
+reports keyed entries that moved subtask as relocated rather than changed,
+compares operator state only between the same subtasks, does not compare a
+slot whose schema changed unless `--raw-bytes`, states the lineage, and
+exits 3 when the result is not established, so a partial side or a limit
+never reads as no differences. The older `--dir` forms now say they are not
+checkpoint-consistent. RocksDB and other state outside the checkpoint
+directory is reported unsupported. `examples/state-inspection/` qualifies it
+against the state folded from the job's own Kafka records.
+
 **`clink-audit` audits running windowed jobs.** The runner no longer
 refuses a windowed job: its first audit is the whole lineage at the job's
 first checkpoint, and each after it is the increment from the newest

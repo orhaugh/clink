@@ -51,8 +51,10 @@ The correctness claim is one you can check rather than take on trust:
   [cost and footprint](https://orhaugh.github.io/clink/efficiency/)).
 
 State is also an open dataset: checkpoints are documented Arrow IPC that
-open in pyarrow, DuckDB or Polars, and a running job's state answers point
-lookups and scans over HTTP. A flight recorder can replay an incident
+open in pyarrow, DuckDB or Polars, a completed checkpoint of a whole
+distributed job exports as one verified dataset to query and compare
+offline, and a running job's state answers point lookups and scans over
+HTTP. A flight recorder can replay an incident
 deterministically and freeze it into a regression test, and, for a Kafka to
 ClickHouse job, say whether the table holds exactly what a completed
 checkpoint owed it, once or for every checkpoint of a running job.

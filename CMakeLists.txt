@@ -513,6 +513,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/state/in_memory_state_backend.cpp
     src/state/snapshot_arrow_writer.cpp
     src/state/snapshot_canonicalise.cpp
+    src/state/checkpoint_dataset.cpp
     src/state/changelog_state_backend.cpp
     src/state/state_backend_factory.cpp
     src/state/schema_version.cpp
