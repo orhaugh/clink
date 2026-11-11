@@ -45,7 +45,10 @@ from the source and the recorded watermarks whether it arrived before its
 window closed; when that cannot be decided, it leaves the window out with
 why. It writes a version 2 artifact: the final windows' rows, the windows
 left out, the source's watermark bound at every checkpoint, and an account of
-every record.
+every record. Given an increment's scope (`incident-scope --since`), it starts
+from its own state at the base (`--state-in`) and reads only the increment's
+range; `--state-out` writes its state at the scope's checkpoint for the next
+one. `examples/audit-runner/` audits this job that way while it runs.
 
 Each scenario also checks the reference against a second derivation. The
 workload generates every event with the fate the scenario designs for it:

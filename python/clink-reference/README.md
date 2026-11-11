@@ -63,6 +63,27 @@ writer.finish(read.complete, read.incomplete, read.verified, read.recorded, read
 
 The rules are your specification, declared, not read from the job: the audit compares them with the job graph's, and a job configured otherwise fails `reference.semantics`. `event_time` gives every record's event time, the ones the transformation filters out included, since every record the source delivers advances the watermark. `select` gives the record's key and its values for each `SUM`, or `None` for a record the transformation drops. `examples/window-audit/reference_windows.py` is a complete reference for that example's job, with its specification in `windows_transform.py`.
 
+### One increment at a time
+
+A whole lineage needs the job's whole history, and every lineage checkpoint's state, which a running job's Workers do not keep. `clink incident-scope --since=M` writes one increment instead (a version 3 scope): from an earlier checkpoint M to the audited one, owing the windows that close after the watermark recorded at M. Nothing before M changes a decision after it except each partition's greatest event time and the windows still open, so the reference carries those in its own state, `WindowState`, and starts the next increment from it:
+
+```python
+from clink_reference import WindowState
+
+state = WindowState.load("state-41.json", expect_sha256=held_sha)   # refused if it changed
+windows = TumblingWindows(scope, rules, aggregates, state=state)      # refused if not the base's
+read = read_scope(scope, "broker:9092", lambda rec: windows.add(...))  # only the increment's range
+result = windows.finish()
+sha = result.state.save("state-42.json")
+writer = ReferenceWriter("reference.ndjson", scope, implementation, semantics=rules.semantics(),
+                         state_in={"checkpoint": state.checkpoint, "sha256": state.sha256})
+write_result(writer, result, output)
+writer.finish(..., source_bounds=result.source_bounds, records=result.records,
+              state_out={"checkpoint": 42, "sha256": sha})
+```
+
+A version 2 computation leaves a state too (`result.state`), which starts the chain. The state is the reference's own, computed from the records it read: its checkpoint, positions, the watermark recorded there, the logs, the window rules and the aggregates must all be the increment's base, or `TumblingWindows` refuses it. Its hash shows it was not changed, not that it is right. `tests/test_window_increments.py` checks, over random keyed streams with records out of order and late, random checkpoint cuts and recorded watermarks, that a chain of increments gives exactly the whole lineage's rows, windows left out, bounds and account of every record.
+
 ## What a read establishes
 
 For each source, before reading:
@@ -100,6 +121,8 @@ NDJSON, format `clink-reference-result`, version 1:
    - what was verified, what was recorded, and each range's read.
 
 A windowed scope's artifact is version 2. Its header adds `semantics`, the window rules the reference implements. Its body adds a `window` line for each window left out, open or undetermined, with why. Its end line adds `windows` and `windows_sha256`, `source_bounds` (the watermark the records allow at each checkpoint of the lineage) and `records` (what became of every record: folded, dropped late, undetermined or filtered).
+
+An increment's artifact is version 3: its header adds `state_in`, the checkpoint and sha256 of the state it started from, and its end line `state_out`, those of the state it left, which a complete one must give. A version 2 artifact may give `state_out` too.
 
 An artifact without its end line was not finished, and clink refuses it. So does one whose hashes or count do not hold, whose scope is not the audit's, or whose cells are not canonical for their column. The hashes show the file is whole as its writer finished it, not who wrote it.
 

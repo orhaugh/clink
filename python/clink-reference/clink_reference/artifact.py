@@ -18,6 +18,12 @@ A windowed (version 2) scope's artifact is version 2: its header adds
 
 per window it leaves out of the comparison; and its end line adds "windows",
 "windows_sha256" (over the window lines), "source_bounds" and "records".
+
+An increment's (version 3) scope gives a version 3 artifact: its header adds
+"state_in", the checkpoint and sha256 of the window state it started from,
+and its end line "state_out", those of the state it left at the scope's
+checkpoint. A windowed artifact of either version may give "state_out", so a
+whole-lineage reference can start a chain of increments.
 """
 
 import datetime as _dt
@@ -29,6 +35,7 @@ from .canonical import ColumnType, cell
 REFERENCE_FORMAT = "clink-reference-result"
 REFERENCE_VERSION = 1
 WINDOW_REFERENCE_VERSION = 2
+WINDOW_INCREMENT_REFERENCE_VERSION = 3
 
 
 def _line(obj):
@@ -41,10 +48,16 @@ class ReferenceWriter:
     windowed scope's artifact also needs the rules the reference implements
     (`semantics`, windows.WindowRules.semantics())."""
 
-    def __init__(self, path, scope, implementation, reader=None, semantics=None):
+    def __init__(self, path, scope, implementation, reader=None, semantics=None, state_in=None):
         if not implementation.get("name") or not implementation.get("version"):
             raise ValueError("the implementation needs a name and a version")
-        self.windowed = getattr(scope, "version", 1) == 2
+        version = getattr(scope, "version", 1)
+        self.windowed = version in (2, 3)
+        self.increment = version == 3
+        if self.increment and not state_in:
+            raise ValueError("an increment's reference names the state it started from (state_in)")
+        if not self.increment and state_in:
+            raise ValueError("only an increment's reference starts from a state")
         if self.windowed and not semantics:
             raise ValueError("a windowed scope's reference says which window rules it implements")
         if not self.windowed and semantics:
@@ -53,13 +66,17 @@ class ReferenceWriter:
         self.path = path
         self.types = [(c.name, ColumnType(c.type)) for c in scope.columns]
         header = {"format": REFERENCE_FORMAT,
-                  "version": WINDOW_REFERENCE_VERSION if self.windowed else REFERENCE_VERSION,
+                  "version": (WINDOW_INCREMENT_REFERENCE_VERSION if self.increment else
+                              WINDOW_REFERENCE_VERSION if self.windowed else REFERENCE_VERSION),
                   "scope": scope.document, "implementation": implementation,
                   "created": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="milliseconds")}
         if reader:
             header["reader"] = reader
         if self.windowed:
             header["semantics"] = semantics
+        if self.increment:
+            header["state_in"] = {"checkpoint": int(state_in["checkpoint"]),
+                                  "sha256": str(state_in["sha256"])}
         self._header = _line(header)
         self._rows_hash = hashlib.sha256()
         self._windows_hash = hashlib.sha256()
@@ -100,7 +117,7 @@ class ReferenceWriter:
         self.windows += 1
 
     def finish(self, complete, incomplete=(), verified=(), recorded=(), read=(),
-               source_bounds=None, records=None):
+               source_bounds=None, records=None, state_out=None):
         """Ends the artifact. `complete` is the writer's claim, and comes with
         why not when false: an incomplete reference is never compared. A
         windowed scope's needs `source_bounds`, the watermark the source's
@@ -119,6 +136,14 @@ class ReferenceWriter:
                 raise ValueError("a windowed scope's reference gives the source's watermark bounds")
             end.update({"windows": self.windows, "windows_sha256": self._windows_hash.hexdigest(),
                         "source_bounds": list(source_bounds), "records": dict(records or {})})
+            if self.increment and complete and not state_out:
+                raise ValueError("a complete increment's reference names the state it leaves "
+                                 "(state_out)")
+            if state_out:
+                end["state_out"] = {"checkpoint": int(state_out["checkpoint"]),
+                                    "sha256": str(state_out["sha256"])}
+        elif state_out:
+            raise ValueError("a record-wise reference leaves no window state")
         self._out.write(_line({"end": end}))
         self._out.close()
         self._finished = True

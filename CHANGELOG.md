@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**A windowed reference carries its own state between increments.**
+`python/clink-reference` 0.3.0 reads an increment's scope and computes it
+from `WindowState`, the reference's own state at the base: each partition's
+position and greatest event time, and the windows still open. `finish()`
+leaves the state at the scope's checkpoint, and `ReferenceWriter` names the
+state an increment started from and the one it left. A property test over
+random streams checks that a chain of increments gives exactly the whole
+lineage. A reference no longer fails while explaining a recorded watermark
+the source did not allow; it reports the record undetermined.
+`examples/window-audit/reference_windows.py` takes `--state-in` and
+`--state-out`.
+
 **A windowed job's results are audited one increment at a time.**
 `incident-scope --since=M` writes one increment of a windowed job's lineage
 (scope version 3): from an earlier completed checkpoint of the lineage, with

@@ -11,7 +11,12 @@ start at the job's own start, and it adds the window's rules as the job
 declares them (`transform`), the job's lineage (each completed checkpoint's
 source positions and the watermark the sink recorded at its barrier, and the
 restores it passes through) and the watermark windows are final by
-(`finality`).
+(`finality`). Version 3 is one increment of a windowed job's lineage: its
+ranges start at an earlier checkpoint of the lineage (`base`, with where the
+source stood there and the watermark the sink recorded), its lineage holds
+the checkpoints after it, and it owes the windows that became final after
+the base. A reference computes it from its own state at the base
+(windows.WindowState), never from the job's.
 """
 
 import json
@@ -20,6 +25,7 @@ from dataclasses import dataclass, field
 SCOPE_FORMAT = "clink-audit-scope"
 SCOPE_VERSION = 1
 WINDOW_SCOPE_VERSION = 2
+WINDOW_INCREMENT_SCOPE_VERSION = 3
 SEMANTICS = "clink-canonical-cells-v1"
 
 
@@ -104,6 +110,17 @@ class Scope:
     lineage: tuple[LineageCheckpoint, ...] = ()
     restores: tuple[Restore, ...] = ()
     final_watermark_ms: int | None = None
+    base: LineageCheckpoint | None = None  # an increment's: where it starts
+
+    @property
+    def windowed(self):
+        return self.version in (WINDOW_SCOPE_VERSION, WINDOW_INCREMENT_SCOPE_VERSION)
+
+    @property
+    def logs(self):
+        """The Kafka logs the scope's sources read, as (topic, cluster id,
+        topic id)."""
+        return tuple((s.topic, s.cluster_id, s.topic_id) for s in self.sources)
 
     @staticmethod
     def load(path):
@@ -115,9 +132,10 @@ class Scope:
         if not isinstance(doc, dict) or doc.get("format") != SCOPE_FORMAT:
             raise ScopeError("not a %s document" % SCOPE_FORMAT)
         version = doc.get("version")
-        if version not in (SCOPE_VERSION, WINDOW_SCOPE_VERSION):
-            raise ScopeError("version %r of the scope format; this library reads %d and %d"
-                             % (version, SCOPE_VERSION, WINDOW_SCOPE_VERSION))
+        if version not in (SCOPE_VERSION, WINDOW_SCOPE_VERSION, WINDOW_INCREMENT_SCOPE_VERSION):
+            raise ScopeError("version %r of the scope format; this library reads %d, %d and %d"
+                             % (version, SCOPE_VERSION, WINDOW_SCOPE_VERSION,
+                                WINDOW_INCREMENT_SCOPE_VERSION))
         output = doc.get("output") or {}
         if output.get("semantics") != SEMANTICS:
             raise ScopeError("the scope's cells are %r; this library writes %s"
@@ -131,8 +149,10 @@ class Scope:
                 for s in doc["sources"])
             columns = tuple(Column(c["name"], c["type"]) for c in output["columns"])
             extra = {}
-            if version == WINDOW_SCOPE_VERSION:
+            if version in (WINDOW_SCOPE_VERSION, WINDOW_INCREMENT_SCOPE_VERSION):
                 extra = _window_parts(doc)
+            if version == WINDOW_INCREMENT_SCOPE_VERSION:
+                extra["base"] = _checkpoint(doc["base"])
             return Scope(document=doc, fingerprint=doc["scope_sha256"], version=version,
                          job=doc["job"], checkpoint=int(doc["checkpoint"]),
                          starts_after=int(doc["starts_after"]),
@@ -140,6 +160,18 @@ class Scope:
                          sources_complete=bool(doc["sources_complete"]), columns=columns, **extra)
         except (KeyError, TypeError, ValueError) as e:
             raise ScopeError("the scope document is malformed: %s" % e) from e
+
+
+def _checkpoint(c):
+    """One checkpoint of a lineage, or an increment's base."""
+    positions = {}
+    for p in c["positions"]:
+        if p["next_offset"] is None:
+            raise ValueError("checkpoint %s records no position for partition %s"
+                             % (c["checkpoint"], p["partition"]))
+        positions[int(p["partition"])] = int(p["next_offset"])
+    wm = c.get("watermark_ms")
+    return LineageCheckpoint(int(c["checkpoint"]), positions, None if wm is None else int(wm))
 
 
 def _window_parts(doc):
@@ -156,17 +188,7 @@ def _window_parts(doc):
         lag_ms=int(t["watermark"]["lag_ms"]),
         allowed_lateness_ms=int(t["lateness"]["allowed_lateness_ms"]),
         source_parallelism=int(t["source_parallelism"]))
-    lineage = []
-    for c in doc["lineage"]["checkpoints"]:
-        positions = {}
-        for p in c["positions"]:
-            if p["next_offset"] is None:
-                raise ValueError("checkpoint %s records no position for partition %s"
-                                 % (c["checkpoint"], p["partition"]))
-            positions[int(p["partition"])] = int(p["next_offset"])
-        wm = c.get("watermark_ms")
-        lineage.append(LineageCheckpoint(int(c["checkpoint"]), positions,
-                                         None if wm is None else int(wm)))
+    lineage = [_checkpoint(c) for c in doc["lineage"]["checkpoints"]]
     restores = tuple(Restore(int(r["restored_from"]), int(r["first_epoch"]))
                      for r in doc["lineage"]["restores"])
     final = doc["finality"]

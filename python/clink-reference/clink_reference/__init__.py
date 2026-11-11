@@ -22,15 +22,31 @@ at the checkpoint come out, or why one is left out:
         result = windows.finish()
         write_result(w, result, output)
         w.finish(..., source_bounds=result.source_bounds, records=result.records)
+
+A running job is audited one increment at a time (a version 3 scope): the
+reference starts from its own state at the increment's base and leaves its
+state at the increment's checkpoint for the next:
+
+    state = WindowState.load("state-41.json", expect_sha256=...)
+    windows = TumblingWindows(scope, rules, aggregates, state=state)
+    ... read the increment's ranges into windows.add ...
+    result = windows.finish()
+    sha = result.state.save("state-42.json")
+    with ReferenceWriter(path, scope, implementation, semantics=rules.semantics(),
+                         state_in={"checkpoint": 41, "sha256": ...}) as w:
+        write_result(w, result, output)
+        w.finish(..., state_out={"checkpoint": 42, "sha256": sha})
 """
 
-from .artifact import REFERENCE_FORMAT, REFERENCE_VERSION, WINDOW_REFERENCE_VERSION, ReferenceWriter
+from .artifact import (REFERENCE_FORMAT, REFERENCE_VERSION, WINDOW_INCREMENT_REFERENCE_VERSION,
+                       WINDOW_REFERENCE_VERSION, ReferenceWriter)
 from .canonical import CellError, ColumnType, cell
 from .kafka_range import ReadResult, Record, client_versions, kafka_uuid_text, read_scope
 from .scope import Aggregate, Column, LineageCheckpoint, Range, Restore, Scope, ScopeError, Source, Window
-from .windows import Result, TumblingWindows, WindowRules, write_result
+from .windows import Result, StateError, TumblingWindows, WindowRules, WindowState, write_result
 
 __all__ = ["REFERENCE_FORMAT", "REFERENCE_VERSION", "WINDOW_REFERENCE_VERSION", "ReferenceWriter", "CellError", "ColumnType",
            "cell", "ReadResult", "Record", "client_versions", "kafka_uuid_text", "read_scope", "Column", "Range",
            "Scope", "ScopeError", "Source", "Aggregate", "LineageCheckpoint", "Restore", "Window",
-           "Result", "TumblingWindows", "WindowRules", "write_result"]
+           "Result", "StateError", "TumblingWindows", "WindowRules", "WindowState", "write_result",
+           "WINDOW_INCREMENT_REFERENCE_VERSION"]

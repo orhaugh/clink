@@ -957,13 +957,17 @@ jobs:
           CLINK_BIN=/usr/local/bin/clink "${RUNNER_TEMP}/mcpvenv/bin/pytest" python/clink-mcp/tests -q -p no:cacheprovider
       - name: clink-reference offline tests
         # python/clink-reference writes the reference artifact the audit reads:
-        # its canonical cells and the artifact's hashes, without a broker. The
-        # live suite (scripts/reference-live.sh) needs Docker and runs where
-        # the destination-reconciliation example qualifies.
+        # its canonical cells, the artifact's hashes and the windows, without
+        # a broker. The live suite (scripts/reference-live.sh) needs Docker and
+        # runs where the destination-reconciliation example qualifies.
         run: |
           "${RUNNER_TEMP}/mcpvenv/bin/pip" install -q ./python/clink-reference
           PYTHONDONTWRITEBYTECODE=1 "${RUNNER_TEMP}/mcpvenv/bin/python" -m unittest discover \
             -s python/clink-reference/tests -p 'test_offline.py' -v
+          # The windows, offline: the bounds, finality and the artifact, and
+          # a chain of increments against the whole lineage on random streams.
+          PYTHONDONTWRITEBYTECODE=1 "${RUNNER_TEMP}/mcpvenv/bin/python" -m unittest discover \
+            -s python/clink-reference/tests -p 'test_window*.py' -v
       - name: Tiny downstream find_package smoke
         run: |
           mkdir -p /tmp/smoke && cd /tmp/smoke
