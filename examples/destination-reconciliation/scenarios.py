@@ -425,8 +425,26 @@ def restore_scenario(demo, name, faults, window=1000):
                   (before, nxt, after[:5]))
         bundle = demo.work / "bundles" / name
         cluster.collect(bundle)
-        for label, ckpt in (("before", before), ("first-after", after[0]), ("later", after[2])):
-            code, report, text = demo.reconcile("%s-%s" % (name, label), bundle, ckpt)
+        # The restored run's scope, from the restore to the first checkpoint
+        # whose interval carried rows: the run can reach its first barrier
+        # before its source has fetched anything, and an empty scope is
+        # partial, which says nothing about the restore.
+        after = [c for c in completed_in(bundle) if c >= nxt]
+
+        def interval_rows(epoch):
+            return sum(json.loads(f.read_text())["records"]["seen"] for f in
+                       (cluster.dir / "capture").glob("op-*/subtask-*/epoch-%d.sink.json" % epoch))
+
+        first = next((c for c in after if interval_rows(c) > 0), after[0])
+        # A later checkpoint of the restored run, one interval on at least,
+        # whose own interval carried rows too.
+        beyond = [c for c in after if c > first]
+        later = next((c for c in beyond[1:] if interval_rows(c) > 0),
+                     beyond[1] if len(beyond) > 1 else beyond[-1])
+        for label, ckpt in (("before", before), ("first-after", first), ("later", later)):
+            code, report, text = demo.reconcile(
+                "%s-%s" % (name, label), bundle, ckpt,
+                extra=["--from-run-start"] if label == "first-after" else ())
             ind = demo.independent("%s-%s" % (name, label), topic, table, report) if report else None
             required = "exit 0" if label != "first-after" else "exit 0 or 1, as the destination is"
             ok = code == 0 if label != "first-after" else code in (0, 1)
