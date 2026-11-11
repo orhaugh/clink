@@ -18,7 +18,8 @@ a subtask that owns none marks its output idle. This changes behaviour for a
 job with a partition that is never written to: it now holds every window
 until the table sets `idle_timeout_ms`, and the assigner logs a warning
 naming the partition after a minute. The assigner records the partitions it
-was declared in its checkpointed state.
+was declared in its checkpointed state, and the audit of windowed results
+reads that record and now supports several partitions to a source subtask.
 
 **Auditing windowed results.** The independent reference audit now covers a
 job of one keyed tumbling window (`COUNT` and exact `SUM`) from Kafka into
@@ -30,8 +31,7 @@ each completed checkpoint's source positions, and the watermark the sink
 recorded at its barrier. Whether a record arrived after its window closed
 depends on the order the job read its partitions in, which offsets do not
 record. The audit decides it with bounds: from above by the source alone, and
-from below by the recorded watermark, with one partition per source subtask
-and aligned checkpoints. A record or window they cannot place is left out by
+from below by the recorded watermark, with aligned checkpoints. A record or window they cannot place is left out by
 name and the result is partial, never guessed. `python/clink-reference` adds
 `TumblingWindows`, which computes a windowed job's final windows from every
 record it reads, under the window rules the operator declares. Its artifact
@@ -41,8 +41,8 @@ allows at each checkpoint. `clink incident-reconcile --reference` adds
 `reference.watermark`, the recorded watermark never ahead of the source and no
 window closed early; and `reference.finality`, every window decided and every
 open one truly open. Recovery duplicates stay visible and are put down to the
-restore. Other windows, joins, aggregates, idleness, unaligned checkpoints and
-several partitions to a source subtask are refused by name. The Coordinator
+restore. Other windows, joins, aggregates, idleness and unaligned checkpoints
+are refused by name. The Coordinator
 now persists a job's checkpoint alignment in its manifest: a bundle reads it,
 and a takeover no longer redeploys an unaligned or adaptive job aligned. The
 new `examples/window-audit/` runs it all against Kafka and ClickHouse, with

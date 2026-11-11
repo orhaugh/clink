@@ -51,12 +51,15 @@ def artifact_parts(path):
     return rows, windows, end
 
 
-def start_run(demo, name, variant=None, faults="", defer_worker2=False, worker2_late=False):
+def start_run(demo, name, variant=None, faults="", defer_worker2=False, worker2_late=False,
+              parallelism=None):
     topic, table = "payments-" + name, "windows_" + name.replace("-", "_")
     demo.services.create_topic(topic, workload.PARTITIONS)
     demo.create_table(table)
     cluster = WindowCluster(demo, name, variant=variant, worker1_faults=faults,
                             defer_worker2=defer_worker2, worker2_late=worker2_late)
+    if parallelism is not None:
+        cluster.parallelism = parallelism
     cluster.start(topic, table, demo.services.ch_port)
     return {"name": name, "topic": topic, "table": table, "cluster": cluster}
 
@@ -402,6 +405,32 @@ def windows_crash_after_output(demo):
                  "delivery" in findings(report) and "transformation" not in findings(report))
 
 
+def windows_spare_subtask(demo):
+    """Four source subtasks over three partitions: subtask 3 owns none. It
+    marks its output idle, so the windows downstream close on the other
+    three's watermark instead of waiting on it for good; the run audits
+    clean, the table read whole."""
+    name = "windows-spare-subtask"
+    run = start_run(demo, name, parallelism=4)
+    t = Timeline(seed=7)
+    events = t.steady([0, 1, 2], 0, E) + [t.at(p, E + LAG_MS, kind="purchase") for p in (0, 1, 2)]
+    try:
+        demo.produce(run["topic"], events)
+        exact = run["cluster"].await_watermark(BASE_MS + E, exact=True, holds=2)
+        demo.outcome(name, "the windows close with a subtask that owns no partition",
+                     "the recorded watermark reaches E", "checkpoint %d recorded it" % exact, True)
+        quiet = run["cluster"].await_quiet(3)
+        collect(demo, run)
+    finally:
+        run["cluster"].stop()
+    demo.services.ch("OPTIMIZE TABLE demo.%s FINAL" % run["table"])
+    ref = reference_for(demo, run, name, quiet[0])
+    code, report, _ = audit(demo, run, name, quiet[0], ref["reference"], "complete-table")
+    demo.outcome(name, "incident-reconcile --reference (complete-table)", "exit 0, every check passed",
+                 "exit %d, %s" % (code, not_passed(report)), code == 0 and every_passed(report))
+    designed_check(demo, name, name, ref["scope"], ref["reference"], events)
+
+
 def windows_empty(demo):
     """Nothing but chargebacks: no window holds a payment, the job writes
     nothing, and the dedicated table read whole is empty, as the reference
@@ -585,6 +614,7 @@ ALL = [
     ("windows-missing-history", windows_missing_history),
     ("windows-recovery", windows_recovery),
     ("windows-crash-after-output", windows_crash_after_output),
+    ("windows-spare-subtask", windows_spare_subtask),
     ("windows-empty", windows_empty),
     ("windows-wrong-time-column", windows_wrong_time_column),
     ("windows-wrong-sign", windows_wrong_sign),

@@ -23,7 +23,9 @@ Which records arrive after their window closed depends on the order the job
 read its partitions in, which offsets do not record. So each record is
 decided by what bounds the watermark when it arrived:
 
-* from above, by the source alone: at most the record's own partition's
+* from above, by the source alone (a source subtask's watermark is the least
+  over the partitions it owns, each held until it delivers, which the audit
+  checks the run recorded): at most the record's own partition's
   greatest earlier event time, less the lag, and at most the least partition
   maximum at the checkpoint after it (aligned barriers: nothing past a
   barrier reaches the window operator before the barrier does). A record

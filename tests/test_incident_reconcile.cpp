@@ -655,6 +655,18 @@ protected:
             if (!log.empty()) {
                 be.put_operator_state(clink::OperatorId{4242}, "__kafka_identity__", log);
             }
+            // The watermark assigners' declared partitions, as a Worker that
+            // holds for undelivered ones records them: in the first
+            // participant's snapshot, as any subtask's would be found.
+            if (sub == rows_by_sub.begin()->first) {
+                const auto at = declared_rows_at_.find(id);
+                for (const auto& [assigner, list] :
+                     at != declared_rows_at_.end() ? at->second : declared_rows_) {
+                    be.put_operator_state(clink::OperatorId{4243},
+                                          "__clink_wm_declared:" + std::to_string(assigner),
+                                          list);
+                }
+            }
             for (const auto& [partition, offset] : rows) {
                 std::string value(8, '\0');
                 for (int i = 0; i < 8; ++i) {
@@ -682,6 +694,12 @@ protected:
                                                   clink::cluster::recorded_state_location(
                                                       ckpt.string(), kReconcileJob, state_root())));
     }
+
+    // Rows "__clink_wm_declared:<assigner subtask>" -> "p,p" that
+    // write_checkpoint_with_offsets adds to each checkpoint.
+    std::map<std::uint32_t, std::string> declared_rows_;
+    // The same, for one checkpoint id in place of declared_rows_.
+    std::map<std::uint64_t, std::map<std::uint32_t, std::string>> declared_rows_at_;
 
     enum class Mode { Written, Disarmed, Truncated };
 
@@ -2185,7 +2203,7 @@ TEST_F(ReconcileWindow, WindowsTheAuditDoesNotModelAreRefusedByName) {
         {WindowGraph{.alignment = "unaligned"}, "aligned ones"},
         {WindowGraph{.alignment = ""}, "does not record how checkpoint barriers aligned"},
         {WindowGraph{.filter_after_window = true}, "between the window and the sink"},
-        {WindowGraph{.source_parallelism = 1}, "one partition per source subtask"},
+        {WindowGraph{.source_parallelism = 1}, "records no partitions its source declared"},
     };
     // Nothing an unsupported job's audit reads of a reference: it is refused
     // before it is opened.
@@ -2213,6 +2231,43 @@ TEST_F(ReconcileWindow, WindowsTheAuditDoesNotModelAreRefusedByName) {
                   0)
             << phrase;
     }
+}
+
+// Two partitions to one source subtask: its watermark is the least over both
+// only if it held for one that had not delivered, which a Worker that did
+// records as the partitions its source declared. With that record the window
+// is audited; with a record that leaves a partition out, it is not.
+TEST_F(ReconcileWindow, SeveralPartitionsToASourceSubtaskNeedItsWatermarkToHaveWaitedForEach) {
+    declared_rows_ = {{0, "0,1"}};
+    const auto bundle = windowed(WindowGraph{.source_parallelism = 1}, "declared");
+    {
+        const Bundle b = read_bundle(bundle);
+        const auto sc = load_scope(b, 2, 0, false, true);
+        EXPECT_FALSE(sc.window_unsupported.has_value()) << *sc.window_unsupported;
+        ASSERT_TRUE(sc.window.has_value());
+    }
+    const auto r = window_audit(bundle, owed_windows(), open_window(), bounds_equal());
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    // Before any batch reached it, the record is empty: nothing was decided.
+    declared_rows_at_ = {{1, {{0, ""}}}};
+    const auto early = windowed(WindowGraph{.source_parallelism = 1}, "early");
+    EXPECT_FALSE(load_scope(read_bundle(early), 2, 0, false, true).window_unsupported.has_value());
+    declared_rows_at_.clear();
+    declared_rows_ = {{0, "0"}};
+    const auto partial = windowed(WindowGraph{.source_parallelism = 1}, "partial");
+    const Bundle b = read_bundle(partial);
+    const auto sc = load_scope(b, 2, 0, false, true);
+    ASSERT_TRUE(sc.window_unsupported.has_value());
+    EXPECT_NE(sc.window_unsupported->find("was not waiting for partition 1"), std::string::npos)
+        << *sc.window_unsupported;
+    // A checkpoint with no record at all: a Worker that did not hold.
+    declared_rows_ = {{0, "0,1"}};
+    declared_rows_at_ = {{2, {}}};
+    const auto gap = windowed(WindowGraph{.source_parallelism = 1}, "gap");
+    const auto gs = load_scope(read_bundle(gap), 2, 0, false, true);
+    ASSERT_TRUE(gs.window_unsupported.has_value());
+    EXPECT_NE(gs.window_unsupported->find("at checkpoint 2"), std::string::npos)
+        << *gs.window_unsupported;
 }
 
 int scope_cli(const std::string& args, std::string* out) {

@@ -61,9 +61,12 @@ WINDOW_VARIANTS = {
 
 
 class WindowCluster(reconcile_demo.Cluster):
-    """Three source subtasks for the three partitions, one partition each."""
+    """Two source subtasks for the three partitions: subtask 0 owns partitions
+    0 and 2, subtask 1 owns partition 1, so a subtask's watermark is the least
+    over partitions it reads together. A scenario sets more subtasks than
+    partitions to have one own none."""
     job_template = HERE / "job.sql.in"
-    parallelism = workload.PARTITIONS
+    parallelism = 2
     variants = WINDOW_VARIANTS
 
     def start(self, topic, table, ch_port):

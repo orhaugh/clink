@@ -19,8 +19,10 @@ is the qualification bundle (see `run.sh`).
 
 ## The job
 
-`job.sql.in`: payments from a three-partition topic, read by three source
-subtasks, one partition each. Event time is `ts`, epoch milliseconds, and the
+`job.sql.in`: payments from a three-partition topic, read by two source
+subtasks: one owns partitions 0 and 2, the other partition 1. A subtask's
+watermark is the least over the partitions it owns, each held until it
+delivers. Event time is `ts`, epoch milliseconds, and the
 watermark trails the least partition maximum by two seconds. Per account and
 ten-second window, a row counts the purchases and refunds, sums their signed
 amounts exactly (`DECIMAL(38, 2)`) and their units. Chargebacks are filtered
@@ -69,7 +71,8 @@ interleave its partitions:
 2. Events for the window that closed, one at its last millisecond, are
    dropped. One at E itself is folded into the next window.
 3. Partition 2 goes quiet while 0 and 1 run 28 seconds ahead. With no
-   idleness, it holds the watermark at E and no window closes. An event on
+   idleness, it holds the watermark at E and no window closes, though the
+   subtask that owns it reads partition 0 as well. An event on
    partition 0 far behind its own partition is still folded, its window held
    open.
 4. Partition 2 catches up, all three run on to E + 50 s, and the windows up
@@ -84,6 +87,7 @@ interleave its partitions:
 | `windows-missing-history` | Records the main run's windows depend on are deleted from the topic. | The reference says it is incomplete (exit 3), and the audit is partial with `reference.scope` unavailable. |
 | `windows-recovery` | worker-1 runs the job alone and is killed in the quiet stretch, its windows half accumulated; the job restores on worker-2. | The lineage passes the restore, and the audit read whole passes: every final window exact, once. |
 | `windows-crash-after-output` | worker-1 dies just after an INSERT of window rows is acknowledged and before its checkpoint completes (`clickhouse.after_end_insert`); the restored run writes those windows again. | Exit 1 with the transformation passing and duplicates only in the delivery, counted in `reconcile.rows` and `reference.destination`, put down to the restore. |
+| `windows-spare-subtask` | Four source subtasks over three partitions: one owns none. | It marks its output idle, so the windows close on the other three's watermark; the audit, reading the table whole, passes. |
 | `windows-empty` | Only chargebacks: no window holds a payment. | The reference has no rows, and the audit, reading the table whole, passes on an empty table. |
 | `windows-wrong-time-column` | The job windows on when the device sent the event (`sent_ts`), not when it happened. | Reconciliation alone passes; the audit fails `reference.semantics` and `reference.capture`, naming the transformation, with the delivery passing. |
 | `windows-wrong-sign` | The job adds refunds to the net amount. | Reconciliation alone passes; the audit fails `reference.capture`. |

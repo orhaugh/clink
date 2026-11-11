@@ -909,6 +909,60 @@ std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> kafka_positions(
     return out;
 }
 
+// The partitions each watermark assigner subtask had been declared, as it
+// recorded them at `checkpoint` (WatermarkAssignerOperator's
+// "__clink_wm_declared<slot>:<subtask>" rows): subtask -> partitions.
+std::map<std::uint32_t, std::set<std::int32_t>> declared_partitions(const Bundle& b,
+                                                                    std::uint64_t checkpoint) {
+    constexpr std::string_view kDeclared = "__clink_wm_declared";
+    std::map<std::uint32_t, std::set<std::int32_t>> out;
+    const std::string suffix = "/checkpoint-" + std::to_string(checkpoint) + ".snap";
+    const std::string prefix = "checkpoint/_state/" + std::to_string(b.job()) + "/";
+    for (const auto& a : b.artifacts) {
+        if ((a.role != "snapshot" && a.role != "replay_state" && a.role != "interval_state") ||
+            a.path.rfind(prefix, 0) != 0 || !a.path.ends_with(suffix)) {
+            continue;
+        }
+        try {
+            const std::string bytes = read_bounded(b.root / a.path, 8ULL << 30);
+            std::vector<std::byte> v(bytes.size());
+            std::memcpy(v.data(), bytes.data(), bytes.size());
+            InMemoryStateBackend backend;
+            backend.restore(
+                Snapshot{.checkpoint_id = CheckpointId{checkpoint}, .bytes = std::move(v)});
+            for (const auto op : backend.operator_ids()) {
+                backend.scan_operator_state(
+                    op, [&](StateBackend::KeyView key, StateBackend::ValueView value) {
+                        if (!key.starts_with(kDeclared)) {
+                            return;
+                        }
+                        const auto colon = key.rfind(':');
+                        const auto sub = colon == std::string_view::npos
+                                             ? std::nullopt
+                                             : small_int(key.substr(colon + 1));
+                        if (!sub) {
+                            return;
+                        }
+                        auto& set = out[static_cast<std::uint32_t>(*sub)];
+                        std::string_view list{reinterpret_cast<const char*>(value.data()),
+                                              value.size()};
+                        while (!list.empty()) {
+                            const auto comma = list.find(',');
+                            if (const auto p = small_int(list.substr(0, comma)); p) {
+                                set.insert(static_cast<std::int32_t>(*p));
+                            }
+                            list = comma == std::string_view::npos ? std::string_view{}
+                                                                   : list.substr(comma + 1);
+                        }
+                    });
+            }
+        } catch (const std::exception&) {
+            // An unreadable snapshot is reported by the position scan.
+        }
+    }
+    return out;
+}
+
 void describe_sources(const Bundle& b, SourcePositions& sp) {
     sp.isolation = "read_committed (librdkafka's default; the job sets no isolation.level)";
     sp.isolation_level = "read_committed";
@@ -1457,24 +1511,61 @@ Scope load_scope(const Bundle& b,
             }
             sc.lineage.push_back(std::move(lc));
         }
-        // One partition per source subtask: a subtask reading several takes
-        // the least of only those it has read from so far, so the order of
-        // its first fetches decides which records are late.
+        // Several partitions to a source subtask: its watermark is the least
+        // over them only if it held for each one that had not delivered, which
+        // a Worker that did records as the partitions its source declared. A
+        // subtask that owns none marks its output idle and holds nothing.
         if (sc.window) {
-            std::set<std::pair<std::uint64_t, std::int32_t>> partitions;
+            const std::uint64_t par = sc.window->source_parallelism;
+            std::map<std::uint64_t, std::set<std::int32_t>> owned_by;
             for (const auto& [k, _] : to) {
-                partitions.insert(k);
+                owned_by[par == 0 ? 0 : static_cast<std::uint64_t>(k.second) % par].insert(
+                    k.second);
             }
-            if (partitions.size() != sc.window->source_parallelism) {
-                sc.window_unsupported =
-                    "the source reads " + std::to_string(partitions.size()) +
-                    " partition(s) with " + std::to_string(sc.window->source_parallelism) +
-                    " subtask(s): a source subtask's watermark is the least over the partitions "
-                    "it has read from so far, so with several partitions to a subtask the order "
-                    "of its first fetches decides which records are late, and with none a "
-                    "subtask holds every window open; the audit needs one partition per source "
-                    "subtask";
-                sc.window.reset();
+            bool several = false;
+            for (const auto& [sub, parts] : owned_by) {
+                several = several || parts.size() > 1;
+            }
+            if (several) {
+                // Every assigner of a Worker that holds writes its record at
+                // every barrier, empty until its source declares partitions;
+                // one that wrote none did not hold. A record that names
+                // partitions must name every one its subtask owned there.
+                std::string why;
+                for (const auto& lc : sc.lineage) {
+                    const auto declared = declared_partitions(b, lc.checkpoint);
+                    for (const auto& [sub, _] : owned_by) {
+                        const auto it = declared.find(static_cast<std::uint32_t>(sub));
+                        if (it == declared.end()) {
+                            if (why.empty()) {
+                                why = "at checkpoint " + std::to_string(lc.checkpoint) +
+                                      " the watermark of source subtask " + std::to_string(sub) +
+                                      " records no partitions its source declared (a Worker "
+                                      "that did not yet hold the watermark for a partition that "
+                                      "had delivered nothing), and the source's subtasks read "
+                                      "several partitions each, so the order of their first "
+                                      "fetches could decide which records were late";
+                            }
+                            continue;
+                        }
+                        if (it->second.empty()) {
+                            continue;  // no batch had reached it: it emitted no watermark
+                        }
+                        for (const auto& p : lc.positions) {
+                            if (par != 0 && static_cast<std::uint64_t>(p.partition) % par == sub &&
+                                !it->second.contains(p.partition) && why.empty()) {
+                                why = "at checkpoint " + std::to_string(lc.checkpoint) +
+                                      " the watermark of source subtask " + std::to_string(sub) +
+                                      " was not waiting for partition " +
+                                      std::to_string(p.partition) + ", which it owned";
+                            }
+                        }
+                    }
+                }
+                if (!why.empty()) {
+                    sc.window_unsupported = why;
+                    sc.window.reset();
+                }
             }
         }
     }

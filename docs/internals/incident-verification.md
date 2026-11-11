@@ -319,7 +319,7 @@ CH_PASSWORD=... clink incident-reconcile incident-7 --checkpoint=41 --reference=
 
 | Part | Supported |
 | --- | --- |
-| Source | One Kafka SQL table, read one partition per source subtask: the source's parallelism equals the topic's partitions. |
+| Source | One Kafka SQL table. A source subtask may own several partitions, or none, when its Worker records the partitions its watermark waited for (see below). |
 | Event time | An integer column of epoch milliseconds, the source table's `event_time_column`. |
 | Watermark | `watermark_lag_ms`, and no `idle_timeout_ms`. Each partition's greatest event time so far, the least of those over the partitions, less the lag. It is assigned to every record the source delivers, before any filter. |
 | Transformation | Record-wise filters and projections, the time column passed through unchanged. |
@@ -328,11 +328,11 @@ CH_PASSWORD=... clink incident-reconcile incident-7 --checkpoint=41 --reference=
 | Output | The window's rows as the window computes them, into the ClickHouse native sink. A row's identity is its group key columns, `window_start` and `window_end`, which is the audit's key. |
 | Checkpoints | Aligned, as the job manifest records them (`alignment`, which the Coordinator persists). |
 
-Anything else is refused by name: `incident-scope` exits 3 without writing a scope, and an audit's reference checks are unsupported, while the delivery is still checked. That covers sliding, session and cumulating windows, joins, other aggregates, a filter after the window, idleness (which drops a quiet partition from the watermark after wall-clock time the records do not show), unaligned checkpoints, and several partitions to a source subtask. A subtask then takes the least over only the partitions it has read from, so its first fetches decide which records are late.
+Anything else is refused by name: `incident-scope` exits 3 without writing a scope, and an audit's reference checks are unsupported, while the delivery is still checked. That covers sliding, session and cumulating windows, joins, other aggregates, a filter after the window, idleness (which drops a quiet partition from the watermark after wall-clock time the records do not show), unaligned checkpoints, and several partitions to a source subtask on a Worker that does not record the partitions its watermark waited for. An older Worker's watermark took the least over only the partitions it had read from, so its first fetches decided which records were late.
 
 **What decides a record's fate.** The window operator's watermark when a record arrives is bounded from above by the source alone, and from below by evidence:
 
-- *Its own partition.* With one partition per subtask, the watermark is at most the record's partition's greatest earlier event time, less the lag.
+- *Its own partition.* A source subtask's watermark is the least over the partitions it owns, each holding until it delivers ([time and windowing](./time-and-windowing.md#guarantees-and-caveats)), so the watermark is at most the record's partition's greatest earlier event time, less the lag. The audit takes that hold from the assigners' record of the partitions their source declared (`__clink_wm_declared`). A Worker that holds writes it at every barrier, empty until its source declares any. Every lineage checkpoint must hold it for each source subtask that owns partitions, naming every one the subtask owned once it names any. A subtask that owns none marks its output idle, and contributes nothing to either bound.
 - *The next barrier.* With aligned checkpoints, nothing past a barrier reaches the window operator before the barrier does. So when a record arrives, the watermark is at most the least, over partitions, of the greatest event time before the next checkpoint's positions, less the lag. The reference computes that bound at every checkpoint of the lineage (`source_bounds`).
 - *The previous barrier.* The window operator forwards a watermark after closing what it closes, and the sink records the last watermark it had at each barrier. The least over the sink's subtasks, at the checkpoint before the record, is a floor on the watermark when the record arrived.
 
@@ -394,7 +394,7 @@ Destination reconciliation does not support:
 - destinations other than the ClickHouse native sink into a plain `MergeTree`;
 - replicated, distributed or row-rewriting tables, and tables with a TTL;
 - column types beyond those above;
-- jobs that are neither record-wise nor the windowed shape above: sliding, session and cumulating windows, joins, other aggregates, idleness, unaligned checkpoints, several partitions to a source subtask;
+- jobs that are neither record-wise nor the windowed shape above: sliding, session and cumulating windows, joins, other aggregates, idleness, unaligned checkpoints, several partitions to a source subtask without the record of its declared partitions;
 - sinks of an embedded `clink run`, which the recorder does not record;
 - `system.query_log` as acknowledgement evidence.
 
