@@ -47,6 +47,35 @@
 // header_sha256 over the header line's. A file without its end line was not
 // finished and is refused, as is one whose hashes or count do not hold, whose
 // scope is not the audit's, or whose cells are not canonical for their column.
+//
+// A windowed job's scope is version 2: version 1's fields, and
+//
+//   transform    the window's rules: kind, size_ms, time_column, group_keys,
+//                identity (the sink columns naming one window's row),
+//                start_column, end_column, aggregates, watermark (strategy,
+//                lag_ms, idleness, assigned_on), lateness (allowed_lateness_ms,
+//                late_records), source_parallelism, alignment
+//   lineage      restores [{restored_from, first_epoch}], and per completed
+//                checkpoint {checkpoint, positions [{op, partition,
+//                next_offset}], watermark_ms}: the source's positions and the
+//                least watermark the sink's subtasks had at its barrier
+//   finality     {checkpoint, watermark_ms}: the recorded watermark windows
+//                are final by
+//
+// with the sources' ranges from the job's start (from null). Its reference is
+// version 2: the header adds "semantics", the window rules the reference
+// implements, in the transform's field names; the body holds, beside the row
+// lines,
+//
+//   {"window": {"identity": {<identity column>: <cell>, ...},
+//               "status": "open" | "undetermined", "end_ms": N, "why": ...}}
+//
+// once per window it leaves out of the comparison: open at the checkpoint, or
+// one whose value or finality the evidence does not decide; and the end line
+// adds "windows", "windows_sha256" (over the window lines, as rows_sha256 is
+// over the row lines), "source_bounds" [{checkpoint, watermark_ms}], the
+// watermark the source's records allow at each lineage checkpoint as the
+// reference computed it, and "records", its account of the records it read.
 
 #include <cstdint>
 #include <filesystem>
@@ -65,6 +94,12 @@ inline constexpr std::int64_t kScopeVersion = 1;
 inline constexpr const char* kReferenceFormat = "clink-reference-result";
 inline constexpr std::int64_t kReferenceVersion = 1;
 inline constexpr const char* kCanonicalSemantics = "clink-canonical-cells-v1";
+// A windowed job's scope and reference (below) are version 2 of their formats;
+// a record-wise job's stay version 1, unchanged.
+inline constexpr std::int64_t kWindowScopeVersion = 2;
+inline constexpr std::int64_t kWindowReferenceVersion = 2;
+inline constexpr const char* kTumblingWindowKind = "tumbling-window";
+inline constexpr const char* kWatermarkStrategy = "per-partition bounded out-of-orderness";
 
 // The scope document for `scope`, from the bundle alone, with its fingerprint.
 [[nodiscard]] config::JsonValue scope_document(const Bundle& bundle, const Scope& scope);
@@ -78,9 +113,33 @@ struct ReferenceRefused : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// A window a version 2 reference leaves out of the comparison.
+struct ExcludedWindow {
+    Row identity;        // cells of the transform's identity columns, in that order
+    std::string status;  // "open" or "undetermined"
+    std::int64_t end_ms{0};
+    std::string why;
+};
+
+// The watermark a lineage checkpoint's source positions allow, as a reference
+// computed it from the records: none when a partition had delivered nothing.
+struct SourceBound {
+    std::uint64_t checkpoint{0};
+    std::optional<std::int64_t> watermark_ms;
+};
+
 struct Reference {
     std::string path;
+    std::int64_t version{1};
     std::vector<Row> rows;  // canonical, in the scope's column order, multiplicity kept
+    // Version 2: the window rules the reference implements, the windows it
+    // leaves out, the watermark bounds it computed, and its account of the
+    // records it read.
+    std::optional<config::JsonValue> semantics;
+    std::vector<ExcludedWindow> windows;
+    std::string windows_sha256;
+    std::vector<SourceBound> source_bounds;
+    config::JsonValue records;
     bool complete{false};
     std::vector<std::string> incomplete;  // why not, as the artifact says
     std::string rows_sha256;
@@ -102,6 +161,13 @@ struct Reference {
                                        const config::JsonValue& document,
                                        const std::vector<Column>& columns,
                                        std::uint64_t max_bytes);
+
+// Where the window rules a version 2 scope declares (its "transform") and the
+// ones a reference implements (its "semantics") differ, field by field: the
+// kind, size, time column, watermark strategy, lag and idleness, and the
+// allowed lateness and treatment of late records. Empty when they agree.
+[[nodiscard]] std::vector<std::string> semantics_differences(const config::JsonValue& transform,
+                                                             const config::JsonValue& semantics);
 
 // Whether `cell` is a canonical cell a column of `type` can hold.
 [[nodiscard]] bool canonical_for(std::string_view cell, const ColumnType& type);

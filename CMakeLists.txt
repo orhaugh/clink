@@ -527,6 +527,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/incident/collect.cpp
     src/incident/reconcile.cpp
     src/incident/reference.cpp
+    src/incident/window_scope.cpp
     src/cluster/state_location.cpp
     src/cluster/outbox.cpp
     src/cluster/protocol_trace.cpp

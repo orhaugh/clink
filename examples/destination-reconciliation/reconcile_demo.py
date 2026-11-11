@@ -94,9 +94,10 @@ class Services:
     def kafka(self, *tool_args, input_text=None, check=True):
         return self.compose("exec", "-T", "kafka", *tool_args, input_text=input_text, check=check)
 
-    def create_topic(self, topic):
+    def create_topic(self, topic, partitions=None):
         self.kafka("/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server=kafka:9092", "--create",
-                   "--topic=%s" % topic, "--partitions=%d" % workload.TOPIC_PARTITIONS,
+                   "--topic=%s" % topic,
+                   "--partitions=%d" % (partitions or workload.TOPIC_PARTITIONS),
                    "--replication-factor=1")
 
     def topic_log(self, topic):
@@ -198,7 +199,13 @@ JOB_VARIANTS = {
 
 
 class Cluster:
-    """A Coordinator and two Workers from the build, for one scenario."""
+    """A Coordinator and two Workers from the build, for one scenario. Another
+    example runs its own job through it by overriding the job's template, its
+    parallelism and its deliberate defects."""
+
+    job_template = HERE / "job.sql.in"
+    parallelism = 2
+    variants = JOB_VARIANTS
 
     def __init__(self, demo, name, worker1_faults="", worker2_late=False, capture=True,
                  capture_records=100000, interval_ms=1000, defer_worker2=False, variant=None):
@@ -262,19 +269,19 @@ class Cluster:
         self.worker(1, self.worker1_faults)
         if not self.worker2_late and not self.defer_worker2:
             self.worker(2)
-        sql = (HERE / "job.sql.in").read_text()
+        sql = Path(self.job_template).read_text()
         for k, v in {"@BROKERS@": "127.0.0.1:%d" % self.demo.services.kafka_port, "@TOPIC@": topic,
                      "@CH_PORT@": str(ch_port), "@TABLE@": table}.items():
             sql = sql.replace(k, v)
         if self.variant is not None:
-            right, wrong = JOB_VARIANTS[self.variant]
+            right, wrong = self.variants[self.variant]
             if right not in sql:
                 raise Failed("the job's SQL has no %r for variant %s" % (right, self.variant))
             sql = sql.replace(right, wrong)
         (self.dir / "job.sql").write_text(sql)
         args = [str(self.demo.bin / "clink"), "run", str(self.dir / "job.sql"),
                 "--coordinator-host=127.0.0.1", "--coordinator-port=%d" % self.coord_http,
-                "--name=%s" % self.name, "--parallelism=2",
+                "--name=%s" % self.name, "--parallelism=%d" % self.parallelism,
                 "--checkpoint-dir=%s" % (self.dir / "checkpoints"),
                 "--checkpoint-interval-ms=%d" % self.interval_ms]
         if self.capture:

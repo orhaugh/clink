@@ -642,6 +642,8 @@ namespace {
 
 constexpr std::uintmax_t kMaxIntervalBytes = 64ULL << 20;
 constexpr std::size_t kMaxIntervalsWalked = 256;
+// A lineage from a run's start, through its restores.
+constexpr std::size_t kMaxLineageIntervals = 100000;
 
 std::string read_bounded(const fs::path& path, std::uintmax_t max_bytes) {
     std::error_code ec;
@@ -958,9 +960,32 @@ std::optional<bool> SourceIdentity::same_log() const {
            agree(start->topic_id, end->topic_id);
 }
 
-Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_op, bool whole_run) {
+Scope load_scope(const Bundle& b,
+                 std::uint64_t checkpoint,
+                 std::uint64_t sink_op,
+                 bool whole_run,
+                 bool for_audit) {
     Scope sc;
+    // A window's output depends on every record before it, so an audit of a
+    // windowed job spans its whole lineage, through the restores the bundle
+    // records, back to a start with no state.
+    const WindowAnalysis analysis = analyse_window(b);
+    const bool lineage = analysis.windowed && (whole_run || for_audit);
+    if (analysis.windowed) {
+        if (analysis.semantics) {
+            sc.window = analysis.semantics;
+        } else {
+            sc.window_unsupported = analysis.unsupported;
+        }
+    }
+    whole_run = whole_run || lineage;
     sc.whole_run = whole_run;
+    if (b.find("job/manifest.json") == nullptr) {
+        sc.notes.push_back(
+            "the bundle holds no job graph (it was collected without --ha-dir, or after the job "
+            "ended), so that the job is record-wise is assumed, not read: a windowed job's audit "
+            "needs the graph");
+    }
     sc.job = b.job();
     sc.checkpoint = checkpoint != 0 ? checkpoint : b.checkpoint();
     const std::uint64_t n = sc.checkpoint;
@@ -1077,21 +1102,60 @@ Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_o
     };
 
     // Back from the checkpoint to the previous completed one, or to the start
-    // of the run: everything in between is what this checkpoint completed.
+    // of the run: everything in between is what this checkpoint completed. A
+    // lineage walk carries on through each restore the bundle records into the
+    // run that completed the restored checkpoint, until a run that began with
+    // no state.
     std::uint64_t epoch = n;
+    std::size_t segment = 0;  // runs walked back through, for the attempt check
+    std::map<std::uint64_t, std::size_t> segment_of;
+    const std::size_t walk_bound = whole_run ? kMaxLineageIntervals : kMaxIntervalsWalked;
+    std::optional<std::vector<cluster::RestoredRecord>> restores_seen;
     while (true) {
-        if (sc.epochs.size() >= kMaxIntervalsWalked) {
-            return gap("more than " + std::to_string(kMaxIntervalsWalked) +
-                       " intervals since the previous completed checkpoint");
+        if (sc.epochs.size() >= walk_bound) {
+            return gap("more than " + std::to_string(walk_bound) + " intervals " +
+                       (whole_run ? std::string{"since the run's start"}
+                                  : std::string{"since the previous completed checkpoint"}));
         }
         auto got = load_epoch(epoch);
         if (!got) {
             return sc;
         }
         sc.epochs.insert(sc.epochs.begin(), epoch);
+        segment_of[epoch] = segment;
         const std::uint64_t prev = got->front().previous_barrier;
         for (auto& e : *got) {
             sc.intervals.push_back(std::move(e));
+        }
+        if (prev == 0 && lineage) {
+            if (!restores_seen) {
+                try {
+                    restores_seen = recorded_restores(b);
+                } catch (const std::exception& e) {
+                    return gap(std::string{"the job's restore record cannot be read: "} + e.what());
+                }
+            }
+            const auto start = epoch_start(b, *restores_seen, epoch);
+            if (!start.known) {
+                return gap("the run that began at barrier " + std::to_string(epoch) +
+                               " cannot be placed in the job's lineage: " + start.reason,
+                           start.unsupported);
+            }
+            if (start.checkpoint > 0) {
+                if (!completed.contains(start.checkpoint)) {
+                    return gap("the run that began at barrier " + std::to_string(epoch) +
+                               " restored from checkpoint " + std::to_string(start.checkpoint) +
+                               ", which the bundle does not hold: the history a window's result "
+                               "depends on is not all in it");
+                }
+                sc.restores.insert(sc.restores.begin(), LineageRestore{start.checkpoint, epoch});
+                sc.notes.push_back("the run that began at barrier " + std::to_string(epoch) +
+                                   " restored from checkpoint " + std::to_string(start.checkpoint) +
+                                   "; the lineage carries on through the run that completed it");
+                ++segment;
+                epoch = start.checkpoint;
+                continue;
+            }
         }
         if (prev == 0) {
             sc.starts_at_run_start = true;
@@ -1157,15 +1221,17 @@ Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_o
         return gap("the evidence names no columns the sink wrote");
     }
 
-    // One runner attempt per sink subtask across the scope: the walk follows
-    // one run's barriers, so another attempt here means mixed evidence.
+    // One runner attempt per sink subtask across each run the scope walks: the
+    // walk follows one run's barriers, so another attempt there means mixed
+    // evidence.
     {
-        std::map<std::uint64_t, std::string> attempt_of;
+        std::map<std::pair<std::size_t, std::uint64_t>, std::string> attempt_of;
         for (const auto& e : sc.intervals) {
-            const auto [it, fresh] = attempt_of.emplace(e.sink_subtask, e.attempt);
+            const auto [it, fresh] =
+                attempt_of.emplace(std::pair{segment_of[e.epoch], e.sink_subtask}, e.attempt);
             if (!fresh && it->second != e.attempt) {
                 return gap("sink subtask " + std::to_string(e.sink_subtask) +
-                           "'s intervals in the scope come from two runner attempts (" +
+                           "'s intervals in one run of the scope come from two runner attempts (" +
                            it->second + ", " + e.attempt + ")");
             }
         }
@@ -1247,6 +1313,7 @@ Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_o
                     canon_expected(it == obj.end() ? config::JsonValue{} : it->second, col.type));
             }
             sc.expected.push_back(std::move(row));
+            sc.expected_epochs.push_back(e.epoch);
         }
     }
     if (ledger_whole && ledger_rows != sc.expected.size()) {
@@ -1333,6 +1400,83 @@ Scope load_scope(const Bundle& b, std::uint64_t checkpoint, std::uint64_t sink_o
         sc.source.notes.push_back(
             "the bounding checkpoints record no log for the sources' positions (their topic, "
             "cluster and topic ids): a release before identities were recorded took them");
+    }
+    // A windowed lineage: every completed checkpoint it passes, with where the
+    // source stood (from that checkpoint's own snapshots) and the watermark
+    // the sink had at its barrier, the least over its subtasks.
+    if (lineage) {
+        for (const auto ep : sc.epochs) {
+            if (!completed.contains(ep)) {
+                continue;
+            }
+            LineageCheckpoint lc;
+            lc.checkpoint = ep;
+            std::map<std::pair<std::uint64_t, std::int32_t>, std::int64_t> pos;
+            if (ep == sc.checkpoint) {
+                pos = to;
+            } else {
+                bool whole = false;
+                std::map<std::uint64_t, SourceLog> logs;
+                std::vector<std::string> notes;
+                pos = kafka_positions(b, ep, whole, notes, logs);
+                if (!whole || pos.empty()) {
+                    return gap("checkpoint " + std::to_string(ep) +
+                               "'s snapshots are not all in the bundle, so where the source "
+                               "stood at it in the lineage is not known (collect with "
+                               "--include-state)");
+                }
+                for (const auto& [op, log] : logs) {
+                    const auto it = logs_to.find(op);
+                    if (it == logs_to.end() || !(it->second == log)) {
+                        return gap("checkpoint " + std::to_string(ep) + " records " +
+                                   describe_log(log) + " for the source (operator " +
+                                   std::to_string(op) + "), and checkpoint " +
+                                   std::to_string(sc.checkpoint) +
+                                   (it == logs_to.end() ? std::string{" none"}
+                                                        : " " + describe_log(it->second)) +
+                                   ": the lineage's positions are not of one log");
+                    }
+                }
+            }
+            for (const auto& [k, offset] : pos) {
+                lc.positions.push_back(SourceRange{k.first, k.second, std::nullopt, offset});
+            }
+            bool every = true;
+            for (const auto& e : sc.intervals) {
+                if (e.epoch != ep) {
+                    continue;
+                }
+                if (!e.watermark_ms) {
+                    every = false;
+                } else if (!lc.watermark_ms || *e.watermark_ms < *lc.watermark_ms) {
+                    lc.watermark_ms = e.watermark_ms;
+                }
+            }
+            if (!every) {
+                lc.watermark_ms.reset();
+            }
+            sc.lineage.push_back(std::move(lc));
+        }
+        // One partition per source subtask: a subtask reading several takes
+        // the least of only those it has read from so far, so the order of
+        // its first fetches decides which records are late.
+        if (sc.window) {
+            std::set<std::pair<std::uint64_t, std::int32_t>> partitions;
+            for (const auto& [k, _] : to) {
+                partitions.insert(k);
+            }
+            if (partitions.size() != sc.window->source_parallelism) {
+                sc.window_unsupported =
+                    "the source reads " + std::to_string(partitions.size()) +
+                    " partition(s) with " + std::to_string(sc.window->source_parallelism) +
+                    " subtask(s): a source subtask's watermark is the least over the partitions "
+                    "it has read from so far, so with several partitions to a subtask the order "
+                    "of its first fetches decides which records are late, and with none a "
+                    "subtask holds every window open; the audit needs one partition per source "
+                    "subtask";
+                sc.window.reset();
+            }
+        }
     }
     if (b.manifest.contains("delivery")) {
         sc.delivery = b.manifest.at("delivery");
@@ -1572,6 +1716,268 @@ std::string key_text(const Row& key,
 
 namespace {
 
+// ---- the windows of an audit -------------------------------------------------------
+//
+// A window's row is owed once the watermark passes its end plus the allowed
+// lateness. The recorded evidence of that is the watermark the sink had at
+// each barrier (the least over its subtasks): a window operator forwards a
+// watermark after firing what it closes, and with aligned checkpoints it has
+// processed everything before a barrier, on every input, before the barrier
+// passes. The source's records bound the same watermark from above: at a
+// checkpoint, no partition can have advanced it past its greatest event time
+// before its position, less the lag. The reference computes that bound
+// independently; these checks hold the recorded evidence to it.
+
+struct WindowJudgement {
+    Check semantics = make_check("reference.semantics");
+    Check watermark = make_check("reference.watermark");
+    Check finality = make_check("reference.finality");
+    std::set<std::string> undetermined;  // identity keys: compared nowhere
+    std::set<std::string> open;          // identity keys: owed nothing yet
+    std::vector<Row> captured;           // the captured rows the reference is compared with
+    WindowAudit audit;
+};
+
+std::string cells_key(const Row& cells) {
+    std::string k;
+    for (const auto& c : cells) {
+        k += std::to_string(c.size());
+        k += ':';
+        k += c;
+    }
+    return k;
+}
+
+std::optional<std::int64_t> integer_cell(const std::string& cell) {
+    if (cell.size() < 2 || cell.front() != 'I') {
+        return std::nullopt;
+    }
+    return as_i64(std::string_view{cell}.substr(1));
+}
+
+std::string ms_text(const std::optional<std::int64_t>& v) {
+    return v ? std::to_string(*v) + " ms" : std::string{"none"};
+}
+
+WindowJudgement judge_windows(const Scope& sc,
+                              const Reference& ref,
+                              const std::vector<std::size_t>& key,
+                              const config::JsonValue& document) {
+    WindowJudgement j;
+    const WindowSemantics& w = *sc.window;
+    WindowAudit& a = j.audit;
+    a.final_windows = ref.rows.size();
+    a.reference_semantics = ref.semantics ? *ref.semantics : config::JsonValue{};
+    a.records = ref.records;
+
+    // The rules.
+    a.semantics_differences = semantics_differences(
+        document.at("transform"), ref.semantics ? *ref.semantics : config::JsonValue{});
+    j.semantics.evidence = {"job/manifest.json", ref.path};
+    if (a.semantics_differences.empty()) {
+        j.semantics.verdict = Verdict::Passed;
+        j.semantics.reason =
+            "the reference implements the job's window rules: tumbling windows of " +
+            std::to_string(w.size_ms) + " ms on " + w.time_column +
+            ", the per-partition watermark " + std::to_string(w.lag_ms) +
+            " ms behind, an allowed lateness of " + std::to_string(w.allowed_lateness_ms) +
+            " ms, late records dropped";
+    } else {
+        j.semantics.verdict = Verdict::Failed;
+        j.semantics.reason =
+            "the job's window rules are not the reference's: " + a.semantics_differences.front();
+        j.semantics.details = a.semantics_differences;
+        j.semantics.next_action =
+            "correct the job's window or source options, or the reference's specification";
+    }
+
+    // The windows left out.
+    for (const auto& x : ref.windows) {
+        (x.status == "open" ? j.open : j.undetermined).insert(cells_key(x.identity));
+    }
+    a.open_windows = j.open.size();
+    a.undetermined_windows = j.undetermined.size();
+
+    // The watermark: recorded against the source's bound at every lineage
+    // checkpoint, and every window the sink received closed by the bound at
+    // the checkpoint after it.
+    std::map<std::uint64_t, std::optional<std::int64_t>> bound;
+    for (const auto& b : ref.source_bounds) {
+        bound[b.checkpoint] = b.watermark_ms;
+    }
+    std::vector<std::string> ahead;  // recorded watermarks past the source's bound
+    std::uint64_t early = 0;         // windows received before the bound let them close
+    std::size_t equal = 0;
+    for (const auto& lc : sc.lineage) {
+        const auto sb = bound.contains(lc.checkpoint) ? bound.at(lc.checkpoint) : std::nullopt;
+        a.watermarks.push_back(WindowAudit::Mark{lc.checkpoint, lc.watermark_ms, sb});
+        if (lc.watermark_ms && !sb) {
+            ahead.push_back("at checkpoint " + std::to_string(lc.checkpoint) +
+                            " the sink recorded a watermark of " + ms_text(lc.watermark_ms) +
+                            " while a partition had delivered nothing, so the source's records "
+                            "allow none");
+        } else if (lc.watermark_ms && *lc.watermark_ms > *sb) {
+            ahead.push_back("at checkpoint " + std::to_string(lc.checkpoint) +
+                            " the sink's recorded watermark was " + ms_text(lc.watermark_ms) +
+                            ", past the " + ms_text(sb) + " the source's records allow");
+        }
+        equal += lc.watermark_ms == sb ? 1 : 0;
+    }
+    std::size_t end_at = sc.columns.size();
+    for (std::size_t i = 0; i < sc.columns.size(); ++i) {
+        if (sc.columns[i].name == w.end_column) {
+            end_at = i;
+        }
+    }
+    const auto bound_after =
+        [&](std::uint64_t epoch) -> std::optional<std::optional<std::int64_t>> {
+        for (const auto& lc : sc.lineage) {
+            if (lc.checkpoint >= epoch) {
+                return bound.contains(lc.checkpoint) ? bound.at(lc.checkpoint) : std::nullopt;
+            }
+        }
+        return std::nullopt;
+    };
+    for (std::size_t i = 0; i < sc.expected.size(); ++i) {
+        const Row& row = sc.expected[i];
+        const std::string k = key_of(row, key);
+        const auto end = end_at < row.size() ? integer_cell(row[end_at]) : std::nullopt;
+        const std::uint64_t epoch = i < sc.expected_epochs.size() ? sc.expected_epochs[i] : 0;
+        const auto sb = bound_after(epoch);
+        if (!end || !sb || !*sb || *end + w.allowed_lateness_ms > **sb) {
+            if (a.early.size() < 20) {
+                a.early.push_back(
+                    "window " + key_text(key_cells(row, key), key, sc.columns) +
+                    " was received in the interval ending at barrier " + std::to_string(epoch) +
+                    ", and the watermark the source's records allow by the checkpoint after it " +
+                    "is " + (sb ? ms_text(*sb) : std::string{"not known"}) + ", short of its end " +
+                    (end ? std::to_string(*end) : std::string{"(unreadable)"}) +
+                    " plus the allowed lateness " + std::to_string(w.allowed_lateness_ms) + " ms");
+            }
+            ++early;
+        }
+        if (j.undetermined.contains(k)) {
+            ++a.captured_left_out;
+        } else if (!j.open.contains(k)) {
+            j.captured.push_back(row);
+        }
+    }
+    j.watermark.evidence = {ref.path};
+    j.watermark.counts = {{"checkpoints", sc.lineage.size()},
+                          {"equal_to_bound", equal},
+                          {"windows_received", sc.expected.size()},
+                          {"closed_early", early}};
+    if (j.semantics.verdict != Verdict::Passed) {
+        j.watermark.verdict = Verdict::Unavailable;
+        j.watermark.reason =
+            "not checked: the reference computes the source's bound under other window rules than "
+            "the job declares (reference.semantics)";
+    } else if (!ahead.empty() || early > 0) {
+        j.watermark.verdict = Verdict::Failed;
+        j.watermark.reason = "the job's watermark ran ahead of what the source's records allow: " +
+                             (ahead.empty() ? a.early.front() : ahead.front());
+        if (early > 0) {
+            ahead.push_back(std::to_string(early) +
+                            " window row(s) were received before the source's records let them "
+                            "close");
+        }
+        for (const auto& e : ahead) {
+            j.watermark.details.push_back(e);
+        }
+        for (const auto& e : a.early) {
+            j.watermark.details.push_back(e);
+        }
+        j.watermark.next_action =
+            "inspect the watermark the job assigned: a window that closes early holds part of its "
+            "records, and the rest are dropped as late";
+    } else {
+        j.watermark.verdict = Verdict::Passed;
+        j.watermark.reason =
+            "at each of the lineage's " + std::to_string(sc.lineage.size()) +
+            " checkpoint(s) the sink's recorded watermark is within what the source's records "
+            "allow (equal at " +
+            std::to_string(equal) + "), and each of the " + std::to_string(sc.expected.size()) +
+            " window row(s) the sink received had closed by the watermark the source allowed at "
+            "the checkpoint after it";
+    }
+
+    // Finality: every window the reference computed is decided, and every row
+    // it gives is of a window the recorded watermark had closed.
+    const std::optional<std::int64_t> final_wm =
+        sc.lineage.empty() ? std::nullopt : sc.lineage.back().watermark_ms;
+    std::uint64_t not_final = 0;
+    std::string first_not_final;
+    for (const auto& row : ref.rows) {
+        const auto end = end_at < row.size() ? integer_cell(row[end_at]) : std::nullopt;
+        if (!end || !final_wm || *end + w.allowed_lateness_ms > *final_wm) {
+            if (not_final++ == 0) {
+                first_not_final = key_text(key_cells(row, key), key, sc.columns);
+            }
+        }
+    }
+    // A window left out as open is owed nothing only if the recorded
+    // watermark had not closed it: one it had closed would be hidden from the
+    // comparison.
+    std::uint64_t not_open = 0;
+    std::string first_not_open;
+    for (const auto& x : ref.windows) {
+        if (x.status == "open" && final_wm && x.end_ms + w.allowed_lateness_ms <= *final_wm) {
+            if (not_open++ == 0) {
+                first_not_open = key_text(x.identity, key, sc.columns);
+            }
+        }
+    }
+    j.finality.evidence = {ref.path};
+    j.finality.counts = {{"final", ref.rows.size()},
+                         {"open", a.open_windows},
+                         {"undetermined", a.undetermined_windows},
+                         {"captured_left_out", a.captured_left_out}};
+    if (not_open > 0) {
+        j.finality.verdict = Verdict::Failed;
+        j.finality.reason = "the reference leaves out as open " + std::to_string(not_open) +
+                            " window(s) the recorded watermark at checkpoint " +
+                            std::to_string(sc.checkpoint) + " (" + ms_text(final_wm) +
+                            ") had closed, such as " + first_not_open +
+                            ", which keeps them from being compared";
+        j.finality.next_action =
+            "a window is open only while the recorded watermark is short of its end plus the "
+            "allowed lateness; correct the reference";
+    } else if (not_final > 0) {
+        j.finality.verdict = Verdict::Failed;
+        j.finality.reason = "the reference gives " + std::to_string(not_final) +
+                            " row(s) for windows the recorded watermark at checkpoint " +
+                            std::to_string(sc.checkpoint) + " (" + ms_text(final_wm) +
+                            ") had not closed, such as " + first_not_final;
+        j.finality.next_action =
+            "a window is final at a checkpoint only once the watermark recorded there passes its "
+            "end plus the allowed lateness; correct the reference";
+    } else if (!ref.windows.empty() && a.undetermined_windows > 0) {
+        j.finality.verdict = Verdict::Unavailable;
+        std::string why;
+        for (const auto& x : ref.windows) {
+            if (x.status == "undetermined") {
+                why = x.why;
+                break;
+            }
+        }
+        j.finality.reason = std::to_string(a.undetermined_windows) +
+                            " window(s) are left out undecided, so the scope's windows are not all "
+                            "compared: " +
+                            why;
+        j.finality.next_action =
+            "audit a checkpoint where the evidence decides every window, or read the windows left "
+            "out in the reference";
+    } else {
+        j.finality.verdict = Verdict::Passed;
+        j.finality.reason =
+            "every window the reference computed from the scope's records is decided: " +
+            std::to_string(ref.rows.size()) + " final by the watermark recorded at checkpoint " +
+            std::to_string(sc.checkpoint) + " (" + ms_text(final_wm) + "), " +
+            std::to_string(a.open_windows) + " open and owed nothing yet";
+    }
+    return j;
+}
+
 // destination.coverage: the table read whole against the expected rows (the
 // reference's when there is one, the captured input's otherwise). Established
 // only for a scope that spans a run begun with no state, whose sink the bundle
@@ -1585,6 +1991,7 @@ void audit_whole_table(const Bundle& b,
                        Destination& dest,
                        const Options& o,
                        const std::vector<Row>* reference,
+                       const std::set<std::string>* left_out,
                        const std::vector<std::string>& unsettled,
                        Check& check,
                        Report& r) {
@@ -1667,6 +2074,27 @@ void audit_whole_table(const Bundle& b,
             return;
         }
         r.coverage.table_rows_read = all.size();
+        // Rows of windows the reference leaves undecided are not compared.
+        if (left_out != nullptr && !left_out->empty()) {
+            std::vector<Row> kept;
+            std::uint64_t dropped = 0;
+            for (auto& row : all) {
+                if (left_out->contains(key_of(row, key))) {
+                    ++dropped;
+                } else {
+                    kept.push_back(std::move(row));
+                }
+            }
+            all = std::move(kept);
+            if (r.window_audit) {
+                r.window_audit->destination_left_out = dropped;
+            }
+            if (dropped > 0) {
+                check.details.push_back(std::to_string(dropped) +
+                                        " row(s) of windows the reference leaves undecided were "
+                                        "read and not compared");
+            }
+        }
         const std::vector<Row>& want = reference != nullptr ? *reference : sc.expected;
         const std::string whose = reference != nullptr ? "the reference's" : "the captured input's";
         Comparison t = compare_multiset(want, key, all, all, o.list_limit);
@@ -1754,11 +2182,22 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
     Check ref_capture_check = make_check("reference.capture");
     Check ref_dest_check = make_check("reference.destination");
     Check coverage_check = make_check("destination.coverage");
+    // A windowed job's audit adds three: its window rules, its watermark and
+    // the windows' finality.
+    Check ref_semantics_check = make_check("reference.semantics");
+    Check ref_watermark_check = make_check("reference.watermark");
+    Check ref_finality_check = make_check("reference.finality");
+    bool window_checks = false;
     r.coverage.mode = complete_table ? "complete-table" : "selected-keys";
     const auto finish = [&]() -> Report& {
         std::vector<Check*> order{&scope_check};
         if (auditing) {
             order.push_back(&ref_scope_check);
+            if (window_checks) {
+                order.push_back(&ref_semantics_check);
+                order.push_back(&ref_watermark_check);
+                order.push_back(&ref_finality_check);
+            }
             order.push_back(&ref_capture_check);
         }
         order.push_back(&dest_check);
@@ -1794,7 +2233,22 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
             if (c.verdict != Verdict::Failed) {
                 continue;
             }
-            if (c.id == "reference.capture") {
+            if (c.id == "reference.semantics") {
+                r.findings.push_back(Finding{"transformation",
+                                             "the job's window rules are not the ones the "
+                                             "reference implements: " +
+                                                 c.reason.substr(c.reason.find(": ") + 2)});
+            } else if (c.id == "reference.watermark") {
+                r.findings.push_back(Finding{
+                    "transformation",
+                    "the job's watermark ran ahead of what the source's records allow, so windows "
+                    "closed before all their records could arrive"});
+            } else if (c.id == "reference.finality") {
+                r.findings.push_back(
+                    Finding{"transformation",
+                            "the reference and the recorded watermark disagree on which windows "
+                            "are final: the reference is wrong"});
+            } else if (c.id == "reference.capture") {
                 r.findings.push_back(Finding{
                     "transformation",
                     "the job's sink received other rows than the independent reference computes "
@@ -1831,20 +2285,43 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
         return finish();
     }
     try {
-        r.scope = load_scope(b, o.checkpoint, o.sink_op, o.from_run_start || complete_table);
+        r.scope = load_scope(b,
+                             o.checkpoint,
+                             o.sink_op,
+                             o.from_run_start || complete_table,
+                             auditing || complete_table);
     } catch (const ScopeRefused& e) {
         r.refused = e.what();
         return r;
     }
     const Scope& sc = r.scope;
+    window_checks = auditing && sc.window.has_value();
 
-    // The key: columns the sink wrote, of a type a key can be read by.
+    // The key: columns the sink wrote, of a type a key can be read by. A
+    // window's row is identified by its group key and its bounds.
     std::vector<std::size_t> key;
-    if (o.key.empty()) {
+    std::vector<std::string> key_names = o.key;
+    if (sc.window) {
+        const std::set<std::string> want(sc.window->identity.begin(), sc.window->identity.end());
+        const std::set<std::string> given(o.key.begin(), o.key.end());
+        if (!o.key.empty() && given != want) {
+            std::string id;
+            for (const auto& c : sc.window->identity) {
+                id += (id.empty() ? "" : ",") + c;
+            }
+            r.refused = "--key names other columns than the window's identity (" + id +
+                        "): a windowed job's row is identified by its group key and the window's "
+                        "start and end";
+            return r;
+        }
+        key_names = sc.window->identity;
+        r.key = key_names;
+    }
+    if (key_names.empty()) {
         r.refused = "--key is required: the columns that identify one row the job writes";
         return r;
     }
-    for (const auto& name : o.key) {
+    for (const auto& name : key_names) {
         std::size_t idx = sc.columns.size();
         for (std::size_t i = 0; i < sc.columns.size(); ++i) {
             if (sc.columns[i].name == name) {
@@ -1894,10 +2371,13 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
         scope_check.next_action =
             sc.gap_unsupported ? "" : "collect the bundle again with the evidence named";
     } else {
+        // A window is owed once, so a window's identity received twice is the
+        // transformation's fault, which the comparisons count; a record-wise
+        // key received twice cannot pair rows at all.
         std::set<std::string> seen;
         std::string dup;
         for (const auto& row : sc.expected) {
-            if (!seen.insert(key_of(row, key)).second && dup.empty()) {
+            if (!seen.insert(key_of(row, key)).second && dup.empty() && !sc.window) {
                 dup = key_text(key_cells(row, key), key, sc.columns);
             }
         }
@@ -1920,13 +2400,21 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
     // The reference: bound to this scope, whole, and complete by its own
     // account, or refused. Nothing it names is run or read.
     std::optional<Reference> ref;
+    std::optional<WindowJudgement> wj;
     if (auditing) {
         r.reference_path = o.reference;
         r.assumptions.push_back(
             "the reference implementation computes the transformation independently of the job: "
             "the audit establishes that the artifact is whole and bound to this scope, not who "
             "wrote it or how");
-        if (sc.columns.empty()) {
+        if (sc.window_unsupported) {
+            ref_scope_check.verdict = Verdict::Unsupported;
+            ref_scope_check.reason =
+                "the job keeps state across records in a form the audit does not support: " +
+                *sc.window_unsupported;
+            ref_scope_check.next_action =
+                "check the delivery alone, with incident-reconcile and no reference";
+        } else if (sc.columns.empty()) {
             ref_scope_check.reason =
                 "not read: the scope names no columns, so the reference has nothing to be bound to";
         } else {
@@ -1985,9 +2473,29 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
                     std::to_string(ref->rows.size()) + " row(s) from " + ref->implementation;
             }
         }
+        if (window_checks && ref_scope_check.verdict == Verdict::Passed &&
+            scope_check.verdict == Verdict::Passed) {
+            wj = judge_windows(sc, *ref, key, *r.scope_document);
+            ref_semantics_check = wj->semantics;
+            ref_watermark_check = wj->watermark;
+            ref_finality_check = wj->finality;
+            r.window_audit = wj->audit;
+        } else if (window_checks) {
+            for (Check* c : {&ref_semantics_check, &ref_watermark_check, &ref_finality_check}) {
+                c->verdict = ref_scope_check.verdict == Verdict::Unsupported ||
+                                     scope_check.verdict == Verdict::Unsupported
+                                 ? Verdict::Unsupported
+                                 : Verdict::Unavailable;
+                c->reason = "not run: the scope or the reference could not be established";
+            }
+        }
         if (ref_scope_check.verdict == Verdict::Passed && scope_check.verdict == Verdict::Passed) {
-            Comparison rc =
-                compare_multiset(ref->rows, key, sc.expected, sc.expected, o.list_limit);
+            // A windowed job's capture is compared without the windows the
+            // reference leaves out: open ones are owed nothing yet (one
+            // received is reference.watermark's), undetermined ones are not
+            // decided.
+            const std::vector<Row>& captured = wj ? wj->captured : sc.expected;
+            Comparison rc = compare_multiset(ref->rows, key, captured, captured, o.list_limit);
             ref_capture_check.counts = {{"expected", rc.expected_rows},
                                         {"observed", rc.observed_rows},
                                         {"matched", rc.matched},
@@ -2018,6 +2526,14 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
                     "the sink received exactly the " + std::to_string(rc.expected_rows) +
                     " row(s) the reference computes from the scope's source range, value for "
                     "value and copy for copy";
+            }
+            if (wj) {
+                ref_capture_check.details.push_back(
+                    "compared over the reference's " + std::to_string(wj->audit.final_windows) +
+                    " final window(s); " + std::to_string(wj->audit.open_windows) + " open and " +
+                    std::to_string(wj->audit.undetermined_windows) +
+                    " undetermined window(s) left out, the sink having received " +
+                    std::to_string(wj->audit.captured_left_out) + " row(s) of undetermined ones");
             }
             r.reference_capture = std::move(rc);
         } else if (ref_capture_check.reason.empty()) {
@@ -2258,14 +2774,27 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
         }
         return out;
     };
-    Comparison c = compare(sc.expected, key, of_capture(first), of_capture(second), o.list_limit);
+    // A windowed job's identities are compared as multisets: a window the job
+    // emitted twice is counted, not refused.
+    Comparison c =
+        sc.window ? compare_multiset(
+                        sc.expected, key, of_capture(first), of_capture(second), o.list_limit)
+                  : compare(sc.expected, key, of_capture(first), of_capture(second), o.list_limit);
     const bool empty_scope = sc.expected.empty();
 
     // The whole table, when the operator declares it holds this one bounded
     // run's writes and nothing else.
     if (complete_table) {
-        audit_whole_table(
-            b, sc, key, dest, o, ref_usable ? &ref->rows : nullptr, unsettled, coverage_check, r);
+        audit_whole_table(b,
+                          sc,
+                          key,
+                          dest,
+                          o,
+                          ref_usable ? &ref->rows : nullptr,
+                          wj ? &wj->undetermined : nullptr,
+                          unsettled,
+                          coverage_check,
+                          r);
     }
     rows_check.counts = {{"expected", c.expected_rows},
                          {"observed", c.observed_rows},
@@ -2308,7 +2837,16 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
                     ": rows the discarded run wrote after it were written again by the restored "
                     "run, which at-least-once delivery allows");
             }
-            if (rs.fresh_rows == 0 && !(sc.starts_at_run_start && sc.starts_after > 0)) {
+            for (const auto& rs_ : sc.restores) {
+                rows_check.details.push_back(
+                    "the lineage passes the restore from checkpoint " +
+                    std::to_string(rs_.restored_from) + " (the run numbering from barrier " +
+                    std::to_string(rs_.first_epoch) +
+                    "): rows the discarded run wrote after that checkpoint were written again by "
+                    "the restored run, which at-least-once delivery allows");
+            }
+            if (rs.fresh_rows == 0 && !(sc.starts_at_run_start && sc.starts_after > 0) &&
+                sc.restores.empty()) {
                 rows_check.details.push_back(
                     "the evidence records no resend in doubt and no restore that would explain "
                     "them");
@@ -2371,7 +2909,23 @@ Report run(const fs::path& bundle_dir, const DestinationFactory& open, const Opt
                                          : Verdict::Unavailable;
             ref_dest_check.reason = "not compared: the reference could not be established";
         } else {
-            Comparison rd = compare_multiset(ref->rows, key, first, second, o.list_limit);
+            // Without the windows the reference leaves out: an open window's
+            // rows are owed nothing yet, an undetermined one's are not decided.
+            const auto decided = [&](const std::vector<Row>& rows) {
+                if (!wj) {
+                    return rows;
+                }
+                std::vector<Row> out;
+                for (const auto& row : rows) {
+                    const auto k = key_of(row, key);
+                    if (!wj->undetermined.contains(k) && !wj->open.contains(k)) {
+                        out.push_back(row);
+                    }
+                }
+                return out;
+            };
+            Comparison rd =
+                compare_multiset(ref->rows, key, decided(first), decided(second), o.list_limit);
             ref_dest_check.counts = {{"expected", rd.expected_rows},
                                      {"observed", rd.observed_rows},
                                      {"matched", rd.matched},
@@ -2533,6 +3087,22 @@ std::string Report::render_text() const {
             out << "\n";
         }
     }
+    if (scope.window) {
+        const auto& w = *scope.window;
+        out << "window:      tumbling, " << w.size_ms << " ms on " << w.time_column
+            << "; watermark " << w.lag_ms << " ms behind the least partition maximum, no "
+            << "idleness; allowed lateness " << w.allowed_lateness_ms
+            << " ms, later records dropped\n";
+        out << "lineage:     " << scope.lineage.size() << " completed checkpoint(s) from a start "
+            << "with no state";
+        for (const auto& rs : scope.restores) {
+            out << "; restored from checkpoint " << rs.restored_from << " at barrier "
+                << rs.first_epoch;
+        }
+        out << "\n";
+    } else if (scope.window_unsupported) {
+        out << "window:      not supported: " << *scope.window_unsupported << "\n";
+    }
     out << "\n";
     for (const auto& c : checks) {
         out << "[" << to_string(c.verdict) << "] " << c.id << "\n    " << c.reason << "\n";
@@ -2594,6 +3164,30 @@ std::string Report::render_text() const {
         out << "\nfindings:\n";
         for (const auto& f : findings) {
             out << "  " << f.relationship << ": " << f.summary << "\n";
+        }
+    }
+    if (window_audit) {
+        const auto& wa = *window_audit;
+        out << "\nwindows:     " << wa.final_windows << " final, " << wa.open_windows << " open, "
+            << wa.undetermined_windows << " undetermined";
+        if (wa.captured_left_out + wa.destination_left_out > 0) {
+            out << "; left out: " << wa.captured_left_out << " captured row(s), "
+                << wa.destination_left_out << " table row(s)";
+        }
+        out << "\n";
+        const auto ms = [](const std::optional<std::int64_t>& v) {
+            return v ? std::to_string(*v) : std::string{"none"};
+        };
+        out << "watermarks:  recorded / allowed by the source, per lineage checkpoint\n";
+        const std::size_t n = wa.watermarks.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (n > 12 && i == 6) {
+                out << "             ... " << (n - 12) << " more\n";
+                i = n - 6;
+            }
+            const auto& m = wa.watermarks[i];
+            out << "             " << m.checkpoint << ": " << ms(m.recorded_ms) << " / "
+                << ms(m.source_bound_ms) << "\n";
         }
     }
     out << "\ncoverage:    " << coverage.mode << ", " << coverage.keys_selected
@@ -2755,6 +3349,36 @@ std::string Report::render_json() const {
     }
     src["identities"] = config::JsonValue{std::move(identities)};
     scope_o["source"] = config::JsonValue{std::move(src)};
+    if (scope.window) {
+        const auto& w = *scope.window;
+        config::JsonObject wj;
+        wj["kind"] = config::JsonValue{std::string{"tumbling-window"}};
+        wj["size_ms"] = config::JsonValue{w.size_ms};
+        wj["time_column"] = config::JsonValue{w.time_column};
+        wj["lag_ms"] = config::JsonValue{w.lag_ms};
+        wj["allowed_lateness_ms"] = config::JsonValue{w.allowed_lateness_ms};
+        config::JsonArray idj;
+        for (const auto& c : w.identity) {
+            idj.emplace_back(c);
+        }
+        wj["identity"] = config::JsonValue{std::move(idj)};
+        wj["source_parallelism"] =
+            config::JsonValue{static_cast<std::int64_t>(w.source_parallelism)};
+        wj["alignment"] = config::JsonValue{w.alignment};
+        scope_o["window"] = config::JsonValue{std::move(wj)};
+        config::JsonArray rsj;
+        for (const auto& rs : scope.restores) {
+            config::JsonObject x;
+            x["restored_from"] = config::JsonValue{static_cast<std::int64_t>(rs.restored_from)};
+            x["first_epoch"] = config::JsonValue{static_cast<std::int64_t>(rs.first_epoch)};
+            rsj.emplace_back(std::move(x));
+        }
+        scope_o["restores"] = config::JsonValue{std::move(rsj)};
+        scope_o["lineage_checkpoints"] =
+            config::JsonValue{static_cast<std::int64_t>(scope.lineage.size())};
+    } else if (scope.window_unsupported) {
+        scope_o["window_unsupported"] = config::JsonValue{*scope.window_unsupported};
+    }
     o["scope"] = config::JsonValue{std::move(scope_o)};
     o["delivery"] = scope.delivery;
 
@@ -2912,6 +3536,35 @@ std::string Report::render_json() const {
         }
         if (reference_destination) {
             a["reference_destination_discrepancies"] = listed_json(*reference_destination);
+        }
+        if (window_audit) {
+            const auto& wa = *window_audit;
+            const auto n64 = [](std::uint64_t v) {
+                return config::JsonValue{static_cast<std::int64_t>(v)};
+            };
+            const auto opt = [](const std::optional<std::int64_t>& v) {
+                return v ? config::JsonValue{*v} : config::JsonValue{};
+            };
+            config::JsonObject wj;
+            wj["final"] = n64(wa.final_windows);
+            wj["open"] = n64(wa.open_windows);
+            wj["undetermined"] = n64(wa.undetermined_windows);
+            wj["captured_left_out"] = n64(wa.captured_left_out);
+            wj["destination_left_out"] = n64(wa.destination_left_out);
+            wj["semantics_differences"] = strings(wa.semantics_differences);
+            wj["reference_semantics"] = wa.reference_semantics;
+            wj["closed_early"] = strings(wa.early);
+            wj["records"] = wa.records;
+            config::JsonArray marks;
+            for (const auto& m : wa.watermarks) {
+                config::JsonObject mj;
+                mj["checkpoint"] = n64(m.checkpoint);
+                mj["recorded_ms"] = opt(m.recorded_ms);
+                mj["source_bound_ms"] = opt(m.source_bound_ms);
+                marks.emplace_back(std::move(mj));
+            }
+            wj["watermarks"] = config::JsonValue{std::move(marks)};
+            a["window"] = config::JsonValue{std::move(wj)};
         }
         o["audit"] = config::JsonValue{std::move(a)};
     }

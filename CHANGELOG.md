@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+**Auditing windowed results.** The independent reference audit now covers a
+job of one keyed tumbling window (`COUNT` and exact `SUM`) from Kafka into
+ClickHouse. A window holds records from every earlier interval and is owed
+only once the watermark passes its end, so its scope is the job's whole
+lineage from a start with no state, through every restore the bundle records.
+The scope document (version 2) carries the window's rules from the job graph,
+each completed checkpoint's source positions, and the watermark the sink
+recorded at its barrier. Whether a record arrived after its window closed
+depends on the order the job read its partitions in, which offsets do not
+record. The audit decides it with bounds: from above by the source alone, and
+from below by the recorded watermark, with one partition per source subtask
+and aligned checkpoints. A record or window they cannot place is left out by
+name and the result is partial, never guessed. `python/clink-reference` adds
+`TumblingWindows`, which computes a windowed job's final windows from every
+record it reads, under the window rules the operator declares. Its artifact
+(version 2) lists the windows it leaves out and the watermark the source
+allows at each checkpoint. `clink incident-reconcile --reference` adds
+`reference.semantics`, the job's window rules against the reference's;
+`reference.watermark`, the recorded watermark never ahead of the source and no
+window closed early; and `reference.finality`, every window decided and every
+open one truly open. Recovery duplicates stay visible and are put down to the
+restore. Other windows, joins, aggregates, idleness, unaligned checkpoints and
+several partitions to a source subtask are refused by name. The Coordinator
+now persists a job's checkpoint alignment in its manifest: a bundle reads it,
+and a takeover no longer redeploys an unaligned or adaptive job aligned. The
+new `examples/window-audit/` runs it all against Kafka and ClickHouse, with
+jobs with a wrong time column, a wrong aggregate and a wrong lateness, which
+reconciliation passes and the audit fails.
+
 **An independent reference audit for the Kafka to ClickHouse pipeline.**
 Destination reconciliation compares the destination with the sink's own
 record of its input, so a transformation that computes the wrong rows, and

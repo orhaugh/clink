@@ -40,7 +40,7 @@ CH_PASSWORD=... clink incident-reconcile incident-1 --checkpoint=12 --key=event_
     --password-env=CH_PASSWORD
 ```
 
-`incident-collect` exits 0 when it published a bundle, 1 when it refused (and left nothing at `--out`), 2 on bad usage. `incident-verify` exits 0 when every check the profile requires passed, 1 when any check failed, 3 when none failed but a required check is unavailable or unsupported, and 2 on bad usage or a bundle the reader refuses. A partial result (3) is never reported as success. `incident-regress` exits 0 when the regression bundle is written and passes on this build, 1 when it refuses. `incident-reconcile` exits as `incident-verify` does, and 2 when the request does not fit the bundle, the destination is not the one its evidence names, or a reference artifact is malformed or bound to another scope. `incident-scope` exits 0 when it wrote the scope document, 3 when it wrote one whose evidence or source positions are not whole, and 2 on bad usage or a request the bundle does not fit.
+`incident-collect` exits 0 when it published a bundle, 1 when it refused (and left nothing at `--out`), 2 on bad usage. `incident-verify` exits 0 when every check the profile requires passed, 1 when any check failed, 3 when none failed but a required check is unavailable or unsupported, and 2 on bad usage or a bundle the reader refuses. A partial result (3) is never reported as success. `incident-regress` exits 0 when the regression bundle is written and passes on this build, 1 when it refuses. `incident-reconcile` exits as `incident-verify` does, and 2 when the request does not fit the bundle, the destination is not the one its evidence names, or a reference artifact is malformed or bound to another scope. `incident-scope` exits 0 when it wrote the scope document; 3 when the scope's evidence or source positions are not whole (it writes the document once the sink's columns are known), or when the job keeps state across records in a form the audit does not support (it writes nothing); and 2 on bad usage or a request the bundle does not fit.
 
 ## The bundle
 
@@ -301,6 +301,73 @@ Every comparison is of whole typed rows with their copies counted, under the can
 
 Two equal reads alone do not establish that a table was still. A shared or continuously written table keeps the selected-key comparison, and its completeness stays unavailable. An empty expected output does not pass by having nothing to compare: with selected keys no key is selected and the result is partial, and read whole it passes only when the table is empty.
 
+## Auditing windowed results
+
+A record-wise job's rows in a checkpoint's scope come from the records in that scope. A window's row does not. It holds records from any earlier interval, and it exists only once the watermark has passed its end. A record arriving after that is dropped, and whether one did depends on the order the job read its partitions in, which offsets do not record. The audit supports one windowed shape, for which it decides each of those questions from the source and the recorded evidence, and leaves out, by name, any it cannot decide.
+
+```bash
+# The scope of a windowed job is its lineage: from a start with no state to checkpoint 41.
+clink incident-scope incident-7 --checkpoint=41 --out=scope.json
+python3 reference_windows.py --scope=scope.json --bootstrap=kafka.internal:9092 \
+    --run-start-offset=ALL=0 --out=reference.ndjson
+# The key is the windows' identity, which the bundle names.
+CH_PASSWORD=... clink incident-reconcile incident-7 --checkpoint=41 --reference=reference.ndjson \
+    --coverage=complete-table --host=clickhouse.internal --user=reconciler --password-env=CH_PASSWORD
+```
+
+**The supported job.**
+
+| Part | Supported |
+| --- | --- |
+| Source | One Kafka SQL table, read one partition per source subtask: the source's parallelism equals the topic's partitions. |
+| Event time | An integer column of epoch milliseconds, the source table's `event_time_column`. |
+| Watermark | `watermark_lag_ms`, and no `idle_timeout_ms`. Each partition's greatest event time so far, the least of those over the partitions, less the lag. It is assigned to every record the source delivers, before any filter. |
+| Transformation | Record-wise filters and projections, the time column passed through unchanged. |
+| Window | One keyed `TUMBLE`, with `COUNT` and `SUM` (not `DISTINCT`). A record at time t is in `[s, s + size)`, where `s = floor(t / size) * size`. |
+| Closing and lateness | A window closes once the watermark reaches its end plus `allowed_lateness_ms` (default 0); reaching it exactly closes it. A record for a window that has closed is dropped. `late_records_to_dlq` does not change the output. |
+| Output | The window's rows as the window computes them, into the ClickHouse native sink. A row's identity is its group key columns, `window_start` and `window_end`, which is the audit's key. |
+| Checkpoints | Aligned, as the job manifest records them (`alignment`, which the Coordinator persists). |
+
+Anything else is refused by name: `incident-scope` exits 3 without writing a scope, and an audit's reference checks are unsupported, while the delivery is still checked. That covers sliding, session and cumulating windows, joins, other aggregates, a filter after the window, idleness (which drops a quiet partition from the watermark after wall-clock time the records do not show), unaligned checkpoints, and several partitions to a source subtask. A subtask then takes the least over only the partitions it has read from, so its first fetches decide which records are late.
+
+**What decides a record's fate.** The window operator's watermark when a record arrives is bounded from above by the source alone, and from below by evidence:
+
+- *Its own partition.* With one partition per subtask, the watermark is at most the record's partition's greatest earlier event time, less the lag.
+- *The next barrier.* With aligned checkpoints, nothing past a barrier reaches the window operator before the barrier does. So when a record arrives, the watermark is at most the least, over partitions, of the greatest event time before the next checkpoint's positions, less the lag. The reference computes that bound at every checkpoint of the lineage (`source_bounds`).
+- *The previous barrier.* The window operator forwards a watermark after closing what it closes, and the sink records the last watermark it had at each barrier. The least over the sink's subtasks, at the checkpoint before the record, is a floor on the watermark when the record arrived.
+
+A record whose window closes above the upper bound was folded in. One whose window closes at or below the floor was dropped. Anything between is undetermined, and so is its window, which the reference lists as left out rather than guessing. A window is final at the audited checkpoint when its end plus the lateness is at or below the watermark the sink recorded there. It is open when above what the source allows there, and undetermined between the two. In the example's runs the recorded watermark equals the source's bound at every checkpoint, so the band is empty.
+
+**Recomputed and recorded.** The window's rules come from the job graph. The reference declares its own, its operator's specification, in the artifact's `semantics`, and does not read the job's. The recorded watermarks are the sink's interval evidence. The bounds are the reference's computation from the source. The audit holds each against the others:
+
+| Check | Passed means |
+| --- | --- |
+| `reference.semantics` | The job's window rules are the reference's: kind, size, time column, watermark strategy, lag and idleness, allowed lateness and late records. |
+| `reference.watermark` | At every completed checkpoint of the lineage, the watermark the sink recorded is no further on than the source's records allow. Every window row the sink received had closed by the bound at the checkpoint after it. A job whose watermark ran ahead, or that closed a window early, fails it. |
+| `reference.finality` | Every window the reference computed is decided. Every row it gives is of a window the recorded watermark had closed. Every window it leaves out as open is one the recorded watermark had not closed, so a reference cannot hide a window from the comparison by calling it open. An undetermined window makes it unavailable. |
+
+`reference.capture`, `reconcile.rows`, `reference.destination` and `destination.coverage` then compare as they do for a record-wise job, keyed by the windows' identity, with the windows the reference leaves out kept out of every comparison with the reference.
+
+**The scope and the artifact.** A windowed job's scope document is version 2. Its sources start at the job's own start, which its checkpoints do not record, so the reference is given the run's first offsets (`--run-start-offset`) and records them as the operator's. It adds:
+
+- `transform`: the window's rules as the job declares them;
+- `lineage`: the restores it passes and, at each completed checkpoint, the source's positions and the recorded watermark;
+- `finality`: the checkpoint and the watermark windows are final by.
+
+The lineage runs back through every restore the bundle records, its `RESTORED` record and its traces, into the run that completed the restored checkpoint, until a run that began with no state. A restored checkpoint the bundle does not hold, or an interval of the lineage missing from it, leaves the scope unavailable. The reference artifact for it is version 2 too:
+
+- its header's `semantics`;
+- a `window` line per window left out: its identity, whether open or undetermined, and why;
+- in its end line, the window lines' count and hash beside the rows', `source_bounds`, and an account of what became of every record: folded, dropped late, undetermined or filtered.
+
+[`python/clink-reference`](https://github.com/orhaugh/clink/tree/main/python/clink-reference) computes it (`TumblingWindows`) from the records it reads, with the window rules the operator declares (`WindowRules`) and the operator's own reading of each record.
+
+**Recovery.** The lineage holds what the surviving runs processed. A run the restore discarded may have written windows to the destination after the restored checkpoint. The restored run then writes them again, under fresh INSERTs, and the destination holds them twice. The comparisons count those copies, `reconcile.rows` and `reference.destination` fail with them, and the report puts them down to the restore. Nothing is collapsed with `DISTINCT` to make a run pass. A discarded run that decided an undetermined record otherwise leaves a changed row, and the report shows that too.
+
+**Coverage.** A selected-key read selects the identities of the reference's final windows and of the captured rows. `--coverage=complete-table` compares the whole table with the final windows, on the same conditions as for a record-wise job. Rows of undetermined windows are counted and left out, and a row of an open window, or of an identity neither side names, fails.
+
+**What a passing windowed audit establishes.** The job's declared window rules are the reference's. Its recorded watermark never ran ahead of what the source's records allowed, and no window closed early. Every window final at the audited checkpoint holds exactly the reference's value, computed outside the job from the job's whole lineage. That holds in the sink's captured input and in the destination for the identities read, or the whole table under `complete-table`, with copies counted. It establishes nothing about windows still open at the checkpoint, nor records after it. Like the record-wise audit, it is only as independent as the reference.
+
 ## What passing does not mean
 
 The digests establish that nothing in a bundle changed after it was collected. They do not establish who collected it: anyone who can replace the bundle can replace its manifest too, and signing is out of scope. A passing bundle is evidence about the files in it, checked by this build's readers. It is not a proof that the implementation is correct, that the job's business logic is right, or that any external system holds what the job wrote: nothing offline reads a destination. A passing reconciliation establishes one checkpoint's effects in one table at one observation time, against what the job's own sink received. It does not establish that the transformation is right, which the replay checks and an independent reference address, nor that the rows survive the server's host losing power, nor anything about the table after the read. A passing audit adds that the job's output, and the destination over the keys read, equal what a reference computed outside the job, from the same records. That is only as independent as the reference is, and the audit cannot establish that. With selected keys, it establishes nothing about rows of other keys.
@@ -327,7 +394,7 @@ Destination reconciliation does not support:
 - destinations other than the ClickHouse native sink into a plain `MergeTree`;
 - replicated, distributed or row-rewriting tables, and tables with a TTL;
 - column types beyond those above;
-- jobs that are not record-wise, where a key repeats;
+- jobs that are neither record-wise nor the windowed shape above: sliding, session and cumulating windows, joins, other aggregates, idleness, unaligned checkpoints, several partitions to a source subtask;
 - sinks of an embedded `clink run`, which the recorder does not record;
 - `system.query_log` as acknowledgement evidence.
 
@@ -341,6 +408,7 @@ Destination reconciliation does not support:
 | The commands | `tools/clink_incident.cpp`, with `tools/clink_incident_replay.cpp` or its SQL-off stub, and `tools/clink_incident_reconcile.cpp` or its stub without the ClickHouse connector |
 | Sink interval evidence | `include/clink/runtime/sink_evidence.hpp`, `src/runtime/sink_evidence.cpp`, the sink runner in `include/clink/runtime/dag.hpp`; the ClickHouse native sink's account in `impls/clickhouse/src/native/` |
 | Destination reconciliation | `include/clink/incident/reconcile.hpp`, `src/incident/reconcile.cpp`; the ClickHouse reader `impls/clickhouse/include/clink/clickhouse/reconcile_destination.hpp`, `impls/clickhouse/src/reconcile_destination.cpp` |
-| Tests | `tests/test_incident_bundle.cpp` (collection, the reader, the core checks), `tests/test_incident_replay.cpp` (replay on a real captured run), `tests/test_incident_reconcile.cpp` (the cells, the comparison, the sink's interval evidence, whole reconciliations), `impls/clickhouse/tests/test_reconcile_destination_live.cpp` (the reader against a real server, in `scripts/clickhouse-live.sh`), and the example `examples/destination-reconciliation/` |
+| The independent reference audit | `include/clink/incident/reference.hpp`, `src/incident/reference.cpp` (the scope document, the artifact's reader, the multiset comparison); a windowed job's shape and lineage in `src/incident/window_scope.cpp` and `load_scope`, its checks in `src/incident/reconcile.cpp`; the reference library `python/clink-reference/` (`windows.py` for windows) |
+| Tests | `tests/test_incident_bundle.cpp` (collection, the reader, the core checks), `tests/test_incident_replay.cpp` (replay on a real captured run), `tests/test_incident_reconcile.cpp` (the cells, the comparison, the sink's interval evidence, whole reconciliations, `ReconcileWindow.*` for windowed jobs), `impls/clickhouse/tests/test_reconcile_destination_live.cpp` (the reader against a real server, in `scripts/clickhouse-live.sh`), `python/clink-reference/tests/`, and the examples `examples/destination-reconciliation/` and `examples/window-audit/` |
 | The example and gate | `examples/incident-verification/`; `scripts/incident-gate.sh` runs both suites, requires every case to have run, then the example |
 | Network isolation, proven before verification relies on it | `scripts/network-isolation.sh`, tested by `scripts/tests/test_network_isolation.py` |

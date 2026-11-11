@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clink-reference"
-version = "0.1.0"
-description = "Compute an independent reference result for a clink checkpoint's scope: read its exact Kafka range, apply your own transformation, and write the artifact clink incident-reconcile --reference audits"
+version = "0.2.0"
+description = "Compute an independent reference result for a clink checkpoint's scope: read its exact Kafka range, apply your own transformation or tumbling window, and write the artifact clink incident-reconcile --reference audits"
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Ross Haugh", email = "orhaugh@gmail.com" }]

@@ -15,6 +15,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -27,6 +28,7 @@
 #include <sys/wait.h>
 
 #include "clink/checkpoint/checkpoint_coordinator.hpp"
+#include "clink/cluster/in_doubt_resolution.hpp"
 #include "clink/cluster/state_location.hpp"
 #include "clink/config/decimal.hpp"
 #include "clink/config/json.hpp"
@@ -692,14 +694,17 @@ protected:
                         const std::vector<std::string>& rows,
                         Mode mode = Mode::Written,
                         const std::string& destination = destination_json(),
-                        const std::string& resend = "") const {
+                        const std::string& resend = "",
+                        std::optional<std::int64_t> watermark = std::nullopt,
+                        const std::string& attempt = "00000000000000aa") const {
         const std::size_t capture_idx = 10 + sink_subtask;
         clink::capture::SinkIntervalHeader h;
         h.op = clink::OperatorId{kReconcileSink};
         h.subtask_idx = capture_idx;
         h.checkpoint = epoch;
         h.previous_barrier = prev;
-        h.attempt = "00000000000000aa";
+        h.attempt = attempt;
+        h.watermark_ms = watermark;
         h.records_seen = rows.size();
         h.records_stored = rows.size();
         h.truncated = mode == Mode::Truncated;
@@ -748,6 +753,9 @@ protected:
         o.capture_dir = cap.string();
         o.epochs = std::pair{from_epoch, to_epoch};
         o.out = (root / name).string();
+        if (fs::exists(root / "ha")) {
+            o.ha_dir = (root / "ha").string();
+        }
         return collect(o).bundle;
     }
 
@@ -1639,6 +1647,608 @@ TEST_F(ReconcileBundle, TheExpectationExportsAsCanonicalCells) {
     EXPECT_NE(nd.find(R"("amount":"D1050@2")"), std::string::npos) << nd;
     EXPECT_NE(nd.find(R"("note":"N")"), std::string::npos);
     EXPECT_EQ(std::count(nd.begin(), nd.end(), '\n'), 4);
+}
+
+// ---- windowed jobs ----------------------------------------------------------------
+//
+// A job of one keyed tumbling window: its scope is its lineage, with the
+// window's rules from the job graph and the watermark the sink recorded at
+// each barrier, and its audit holds that watermark to the bound the
+// reference computes from the source.
+
+// What a window job's graph varies by, for the refusals.
+struct WindowGraph {
+    std::string window_type{"tumbling_window_row"};
+    std::int64_t source_parallelism{2};
+    std::string idle_timeout_ms;
+    std::string alignment{"aligned"};  // empty: not recorded
+    bool filter_after_window{false};
+    std::string allowed_lateness_ms;
+};
+
+std::string window_graph_json(const WindowGraph& g) {
+    using clink::config::JsonArray;
+    using clink::config::JsonObject;
+    JsonArray ops;
+    const auto op = [&](const std::string& id,
+                        const std::string& type,
+                        const std::string& input,
+                        std::int64_t parallelism,
+                        JsonObject params) {
+        JsonObject o;
+        o["id"] = JsonValue{id};
+        o["type"] = JsonValue{type};
+        JsonArray in;
+        if (!input.empty()) {
+            in.emplace_back(input);
+        }
+        o["inputs"] = JsonValue{std::move(in)};
+        o["parallelism"] = JsonValue{parallelism};
+        o["params"] = JsonValue{std::move(params)};
+        ops.emplace_back(std::move(o));
+    };
+    const auto p = g.source_parallelism;
+    op("src_0",
+       "kafka_source_string",
+       "",
+       p,
+       JsonObject{{"topic", JsonValue{std::string{"events"}}}});
+    op("bridge_1", "json_string_to_row_columnar", "src_0", p, JsonObject{});
+    JsonObject ts{{"column", JsonValue{std::string{"ts"}}},
+                  {"out_of_order_ms", JsonValue{std::string{"2000"}}}};
+    if (!g.idle_timeout_ms.empty()) {
+        ts["idle_timeout_ms"] = JsonValue{g.idle_timeout_ms};
+    }
+    op("ts_2", "assign_timestamps_row", "bridge_1", p, std::move(ts));
+    op("proj_3",
+       "project_row",
+       "ts_2",
+       p,
+       JsonObject{
+           {"outputs",
+            JsonValue{std::string{
+                R"([{"expr":{"col":"account"},"name":"account"},{"expr":{"col":"ts"},"name":"ts"},)"
+                R"({"expr":{"col":"amount"},"name":"amount"}])"}}}});
+    op("key_4",
+       "row_compute_key",
+       "proj_3",
+       2,
+       JsonObject{{"columns", JsonValue{std::string{"account"}}}});
+    JsonObject win{
+        {"time_column", JsonValue{std::string{"ts"}}},
+        {"size_ms", JsonValue{std::string{"10000"}}},
+        {"group_keys", JsonValue{std::string{"account"}}},
+        {"group_key_outputs", JsonValue{std::string{"account"}}},
+        {"window_start_output", JsonValue{std::string{"window_start"}}},
+        {"window_end_output", JsonValue{std::string{"window_end"}}},
+        {"aggregates",
+         JsonValue{std::string{
+             R"([{"distinct":false,"fn":"count","input_column":"","name":"events"},)"
+             R"({"distinct":false,"fn":"sum","input_column":"amount","name":"net"}])"}}}};
+    if (!g.allowed_lateness_ms.empty()) {
+        win["allowed_lateness_ms"] = JsonValue{g.allowed_lateness_ms};
+    }
+    op("agg_5", g.window_type, "key_4", 2, std::move(win));
+    std::string into_bind = "agg_5";
+    if (g.filter_after_window) {
+        op("filt_6", "filter_row_predicate", "agg_5", 2, JsonObject{});
+        into_bind = "filt_6";
+    }
+    const JsonValue cols{std::string{"account,window_start,window_end,events,net"}};
+    op("sinkbind_7",
+       "row_bind_columns",
+       into_bind,
+       2,
+       JsonObject{{"select_columns", cols}, {"sink_columns", cols}});
+    op("snk_8", "clickhouse_native_sink", "sinkbind_7", 2, JsonObject{});
+    JsonObject graph{{"name", JsonValue{std::string{"windows"}}},
+                     {"ops", JsonValue{std::move(ops)}}};
+    return JsonValue{std::move(graph)}.serialize(0);
+}
+
+std::string window_destination_json() {
+    using clink::config::JsonArray;
+    using clink::config::JsonObject;
+    auto d = clink::config::parse(destination_json());
+    JsonArray columns;
+    for (const auto& [name, declared, target] :
+         std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"account", "VARCHAR", "String"},
+             {"window_start", "BIGINT", "Int64"},
+             {"window_end", "BIGINT", "Int64"},
+             {"events", "BIGINT", "Int64"},
+             {"net", "DECIMAL(38, 2)", "Decimal(38, 2)"}}) {
+        columns.emplace_back(JsonObject{{"name", JsonValue{name}},
+                                        {"declared", JsonValue{declared}},
+                                        {"target", JsonValue{target}}});
+    }
+    d.as_object()["columns"] = JsonValue{std::move(columns)};
+    return d.serialize(0);
+}
+
+// A window's row as the sink received it.
+std::string wrow(const std::string& account,
+                 std::int64_t start,
+                 std::int64_t events,
+                 const std::string& net) {
+    return R"({"account":")" + account + R"(","events":)" + std::to_string(events) +
+           R"(,"net":"\u0001)" + net + R"(","window_end":)" + std::to_string(start + 10000) +
+           R"(,"window_start":)" + std::to_string(start) + "}";
+}
+
+// The same row's canonical cells, in the sink's column order.
+Row wcells(const std::string& account,
+           std::int64_t start,
+           std::int64_t events,
+           std::int64_t cents) {
+    return {"S" + account,
+            "I" + std::to_string(start),
+            "I" + std::to_string(start + 10000),
+            "I" + std::to_string(events),
+            "D" + std::to_string(cents) + "@2"};
+}
+
+// The window rules a reference declares; the job graph's, unless changed.
+JsonValue window_semantics(std::int64_t lag_ms = 2000, std::int64_t lateness_ms = 0) {
+    using clink::config::JsonObject;
+    return JsonValue{
+        JsonObject{{"kind", JsonValue{std::string{"tumbling-window"}}},
+                   {"size_ms", JsonValue{std::int64_t{10000}}},
+                   {"time_column", JsonValue{std::string{"ts"}}},
+                   {"watermark",
+                    JsonValue{JsonObject{{"strategy", JsonValue{std::string{kWatermarkStrategy}}},
+                                         {"lag_ms", JsonValue{lag_ms}},
+                                         {"idleness", JsonValue{std::string{"none"}}}}}},
+                   {"lateness",
+                    JsonValue{JsonObject{{"allowed_lateness_ms", JsonValue{lateness_ms}},
+                                         {"late_records", JsonValue{std::string{"dropped"}}}}}}}};
+}
+
+struct WindowLine {
+    Row identity;  // account, window_start, window_end cells
+    std::string status;
+    std::int64_t end_ms{0};
+};
+
+// A version 2 reference artifact, written as its format says.
+void write_window_reference(
+    const fs::path& path,
+    const JsonValue& doc,
+    const std::vector<Row>& rows,
+    const std::vector<WindowLine>& windows,
+    const std::vector<std::pair<std::uint64_t, std::optional<std::int64_t>>>& bounds,
+    const JsonValue& semantics = window_semantics()) {
+    using clink::config::JsonArray;
+    using clink::config::JsonObject;
+    static const std::vector<std::string> kCols{
+        "account", "window_start", "window_end", "events", "net"};
+    JsonObject h{{"format", JsonValue{std::string{kReferenceFormat}}},
+                 {"version", JsonValue{kWindowReferenceVersion}},
+                 {"scope", doc},
+                 {"implementation",
+                  JsonValue{JsonObject{{"name", JsonValue{std::string{"test-windows"}}},
+                                       {"version", JsonValue{std::string{"1"}}}}}},
+                 {"semantics", semantics}};
+    const std::string header = JsonValue{std::move(h)}.serialize(0) + "\n";
+    std::string body;
+    clink::Sha256 rows_hash;
+    for (const auto& r : rows) {
+        JsonObject cells;
+        for (std::size_t i = 0; i < kCols.size(); ++i) {
+            cells[kCols[i]] = JsonValue{r.at(i)};
+        }
+        const std::string line =
+            JsonValue{JsonObject{{"row", JsonValue{std::move(cells)}}}}.serialize(0) + "\n";
+        rows_hash.update(line.data(), line.size());
+        body += line;
+    }
+    clink::Sha256 windows_hash;
+    for (const auto& w : windows) {
+        JsonObject id;
+        for (std::size_t i = 0; i < 3; ++i) {
+            id[kCols[i]] = JsonValue{w.identity.at(i)};
+        }
+        const std::string line =
+            JsonValue{JsonObject{{"window",
+                                  JsonValue{JsonObject{{"identity", JsonValue{std::move(id)}},
+                                                       {"status", JsonValue{w.status}},
+                                                       {"end_ms", JsonValue{w.end_ms}},
+                                                       {"why", JsonValue{std::string{"test"}}}}}}}}
+                .serialize(0) +
+            "\n";
+        windows_hash.update(line.data(), line.size());
+        body += line;
+    }
+    clink::Sha256 header_hash;
+    header_hash.update(header.data(), header.size());
+    JsonArray sb;
+    for (const auto& [ckpt, wm] : bounds) {
+        sb.emplace_back(JsonObject{{"checkpoint", JsonValue{static_cast<std::int64_t>(ckpt)}},
+                                   {"watermark_ms", wm ? JsonValue{*wm} : JsonValue{}}});
+    }
+    JsonObject end{{"rows", JsonValue{static_cast<std::int64_t>(rows.size())}},
+                   {"rows_sha256", JsonValue{clink::Sha256::to_hex(rows_hash.finalize())}},
+                   {"header_sha256", JsonValue{clink::Sha256::to_hex(header_hash.finalize())}},
+                   {"windows", JsonValue{static_cast<std::int64_t>(windows.size())}},
+                   {"windows_sha256", JsonValue{clink::Sha256::to_hex(windows_hash.finalize())}},
+                   {"source_bounds", JsonValue{std::move(sb)}},
+                   {"complete", JsonValue{true}},
+                   {"incomplete", JsonValue{JsonArray{}}}};
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << header << body << JsonValue{JsonObject{{"end", JsonValue{std::move(end)}}}}.serialize(0)
+        << "\n";
+}
+
+class ReconcileWindow : public ReconcileBundle {
+protected:
+    void SetUp() override {
+        ReconcileBundle::SetUp();
+        dest.desc.columns = {{"account", "String"},
+                             {"window_start", "Int64"},
+                             {"window_end", "Int64"},
+                             {"events", "Int64"},
+                             {"net", "Decimal(38, 2)"}};
+    }
+
+    void write_manifest(const WindowGraph& g = {}) const {
+        clink::config::JsonObject m{{"graph_json", JsonValue{window_graph_json(g)}},
+                                    {"requires_commit_confirmation", JsonValue{false}}};
+        if (!g.alignment.empty()) {
+            m["alignment"] = JsonValue{g.alignment};
+        }
+        reconcile_spill(root / "ha" / "jobs" / std::to_string(kReconcileJob) / "manifest.json",
+                        JsonValue{std::move(m)}.serialize(2));
+    }
+
+    void winterval(std::uint64_t epoch,
+                   std::uint64_t prev,
+                   std::uint32_t sub,
+                   const std::vector<std::string>& rows,
+                   std::optional<std::int64_t> watermark,
+                   const std::string& attempt = "00000000000000aa") const {
+        write_interval(epoch,
+                       prev,
+                       sub,
+                       2,
+                       rows,
+                       Mode::Written,
+                       window_destination_json(),
+                       "",
+                       watermark,
+                       attempt);
+    }
+
+    // Two partitions, one per source subtask. Checkpoint 1 completes with no
+    // watermark yet; by checkpoint 2 the sink has watermark 12000, so window
+    // [0, 10000) is final there, and its two accounts' rows were received;
+    // checkpoints 3 and 4 are quiet.
+    fs::path windowed(const WindowGraph& g = {}, const std::string& name = "bundle") {
+        write_manifest(g);
+        write_checkpoint_with_offsets(1, {{0, {{0, 10}}}, {1, {{1, 20}}}}, kLog);
+        write_checkpoint_with_offsets(2, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+        write_checkpoint_with_offsets(3, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+        write_checkpoint_with_offsets(4, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+        winterval(1, 0, 0, {}, std::nullopt);
+        winterval(1, 0, 1, {}, std::nullopt);
+        winterval(2, 1, 0, {wrow("a", 0, 3, "1.50")}, 12000);
+        winterval(2, 1, 1, {wrow("b", 0, 1, "-2.00")}, 12000);
+        for (const std::uint64_t e : {std::uint64_t{3}, std::uint64_t{4}}) {
+            winterval(e, e - 1, 0, {}, 12000);
+            winterval(e, e - 1, 1, {}, 12000);
+        }
+        dest.rows = {wcells("a", 0, 3, 150), wcells("b", 0, 1, -200)};
+        return collect_bundle(1, 4, name);
+    }
+
+    static JsonValue window_scope_of(const fs::path& bundle, std::uint64_t checkpoint = 2) {
+        const Bundle b = read_bundle(bundle);
+        return scope_document(b, load_scope(b, checkpoint, 0, false, true));
+    }
+
+    reconcile::Report window_run(const fs::path& bundle, Options o = {}) {
+        o.settle = 0ms;
+        if (o.checkpoint == 0) {
+            o.checkpoint = 2;
+        }
+        return run(
+            bundle,
+            [&](const std::string&, const std::string&) -> std::unique_ptr<Destination> {
+                return std::make_unique<ForwardingDestination>(dest);
+            },
+            o);
+    }
+
+    reconcile::Report window_audit(
+        const fs::path& bundle,
+        const std::vector<Row>& rows,
+        const std::vector<WindowLine>& windows,
+        const std::vector<std::pair<std::uint64_t, std::optional<std::int64_t>>>& bounds,
+        Options o = {},
+        const JsonValue& semantics = window_semantics()) {
+        const auto path = root / "reference.ndjson";
+        write_window_reference(path,
+                               window_scope_of(bundle, o.checkpoint != 0 ? o.checkpoint : 2),
+                               rows,
+                               windows,
+                               bounds,
+                               semantics);
+        o.reference = path.string();
+        return window_run(bundle, o);
+    }
+
+    static std::vector<Row> owed_windows() {
+        return {wcells("a", 0, 3, 150), wcells("b", 0, 1, -200)};
+    }
+    static std::vector<WindowLine> open_window() {
+        return {{{"Sa", "I10000", "I20000"}, "open", 20000}};
+    }
+    static std::vector<std::pair<std::uint64_t, std::optional<std::int64_t>>> bounds_equal() {
+        return {{1, std::nullopt}, {2, 12000}};
+    }
+};
+
+TEST_F(ReconcileWindow, TheScopeOfAWindowedJobIsItsLineageAndItsRules) {
+    const auto doc = window_scope_of(windowed());
+    EXPECT_EQ(doc.at("version").as_int(), kWindowScopeVersion);
+    const auto& t = doc.at("transform");
+    EXPECT_EQ(t.at("kind").as_string(), "tumbling-window");
+    EXPECT_EQ(t.at("size_ms").as_int(), 10000);
+    EXPECT_EQ(t.at("watermark").at("lag_ms").as_int(), 2000);
+    EXPECT_EQ(t.at("lateness").at("allowed_lateness_ms").as_int(), 0);
+    EXPECT_EQ(t.at("identity").serialize(0), R"(["account","window_start","window_end"])");
+    EXPECT_EQ(t.at("source_parallelism").as_int(), 2);
+    const auto& ckpts = doc.at("lineage").at("checkpoints").as_array();
+    ASSERT_EQ(ckpts.size(), 2u);
+    EXPECT_EQ(ckpts[0].at("checkpoint").as_int(), 1);
+    EXPECT_TRUE(ckpts[0].at("watermark_ms").is_null()) << "no watermark had reached the sink";
+    EXPECT_EQ(ckpts[1].at("watermark_ms").as_int(), 12000);
+    EXPECT_EQ(ckpts[1].at("positions").as_array().size(), 2u);
+    EXPECT_EQ(doc.at("finality").at("watermark_ms").as_int(), 12000);
+    EXPECT_TRUE(doc.at("sources_complete").as_bool());
+    for (const auto& src : doc.at("sources").as_array()) {
+        for (const auto& p : src.at("partitions").as_array()) {
+            EXPECT_TRUE(p.at("from").is_null()) << "a windowed scope starts at the job's start";
+        }
+    }
+    EXPECT_EQ(doc.at("scope_sha256").as_string(), scope_fingerprint(doc));
+}
+
+TEST_F(ReconcileWindow, AFaithfulWindowedJobPassesAgainstItsReference) {
+    const auto bundle = windowed();
+    const auto r = window_audit(bundle, owed_windows(), open_window(), bounds_equal());
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+    for (const char* id : {"reference.semantics",
+                           "reference.watermark",
+                           "reference.finality",
+                           "reference.capture",
+                           "reconcile.rows",
+                           "reference.destination"}) {
+        EXPECT_EQ(check_of(r, id).verdict, Verdict::Passed) << id << ": " << check_of(r, id).reason;
+    }
+    EXPECT_EQ(r.key, (std::vector<std::string>{"account", "window_start", "window_end"}));
+    ASSERT_TRUE(r.window_audit.has_value());
+    EXPECT_EQ(r.window_audit->final_windows, 2u);
+    EXPECT_EQ(r.window_audit->open_windows, 1u);
+    Options whole;
+    whole.coverage = Options::Coverage::CompleteTable;
+    const auto t = window_audit(bundle, owed_windows(), open_window(), bounds_equal(), whole);
+    EXPECT_EQ(t.exit_code(), 0) << t.render_text();
+    EXPECT_TRUE(t.coverage.complete_established);
+    const auto json = clink::config::parse(t.render_json());
+    EXPECT_EQ(json.at("audit").at("window").at("final").as_int(), 2);
+    EXPECT_EQ(json.at("scope").at("window").at("lag_ms").as_int(), 2000);
+}
+
+TEST_F(ReconcileWindow, TheKeyOfAWindowedJobIsItsWindowsIdentity) {
+    const auto bundle = windowed();
+    Options o;
+    o.key = {"account"};
+    auto r = window_audit(bundle, owed_windows(), open_window(), bounds_equal(), o);
+    ASSERT_TRUE(r.refused.has_value());
+    EXPECT_NE(r.refused->find("window's identity"), std::string::npos) << *r.refused;
+    o.key = {"window_end", "account", "window_start"};
+    r = window_audit(bundle, owed_windows(), open_window(), bounds_equal(), o);
+    EXPECT_EQ(r.exit_code(), 0) << r.render_text();
+}
+
+TEST_F(ReconcileWindow, OtherWindowRulesInTheReferenceFailItsSemantics) {
+    const auto r = window_audit(
+        windowed(), owed_windows(), open_window(), bounds_equal(), {}, window_semantics(5000));
+    EXPECT_EQ(r.exit_code(), 1);
+    EXPECT_EQ(check_of(r, "reference.semantics").verdict, Verdict::Failed);
+    EXPECT_NE(check_of(r, "reference.semantics").reason.find("watermark.lag_ms"), std::string::npos)
+        << check_of(r, "reference.semantics").reason;
+    EXPECT_EQ(check_of(r, "reference.watermark").verdict, Verdict::Unavailable)
+        << "a bound computed under other rules is not held against the job's watermark";
+    ASSERT_FALSE(r.findings.empty());
+    EXPECT_EQ(r.findings.front().relationship, "transformation");
+}
+
+TEST_F(ReconcileWindow, AWatermarkPastWhatTheSourceAllowsFails) {
+    const auto bundle = windowed();
+    // The recorded 12000 past a bound of 11000.
+    auto r = window_audit(bundle, owed_windows(), open_window(), {{1, std::nullopt}, {2, 11000}});
+    EXPECT_EQ(r.exit_code(), 1);
+    EXPECT_EQ(check_of(r, "reference.watermark").verdict, Verdict::Failed);
+    EXPECT_NE(check_of(r, "reference.watermark").reason.find("past"), std::string::npos);
+    // A bound of 9000 also says the windows ending at 10000 closed early.
+    r = window_audit(bundle, owed_windows(), open_window(), {{1, std::nullopt}, {2, 9000}});
+    EXPECT_EQ(check_of(r, "reference.watermark").verdict, Verdict::Failed);
+    ASSERT_TRUE(r.window_audit.has_value());
+    EXPECT_EQ(r.window_audit->early.size(), 2u);
+    // A watermark at the sink while the source allows none.
+    r = window_audit(bundle, owed_windows(), open_window(), {{1, std::nullopt}, {2, std::nullopt}});
+    EXPECT_EQ(check_of(r, "reference.watermark").verdict, Verdict::Failed);
+}
+
+TEST_F(ReconcileWindow, AnUndecidedWindowLeavesTheAuditPartialAndIsComparedNowhere) {
+    const auto bundle = windowed();
+    std::vector<WindowLine> left = open_window();
+    left.push_back({{"Sb", "I0", "I10000"}, "undetermined", 10000});
+    Options whole;
+    whole.coverage = Options::Coverage::CompleteTable;
+    const auto r = window_audit(bundle, {wcells("a", 0, 3, 150)}, left, bounds_equal(), whole);
+    EXPECT_EQ(r.exit_code(), 3) << r.render_text();
+    EXPECT_EQ(check_of(r, "reference.finality").verdict, Verdict::Unavailable);
+    for (const char* id : {"reference.capture", "reference.destination", "destination.coverage"}) {
+        EXPECT_EQ(check_of(r, id).verdict, Verdict::Passed) << id << ": " << check_of(r, id).reason;
+    }
+    ASSERT_TRUE(r.window_audit.has_value());
+    EXPECT_EQ(r.window_audit->captured_left_out, 1u);
+    EXPECT_EQ(r.window_audit->destination_left_out, 1u);
+}
+
+TEST_F(ReconcileWindow, AReferenceThatDisagreesWithTheRecordedWatermarkOnFinalityFails) {
+    const auto bundle = windowed();
+    // A row for [10000, 20000), which the recorded 12000 had not closed.
+    auto rows = owed_windows();
+    rows.push_back(wcells("a", 10000, 1, 100));
+    auto r = window_audit(bundle, rows, {}, bounds_equal());
+    EXPECT_EQ(r.exit_code(), 1);
+    EXPECT_EQ(check_of(r, "reference.finality").verdict, Verdict::Failed);
+    // [0, 10000) called open, which the recorded 12000 had closed: hidden
+    // from the comparison, were it believed.
+    r = window_audit(bundle,
+                     {wcells("a", 0, 3, 150)},
+                     {{{"Sb", "I0", "I10000"}, "open", 10000}},
+                     bounds_equal());
+    EXPECT_EQ(r.exit_code(), 1);
+    EXPECT_EQ(check_of(r, "reference.finality").verdict, Verdict::Failed);
+    EXPECT_NE(check_of(r, "reference.finality").reason.find("as open"), std::string::npos);
+}
+
+TEST_F(ReconcileWindow, TheLineageCarriesOnThroughARecordedRestore) {
+    write_manifest();
+    write_checkpoint_with_offsets(1, {{0, {{0, 10}}}, {1, {{1, 20}}}}, kLog);
+    write_checkpoint_with_offsets(2, {{0, {{0, 15}}}, {1, {{1, 25}}}}, kLog);
+    winterval(1, 0, 0, {}, std::nullopt);
+    winterval(1, 0, 1, {}, std::nullopt);
+    winterval(2, 1, 0, {}, 8000);
+    winterval(2, 1, 1, {}, 8000);
+    // The first run wrote window [0, 10000) of a in the interval ending at
+    // barrier 3, which never completed; the job restored from 2 and numbered
+    // from 4, and wrote it again.
+    winterval(3, 2, 0, {wrow("a", 0, 3, "1.50")}, 12000);
+    winterval(3, 2, 1, {}, 12000);
+    ASSERT_TRUE(clink::cluster::record_restore_point(
+        ckpt.string(), kReconcileJob, 1, {.restore = 2, .next = 4}));
+    write_checkpoint_with_offsets(4, {{0, {{0, 18}}}, {1, {{1, 26}}}}, kLog);
+    write_checkpoint_with_offsets(5, {{0, {{0, 18}}}, {1, {{1, 26}}}}, kLog);
+    winterval(4, 0, 0, {wrow("a", 0, 3, "1.50")}, 12000, "00000000000000bb");
+    winterval(4, 0, 1, {}, 12000, "00000000000000bb");
+    winterval(5, 4, 0, {}, 12000, "00000000000000bb");
+    winterval(5, 4, 1, {}, 12000, "00000000000000bb");
+    dest.rows = {wcells("a", 0, 3, 150), wcells("a", 0, 3, 150)};
+    const auto bundle = collect_bundle(1, 5);
+    const Bundle b = read_bundle(bundle);
+    const auto sc = load_scope(b, 5, 0, false, true);
+    ASSERT_FALSE(sc.gap.has_value()) << *sc.gap;
+    EXPECT_EQ(sc.epochs, (std::vector<std::uint64_t>{1, 2, 4, 5}));
+    ASSERT_EQ(sc.restores.size(), 1u);
+    EXPECT_EQ(sc.restores.front().restored_from, 2u);
+    EXPECT_EQ(sc.restores.front().first_epoch, 4u);
+    ASSERT_EQ(sc.lineage.size(), 4u);
+    EXPECT_EQ(sc.expected.size(), 1u) << "the discarded run's interval is not in the lineage";
+    Options o;
+    o.checkpoint = 5;
+    const auto r = window_audit(bundle,
+                                {wcells("a", 0, 3, 150)},
+                                {},
+                                {{1, std::nullopt}, {2, 8000}, {4, 12000}, {5, 12000}},
+                                o);
+    EXPECT_EQ(r.exit_code(), 1) << r.render_text();
+    EXPECT_EQ(check_of(r, "reference.capture").verdict, Verdict::Passed);
+    EXPECT_EQ(check_of(r, "reconcile.rows").verdict, Verdict::Failed);
+    EXPECT_EQ(r.comparison->duplicated, 1u);
+    const auto& details = check_of(r, "reconcile.rows").details;
+    EXPECT_TRUE(std::any_of(details.begin(), details.end(), [](const std::string& d) {
+        return d.find("restore from checkpoint 2") != std::string::npos;
+    })) << "the duplicate is put down to the restore";
+}
+
+TEST_F(ReconcileWindow, AnIntervalOfTheLineageMissingFromTheBundleLeavesItUnavailable) {
+    windowed();
+    const auto bundle = collect_bundle(2, 4, "from-2");
+    Options o;
+    o.coverage = Options::Coverage::CompleteTable;
+    const auto r = window_run(bundle, o);
+    EXPECT_EQ(r.exit_code(), 3) << r.render_text();
+    EXPECT_EQ(check_of(r, "reconcile.scope").verdict, Verdict::Unavailable);
+    EXPECT_NE(check_of(r, "reconcile.scope").reason.find("barrier 1"), std::string::npos)
+        << check_of(r, "reconcile.scope").reason;
+}
+
+TEST_F(ReconcileWindow, WindowsTheAuditDoesNotModelAreRefusedByName) {
+    const std::vector<std::pair<WindowGraph, std::string>> cases{
+        {WindowGraph{.window_type = "hopping_window_row"}, "one tumbling window"},
+        {WindowGraph{.idle_timeout_ms = "5000"}, "idle_timeout_ms"},
+        {WindowGraph{.alignment = "unaligned"}, "aligned ones"},
+        {WindowGraph{.alignment = ""}, "does not record how checkpoint barriers aligned"},
+        {WindowGraph{.filter_after_window = true}, "between the window and the sink"},
+        {WindowGraph{.source_parallelism = 1}, "one partition per source subtask"},
+    };
+    // Nothing an unsupported job's audit reads of a reference: it is refused
+    // before it is opened.
+    const auto path = root / "unread.ndjson";
+    int n = 0;
+    for (const auto& [graph, phrase] : cases) {
+        const auto bundle = windowed(graph, "bundle-" + std::to_string(n++));
+        const Bundle b = read_bundle(bundle);
+        const auto sc = load_scope(b, 2, 0, false, true);
+        ASSERT_TRUE(sc.window_unsupported.has_value()) << phrase;
+        EXPECT_NE(sc.window_unsupported->find(phrase), std::string::npos) << *sc.window_unsupported;
+        // A window the audit does not model names no identity of its own, so
+        // the operator names the key.
+        Options o;
+        o.key = {"account", "window_start", "window_end"};
+        o.reference = path.string();
+        const auto r = window_run(bundle, o);
+        EXPECT_EQ(check_of(r, "reference.scope").verdict, Verdict::Unsupported) << phrase;
+        EXPECT_EQ(r.exit_code(), 3) << phrase;
+        // The delivery is still checked.
+        EXPECT_EQ(window_run(bundle,
+                             Options{.key = {"account", "window_start", "window_end"},
+                                     .from_run_start = true})
+                      .exit_code(),
+                  0)
+            << phrase;
+    }
+}
+
+int scope_cli(const std::string& args, std::string* out) {
+    const std::string cmd = std::string{CLINK_CLI_BINARY} + " incident-scope " + args + " 2>&1";
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    if (pipe == nullptr) {
+        return -1;
+    }
+    std::array<char, 4096> buf{};
+    std::size_t n = 0;
+    while ((n = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) {
+        out->append(buf.data(), n);
+    }
+    const int status = ::pclose(pipe);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+TEST_F(ReconcileWindow, TheScopeCommandWritesAWindowedScopeOrRefusesOne) {
+    std::string out;
+    const auto doc_path = root / "scope.json";
+    EXPECT_EQ(scope_cli(windowed().string() + " --checkpoint=2 --out=" + doc_path.string(), &out),
+              0)
+        << out;
+    EXPECT_NE(out.find("a windowed scope"), std::string::npos) << out;
+    EXPECT_EQ(clink::config::parse(reconcile_slurp(doc_path)).at("version").as_int(),
+              kWindowScopeVersion);
+    out.clear();
+    const auto other = root / "other.json";
+    EXPECT_EQ(
+        scope_cli(windowed(WindowGraph{.window_type = "session_window_row"}, "session").string() +
+                      " --checkpoint=2 --out=" + other.string(),
+                  &out),
+        3)
+        << out;
+    EXPECT_NE(out.find("does not support"), std::string::npos) << out;
+    EXPECT_FALSE(fs::exists(other)) << "no document is written for a job the audit cannot model";
 }
 
 }  // namespace

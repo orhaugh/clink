@@ -239,6 +239,71 @@ struct SourcePositions {
     std::vector<std::string> notes;
 };
 
+// ---- windowed results ----------------------------------------------------------
+//
+// The audit of a windowed job (docs/internals/incident-verification.md,
+// "Auditing windowed results"; design record 015). One shape is supported: one
+// Kafka source, read one partition per source subtask; the per-partition
+// bounded-out-of-orderness watermark assigned on every record the source
+// delivers, with no idleness; record-wise filters and projections; one keyed
+// tumbling window of COUNT and SUM; and the ClickHouse native sink, with
+// aligned checkpoints. A window's output depends on every record before it,
+// so its scope is the job's whole lineage from a start with no state, through
+// the restores the bundle records.
+
+struct WindowAggregate {
+    std::string function;  // "count" or "sum"
+    std::string input;     // the column it reads; empty for COUNT(*)
+    std::string output;    // the sink column it lands in
+};
+
+// What the job's graph and manifest declare, as the audit reads them.
+struct WindowSemantics {
+    std::int64_t size_ms{0};
+    std::string time_column;  // event time, epoch milliseconds
+    std::vector<std::string> group_keys;
+    // The sink columns that identify one window's row: the group keys'
+    // outputs, then the window's start and end.
+    std::vector<std::string> identity;
+    std::string start_column;
+    std::string end_column;
+    std::vector<WindowAggregate> aggregates;
+    std::int64_t lag_ms{0};  // the watermark trails the least partition maximum by this
+    std::int64_t allowed_lateness_ms{0};
+    std::uint64_t source_parallelism{0};
+    std::string alignment;  // "aligned"
+    std::string window_op;  // its id in the job graph
+};
+
+// What the bundle's job graph and manifest say about state across records.
+struct WindowAnalysis {
+    // The graph holds a window or another operator that keeps state across
+    // records, so the job is not record-wise.
+    bool windowed{false};
+    std::optional<WindowSemantics> semantics;  // the supported shape
+    std::string unsupported;                   // when windowed and not supported: why
+};
+
+// Reads the bundle's job manifest. A bundle without one says nothing.
+[[nodiscard]] WindowAnalysis analyse_window(const Bundle& bundle);
+
+// A completed checkpoint of the scope's lineage: where the source stood, and
+// the watermark the sink had when its barrier arrived, the least over the
+// sink's subtasks (none when any had none: then no window had closed by it
+// everywhere).
+struct LineageCheckpoint {
+    std::uint64_t checkpoint{0};
+    std::vector<SourceRange> positions;  // `to` is the next offset to read
+    std::optional<std::int64_t> watermark_ms;
+};
+
+// A restore the lineage passes through: the run that numbered its barriers
+// from `first_epoch` began from `restored_from`'s state.
+struct LineageRestore {
+    std::uint64_t restored_from{0};
+    std::uint64_t first_epoch{0};
+};
+
 struct Scope {
     JobId job{0};
     std::uint64_t checkpoint{0};
@@ -255,8 +320,18 @@ struct Scope {
     config::JsonValue destination;  // as the sink's open found it
     std::vector<Column> columns;    // the sink's planned columns
     std::vector<Row> expected;      // every row the sink received in the scope
+    // The interval each expected row was received in (the barrier it ended at).
+    std::vector<std::uint64_t> expected_epochs;
     SourcePositions source;
     config::JsonValue delivery;  // the bundle's delivery report, when it has one
+    // A windowed job: what it declares, its lineage's completed checkpoints,
+    // oldest first, and the restores the lineage passes through. When the job
+    // has a window the audit does not support, `window` is empty and
+    // `window_unsupported` says why.
+    std::optional<WindowSemantics> window;
+    std::optional<std::string> window_unsupported;
+    std::vector<LineageCheckpoint> lineage;
+    std::vector<LineageRestore> restores;
     // When the scope could not be established whole: why, and whether the
     // gap is evidence that is missing (unavailable) or a case this release
     // does not handle (unsupported).
@@ -277,11 +352,16 @@ struct ScopeRefused : std::runtime_error {
 // artifacts the caller has verified. Reads the interval files and the sink's
 // captured epochs; a gap is recorded in the scope rather than thrown.
 // With `whole_run`, the scope spans every interval from the run's start to the
-// checkpoint, through the completed checkpoints between.
+// checkpoint, through the completed checkpoints between. A windowed job's
+// scope, when `whole_run` or `for_audit` (a scope for a reference to be
+// computed from) asks for it, spans the job's whole lineage instead: back
+// through every restore the bundle records to a run that began with no state,
+// with each completed checkpoint's source positions and recorded watermark.
 [[nodiscard]] Scope load_scope(const Bundle& bundle,
                                std::uint64_t checkpoint,
                                std::uint64_t sink_op,
-                               bool whole_run = false);
+                               bool whole_run = false,
+                               bool for_audit = false);
 
 // ---- the comparison ----------------------------------------------------------
 
@@ -356,6 +436,27 @@ struct Coverage {
     std::uint64_t table_rows_read{0};
 };
 
+// What the audit of a windowed job established about its windows.
+struct WindowAudit {
+    std::uint64_t final_windows{0};  // the reference's rows
+    std::uint64_t open_windows{0};
+    std::uint64_t undetermined_windows{0};
+    std::uint64_t captured_left_out{0};     // captured rows of undetermined windows
+    std::uint64_t destination_left_out{0};  // rows of them in a whole-table read
+    // Per lineage checkpoint: the watermark the sink recorded at its barrier,
+    // and the one the source's records allow there, as the reference computed it.
+    struct Mark {
+        std::uint64_t checkpoint{0};
+        std::optional<std::int64_t> recorded_ms;
+        std::optional<std::int64_t> source_bound_ms;
+    };
+    std::vector<Mark> watermarks;
+    std::vector<std::string> semantics_differences;
+    std::vector<std::string> early;  // windows received before the source allowed them to close
+    config::JsonValue reference_semantics;
+    config::JsonValue records;  // the reference's account of the records it read
+};
+
 // One relationship the audit found broken, named for what it implicates.
 struct Finding {
     std::string relationship;  // "transformation", "delivery", "reference-destination", "coverage"
@@ -392,6 +493,7 @@ struct Report {
     std::optional<Comparison> table_comparison;       // complete table vs expectation
     Coverage coverage;
     std::vector<Finding> findings;
+    std::optional<WindowAudit> window_audit;  // a windowed job's audit
 
     // 0: every check passed. 1: one failed. 3: none failed, one is unavailable
     // or unsupported. 2: refused.

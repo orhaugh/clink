@@ -17,7 +17,7 @@ This release reconciles one configuration:
 | Part | Supported |
 | --- | --- |
 | Source | A Kafka SQL table. Its checkpoint position per partition is the next offset to read, so an interval consumed `[from, to)`. Its isolation level is the job's `isolation.level`, librdkafka's `read_committed` when unset. |
-| Transformation | Record-wise: filters, projections and per-record expressions. Then the rows a checkpoint's intervals hand the sink are exactly those derived from the records between the bounding checkpoints' positions. Windows, joins and aggregates have well-defined interval effects too, but none of that holds for them, and a key such a job writes can repeat. |
+| Transformation | Record-wise: filters, projections and per-record expressions. Then the rows a checkpoint's intervals hand the sink are exactly those derived from the records between the bounding checkpoints' positions. Windows, joins and aggregates have well-defined interval effects too, but none of that holds for them, and a key such a job writes can repeat. One windowed shape is audited over its whole lineage instead ("Windowed results" below). |
 | Sink | The ClickHouse native sink (`insert_format='native'`), at least once. |
 | Table | A plain `MergeTree`: not `Replicated*`, `Shared*`, `Distributed`, nor an engine whose merges rewrite rows (`Replacing`, `Summing`, `Aggregating`, `Collapsing`); no `TTL`. `async_insert = 0`, which the sink enforces. A deduplication window (`non_replicated_deduplication_window > 0`) is recommended. |
 | Key | One or more integer or `String` columns, not `Nullable`, that identify one row the job writes. A correct run writes each key in exactly one checkpoint interval. |
@@ -153,13 +153,27 @@ Reconciliation's expectation is the sink's own record of its input, so it establ
 
 Two equal reads do not establish a frozen table, and no checkpoint attribution is invented for rows of a live, shared table. An empty expected output passes only when the table is read whole and is empty.
 
+## Windowed results
+
+A window's row does not come from the records between two checkpoints. It holds records from every earlier interval, it is owed only once the watermark passes its end, and a record arriving after that is dropped. Whether one did depends on the order the job read its partitions in, which offsets do not record. Taking a checkpoint for a window's finality, starting a reference at the previous checkpoint, or letting the reference assume an order would each verify something the job did not do. The audit supports one windowed shape and refuses the rest by name.
+
+**The contract.** One Kafka source, read one partition per source subtask. Event time is an integer column of epoch milliseconds. The watermark is the per-partition bounded-out-of-orderness one (`watermark_lag_ms`, no idleness), assigned to every record the source delivers. Record-wise filters and projections pass the time column through. One keyed tumbling window of `COUNT` and `SUM`, with an allowed lateness (default 0) after which a record is dropped. The window's rows, identified by their group key and bounds, go to the ClickHouse native sink. Checkpoints are aligned, which the job manifest now records, and a takeover now keeps. None of this is new engine semantics. It is the existing behaviour, read from the job graph, and anything else (other windows, joins, aggregates, idleness, unaligned checkpoints, several partitions to a subtask) is unsupported.
+
+**History.** The scope is the job's lineage from a start with no state to the audited checkpoint. It runs back through every restore the bundle records into the run that completed the restored checkpoint. A missing interval, or a restored checkpoint the bundle lacks, leaves it unavailable. The scope document (version 2) carries the window's rules, each completed checkpoint's source positions, and the watermark the sink recorded at its barrier.
+
+**Order, decided by bounds.** When a record arrives, the window operator's watermark is at most its own partition's greatest earlier event time less the lag (one partition per subtask). It is also at most the least partition maximum, less the lag, at the next checkpoint's positions: aligned barriers let nothing past a barrier through first. Both bounds come from the source alone. It is at least the watermark the sink recorded at the previous barrier, since the window operator forwards a watermark only after closing what it closes. A record whose window closes above the upper bound was folded in. One whose window closes at or below the floor was dropped. Any other is undetermined, and its window is left out and the result partial, never guessed. A window is final at the checkpoint once its end plus lateness is at or below the watermark recorded there, and open when it is above what the source allows there.
+
+**Recomputed against recorded.** The reference implements the operator's own window rules, declared in the artifact and compared with the job graph's (`reference.semantics`). It computes the source's bound at every lineage checkpoint. The audit requires the recorded watermark never to exceed it, and every window the sink received to have closed by the bound after it (`reference.watermark`). The reference must leave out as open only windows the recorded watermark had not closed, and give rows only for windows it had (`reference.finality`). No aggregate state, restored value or sink conversion of the job's is an input to the reference.
+
+**Recovery.** The lineage excludes the runs restores discarded. Their writes after the restored checkpoint are in the destination beside the restored run's, and are reported as duplicates (or a changed row) and put down to the restore, never collapsed.
+
 ## Unsupported in this release
 
 The following are not supported:
 
 - other destinations and sink modes: ClickHouse's text sink, upserts, materialised views;
 - replicated, shared, distributed or row-rewriting tables, and tables with a TTL;
-- jobs that are not record-wise, where they need source positions or a key that repeats;
+- jobs that are neither record-wise nor the windowed shape above, where they need source positions or a key that repeats;
 - an embedded `clink run`, whose sinks the flight recorder does not record;
 - reading `system.query_log` as acknowledgement evidence;
 - continuous reconciliation, repair, signing.
@@ -175,9 +189,11 @@ The following are not supported:
 | The ClickHouse reader | `impls/clickhouse/include/clink/clickhouse/reconcile_destination.hpp`, `impls/clickhouse/src/reconcile_destination.cpp` |
 | The command | `tools/clink_incident.cpp`, `tools/clink_incident_reconcile.cpp`, or its stub without the connector |
 | The audit: the scope document, the artifact's reader and binding, the multiset comparison | `include/clink/incident/reference.hpp`, `src/incident/reference.cpp`; the relationships and the whole-table check in `src/incident/reconcile.cpp` |
-| The reference library | `python/clink-reference/` (`scope.py`, `canonical.py`, `kafka_range.py`, `artifact.py`) |
+| The reference library | `python/clink-reference/` (`scope.py`, `canonical.py`, `kafka_range.py`, `artifact.py`, `windows.py`) |
+| Windowed jobs: the shape, the lineage and the checks | `src/incident/window_scope.cpp`, `load_scope` and `judge_windows` in `src/incident/reconcile.cpp`; the alignment in the job manifest, `src/cluster/coordinator.cpp` |
 
 - **Unit tests**: `tests/test_incident_reconcile.cpp`. These cover the cells, the comparison, the sink runner's evidence, and whole reconciliations of collected bundles against a destination served from memory: every kind of difference, refusals, missing and truncated evidence, limits, instability, mutations, unsupported forms, and source positions after a restore. The incident gate runs them and requires every case.
 - **Live tests**: `impls/clickhouse/tests/test_reconcile_destination_live.cpp`, on each line in `scripts/clickhouse-live.sh`. These cover what the reader reads against the expectation's cells, identity, mutations, bounds, and the server's refusal of a write.
 - **The example**: `examples/destination-reconciliation/`, with Kafka and ClickHouse and every scenario checked against an independent reference. It includes jobs with a deliberate defect (a wrong projection, a filter that drops valid rows, one that lets through others, counts and totals equal over different rows), faults in the destination alone, an unrelated key, an empty expected output, references for another scope, unfinished or incomplete, and the cost of the audit.
 - **The audit's tests**: `tests/test_incident_reconcile.cpp` (`ReconcileMultiset.*`, and the `ReconcileBundle` audit cases covering the artifact's binding and refusals, each relationship, failure precedence, coverage, and empty scopes). `python/clink-reference/tests/` covers the canonical cells and the artifact offline, and with `scripts/reference-live.sh` the range reader against Apache Kafka, with committed and aborted transactions.
+- **Windowed results**: `tests/test_incident_reconcile.cpp` (`ReconcileWindow.*`: the scope and its lineage through a restore, a faithful job, the key, other rules, a watermark ahead of the source, undecided windows, a reference that disagrees on finality, missing history, and every unsupported shape), `python/clink-reference/tests/test_windows.py` (window assignment, the bounds, late records before and after their window closed, finality, the version 2 scope and artifact), `CheckpointCompletion.ATakeoverKeepsTheCheckpointAlignment`, and the example `examples/window-audit/`: a timeline of out-of-order events, window boundaries, the watermark exactly at a window's end, late events before and after their window closed, a quiet partition, a Worker killed with windows half accumulated, a crash after an INSERT and before its checkpoint, missing history and evidence, an empty output, an unexpected window, and jobs with a wrong time column, a wrong aggregate and a wrong lateness.

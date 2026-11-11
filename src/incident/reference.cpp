@@ -1,6 +1,7 @@
 #include "clink/incident/reference.hpp"
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <map>
 #include <set>
@@ -108,6 +109,9 @@ std::string first_difference(const config::JsonValue& theirs, const config::Json
                                                   "sources",
                                                   "sources_complete",
                                                   "output",
+                                                  "transform",
+                                                  "lineage",
+                                                  "finality",
                                                   "scope_sha256"};
     for (const auto field : kOrder) {
         const bool a = theirs.contains(field);
@@ -125,6 +129,136 @@ std::string first_difference(const config::JsonValue& theirs, const config::Json
         }
     }
     return "the documents differ";
+}
+
+config::JsonValue strings_json(const std::vector<std::string>& v) {
+    config::JsonArray a;
+    for (const auto& s : v) {
+        a.emplace_back(s);
+    }
+    return config::JsonValue{std::move(a)};
+}
+
+// The window's rules as the scope document carries them. The same field names
+// are what a reference declares its own rules with (the artifact's
+// "semantics"), so the two are compared field by field.
+config::JsonValue transform_document(const WindowSemantics& w) {
+    config::JsonObject t;
+    t["kind"] = config::JsonValue{std::string{kTumblingWindowKind}};
+    t["size_ms"] = config::JsonValue{w.size_ms};
+    t["time_column"] = config::JsonValue{w.time_column};
+    t["time_unit"] = config::JsonValue{std::string{"epoch milliseconds"}};
+    t["group_keys"] = strings_json(w.group_keys);
+    t["identity"] = strings_json(w.identity);
+    t["start_column"] = config::JsonValue{w.start_column};
+    t["end_column"] = config::JsonValue{w.end_column};
+    config::JsonArray aggs;
+    for (const auto& g : w.aggregates) {
+        config::JsonObject o;
+        o["function"] = config::JsonValue{g.function};
+        o["input"] = g.input.empty() ? config::JsonValue{} : config::JsonValue{g.input};
+        o["output"] = config::JsonValue{g.output};
+        aggs.emplace_back(std::move(o));
+    }
+    t["aggregates"] = config::JsonValue{std::move(aggs)};
+    config::JsonObject wm;
+    wm["strategy"] = config::JsonValue{std::string{kWatermarkStrategy}};
+    wm["lag_ms"] = config::JsonValue{w.lag_ms};
+    wm["idleness"] = config::JsonValue{std::string{"none"}};
+    wm["assigned_on"] = config::JsonValue{std::string{"every record the source delivers"}};
+    t["watermark"] = config::JsonValue{std::move(wm)};
+    config::JsonObject late;
+    late["allowed_lateness_ms"] = config::JsonValue{w.allowed_lateness_ms};
+    late["late_records"] = config::JsonValue{std::string{"dropped"}};
+    t["lateness"] = config::JsonValue{std::move(late)};
+    t["source_parallelism"] = config::JsonValue{static_cast<std::int64_t>(w.source_parallelism)};
+    t["alignment"] = config::JsonValue{w.alignment};
+    return config::JsonValue{std::move(t)};
+}
+
+// One window line of a version 2 reference: its identity's cells, each
+// canonical for its column, and why it is left out.
+ExcludedWindow window_line(const config::JsonValue& w,
+                           const std::vector<std::string>& identity,
+                           const std::vector<Column>& columns,
+                           const std::map<std::string, std::size_t>& index,
+                           std::size_t line_no) {
+    const std::string where = "line " + std::to_string(line_no) + " (a window)";
+    ExcludedWindow out;
+    if (!w.contains("identity") || !w.at("identity").is_object() ||
+        w.at("identity").as_object().size() != identity.size()) {
+        throw ReferenceRefused(where + " does not name exactly the window identity's " +
+                               std::to_string(identity.size()) + " column(s)");
+    }
+    for (const auto& name : identity) {
+        const auto& cells = w.at("identity");
+        const auto it = index.find(name);
+        if (!cells.contains(name) || it == index.end()) {
+            throw ReferenceRefused(where + " has no cell for " + name);
+        }
+        const auto& cell = cells.at(name);
+        if (!cell.is_string() || !canonical_for(cell.as_string(), columns[it->second].type)) {
+            throw ReferenceRefused(
+                where + ": " + name + " holds " + cell.serialize().substr(0, 80) +
+                ", which is not a canonical cell of " + columns[it->second].type.spelling);
+        }
+        out.identity.push_back(cell.as_string());
+    }
+    out.status = w.string_or("status", "");
+    if (out.status != "open" && out.status != "undetermined") {
+        throw ReferenceRefused(where + " has status '" + out.status +
+                               "'; a window is left out as open or undetermined");
+    }
+    if (!w.contains("end_ms") || !w.at("end_ms").is_integral_number()) {
+        throw ReferenceRefused(where + " gives no end_ms");
+    }
+    out.end_ms = w.at("end_ms").as_int();
+    if (!w.contains("why") || !w.at("why").is_string()) {
+        throw ReferenceRefused(where + " does not say why it is left out");
+    }
+    out.why = w.at("why").as_string();
+    return out;
+}
+
+// The watermark bounds a version 2 reference computed: one per checkpoint of
+// the scope's lineage, in its order.
+std::vector<SourceBound> source_bounds_of(const config::JsonValue& end,
+                                          const config::JsonValue& document) {
+    std::vector<std::uint64_t> want;
+    for (const auto& c : document.at("lineage").at("checkpoints").as_array()) {
+        want.push_back(static_cast<std::uint64_t>(c.at("checkpoint").as_int()));
+    }
+    if (!end.contains("source_bounds") || !end.at("source_bounds").is_array()) {
+        throw ReferenceRefused(
+            "the reference's end line gives no source_bounds: the watermark the source's "
+            "records allow at each checkpoint of the lineage");
+    }
+    std::vector<SourceBound> out;
+    for (const auto& b : end.at("source_bounds").as_array()) {
+        if (!b.is_object() || !b.contains("checkpoint") ||
+            !b.at("checkpoint").is_integral_number() || !b.contains("watermark_ms") ||
+            !(b.at("watermark_ms").is_null() || b.at("watermark_ms").is_integral_number())) {
+            throw ReferenceRefused(
+                "the reference's source_bounds hold an entry that is not "
+                "{checkpoint, watermark_ms}");
+        }
+        SourceBound s;
+        s.checkpoint = static_cast<std::uint64_t>(b.at("checkpoint").as_int());
+        if (!b.at("watermark_ms").is_null()) {
+            s.watermark_ms = b.at("watermark_ms").as_int();
+        }
+        out.push_back(s);
+    }
+    std::vector<std::uint64_t> have;
+    for (const auto& s : out) {
+        have.push_back(s.checkpoint);
+    }
+    if (have != want) {
+        throw ReferenceRefused(
+            "the reference's source_bounds do not name exactly the checkpoints of the scope's "
+            "lineage, in order");
+    }
+    return out;
 }
 
 std::vector<std::string> strings_of(const config::JsonValue& o, std::string_view field) {
@@ -223,11 +357,104 @@ config::JsonValue scope_document(const Bundle& b, const Scope& sc) {
         out["semantics"] = config::JsonValue{std::string{kCanonicalSemantics}};
         d["output"] = config::JsonValue{std::move(out)};
     }
+    if (sc.window) {
+        d["version"] = config::JsonValue{kWindowScopeVersion};
+        d["transform"] = transform_document(*sc.window);
+        config::JsonObject lineage;
+        config::JsonArray restores;
+        for (const auto& r : sc.restores) {
+            config::JsonObject o;
+            o["restored_from"] = config::JsonValue{static_cast<std::int64_t>(r.restored_from)};
+            o["first_epoch"] = config::JsonValue{static_cast<std::int64_t>(r.first_epoch)};
+            restores.emplace_back(std::move(o));
+        }
+        lineage["restores"] = config::JsonValue{std::move(restores)};
+        config::JsonArray checkpoints;
+        std::optional<std::int64_t> final_watermark;
+        for (const auto& lc : sc.lineage) {
+            config::JsonObject o;
+            o["checkpoint"] = config::JsonValue{static_cast<std::int64_t>(lc.checkpoint)};
+            config::JsonArray positions;
+            for (const auto& p : lc.positions) {
+                config::JsonObject po;
+                po["op"] = config::JsonValue{std::to_string(p.op)};
+                po["partition"] = config::JsonValue{static_cast<std::int64_t>(p.partition)};
+                po["next_offset"] = p.to ? config::JsonValue{*p.to} : config::JsonValue{};
+                positions.emplace_back(std::move(po));
+            }
+            o["positions"] = config::JsonValue{std::move(positions)};
+            o["watermark_ms"] =
+                lc.watermark_ms ? config::JsonValue{*lc.watermark_ms} : config::JsonValue{};
+            if (lc.checkpoint == sc.checkpoint) {
+                final_watermark = lc.watermark_ms;
+            }
+            checkpoints.emplace_back(std::move(o));
+        }
+        lineage["checkpoints"] = config::JsonValue{std::move(checkpoints)};
+        d["lineage"] = config::JsonValue{std::move(lineage)};
+        config::JsonObject finality;
+        finality["checkpoint"] = config::JsonValue{static_cast<std::int64_t>(sc.checkpoint)};
+        finality["watermark_ms"] =
+            final_watermark ? config::JsonValue{*final_watermark} : config::JsonValue{};
+        d["finality"] = config::JsonValue{std::move(finality)};
+        if (sc.lineage.empty() || sc.lineage.back().checkpoint != sc.checkpoint ||
+            !(sc.starts_at_run_start && sc.starts_after == 0)) {
+            d["sources_complete"] = config::JsonValue{false};
+        }
+    }
     config::JsonValue doc{std::move(d)};
     const std::string fp = scope_fingerprint(doc);
     config::JsonObject withfp = doc.as_object();
     withfp["scope_sha256"] = config::JsonValue{fp};
     return config::JsonValue{std::move(withfp)};
+}
+
+std::vector<std::string> semantics_differences(const config::JsonValue& transform,
+                                               const config::JsonValue& semantics) {
+    // The rules that decide which window a record lands in, when a window
+    // closes and what becomes of a record that arrives after: what a reference
+    // has to implement the same way for its rows to be the job's.
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 8> kFields{{
+        {"", "kind"},
+        {"", "size_ms"},
+        {"", "time_column"},
+        {"watermark", "strategy"},
+        {"watermark", "lag_ms"},
+        {"watermark", "idleness"},
+        {"lateness", "allowed_lateness_ms"},
+        {"lateness", "late_records"},
+    }};
+    std::vector<std::string> out;
+    const auto at = [](const config::JsonValue& d,
+                       std::string_view group,
+                       std::string_view field) -> std::optional<config::JsonValue> {
+        const config::JsonValue* o = &d;
+        if (!group.empty()) {
+            if (!d.is_object() || !d.contains(group) || !d.at(group).is_object()) {
+                return std::nullopt;
+            }
+            o = &d.at(group);
+        }
+        if (!o->is_object() || !o->contains(field)) {
+            return std::nullopt;
+        }
+        return o->at(field);
+    };
+    for (const auto& [group, field] : kFields) {
+        const std::string name =
+            group.empty() ? std::string{field} : std::string{group} + "." + std::string{field};
+        const auto job = at(transform, group, field);
+        const auto ref = at(semantics, group, field);
+        if (!ref) {
+            out.push_back("the reference does not say its " + name + " (the job's is " +
+                          (job ? job->serialize() : std::string{"unknown"}) + ")");
+        } else if (!job || !(*job == *ref)) {
+            out.push_back(name + ": the job's is " +
+                          (job ? job->serialize() : std::string{"unknown"}) + ", the reference's " +
+                          ref->serialize());
+        }
+    }
+    return out;
 }
 
 bool canonical_for(std::string_view cell, const ColumnType& type) {
@@ -313,11 +540,17 @@ Reference read_reference(const fs::path& path,
         throw ReferenceRefused("the reference's first line is not a " +
                                std::string{kReferenceFormat} + " header");
     }
+    // A record-wise scope's reference is version 1, a windowed scope's 2.
+    const bool windowed = document.contains("transform");
+    const std::int64_t want_version = windowed ? kWindowReferenceVersion : kReferenceVersion;
     if (!header.contains("version") || !header.at("version").is_integral_number() ||
-        header.at("version").as_int() != kReferenceVersion) {
-        throw ReferenceRefused("the reference is not version " + std::to_string(kReferenceVersion) +
-                               " of its format, which this release reads");
+        header.at("version").as_int() != want_version) {
+        throw ReferenceRefused("the reference is not version " + std::to_string(want_version) +
+                               " of its format, which this release reads for a " +
+                               (windowed ? std::string{"windowed"} : std::string{"record-wise"}) +
+                               " scope");
     }
+    ref.version = want_version;
     if (!header.contains("scope") || !header.at("scope").is_object()) {
         throw ReferenceRefused("the reference names no scope");
     }
@@ -354,12 +587,28 @@ Reference read_reference(const fs::path& path,
     if (header.contains("created") && header.at("created").is_string()) {
         ref.recorded.push_back("written " + header.at("created").as_string());
     }
+    if (windowed) {
+        if (!header.contains("semantics") || !header.at("semantics").is_object()) {
+            throw ReferenceRefused(
+                "the reference does not say which window rules it implements (its header's "
+                "semantics)");
+        }
+        ref.semantics = header.at("semantics");
+    }
+    // The identity columns a window line names, in the transform's order.
+    std::vector<std::string> identity;
+    if (windowed) {
+        for (const auto& v : document.at("transform").at("identity").as_array()) {
+            identity.push_back(v.as_string());
+        }
+    }
 
     std::map<std::string, std::size_t> index;
     for (std::size_t i = 0; i < columns.size(); ++i) {
         index.emplace(columns[i].name, i);
     }
     Sha256 rows_hash;
+    Sha256 windows_hash;
     std::optional<config::JsonValue> end;
     for (std::size_t li = 1; li < lines.size(); ++li) {
         const std::string_view line = lines[li];
@@ -376,10 +625,20 @@ Reference read_reference(const fs::path& path,
             end = v.at("end");
             continue;
         }
+        if (windowed && v.is_object() && v.contains("window") && v.as_object().size() == 1 &&
+            v.at("window").is_object()) {
+            if (!line.ends_with('\n')) {
+                throw ReferenceRefused("the reference's last window has no end line after it");
+            }
+            windows_hash.update(line.data(), line.size());
+            ref.windows.push_back(window_line(v.at("window"), identity, columns, index, li + 1));
+            continue;
+        }
         if (!v.is_object() || !v.contains("row") || v.as_object().size() != 1 ||
             !v.at("row").is_object()) {
-            throw ReferenceRefused("line " + std::to_string(li + 1) +
-                                   " is neither a row nor the end");
+            throw ReferenceRefused("line " + std::to_string(li + 1) + " is neither a row" +
+                                   (windowed ? std::string{", a window"} : std::string{}) +
+                                   " nor the end");
         }
         if (!line.ends_with('\n')) {
             throw ReferenceRefused("the reference's last row has no end line after it");
@@ -444,6 +703,22 @@ Reference read_reference(const fs::path& path,
     if (ref.complete && !ref.incomplete.empty()) {
         throw ReferenceRefused("the reference says it is complete and also why it is not");
     }
+    if (windowed) {
+        ref.windows_sha256 = Sha256::to_hex(windows_hash.finalize());
+        if (!end->contains("windows") || !end->at("windows").is_integral_number() ||
+            end->at("windows").as_int() != static_cast<std::int64_t>(ref.windows.size())) {
+            throw ReferenceRefused(
+                "the reference's end line counts " +
+                (end->contains("windows") ? end->at("windows").serialize() : std::string{"no"}) +
+                " windows left out, and it holds " + std::to_string(ref.windows.size()));
+        }
+        if (end->string_or("windows_sha256", "") != ref.windows_sha256) {
+            throw ReferenceRefused(
+                "the reference's window lines do not hash to the end line's windows_sha256");
+        }
+        ref.source_bounds = source_bounds_of(*end, document);
+        ref.records = end->contains("records") ? end->at("records") : config::JsonValue{};
+    }
     ref.writer_verified = strings_of(*end, "verified");
     for (auto& r : strings_of(*end, "recorded")) {
         ref.recorded.push_back(std::move(r));
@@ -454,6 +729,12 @@ Reference read_reference(const fs::path& path,
                            "), which shows the file is whole as its writer "
                            "finished it, not who wrote it");
     ref.verified.push_back("every cell is a canonical cell of its column's type");
+    if (windowed) {
+        ref.verified.push_back(
+            "its " + std::to_string(ref.windows.size()) +
+            " window(s) left out of the comparison hash to its end line's windows_sha256, and "
+            "it gives the source's watermark bound at every checkpoint of the scope's lineage");
+    }
     return ref;
 }
 

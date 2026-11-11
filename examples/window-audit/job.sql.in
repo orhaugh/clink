@@ -1,0 +1,58 @@
+-- The example job: payments from Kafka into ten-second tumbling windows per
+-- account, written to ClickHouse through the native sink. Each window's row
+-- counts the account's purchases and refunds, sums their signed amounts
+-- exactly and their units. The watermark trails the least partition maximum
+-- of `ts` by two seconds; a record for a window that has closed is dropped.
+-- run.sh fills in the @...@ values.
+CREATE TABLE events (
+    event_id BIGINT,
+    account  VARCHAR,
+    kind     VARCHAR,
+    amount   DECIMAL(18, 2),
+    units    BIGINT,
+    ts       BIGINT,
+    sent_ts  BIGINT
+) WITH (
+    connector         = 'kafka',
+    format            = 'json',
+    brokers           = '@BROKERS@',
+    topic             = '@TOPIC@',
+    group_id          = '@TOPIC@-group',
+    auto_offset_reset = 'earliest',
+    event_time_column = 'ts',
+    watermark_lag_ms  = '2000'
+);
+
+-- At least once into a plain MergeTree (see the README for the contract).
+CREATE TABLE account_windows (
+    account      VARCHAR,
+    window_start BIGINT,
+    window_end   BIGINT,
+    events       BIGINT,
+    net          DECIMAL(38, 2),
+    units        BIGINT
+) WITH (
+    connector         = 'clickhouse',
+    format            = 'json',
+    insert_format     = 'native',
+    host              = '127.0.0.1',
+    port              = '@CH_PORT@',
+    database          = 'demo',
+    table             = '@TABLE@',
+    user              = 'clink',
+    password          = 'env://CLINK_DEMO_CH_PASSWORD',
+    batch_interval_ms = '200'
+);
+
+INSERT INTO account_windows
+SELECT account,
+       window_start,
+       window_end,
+       COUNT(*)    AS events,
+       SUM(signed) AS net,
+       SUM(units)  AS units
+FROM (SELECT account, ts, units,
+             CASE WHEN kind = 'refund' THEN -amount ELSE amount END AS signed
+      FROM events
+      WHERE kind IN ('purchase', 'refund')) AS payments
+GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), account;

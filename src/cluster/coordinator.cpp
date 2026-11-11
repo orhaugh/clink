@@ -480,6 +480,35 @@ std::string legacy_state_base_for(const CheckpointConfig& checkpoint) {
     return checkpoint.state_backend_uri;
 }
 
+namespace {
+
+// The manifest's spelling of a checkpoint alignment, and back. A manifest
+// written before the field existed has none and reads as aligned, which is what
+// a takeover deployed then.
+const char* checkpoint_alignment_name(CheckpointAlignment a) {
+    switch (a) {
+        case CheckpointAlignment::Unaligned:
+            return "unaligned";
+        case CheckpointAlignment::Adaptive:
+            return "adaptive";
+        case CheckpointAlignment::Aligned:
+            break;
+    }
+    return "aligned";
+}
+
+CheckpointAlignment checkpoint_alignment_of(const std::string& name) {
+    if (name == "unaligned") {
+        return CheckpointAlignment::Unaligned;
+    }
+    if (name == "adaptive") {
+        return CheckpointAlignment::Adaptive;
+    }
+    return CheckpointAlignment::Aligned;
+}
+
+}  // namespace
+
 void persist_job_manifest_(const std::string& ha_dir,
                            JobId job_id,
                            const std::string& graph_json,
@@ -527,6 +556,9 @@ void persist_job_manifest_(const std::string& ha_dir,
     // the epochs after the restore: the ones an incident across it needs.
     manifest += ",\"capture_dir\":" + q(checkpoint.capture_dir);
     manifest += ",\"capture_records\":" + std::to_string(checkpoint.capture_records);
+    // How barriers align, which a takeover redeploys and an incident bundle
+    // reads: what a window operator can have seen before a barrier depends on it.
+    manifest += ",\"alignment\":" + q(checkpoint_alignment_name(checkpoint.alignment));
     // A rescaled job: the graph before the rescale, which wrote every
     // checkpoint up to prior_graph_through. A takeover that restores one of
     // those plans this graph, since only it lays the checkpoint's directories
@@ -779,6 +811,9 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         // field, and the takeover deploys with capture off, as it did.
         ckpt.capture_dir = read_string_field(body, "capture_dir");
         ckpt.capture_records = read_uint_field(body, "capture_records");
+        // Before the alignment was persisted a takeover redeployed every job
+        // aligned, whatever it was submitted with.
+        ckpt.alignment = checkpoint_alignment_of(read_string_field(body, "alignment"));
         // Pin the recovered job to the backend it ran with BEFORE submit_job
         // re-applies the cluster default: a job persisted with an empty URI
         // (legacy resolution via checkpoint_dir) must not be silently rebound

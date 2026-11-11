@@ -4037,6 +4037,74 @@ TEST(CheckpointCompletion, ATakeoverKeepsTheFlightRecorderArmed) {
     std::filesystem::remove_all(root, ec);
 }
 
+// The alignment a job was submitted with is part of its manifest: a takeover
+// redeploys it, and an incident bundle reads it, since what an operator has
+// seen of its inputs when a barrier passes depends on it. Before it was
+// persisted, every takeover redeployed the job aligned.
+TEST(CheckpointCompletion, ATakeoverKeepsTheCheckpointAlignment) {
+    for (const auto alignment : {CheckpointAlignment::Unaligned, CheckpointAlignment::Adaptive}) {
+        const auto root = std::filesystem::temp_directory_path() /
+                          ("clink_ckpt_takeover_alignment_" + std::to_string(::getpid()) + "_" +
+                           std::to_string(static_cast<int>(alignment)));
+        std::filesystem::remove_all(root);
+        const auto ha_dir = root / "ha";
+        std::filesystem::create_directories(ha_dir);
+        JobId job_id = 0;
+        {
+            Coordinator a;
+            a.set_ha_dir(ha_dir.string());
+            const auto port = a.start();
+            a.expect_workers({"w"});
+            FakeWorker w(port, "w");
+            ASSERT_TRUE(w.valid());
+            ASSERT_TRUE(w.register_and_ack());
+            ASSERT_TRUE(a.await_registrations(2s));
+            CheckpointConfig ckpt;
+            ckpt.checkpoint_dir = (root / "ckpt").string();
+            ckpt.interval_ms = 600'000;
+            ckpt.alignment = alignment;
+            job_id = a.submit_job(two_subtask_graph(root / "out.txt"),
+                                  OperatorRegistry::default_instance(),
+                                  {},
+                                  ckpt);
+            ASSERT_TRUE(w.await_frame(MessageKind::Deploy).has_value());
+            a.stop();
+            w.close();
+        }
+        std::ifstream in(ha_dir / "jobs" / std::to_string(job_id) / "manifest.json");
+        const std::string manifest((std::istreambuf_iterator<char>(in)),
+                                   std::istreambuf_iterator<char>());
+        EXPECT_NE(manifest.find(alignment == CheckpointAlignment::Unaligned
+                                    ? R"("alignment":"unaligned")"
+                                    : R"("alignment":"adaptive")"),
+                  std::string::npos)
+            << manifest.substr(0, 400);
+        std::optional<DeployMsg> taken_over;
+        {
+            Coordinator b;
+            b.set_ha_dir(ha_dir.string());
+            const auto port = b.start();
+            b.expect_workers({"w"});
+            FakeWorker w(port, "w");
+            ASSERT_TRUE(w.valid());
+            ASSERT_TRUE(w.register_and_ack());
+            ASSERT_TRUE(b.await_registrations(2s));
+            b.recover_persisted_jobs();
+            if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+                taken_over = decode_deploy(*deploy);
+            }
+            b.stop();
+            w.close();
+        }
+        ASSERT_TRUE(taken_over.has_value()) << "the new leader dropped the job";
+        EXPECT_EQ(taken_over->unaligned_checkpoints, alignment == CheckpointAlignment::Unaligned)
+            << "the takeover redeployed the job with another alignment";
+        EXPECT_EQ(taken_over->adaptive_barrier_mode, alignment == CheckpointAlignment::Adaptive);
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+}
+
 // The takeover's protocol trace reports, as `confirmed`, the newest CONFIRMED
 // marker in the job's own directory: what the specification reseeds the
 // confirmed restore point from. A job that has confirmed nothing of its own

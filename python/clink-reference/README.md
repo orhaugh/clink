@@ -41,6 +41,28 @@ A row names every column of the scope's output, as Python values: `int`, `float`
 
 Write the transformation from the job's specification, not its code. The audit establishes that the artifact is whole and bound to the scope; it cannot establish that the reference is independent of the job, and a reference that shares the job's logic shares its mistakes.
 
+## A windowed job
+
+A job of one keyed tumbling window has a version 2 scope: its ranges start at the job's own start, and it carries the window's rules as the job declares them, each completed checkpoint's source positions and the watermark the sink recorded there, and the watermark windows are final by. A window's row depends on every record before it, and on whether each arrived before its window closed, which offsets do not record. `TumblingWindows` decides that from bounds: the record's own partition and the next checkpoint's positions bound the watermark from above, from the records alone, and the watermark the sink recorded at the checkpoint before bounds it from below. A record or window the bounds cannot place is left out, with why, never guessed.
+
+```python
+from clink_reference import ReferenceWriter, Scope, TumblingWindows, WindowRules, read_scope, write_result
+
+rules = WindowRules(size_ms=10_000, lag_ms=2_000, time_column="ts", allowed_lateness_ms=0)
+windows = TumblingWindows(scope, rules, [("events", "count"), ("net", "sum")])
+read = read_scope(scope, "broker:9092",
+                  lambda rec: windows.add(rec.partition, rec.offset, event_time(rec.value), select(rec.value)),
+                  run_start_offsets={("payments", p): 0 for p in range(3)})
+result = windows.finish()
+writer = ReferenceWriter("reference.ndjson", scope, {"name": "my-windows", "version": "1"},
+                         semantics=rules.semantics())
+write_result(writer, result, output)  # output(key, start, end, aggregates) -> the row
+writer.finish(read.complete, read.incomplete, read.verified, read.recorded, read.read,
+              source_bounds=result.source_bounds, records=result.records)
+```
+
+The rules are your specification, declared, not read from the job: the audit compares them with the job graph's, and a job configured otherwise fails `reference.semantics`. `event_time` gives every record's event time, the ones the transformation filters out included, since every record the source delivers advances the watermark. `select` gives the record's key and its values for each `SUM`, or `None` for a record the transformation drops. `examples/window-audit/reference_windows.py` is a complete reference for that example's job, with its specification in `windows_transform.py`.
+
 ## What a read establishes
 
 For each source, before reading:
@@ -76,6 +98,8 @@ NDJSON, format `clink-reference-result`, version 1:
    - SHA-256 hashes of the row lines and the header line;
    - `complete` and, if not, why;
    - what was verified, what was recorded, and each range's read.
+
+A windowed scope's artifact is version 2. Its header adds `semantics`, the window rules the reference implements. Its body adds a `window` line for each window left out, open or undetermined, with why. Its end line adds `windows` and `windows_sha256`, `source_bounds` (the watermark the records allow at each checkpoint of the lineage) and `records` (what became of every record: folded, dropped late, undetermined or filtered).
 
 An artifact without its end line was not finished, and clink refuses it. So does one whose hashes or count do not hold, whose scope is not the audit's, or whose cells are not canonical for their column. The hashes show the file is whole as its writer finished it, not who wrote it.
 

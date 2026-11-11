@@ -177,7 +177,7 @@ void regress_usage() {
 }
 
 void reconcile_usage() {
-    std::cerr << "Usage: clink incident-reconcile <bundle> --host=<host> --key=<col>[,<col>...]\n"
+    std::cerr << "Usage: clink incident-reconcile <bundle> --host=<host> [--key=<col>[,<col>...]]\n"
               << "         [--port=N] [--user=<user>] [--password-env=<VAR>] [--secure]\n"
               << "         [--tls-ca-file=<file>] [--tls-verify=true|false]\n"
               << "         [--checkpoint=<id>] [--sink-op=<id>] [--job=<id>]\n"
@@ -194,7 +194,9 @@ void reconcile_usage() {
               << "unexpected or duplicated. The expected rows are the sink's own record of its\n"
               << "input, which the bundle carries when the job's Workers ran with --capture-dir\n"
               << "and it was collected with --include-captures; --key names the columns that\n"
-              << "identify one row the job writes.\n"
+              << "identify one row the job writes. A windowed job's key is its windows'\n"
+              << "identity, the group key's columns and the window's start and end, which the\n"
+              << "bundle's job graph names.\n"
               << "\n"
               << "The connection is the operator's: nothing it connects with or runs comes from\n"
               << "the bundle, and the password is read from the environment variable\n"
@@ -237,9 +239,15 @@ void scope_usage() {
         << "`clink incident-reconcile --reference` refuses an artifact computed for any\n"
         << "other scope. Reads no network.\n"
         << "\n"
-        << "Exit status: 0 written, 3 written for a scope whose evidence or source\n"
-        << "positions are not whole (no reference can be complete for it), 2 bad usage or\n"
-        << "a request the bundle does not fit.\n";
+        << "A windowed job's scope (version 2) spans the job's whole lineage, from a start\n"
+        << "with no state through every restore the bundle records, and adds the window's\n"
+        << "rules, each completed checkpoint's source positions and the watermark the sink\n"
+        << "recorded at its barrier, by which a window is final.\n"
+        << "\n"
+        << "Exit status: 0 written, 3 for a scope whose evidence or source positions are\n"
+        << "not whole (written once its columns are known; no reference can be complete\n"
+        << "for it), or not written for a job whose state across records the audit does\n"
+        << "not support, 2 bad usage or a request the bundle does not fit.\n";
 }
 
 void print_report(const Report& r, bool json, const std::string& report_path) {
@@ -652,9 +660,8 @@ int clink_cmd_incident_reconcile(int argc, char** argv) {
             }
             start = comma + 1;
         }
-        if (o.key.empty() && error.empty()) {
-            error = "--key is required: the columns that identify one row the job writes";
-        }
+        // A windowed job's key is its windows' identity, which the bundle
+        // names; any other job's is required, which the reconciliation says.
     }
     if (!error.empty()) {
         std::cerr << "incident-reconcile: " << error << "\n\n";
@@ -750,15 +757,23 @@ int clink_cmd_incident_scope(int argc, char** argv) {
     }
     rc::Scope sc;
     try {
-        sc = rc::load_scope(b, checkpoint, sink_op, a.switches.contains("from-run-start"));
+        sc = rc::load_scope(b, checkpoint, sink_op, a.switches.contains("from-run-start"), true);
     } catch (const rc::ScopeRefused& e) {
         std::cerr << "incident-scope: " << e.what() << "\n";
         return 2;
     }
     if (sc.columns.empty()) {
+        // Evidence missing before the sink's columns were read: the scope is
+        // not whole, which a bundle collected with the evidence can make it.
         std::cerr << "incident-scope: the scope names no columns"
                   << (sc.gap ? ": " + *sc.gap : std::string{}) << "\n";
-        return 2;
+        return sc.gap ? 3 : 2;
+    }
+    if (sc.window_unsupported) {
+        std::cerr << "incident-scope: the job keeps state across records in a form the audit "
+                     "does not support, so no reference can be computed for it: "
+                  << *sc.window_unsupported << "\n";
+        return 3;
     }
     const auto doc = rc::scope_document(b, sc);
     std::ofstream out(a.get("out"), std::ios::binary | std::ios::trunc);
@@ -770,6 +785,16 @@ int clink_cmd_incident_scope(int argc, char** argv) {
     std::cout << "scope " << doc.string_or("scope_sha256", "") << ": job " << sc.job
               << ", checkpoint " << sc.checkpoint << ", " << sc.expected.size()
               << " captured row(s), written to " << a.get("out") << "\n";
+    if (sc.window) {
+        std::cout << "a windowed scope: the job's lineage from a start with no state, "
+                  << sc.lineage.size() << " completed checkpoint(s), " << sc.restores.size()
+                  << " restore(s); windows are final at checkpoint " << sc.checkpoint
+                  << " by the watermark recorded there ("
+                  << (sc.lineage.empty() || !sc.lineage.back().watermark_ms
+                          ? std::string{"none"}
+                          : std::to_string(*sc.lineage.back().watermark_ms) + " ms")
+                  << ")\n";
+    }
     if (sc.gap) {
         std::cerr << "incident-scope: the scope is not whole: " << *sc.gap << "\n";
         return 3;
