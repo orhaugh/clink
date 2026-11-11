@@ -86,6 +86,29 @@ TEST(CheckpointRetention, SweepCutoffNeverUnderflowsEarlyIds) {
     EXPECT_EQ(r.sweep_cutoff().value(), 0u);  // 2 - (5-1) would underflow
 }
 
+TEST(CheckpointRetention, ARestoredRunKeepsItsRestorePointAmongTheNewest) {
+    // A job restored from 16 on a Worker that never saw 16 complete; its run
+    // numbers from 19. Without the restore point, the first checkpoint's
+    // cutoff (19 - 2 = 17) passed 16 and nothing protected it.
+    CheckpointRetention fresh{3};
+    EXPECT_TRUE(fresh.record_completed(CheckpointId{19}).empty());
+    EXPECT_FALSE(fresh.retained_ids().contains(16u)) << "the defect: 16 was sweepable";
+
+    CheckpointRetention r{3};
+    r.record_restore_point(CheckpointId{16});
+    EXPECT_TRUE(r.record_completed(CheckpointId{19}).empty());
+    EXPECT_EQ(r.sweep_cutoff().value(), 17u);
+    EXPECT_TRUE(r.retained_ids().contains(16u)) << "one of the three newest completed";
+    EXPECT_TRUE(r.record_completed(CheckpointId{20}).empty());
+    const auto purged = r.record_completed(CheckpointId{21});
+    ASSERT_EQ(purged.size(), 1u);
+    EXPECT_EQ(purged[0].value(), 16u) << "gone once three newer ones completed";
+    // A run that began with no state has no restore point.
+    CheckpointRetention none{3};
+    none.record_restore_point(CheckpointId{0});
+    EXPECT_EQ(none.retained_count(), 0u);
+}
+
 TEST(CheckpointRetention, RetainedIdsProtectGapSurvivorsBelowTheCutoff) {
     // Completion gaps (failed checkpoints between retained ones) put a
     // retained id BELOW the arithmetic cutoff. The cutoff is derived from

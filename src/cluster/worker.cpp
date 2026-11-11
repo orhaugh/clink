@@ -1134,6 +1134,14 @@ void Worker::dispatch_commit_checkpoint_(const CommitCheckpointMsg& msg) {
             ret_it = per_job_retention_
                          .emplace(msg.job_id, CheckpointRetention{cfg_.checkpoint_num_retained})
                          .first;
+            // A run this Worker restored began from a completed checkpoint it
+            // never saw complete: it is one of the newest until enough of the
+            // run's own complete.
+            if (const auto cp = per_job_checkpoint_.find(msg.job_id);
+                cp != per_job_checkpoint_.end()) {
+                ret_it->second.record_restore_point(
+                    CheckpointId{cp->second.restore_from_checkpoint_id});
+            }
         }
         auto purge_ids = ret_it->second.record_completed(CheckpointId{msg.checkpoint_id});
         // A savepoint is a checkpoint the operator asked to keep. Neither the

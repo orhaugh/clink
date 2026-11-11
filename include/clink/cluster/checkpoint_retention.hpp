@@ -36,6 +36,20 @@ public:
         return to_purge;
     }
 
+    // The checkpoint a restored run began from, which completed before this
+    // tracker existed: a Worker that restores a job never saw it complete.
+    // It counts among the completed checkpoints the window keeps, so it
+    // stays until num_retained newer ones have completed, and the sweep does
+    // not take it as an orphan while it is one of the newest. A restored run
+    // numbers its checkpoints from past the ones the discarded run used, so
+    // without it the cutoff passes the restore point at the run's first
+    // checkpoint, and the state its scope starts from is gone.
+    void record_restore_point(CheckpointId id) {
+        if (id.value() != 0) {
+            completed_.insert(id.value());
+        }
+    }
+
     [[nodiscard]] std::size_t num_retained() const noexcept { return num_retained_; }
     [[nodiscard]] std::size_t retained_count() const noexcept { return completed_.size(); }
 

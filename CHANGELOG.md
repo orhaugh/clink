@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**A restored run keeps its restore point among the retained checkpoints.**
+A Worker keeps the newest `--checkpoint-num-retained` completed checkpoints
+of a job and sweeps older state, judging what is old from the newest id it
+saw complete. A Worker that deployed a restored run never saw the checkpoint
+it restored from complete, and the run numbers its checkpoints past the
+discarded run's, so the sweep at the run's first checkpoint took the restore
+point while it was still one of the newest: with the default retention of
+two, nothing could collect the evidence of the run's first scope, which
+starts there. The Worker now counts the restore point as completed when it
+starts tracking the job.
+
 **Repeated, bounded audits of a running job.** `clink-audit`
 (`python/clink-audit`) runs the record-wise independent audit against a
 running Kafka to ClickHouse job, again and again: `run` for a scheduler, or
