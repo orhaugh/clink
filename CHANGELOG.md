@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**A checkpoint directory given as a relative path collects and exports.**
+`clink state-export --checkpoint-dir` and `clink incident-collect` refused a
+relative directory as if its state lived on another machine, because the
+state root a marker records is resolved against the directory and only an
+absolute root is read as local. The collector now resolves the checkpoint
+and HA directories against the working directory first.
+
 **Checkpoint datasets read every local backend, name every operator, and
 prove themselves unchanged.** The export reads a changelog backend's
 checkpoints with the materialisation files they name, and RocksDB's

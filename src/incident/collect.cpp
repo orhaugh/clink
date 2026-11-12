@@ -1120,9 +1120,31 @@ const char* collect_error_kind_name(CollectError::Kind kind) noexcept {
     return "other";
 }
 
+// A relative directory is the caller's working directory's. The collector
+// resolves the state roots a marker records against the checkpoint directory
+// and reads only absolute ones as local, so a relative directory made every
+// participant's state look as if it lived elsewhere.
+static std::string absolute_local(const std::string& dir) {
+    if (dir.empty() || dir.find("://") != std::string::npos) {
+        return dir;
+    }
+    std::error_code ec;
+    fs::path p = fs::absolute(dir, ec).lexically_normal();
+    if (ec) {
+        return dir;
+    }
+    if (!p.has_filename() && p.has_parent_path()) {
+        p = p.parent_path();
+    }
+    return p.string();
+}
+
 CollectResult collect(const CollectOptions& options) {
     try {
-        Collector c(options);
+        CollectOptions resolved = options;
+        resolved.checkpoint_dir = absolute_local(options.checkpoint_dir);
+        resolved.ha_dir = absolute_local(options.ha_dir);
+        Collector c(resolved);
         return c.run();
     } catch (const CollectError&) {
         throw;

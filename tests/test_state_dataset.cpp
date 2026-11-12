@@ -230,6 +230,8 @@ protected:
         return sp::open_dataset(root / out);
     }
 
+    // Bind the result before iterating a member of it: a range-for over
+    // doc(...).at(...) iterates a temporary destroyed before the loop body.
     [[nodiscard]] static clink::config::JsonValue doc(const fs::path& dataset) {
         std::ifstream in(dataset / sp::kDatasetFile);
         std::ostringstream s;
@@ -468,7 +470,8 @@ TEST_F(StateDatasetTest, ACheckpointCompletingDuringTheCopyDoesNotRefuseIt) {
     EXPECT_TRUE(r.complete);
     EXPECT_EQ(r.checkpoint, 1U);
     bool noted = false;
-    for (const auto& n : doc(root / "ds").at("notes").as_array()) {
+    const auto ds = doc(root / "ds");
+    for (const auto& n : ds.at("notes").as_array()) {
         noted = noted || n.as_string().find("appeared") != std::string::npos;
     }
     EXPECT_TRUE(noted);
@@ -488,6 +491,30 @@ TEST_F(StateDatasetTest, AMarkerRemovedDuringTheCopyRefusesIt) {
     (void)refusal(o, &kind);
     EXPECT_EQ(kind, "changed");
     EXPECT_FALSE(fs::exists(root / "ds"));
+}
+
+TEST_F(StateDatasetTest, ARelativeCheckpointDirectoryExportsLikeAnAbsoluteOne) {
+    // The state a marker records relative to its checkpoint directory was
+    // read as living elsewhere when that directory was given relative, and
+    // every export from one was refused as unsupported.
+    write_job_checkpoint(1, kBase);
+    const auto cwd = fs::current_path();
+    fs::current_path(root);
+    auto o = options("ds", 1);
+    o.checkpoint_dir = fs::relative(ckpt, root).string();
+    o.out = "ds";
+    sp::DatasetResult r;
+    try {
+        r = sp::export_checkpoint_dataset(o);
+    } catch (...) {
+        fs::current_path(cwd);
+        throw;
+    }
+    fs::current_path(cwd);
+    EXPECT_TRUE(r.complete);
+    const auto absolute = sp::export_checkpoint_dataset(options("abs", 1));
+    EXPECT_EQ(r.entries, absolute.entries);
+    EXPECT_EQ(r.participants, absolute.participants);
 }
 
 TEST_F(StateDatasetTest, TheDigestIdentifiesTheDatasetAndCatchesARewrite) {
@@ -511,7 +538,8 @@ TEST_F(StateDatasetTest, EverySnapshotIsDecodedOnceAndTheDecodeIsReported) {
     write_job_checkpoint(1, kBase);
     (void)sp::export_checkpoint_dataset(options("ds", 1));
     std::size_t decodes = 0;
-    for (const auto& c : doc(root / "ds").at("verification").as_array()) {
+    const auto ds = doc(root / "ds");
+    for (const auto& c : ds.at("verification").as_array()) {
         if (c.at("id").as_string() == "state.decode") {
             ++decodes;
             EXPECT_EQ(c.at("verdict").as_string(), "passed");
@@ -573,7 +601,8 @@ TEST_F(StateDatasetTest, AChangelogCheckpointExportsWithItsMaterialisation) {
         keys.insert(e.user_key + "=" + e.value);
     }
     EXPECT_EQ(keys, (std::set<std::string>{"before=1", "after=2"}));
-    for (const auto& p : doc(root / "ds").at("participants").as_array()) {
+    const auto ds = doc(root / "ds");
+    for (const auto& p : ds.at("participants").as_array()) {
         EXPECT_EQ(p.at("backend").as_string(), "changelog");
     }
 
@@ -688,7 +717,8 @@ TEST_F(StateDatasetTest, OperatorsAreNamedAndComparedBySubtaskFromTheMarkersIden
     EXPECT_EQ(a.op_host.at(kSource), "source");
     EXPECT_EQ(b.op_subtasks.at(kCounts), 4U);
     // Named from the marker alone: the fixture records no job graph.
-    for (const auto& o : doc(root / "b").at("operators").as_array()) {
+    const auto b_doc = doc(root / "b");
+    for (const auto& o : b_doc.at("operators").as_array()) {
         EXPECT_EQ(o.at("named_by").as_string(), "layout");
     }
     const auto r = sp::diff_datasets(a, b, {});
