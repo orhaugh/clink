@@ -60,6 +60,25 @@ clink_add_job_module(clink_cancel_test_job
     SOURCES cancel_test_job.cpp
     OUTPUT_NAME cancel_test_job)
 
+# upgrade_check_job: the one job the upgrade validation workflow supports
+# (examples/upgrade-check/, docs/internals/upgrade-validation.md). Each
+# upgrade_check_job_<variant> is the same source with one controlled defect
+# compiled in, a candidate the gate must catch; the job itself carries none.
+clink_add_job_module(clink_upgrade_check_job
+    SOURCES upgrade-check/upgrade_job.cpp
+    OUTPUT_NAME upgrade_check_job)
+set(_uc_variants compatible wrong_aggregate window_boundary lost_timers schema
+    uid_changed uid_missing crash_restore crash_continue memory_windows
+    string_timer_keys)
+set(_uc_n 1)
+foreach(_uc IN LISTS _uc_variants)
+    clink_add_job_module(clink_upgrade_check_job_${_uc}
+        SOURCES upgrade-check/upgrade_job.cpp
+        OUTPUT_NAME upgrade_check_job_${_uc}
+        DEFINES CLINK_UC_VARIANT=${_uc_n})
+    math(EXPR _uc_n "${_uc_n} + 1")
+endforeach()
+
 # two_phase_commit_job: bounded slow source -> file_2pc_sink_string.
 # Drives test_two_phase_commit.cpp.
 clink_add_job_module(clink_two_phase_commit_job
