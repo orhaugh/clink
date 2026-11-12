@@ -8,15 +8,20 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string_view>
 
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/connectors/capability.hpp"
+#include "clink/incident/bundle.hpp"
 #include "clink/plugin/install_defaults.hpp"
 #include "clink/plugin/plugin.hpp"
 #ifdef CLINK_CLI_HAS_SQL
 #include "clink/sql/install.hpp"
+#ifdef CLINK_LINKED_ROCKSDB
+#include "clink/state/rocksdb_state_backend.hpp"
+#endif
 #endif
 
 // Subcommand entry points. Each lives in its own .cpp under tools/.
@@ -134,6 +139,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     const std::string_view cmd = argv[1];
+#ifdef CLINK_LINKED_ROCKSDB
+    // RocksDB checkpoints in a bundle or a checkpoint dataset are read through
+    // this build's RocksDB, from a scratch copy.
+    clink::incident::register_directory_state_reader(
+        "rocksdb", [](const std::filesystem::path& dir) {
+            return clink::rocksdb_checkpoint_to_arrow(dir.string());
+        });
+#endif
     if (cmd == "--help" || cmd == "-h" || cmd == "help") {
         usage();
         return 0;

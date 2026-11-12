@@ -9,12 +9,15 @@
 // retracting plans - GROUP BY, DISTINCT - print their FINAL rows) and
 // written to stdout as NDJSON, one row per line.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -32,6 +35,7 @@
 #include "clink/sql/ast.hpp"
 #include "clink/sql/binder.hpp"
 #include "clink/sql/catalog.hpp"
+#include "clink/sql/logical_plan.hpp"
 #include "clink/sql/parser.hpp"
 #include "clink/sql/row_kind.hpp"
 #include "clink/sql/type.hpp"
@@ -73,6 +77,8 @@ bool has_flag(int argc, char** argv, std::string_view flag) {
 // A checkpoint dataset's entries as the `state` table: identity, scope and
 // participant as they are, and keys and values only as hex and lengths. No
 // column reads a value as a type: nothing in this build knows a job's codecs.
+constexpr std::int64_t kProjectionRowGroup = 65536;
+
 void write_dataset_projection(const clink::state_processor::Dataset& d, const fs::path& path) {
     namespace sp = clink::state_processor;
     const auto schema = arrow::schema({arrow::field("op_id", arrow::utf8()),
@@ -83,7 +89,9 @@ void write_dataset_projection(const clink::state_processor::Dataset& d, const fs
                                        arrow::field("user_key_hex", arrow::utf8()),
                                        arrow::field("value_hex", arrow::utf8()),
                                        arrow::field("user_key_len", arrow::int64()),
-                                       arrow::field("value_len", arrow::int64())});
+                                       arrow::field("value_len", arrow::int64()),
+                                       arrow::field("operator", arrow::utf8()),
+                                       arrow::field("subtask", arrow::int64())});
     const auto ok = [](const arrow::Status& st) {
         if (!st.ok()) {
             throw std::runtime_error("cannot write the query projection: " + st.ToString());
@@ -95,13 +103,14 @@ void write_dataset_projection(const clink::state_processor::Dataset& d, const fs
     ok(opened.status());
     auto writer = std::move(*opened);
     arrow::StringBuilder op, slot, scope, uk, val;
-    arrow::Int64Builder kg, part, uk_len, val_len;
+    arrow::Int64Builder kg, part, uk_len, val_len, subtask;
+    arrow::StringBuilder op_name;
     std::int64_t pending = 0;
     const auto flush = [&] {
         if (pending == 0) {
             return;
         }
-        std::vector<std::shared_ptr<arrow::Array>> cols(9);
+        std::vector<std::shared_ptr<arrow::Array>> cols(11);
         ok(op.Finish(&cols[0]));
         ok(slot.Finish(&cols[1]));
         ok(scope.Finish(&cols[2]));
@@ -111,6 +120,8 @@ void write_dataset_projection(const clink::state_processor::Dataset& d, const fs
         ok(val.Finish(&cols[6]));
         ok(uk_len.Finish(&cols[7]));
         ok(val_len.Finish(&cols[8]));
+        ok(op_name.Finish(&cols[9]));
+        ok(subtask.Finish(&cols[10]));
         ok(writer->WriteTable(*arrow::Table::Make(schema, cols, pending), pending));
         pending = 0;
     };
@@ -124,7 +135,12 @@ void write_dataset_projection(const clink::state_processor::Dataset& d, const fs
         ok(val.Append(sp::hex_bytes(e.value)));
         ok(uk_len.Append(static_cast<std::int64_t>(e.user_key.size())));
         ok(val_len.Append(static_cast<std::int64_t>(e.value.size())));
-        if (++pending == 65536) {
+        const auto name = d.op_names.find(e.op);
+        ok(name != d.op_names.end() ? op_name.Append(name->second) : op_name.AppendNull());
+        const auto sub = d.layout.find(e.participant);
+        ok(sub != d.layout.end() ? subtask.Append(static_cast<std::int64_t>(sub->second.second))
+                                 : subtask.AppendNull());
+        if (++pending == kProjectionRowGroup) {
             flush();
         }
         return true;
@@ -133,21 +149,97 @@ void write_dataset_projection(const clink::state_processor::Dataset& d, const fs
     ok(writer->Close());
 }
 
+// An aggregate re-emits each group's running result as its input arrives
+// (append-mode snapshots, docs/internals/sql-frontend.md), so over a bounded
+// table the result is each group's last row. That is decidable only for one
+// aggregate at the top of the query whose group columns are all in its output:
+// a HAVING, a LIMIT or an outer query over it, or an aggregate inside a
+// subquery, would act on snapshots that a later one supersedes, and no row
+// says so. Those are refused rather than answered wrongly.
+struct FinalRows {
+    bool by_key{false};
+    std::vector<std::string> key;  // output columns naming a group
+    std::string refusal;
+};
+
+FinalRows final_rows_of(const clink::sql::LogicalPlan& root) {
+    std::function<std::size_t(const clink::sql::LogicalPlan&)> aggregates =
+        [&](const clink::sql::LogicalPlan& n) -> std::size_t {
+        std::size_t c = (n.kind() == "Aggregate" || n.kind() == "WindowAggregate") ? 1 : 0;
+        for (const auto* in : n.inputs()) {
+            c += in != nullptr ? aggregates(*in) : 0;
+        }
+        return c;
+    };
+    FinalRows out;
+    const auto total = aggregates(root);
+    if (total == 0) {
+        return out;
+    }
+    std::vector<const clink::sql::LogicalProject*> projects;
+    const clink::sql::LogicalPlan* n = &root;
+    while (n->kind() == "Project") {
+        projects.push_back(static_cast<const clink::sql::LogicalProject*>(n));
+        n = &projects.back()->input();
+    }
+    const char* why =
+        "state-query answers an aggregate only as one GROUP BY at the top of the query, with "
+        "every group column selected and no HAVING, LIMIT or outer query around it: its "
+        "streaming aggregate emits each group's running result, and only then can each "
+        "group's final row be kept";
+    if (n->kind() != "Aggregate" || total != 1) {
+        out.refusal = why;
+        return out;
+    }
+    const auto* agg = static_cast<const clink::sql::LogicalAggregate*>(n);
+    out.key = agg->key_output_names().empty() ? agg->group_keys() : agg->key_output_names();
+    for (auto it = projects.rbegin(); it != projects.rend(); ++it) {
+        for (auto& k : out.key) {
+            std::string renamed;
+            for (const auto& o : (*it)->outputs()) {
+                const auto e = clink::config::parse(o.expr_json);
+                if (e.is_object() && e.as_object().size() == 1 && e.contains("col") &&
+                    e.at("col").is_string() && e.at("col").as_string() == k) {
+                    renamed = o.name;
+                    break;
+                }
+            }
+            if (renamed.empty()) {
+                out.refusal = why;
+                return out;
+            }
+            k = renamed;
+        }
+    }
+    for (const auto& k : out.key) {
+        if (root.schema() == nullptr || root.schema()->GetFieldIndex(k) < 0) {
+            out.refusal = why;
+            return out;
+        }
+    }
+    out.by_key = true;
+    return out;
+}
+
 void query_usage() {
     std::cout
         << "usage: clink state-query --dataset=<dataset> --sql=\"SELECT ...\" [--allow-partial]\n"
+        << "           [--digest=<sha256>]\n"
         << "       clink state-query (--from=<path> | --dir=<root> --id=N) --sql=\"SELECT ...\"\n"
         << "\n"
         << "--dataset queries a checkpoint dataset (clink state-export --checkpoint-dir)\n"
         << "after verifying that its entry table and bundle manifest hash to what its\n"
-        << "dataset.json records. A partial dataset is refused (exit 3) unless\n"
+        << "dataset.json records, and with --digest that dataset.json has that SHA-256.\n"
+        << "A partial dataset is refused (exit 3) unless\n"
         << "--allow-partial; either way its completeness is stated on stderr. Its\n"
         << "`state` table holds exact identities and no typed readings:\n"
         << "\n"
         << "  op_id TEXT (the operator id, decimal), slot TEXT,\n"
         << "  scope TEXT (keyed | operator | raw), key_group BIGINT (keyed only),\n"
         << "  participant BIGINT, user_key_hex TEXT, value_hex TEXT,\n"
-        << "  user_key_len BIGINT, value_len BIGINT\n"
+        << "  user_key_len BIGINT, value_len BIGINT,\n"
+        << "  operator TEXT (the graph operator it is named as, when the dataset names it),\n"
+        << "  subtask BIGINT (the participant's subtask in its operator, when recorded)\n"
         << "\n"
         << "The --from and --dir forms read snapshot files without the checkpoint's\n"
         << "marker or participants (not checkpoint-consistent), and render keys and\n"
@@ -204,7 +296,8 @@ int clink_cmd_state_query(int argc, char** argv) {
             // 1. A verified dataset -> its hex projection.
             std::optional<clink::state_processor::Dataset> d;
             try {
-                d = clink::state_processor::open_dataset(dataset_dir);
+                d = clink::state_processor::open_dataset(dataset_dir,
+                                                         get_arg(argc, argv, "digest"));
             } catch (const clink::state_processor::DatasetInvalid& e) {
                 std::cerr << "state-query: " << e.what() << "\n";
                 return 2;
@@ -225,7 +318,8 @@ int clink_cmd_state_query(int argc, char** argv) {
             state_ddl =
                 "CREATE TABLE state (op_id TEXT, slot TEXT, scope TEXT, key_group BIGINT, "
                 "participant BIGINT, user_key_hex TEXT, value_hex TEXT, user_key_len BIGINT, "
-                "value_len BIGINT) WITH (connector='parquet', format='json', path='" +
+                "value_len BIGINT, operator TEXT, subtask BIGINT) WITH (connector='parquet', "
+                "format='json', path='" +
                 state_pq.string() + "')";
         } else {
             // 1. Snapshot -> decoded entries -> the query-projection Parquet.
@@ -267,6 +361,11 @@ int clink_cmd_state_query(int argc, char** argv) {
         clink::sql::Binder binder{catalog};
         auto plan = binder.bind_select(std::get<clink::sql::ast::SelectStmt>(script.statements[0]));
         const auto schema = plan->schema();
+        const auto final_rows = final_rows_of(*plan);
+        if (!final_rows.refusal.empty()) {
+            std::cerr << "state-query: " << final_rows.refusal << "\n";
+            return 2;
+        }
 
         std::string result_ddl = "CREATE TABLE __clink_query_result (";
         for (int i = 0; i < schema->num_fields(); ++i) {
@@ -303,8 +402,9 @@ int clink_cmd_state_query(int argc, char** argv) {
         // insert/update_after adds one occurrence of the bare row, a
         // delete/update_before removes one; each surviving row prints
         // count times (exact multiset semantics - unlike the changelog
-        // sink's relation view, duplicate result rows are kept). Rows in
-        // sorted serialised order for determinism.
+        // sink's relation view, duplicate result rows are kept). An
+        // aggregate's result is instead each group's last row (final_rows_of).
+        // Rows in sorted serialised order for determinism.
         std::size_t rows = 0;
         {
             struct Net {
@@ -312,6 +412,7 @@ int clink_cmd_state_query(int argc, char** argv) {
                 std::int64_t count{0};
             };
             std::map<std::string, Net> net;
+            std::map<std::string, std::string> last;  // group -> its last row
             std::ifstream in(out_path);
             std::string line;
             while (std::getline(in, line)) {
@@ -328,10 +429,36 @@ int clink_cmd_state_query(int argc, char** argv) {
                                clink::sql::is_delete_like(it->second.as_string());
                     obj->erase(clink::sql::kRowKindField);
                 }
-                std::string bare = clink::config::JsonValue{std::move(*obj)}.serialize(0);
+                std::string bare = clink::config::JsonValue{*obj}.serialize(0);
+                if (final_rows.by_key) {
+                    std::string group;
+                    for (const auto& k : final_rows.key) {
+                        const auto f = obj->find(k);
+                        group += (f == obj->end() ? std::string{"null"} : f->second.serialize(0)) +
+                                 "\x1f";
+                    }
+                    if (deletion) {
+                        last.erase(group);
+                    } else {
+                        last[group] = std::move(bare);
+                    }
+                    continue;
+                }
                 auto& slot = net[bare];
                 slot.count += deletion ? -1 : 1;
                 slot.line = std::move(bare);
+            }
+            if (final_rows.by_key) {
+                std::vector<std::string> sorted;
+                sorted.reserve(last.size());
+                for (auto& [_, row] : last) {
+                    sorted.push_back(std::move(row));
+                }
+                std::sort(sorted.begin(), sorted.end());
+                for (const auto& row : sorted) {
+                    std::cout << row << "\n";
+                    ++rows;
+                }
             }
             for (const auto& [_, slot] : net) {
                 for (std::int64_t i = 0; i < slot.count; ++i) {

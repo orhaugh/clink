@@ -23,7 +23,10 @@
 #include "clink/cluster/in_doubt_resolution.hpp"
 #include "clink/cluster/state_location.hpp"
 #include "clink/config/json.hpp"
+#include "clink/state/changelog_state_backend.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
+#include "clink/state/file_materialization_store.hpp"
+#include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/schema_version.hpp"
 #include "clink/state/snapshot_arrow_writer.hpp"
 #include "clink/state/state_backend_factory.hpp"
@@ -68,6 +71,9 @@ struct KeyedEntry {
 std::uint32_t owner(std::uint8_t kg, std::uint32_t parallelism) {
     return static_cast<std::uint32_t>(kg) * parallelism / 128;
 }
+
+const std::vector<KeyedEntry> kBase = {
+    {3, "alice", "a1"}, {40, "bob", "b1"}, {70, "carol", "c1"}, {120, "dave", "d1"}};
 
 class StateDatasetTest : public ::testing::Test {
 protected:
@@ -125,17 +131,20 @@ protected:
         clink::state::write_checkpoint_meta(path, id, bytes.data(), bytes.size());
     }
 
-    void write_marker(std::uint64_t id,
-                      const std::set<std::uint32_t>& subs,
-                      std::uint32_t generation = 1,
-                      const std::optional<std::string>& state = std::nullopt) const {
+    void write_marker(
+        std::uint64_t id,
+        const std::set<std::uint32_t>& subs,
+        std::uint32_t generation = 1,
+        const std::optional<std::string>& state = std::nullopt,
+        const std::map<std::uint32_t, clink::cluster::ParticipantIdentity>& layout = {}) const {
         const auto body = clink::cluster::completed_marker_body(
             kDatasetJob,
             id,
             generation,
             subs,
             state.value_or(
-                clink::cluster::recorded_state_location(ckpt.string(), kDatasetJob, state_root())));
+                clink::cluster::recorded_state_location(ckpt.string(), kDatasetJob, state_root())),
+            layout);
         const auto dir = clink::cluster::completed_marker_dir_for(ckpt.string(), kDatasetJob);
         fs::create_directories(dir);
         std::ofstream(dir / ("COMPLETED-" + std::to_string(id)), std::ios::trunc) << body;
@@ -169,6 +178,40 @@ protected:
             subs.insert(p);
         }
         write_marker(id, subs, generation);
+    }
+
+    // A checkpoint whose source and counter run as separate subtasks: the
+    // source's subtasks first or after the counter's, the counter at
+    // `parallelism`, and with or without the marker's identity lines.
+    void write_split_checkpoint(std::uint64_t id,
+                                std::uint32_t generation,
+                                std::uint32_t parallelism,
+                                bool source_first,
+                                bool with_layout) const {
+        std::map<std::uint32_t, clink::cluster::ParticipantIdentity> layout;
+        std::set<std::uint32_t> subs;
+        const std::uint32_t src0 = source_first ? 0 : parallelism;
+        const std::uint32_t cnt0 = source_first ? 2 : 0;
+        for (std::uint32_t i = 0; i < 2; ++i) {
+            write_snapshot(
+                id,
+                src0 + i,
+                {{kSource, op_state("offsets", "partition"), "pos-" + std::to_string(i)}},
+                generation);
+            layout[src0 + i] = {.op = "source", .subtask_in_op = i};
+            subs.insert(src0 + i);
+        }
+        std::map<std::uint32_t, std::vector<StoredRow>> per;
+        for (const auto& e : kBase) {
+            per[owner(e.kg, parallelism)].push_back(
+                StoredRow{kCounts, keyed(e.kg, "counts", e.user_key), e.value});
+        }
+        for (std::uint32_t i = 0; i < parallelism; ++i) {
+            write_snapshot(id, cnt0 + i, per[i], generation);
+            layout[cnt0 + i] = {.op = "counter", .subtask_in_op = i};
+            subs.insert(cnt0 + i);
+        }
+        write_marker(id, subs, generation, std::nullopt, with_layout ? layout : decltype(layout){});
     }
 
     [[nodiscard]] sp::DatasetOptions options(const std::string& out,
@@ -227,9 +270,6 @@ protected:
         return {};
     }
 };
-
-const std::vector<KeyedEntry> kBase = {
-    {3, "alice", "a1"}, {40, "bob", "b1"}, {70, "carol", "c1"}, {120, "dave", "d1"}};
 
 // ---- export ------------------------------------------------------------------
 
@@ -414,9 +454,76 @@ TEST_F(StateDatasetTest, AChangeDuringCollectionPublishesNothing) {
     }
 }
 
+TEST_F(StateDatasetTest, ACheckpointCompletingDuringTheCopyDoesNotRefuseIt) {
+    write_job_checkpoint(1, kBase);
+    auto o = options("ds", 1);
+    bool once = false;
+    o.after_copy = [&](const fs::path& source) {
+        if (!once && source.filename() == "checkpoint-1.snap") {
+            once = true;
+            write_job_checkpoint(2, kBase);  // the job moves on meanwhile
+        }
+    };
+    const auto r = sp::export_checkpoint_dataset(o);
+    EXPECT_TRUE(r.complete);
+    EXPECT_EQ(r.checkpoint, 1U);
+    bool noted = false;
+    for (const auto& n : doc(root / "ds").at("notes").as_array()) {
+        noted = noted || n.as_string().find("appeared") != std::string::npos;
+    }
+    EXPECT_TRUE(noted);
+}
+
+TEST_F(StateDatasetTest, AMarkerRemovedDuringTheCopyRefusesIt) {
+    write_job_checkpoint(1, kBase);
+    write_job_checkpoint(2, kBase);
+    auto o = options("ds", 2);
+    o.after_copy = [&](const fs::path& source) {
+        if (source.filename() == "checkpoint-2.snap") {
+            fs::remove(clink::cluster::completed_marker_dir_for(ckpt.string(), kDatasetJob) /
+                       "COMPLETED-1");
+        }
+    };
+    std::string kind;
+    (void)refusal(o, &kind);
+    EXPECT_EQ(kind, "changed");
+    EXPECT_FALSE(fs::exists(root / "ds"));
+}
+
+TEST_F(StateDatasetTest, TheDigestIdentifiesTheDatasetAndCatchesARewrite) {
+    write_job_checkpoint(1, kBase);
+    fs::remove(snapshot_path(1, 1, 1));
+    auto o = options("ds", 1);
+    o.allow_partial = true;
+    const auto r = sp::export_checkpoint_dataset(o);
+    ASSERT_EQ(r.digest.size(), 64U);
+    EXPECT_EQ(sp::open_dataset(root / "ds", r.digest).digest, r.digest);
+    // Claiming the partial dataset complete keeps every hash it records
+    // intact; only its own digest shows the rewrite.
+    auto j = doc(root / "ds");
+    j.as_object()["complete"] = clink::config::JsonValue{true};
+    std::ofstream(root / "ds" / sp::kDatasetFile, std::ios::trunc) << j.serialize(2);
+    EXPECT_NO_THROW((void)sp::open_dataset(root / "ds"));
+    EXPECT_THROW((void)sp::open_dataset(root / "ds", r.digest), sp::DatasetInvalid);
+}
+
+TEST_F(StateDatasetTest, EverySnapshotIsDecodedOnceAndTheDecodeIsReported) {
+    write_job_checkpoint(1, kBase);
+    (void)sp::export_checkpoint_dataset(options("ds", 1));
+    std::size_t decodes = 0;
+    for (const auto& c : doc(root / "ds").at("verification").as_array()) {
+        if (c.at("id").as_string() == "state.decode") {
+            ++decodes;
+            EXPECT_EQ(c.at("verdict").as_string(), "passed");
+            EXPECT_NE(c.at("reason").as_string().find("decoded by the export"), std::string::npos);
+        }
+    }
+    EXPECT_EQ(decodes, 1U);
+}
+
 TEST_F(StateDatasetTest, StateOutsideTheCheckpointDirectoryIsUnsupported) {
     write_job_checkpoint(1, kBase);
-    write_marker(1, {0, 1}, 1, std::string{"rocksdb:///elsewhere/state"});
+    write_marker(1, {0, 1}, 1, std::string{"s3://bucket/state/11"});
     std::string kind;
     const auto why = refusal(options("ds", 1), &kind);
     EXPECT_EQ(kind, "unsupported") << why;
@@ -434,6 +541,52 @@ TEST_F(StateDatasetTest, AnEntryBoundMakesAPartialDatasetNeverATruncatedComplete
     const auto r = sp::export_checkpoint_dataset(o);
     EXPECT_FALSE(r.complete);
     EXPECT_LE(r.entries, 2U);
+}
+
+TEST_F(StateDatasetTest, AChangelogCheckpointExportsWithItsMaterialisation) {
+    // Each subtask's changelog backend writes its materialisation through the
+    // file store (a handle in the snapshot) and logs the writes after it.
+    std::vector<std::shared_ptr<clink::ChangelogStateBackend>> backends;
+    for (std::uint32_t sub = 0; sub < 2; ++sub) {
+        const fs::path dir = clink::state_dir_for(state_root(), 1, sub);
+        auto b = std::make_shared<clink::ChangelogStateBackend>(
+            std::make_shared<clink::InMemoryStateBackend>(),
+            std::make_shared<clink::FileMaterializationStore>(dir / "materializations"));
+        b->set_snapshot_dir(dir);
+        const std::uint8_t kg = sub == 0 ? 3 : 70;
+        b->put(clink::OperatorId{kCounts}, keyed(kg, "counts", "before"), "1");
+        b->materialize_now();
+        b->put(clink::OperatorId{kCounts}, keyed(kg, "counts", "after"), "2");
+        (void)b->snapshot(clink::CheckpointId{1});
+        backends.push_back(std::move(b));
+    }
+    write_marker(1, {0, 1});
+    ASSERT_TRUE(
+        fs::exists(fs::path{clink::state_dir_for(state_root(), 1, 0)} / "changelog-1.snap"));
+
+    const auto d = export_open("ds", 1);
+    EXPECT_TRUE(d.complete);
+    const auto all = entries_of(d);
+    ASSERT_EQ(all.size(), 4U);
+    std::set<std::string> keys;
+    for (const auto& e : all) {
+        keys.insert(e.user_key + "=" + e.value);
+    }
+    EXPECT_EQ(keys, (std::set<std::string>{"before=1", "after=2"}));
+    for (const auto& p : doc(root / "ds").at("participants").as_array()) {
+        EXPECT_EQ(p.at("backend").as_string(), "changelog");
+    }
+
+    // A materialisation missing from its place: the snapshot cannot be
+    // replayed, and the export is refused rather than published short.
+    for (const auto& e : fs::directory_iterator(fs::path{clink::state_dir_for(state_root(), 1, 1)} /
+                                                "materializations")) {
+        fs::remove(e.path());
+    }
+    std::string kind;
+    const auto why = refusal(options("short", 1), &kind);
+    EXPECT_FALSE(why.empty());
+    EXPECT_FALSE(fs::exists(root / "short"));
 }
 
 // ---- reading -----------------------------------------------------------------
@@ -522,6 +675,62 @@ TEST_F(StateDatasetTest, ARescaleRelocatesEntriesWithoutChangingThem) {
     EXPECT_EQ(pos->added + pos->removed + pos->changed, 0U);
     EXPECT_FALSE(r.established);
     EXPECT_EQ(r.exit_code(), 3);
+}
+
+TEST_F(StateDatasetTest, OperatorsAreNamedAndComparedBySubtaskFromTheMarkersIdentities) {
+    // The counter rescales from 2 to 4 and is placed first: the source's
+    // job-global indices move from {0,1} to {4,5}, its subtasks do not.
+    write_split_checkpoint(1, 1, 2, /*source_first=*/true, /*with_layout=*/true);
+    write_split_checkpoint(2, 2, 4, /*source_first=*/false, /*with_layout=*/true);
+    const auto a = export_open("a", 1);
+    const auto b = export_open("b", 2);
+    EXPECT_TRUE(a.by_subtask);
+    EXPECT_EQ(a.op_host.at(kSource), "source");
+    EXPECT_EQ(b.op_subtasks.at(kCounts), 4U);
+    // Named from the marker alone: the fixture records no job graph.
+    for (const auto& o : doc(root / "b").at("operators").as_array()) {
+        EXPECT_EQ(o.at("named_by").as_string(), "layout");
+    }
+    const auto r = sp::diff_datasets(a, b, {});
+    const auto* pos = slot(r, kSource, "offsets", "operator");
+    ASSERT_NE(pos, nullptr);
+    EXPECT_EQ(pos->status, "compared") << pos->note;
+    EXPECT_EQ(pos->unchanged, 2U);
+    EXPECT_NE(pos->note.find("subtask by subtask"), std::string::npos) << pos->note;
+    const auto* counts = slot(r, kCounts, "counts", "keyed");
+    ASSERT_NE(counts, nullptr);
+    EXPECT_EQ(counts->added + counts->removed + counts->changed, 0U);
+    EXPECT_GT(counts->relocated, 0U);
+    EXPECT_EQ(r.exit_code(), 0);
+}
+
+TEST_F(StateDatasetTest, WithoutTheIdentitiesMovedIndicesMakeOperatorStateIncomparable) {
+    write_split_checkpoint(1, 1, 2, true, /*with_layout=*/false);
+    write_split_checkpoint(2, 2, 4, false, /*with_layout=*/false);
+    const auto a = export_open("a", 1);
+    const auto b = export_open("b", 2);
+    EXPECT_FALSE(a.by_subtask);
+    const auto r = sp::diff_datasets(a, b, {});
+    const auto* pos = slot(r, kSource, "offsets", "operator");
+    ASSERT_NE(pos, nullptr);
+    EXPECT_EQ(pos->status, "subtasks-changed");
+    EXPECT_EQ(r.exit_code(), 3);
+}
+
+TEST_F(StateDatasetTest, AnOperatorsOwnRescaleStillMakesItsOperatorStateIncomparable) {
+    write_split_checkpoint(1, 1, 2, true, true);
+    // Now the source is the one with more subtasks.
+    std::map<std::uint32_t, clink::cluster::ParticipantIdentity> layout;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        write_snapshot(2, i, {{kSource, op_state("offsets", "partition"), "p"}}, 2);
+        layout[i] = {.op = "source", .subtask_in_op = i};
+    }
+    write_marker(2, {0, 1, 2, 3}, 2, std::nullopt, layout);
+    const auto r = sp::diff_datasets(export_open("a", 1), export_open("b", 2), {});
+    const auto* pos = slot(r, kSource, "offsets", "operator");
+    ASSERT_NE(pos, nullptr);
+    EXPECT_EQ(pos->status, "subtasks-changed");
+    EXPECT_NE(pos->note.find("2 subtasks in a and 4 in b"), std::string::npos) << pos->note;
 }
 
 TEST_F(StateDatasetTest, ASchemaChangeIsNotComparedUnlessRawBytesAreAskedFor) {

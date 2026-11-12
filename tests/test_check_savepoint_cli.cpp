@@ -513,6 +513,37 @@ TEST(StateQueryCli, FiltersAndAggregatesOverSavepoint) {
     fs::remove(path);
 }
 
+// An aggregate re-emits each group's running result as its input arrives, so
+// over more entries than one input batch it emits several rows per group;
+// state-query prints each group's final row once. A HAVING over the running
+// results is refused rather than answered from a superseded one.
+TEST(StateQueryCli, AnAggregateOverManyBatchesPrintsEachGroupsFinalRowOnce) {
+    namespace fs = std::filesystem;
+    clink::InMemoryStateBackend backend;
+    constexpr int kEntries = 150000;  // more than two of the source's batches
+    for (int i = 0; i < kEntries; ++i) {
+        const std::string slot = i % 3 == 0 ? "a" : "b";
+        const std::string keyed = std::string{"\x05"} + slot + "|k" + std::to_string(i);
+        backend.put(clink::OperatorId{7}, std::string_view{keyed}, std::string_view{"v"});
+    }
+    auto path = write_savepoint_file(backend.snapshot(clink::CheckpointId{1}),
+                                     "query-many" + std::to_string(getpid()));
+    auto probe = run_cli("state-query --help");
+    if (probe.stderr_text.find("requires a build") != std::string::npos) {
+        GTEST_SKIP() << "CLI built without the SQL frontend";
+    }
+    auto agg = run_cli("state-query --from=" + path.string() +
+                       " '--sql=SELECT slot, count(*) AS n FROM state GROUP BY slot'");
+    ASSERT_EQ(agg.exit_code, 0) << agg.stderr_text;
+    EXPECT_EQ(agg.stdout_text, "{\"n\":100000,\"slot\":\"b\"}\n{\"n\":50000,\"slot\":\"a\"}\n");
+    auto having = run_cli("state-query --from=" + path.string() +
+                          " '--sql=SELECT slot, count(*) AS n FROM state GROUP BY slot "
+                          "HAVING count(*) < 60000'");
+    EXPECT_EQ(having.exit_code, 2);
+    EXPECT_NE(having.stderr_text.find("final row"), std::string::npos) << having.stderr_text;
+    fs::remove(path);
+}
+
 #include "clink/state/changelog_state_backend.hpp"
 
 // The state verbs accept changelog snapshots: an in-blob changelog

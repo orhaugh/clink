@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <map>
@@ -100,8 +101,10 @@ private:
     std::uint64_t checkpoint_{0};
     bool overridden_{false};
     cluster::RestoreSource source_;
-    std::string state_rel_;  // bundle-relative state root ("checkpoint/_state/<job>")
-    bool state_in_checkpoint_dir_{false};
+    std::string state_rel_;      // bundle-relative state root ("checkpoint/_state/<job>")
+    std::string original_root_;  // the state root on this machine, which state_rel_ mirrors
+    config::JsonArray participant_state_;  // each participant's backend and path
+    bool state_local_{false};
 
     // Job manifest facts.
     bool have_job_manifest_{false};
@@ -130,6 +133,31 @@ std::optional<std::string> local_path(const std::string& root) {
         return std::nullopt;
     }
     return canon.string();
+}
+
+// A state root on this machine's filesystem, as written: an absolute path, or
+// one behind the file, RocksDB or changelog-over-files schemes, whose
+// checkpoints a bundle can copy. Anything else (an object store, a remote tier,
+// a relative path, which would depend on the working directory) is not.
+std::optional<std::string> written_state_root(const std::string& root) {
+    std::string_view p = root;
+    for (const std::string_view scheme : {"file://", "rocksdb://", "changelog+file://"}) {
+        if (p.starts_with(scheme)) {
+            p.remove_prefix(scheme.size());
+            if (const auto q = p.find('?'); q != std::string_view::npos) {
+                p = p.substr(0, q);
+            }
+            break;
+        }
+    }
+    if (p.find("://") != std::string_view::npos || p.empty() || !fs::path{p}.is_absolute()) {
+        return std::nullopt;
+    }
+    std::string out{p};
+    while (out.size() > 1 && out.back() == '/') {
+        out.pop_back();
+    }
+    return out;
 }
 
 std::string utc_now() {
@@ -417,20 +445,27 @@ void Collector::collect_checkpoint() {
     }
     std::error_code ec;
     const auto ckpt_canon = fs::weakly_canonical(o_.checkpoint_dir, ec).string() + "/";
-    const auto root_canon = local_path(source_.state_root);
-    state_in_checkpoint_dir_ =
-        !source_.legacy && root_canon.has_value() && root_canon->rfind(ckpt_canon, 0) == 0;
-    if (!state_in_checkpoint_dir_) {
+    const auto root = written_state_root(source_.state_root);
+    state_local_ = !source_.legacy && root.has_value();
+    if (!state_local_) {
         absent("snapshot",
                source_.state_root,
                source_.legacy
                    ? "the checkpoint predates job-namespaced state, which this release does not "
                      "collect"
-                   : "the state lives outside the checkpoint directory, which this release does "
-                     "not collect");
+                   : "the state is not on this machine's filesystem (an object store or a remote "
+                     "tier), which this release does not collect");
         return;
     }
-    state_rel_ = "checkpoint/" + root_canon->substr(ckpt_canon.size());
+    // Files are read where the job wrote them; the canonical form only decides
+    // whether that is inside the checkpoint directory. State there keeps its
+    // place; a root outside it (a RocksDB or changelog path of its own) is
+    // mirrored under _external.
+    original_root_ = *root;
+    const auto root_canon = fs::weakly_canonical(fs::path{*root}, ec).string();
+    state_rel_ = !ec && root_canon.rfind(ckpt_canon, 0) == 0
+                     ? "checkpoint/" + root_canon.substr(ckpt_canon.size())
+                     : "checkpoint/_external/" + std::to_string(o_.job);
     if (!source_.participants.has_value()) {
         absent("snapshot",
                state_rel_,
@@ -438,27 +473,116 @@ void Collector::collect_checkpoint() {
                "unknown");
         return;
     }
-    const auto name = "checkpoint-" + std::to_string(checkpoint_) + ".snap";
+    const auto id = std::to_string(checkpoint_);
+    const auto name = "checkpoint-" + id + ".snap";
     for (const auto sub : *source_.participants) {
-        const fs::path dir = state_dir_for(source_.state_root, source_.generation, sub);
-        const auto rel = state_dir_for(state_rel_, source_.generation, sub) + "/" + name;
-        const auto meta = dir / (name + ".meta");
-        if (fs::exists(meta, ec)) {
-            copy(meta, rel + ".meta", "snapshot_meta", true);
-        } else {
-            absent("snapshot_meta", rel + ".meta", "not present in the job's state directory");
-        }
-        if (!o_.include_state) {
+        const fs::path dir = state_dir_for(original_root_, source_.generation, sub);
+        const auto rel_dir = state_dir_for(state_rel_, source_.generation, sub);
+        config::JsonObject ps;
+        ps["index"] = config::JsonValue{static_cast<std::int64_t>(sub)};
+        const auto record = [&](const std::string& backend, const std::string& path) {
+            ps["backend"] = config::JsonValue{backend};
+            ps["path"] = config::JsonValue{path};
+            participant_state_.push_back(config::JsonValue{ps});
+        };
+        if (fs::exists(dir / name, ec) || fs::exists(dir / (name + ".meta"), ec)) {
+            // The file backend: the canonical snapshot and its sidecar.
+            const auto rel = rel_dir + "/" + name;
+            record("file", rel);
+            if (fs::exists(dir / (name + ".meta"), ec)) {
+                copy(dir / (name + ".meta"), rel + ".meta", "snapshot_meta", true);
+            } else {
+                absent("snapshot_meta", rel + ".meta", "not present in the job's state directory");
+            }
+            if (!o_.include_state) {
+                continue;
+            }
+            if (fs::exists(dir / name, ec)) {
+                copy(dir / name, rel, "snapshot", true);
+            } else {
+                absent("snapshot", rel, "not present in the participant's state directory");
+            }
             continue;
         }
-        if (fs::exists(dir / name, ec)) {
-            copy(dir / name, rel, "snapshot", true);
-        } else {
+        const auto changelog = "changelog-" + id + ".snap";
+        if (fs::exists(dir / changelog, ec)) {
+            // A changelog backend: its snapshot and the materialisation files
+            // its handles name, which must be under the same root.
+            const auto rel = rel_dir + "/" + changelog;
+            record("changelog", rel);
+            if (!o_.include_state) {
+                continue;
+            }
+            copy(dir / changelog, rel, "changelog_snapshot", true);
+            std::vector<std::byte> bytes;
+            {
+                std::ifstream in(tmp_ / rel, std::ios::binary);
+                std::vector<char> raw((std::istreambuf_iterator<char>(in)),
+                                      std::istreambuf_iterator<char>());
+                bytes.resize(raw.size());
+                if (!raw.empty()) {
+                    std::memcpy(bytes.data(), raw.data(), raw.size());
+                }
+            }
+            std::vector<std::string> handles;
+            try {
+                handles = changelog_materialization_handles(bytes);
+            } catch (const std::exception& e) {
+                absent("materialization",
+                       rel,
+                       std::string{"the changelog snapshot does not decode: "} + e.what());
+                continue;
+            }
+            for (const auto& h : handles) {
+                const auto local = written_state_root(h);
+                if (!local.has_value() || local->rfind(original_root_ + "/", 0) != 0) {
+                    absent("materialization",
+                           h,
+                           "a materialisation outside the job's state root, which this release "
+                           "does not collect");
+                    continue;
+                }
+                const auto inner = local->substr(original_root_.size() + 1);
+                if (!safe_relative_path(inner)) {
+                    absent("materialization", h, "not a plain path under the job's state root");
+                    continue;
+                }
+                copy(*local, state_rel_ + "/" + inner, "materialization", true);
+            }
+            continue;
+        }
+        const auto rocks = fs::path{dir.string() + ".cp-" + id};
+        if (fs::is_directory(fs::symlink_status(rocks, ec))) {
+            // A RocksDB checkpoint directory: every file in it.
+            const auto rel = rel_dir + ".cp-" + id;
+            record("rocksdb", rel);
+            if (!o_.include_state) {
+                continue;
+            }
+            std::vector<fs::path> files;
+            for (const auto& e : fs::recursive_directory_iterator(rocks, ec)) {
+                if (!e.is_directory(ec)) {
+                    files.push_back(e.path());
+                }
+            }
+            std::sort(files.begin(), files.end());
+            for (const auto& f : files) {
+                copy(f,
+                     rel + "/" + f.lexically_relative(rocks).generic_string(),
+                     "rocksdb_checkpoint",
+                     true);
+            }
+            continue;
+        }
+        record("file", rel_dir + "/" + name);
+        absent("snapshot_meta",
+               rel_dir + "/" + name + ".meta",
+               "not present in the job's state directory");
+        if (o_.include_state) {
             absent("snapshot",
-                   rel,
-                   "no Arrow snapshot in the participant's state directory: its state is in "
-                   "another backend's format (a RocksDB checkpoint, for one), which this "
-                   "release does not collect, or it is missing");
+                   rel_dir + "/" + name,
+                   "no checkpoint of the participant in its state directory: neither a "
+                   "snapshot, a changelog snapshot nor a RocksDB checkpoint");
         }
     }
 }
@@ -820,12 +944,14 @@ std::string Collector::manifest_text() const {
     }
     sel["participants"] = config::JsonValue{std::move(parts)};
     sel["state_root"] = config::JsonValue{state_rel_};
+    sel["state_root_original"] = config::JsonValue{original_root_};
+    sel["participant_state"] = config::JsonValue{participant_state_};
     m["selection"] = config::JsonValue{std::move(sel)};
 
     m["delivery"] = delivery_.has_value() ? *delivery_ : config::JsonValue{};
 
     config::JsonObject contents;
-    contents["state"] = config::JsonValue{o_.include_state && state_in_checkpoint_dir_};
+    contents["state"] = config::JsonValue{o_.include_state && state_local_};
     contents["captures"] = config::JsonValue{have_captures_};
     contents["sink_intervals"] = config::JsonValue{!interval_list_.empty()};
     contents["traces"] = config::JsonValue{traces_};
@@ -919,7 +1045,27 @@ CollectResult Collector::run() {
         }
         // A marker set that changed while the evidence was copied belongs to
         // a job that moved on: the bundle would describe no single moment.
-        if (list_markers() != markers_before) {
+        const auto markers_after = list_markers();
+        if (o_.allow_new_markers) {
+            std::size_t added = 0;
+            for (const auto& name : markers_before) {
+                if (!markers_after.contains(name)) {
+                    throw CollectError("the job's marker " + name +
+                                           " was removed while the checkpoint was collected; "
+                                           "nothing was published. Collect again.",
+                                       CollectError::Kind::Changed);
+                }
+            }
+            for (const auto& name : markers_after) {
+                added += markers_before.contains(name) ? 0 : 1;
+            }
+            if (added > 0) {
+                notes_.push_back(std::to_string(added) +
+                                 " marker(s) appeared while the checkpoint was collected (later "
+                                 "checkpoints completing, or a restore recorded); they are not "
+                                 "part of it");
+            }
+        } else if (markers_after != markers_before) {
             throw CollectError(
                 "the job's markers changed while the bundle was collected (a "
                 "checkpoint completed or a restart was recorded); nothing was "

@@ -24,8 +24,11 @@
 // state: the key group is the key's own (one of 128, whatever the
 // parallelism), and the participant that owns it is not part of it, so a
 // rescale moves an entry without changing it. Operator state and raw rows are
-// (operator, slot, participant, user key): every participant keeps its own,
-// and rows are never collapsed because their encoded keys match.
+// (operator, slot, owner, user key): each subtask keeps its own, and rows are
+// never collapsed because their encoded keys match. The owner is the subtask
+// within its operator when the checkpoint's marker records each participant's
+// identity (so a rescale of another operator, which moves the job-global
+// indices, does not change it), and the participant otherwise.
 //
 // Nothing here loads a plugin, runs code a dataset names, or opens a
 // connection. The original checkpoint is only read.
@@ -86,6 +89,11 @@ struct DatasetResult {
     std::uint64_t entries{0};
     std::uint64_t bytes{0};  // the dataset's size on disk
     double seconds{0};
+    // SHA-256 of dataset.json: the dataset's identity. dataset.json binds the
+    // entry table and the bundle manifest by hash, and the manifest binds
+    // every file, so a digest recorded elsewhere at export detects any
+    // later change, a deliberate one included.
+    std::string digest;
 };
 
 // Nothing was published. `kind` is the collector's refusal kind (changed,
@@ -123,6 +131,7 @@ using SlotKey = std::tuple<std::uint64_t, std::string, std::uint8_t>;
 struct Dataset {
     std::filesystem::path root;
     config::JsonValue doc;  // dataset.json
+    std::string digest;     // SHA-256 of dataset.json
     bool complete{false};
     std::uint64_t job{0};
     std::uint64_t checkpoint{0};
@@ -140,6 +149,19 @@ struct Dataset {
     std::map<std::uint64_t, std::set<std::uint32_t>> operator_participants;
     // The job graph's operators and their parallelism; empty when it holds none.
     std::map<std::uint64_t, std::uint32_t> graph_ops;
+    // Participant -> (graph operator, subtask within it), as the checkpoint's
+    // marker records it; empty for an older marker.
+    std::map<std::uint32_t, std::pair<std::string, std::uint32_t>> layout;
+    // Every participant's identity is recorded and every operator's rows are
+    // in one graph operator's subtasks: operator state and raw rows are
+    // identified by that subtask instead of the participant.
+    bool by_subtask{false};
+    // State operator -> the graph operator whose subtasks hold it, and how
+    // many subtasks that operator has, when the layout says.
+    std::map<std::uint64_t, std::string> op_host;
+    std::map<std::uint64_t, std::uint32_t> op_subtasks;
+    // State operator -> the graph operator it is named as (by uid or layout).
+    std::map<std::uint64_t, std::string> op_names;
 };
 
 // A directory that is not a dataset this reader may read, or one whose files
@@ -151,7 +173,9 @@ struct DatasetInvalid : std::runtime_error {
 // Opens a dataset and checks it is whole: dataset.json's form, and that
 // entries.parquet and the bundle's manifest hash to what it records. The
 // bundle's own path rules apply, and no file of the dataset may be a link.
-[[nodiscard]] Dataset open_dataset(const std::filesystem::path& root);
+// With `expect_digest`, also that dataset.json is the one with that SHA-256.
+[[nodiscard]] Dataset open_dataset(const std::filesystem::path& root,
+                                   const std::string& expect_digest = {});
 
 // One stored entry. scope: 0 keyed, 1 operator, 2 raw.
 struct DatasetEntry {
@@ -160,6 +184,10 @@ struct DatasetEntry {
     std::uint8_t scope{0};
     std::int16_t key_group{-1};  // keyed only
     std::uint32_t participant{0};
+    // What owns an operator-state or raw row in its identity: the subtask
+    // within its operator when the dataset is `by_subtask`, else the
+    // participant.
+    std::uint32_t owner{0};
     std::string user_key;
     std::string value;
 };
@@ -167,7 +195,7 @@ struct DatasetEntry {
 [[nodiscard]] const char* scope_name(std::uint8_t scope) noexcept;
 
 // Visits every entry in identity order (operator, slot, scope, key group, and
-// for operator and raw rows the participant, then the user key), merging the
+// for operator and raw rows the owner, then the user key), merging the
 // participants' row groups as it streams. Stops when `visit` returns false.
 void for_each_entry(const Dataset& dataset, const std::function<bool(const DatasetEntry&)>& visit);
 
@@ -229,6 +257,7 @@ struct DiffSide {
     std::uint64_t generation{0};
     bool complete{false};
     std::string graph_sha256;
+    std::string digest;
 };
 
 struct DatasetDiff {

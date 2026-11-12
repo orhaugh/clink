@@ -526,6 +526,7 @@ add_library(clink_core ${_clink_core_linkage}
     src/cluster/in_doubt_resolution.cpp
     src/incident/bundle.cpp
     src/incident/collect.cpp
+    src/incident/participant_state.cpp
     src/incident/reconcile.cpp
     src/incident/reference.cpp
     src/incident/window_scope.cpp

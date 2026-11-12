@@ -7,6 +7,7 @@ add_executable(clink_rocksdb_tests
     test_savepoint_relocation.cpp
     test_changelog_rocksdb_store.cpp
     test_rocksdb_snapshot_store.cpp
+    test_rocksdb_dataset.cpp
 )
 target_link_libraries(clink_rocksdb_tests PRIVATE
     clink::core

@@ -1115,20 +1115,21 @@ Check bundle_completeness_check(const Bundle& b) {
     // What the manifest says it holds must be there: a manifest that claims
     // the state or the captures and lacks them is not a partial bundle, it is
     // a wrong one.
-    const auto& sel = b.manifest.at("selection");
-    const auto state_rel = sel.string_or("state_root", "");
-    const auto generation = sel.int_or("generation", 0);
-    for (const auto sub : selection_participants(b)) {
-        if (state_rel.empty() || generation <= 0) {
-            break;
-        }
-        const auto dir = state_dir_for(state_rel, static_cast<std::uint32_t>(generation), sub);
-        const auto snap = dir + "/checkpoint-" + std::to_string(b.checkpoint()) + ".snap";
-        if (b.find(snap + ".meta") == nullptr) {
-            missing.push_back(snap + ".meta (a participant's integrity sidecar)");
-        }
-        if (b.contains("state") && b.find(snap) == nullptr) {
-            missing.push_back(snap + " (a participant's snapshot; the manifest claims the state)");
+    for (const auto& ps : participant_states(b)) {
+        if (ps.backend == "file") {
+            if (b.find(ps.path + ".meta") == nullptr) {
+                missing.push_back(ps.path + ".meta (a participant's integrity sidecar)");
+            }
+            if (b.contains("state") && b.find(ps.path) == nullptr) {
+                missing.push_back(ps.path +
+                                  " (a participant's snapshot; the manifest claims the state)");
+            }
+        } else if (ps.backend == "changelog") {
+            if (b.contains("state") && b.find(ps.path) == nullptr) {
+                missing.push_back(ps.path + " (a participant's changelog snapshot)");
+            }
+        } else if (b.contains("state") && b.find(ps.path + "/CURRENT") == nullptr) {
+            missing.push_back(ps.path + " (a participant's " + ps.backend + " checkpoint)");
         }
     }
     if (b.contains("captures")) {
@@ -1367,21 +1368,46 @@ Check checkpoint_participants_check(const Bundle& b) {
         c.next_action = "verify the state with clink checkpoint-verify on the job's own directory";
         return c;
     }
-    std::error_code ec;
-    if (!b.inside(src.state_root).has_value()) {
+    // Where the bundle holds each participant's checkpoint, and what wrote it.
+    const bool recorded = b.manifest.at("selection").contains("participant_state");
+    std::map<std::uint32_t, ParticipantState> held;
+    for (auto& ps : participant_states(b)) {
+        held[ps.index] = std::move(ps);
+    }
+    if ((!recorded && !b.inside(src.state_root).has_value()) || (recorded && held.empty())) {
         c.verdict = Verdict::Unsupported;
         c.reason = "the checkpoint's state was written to " + src.state_root +
-                   ", outside the checkpoint directory, which a bundle does not carry in this "
-                   "release";
+                   ", which is not on the collecting machine's filesystem, and a bundle does "
+                   "not carry it in this release";
         c.next_action = "check the state with clink checkpoint-verify where it lives";
         return c;
     }
-    const auto name = "checkpoint-" + std::to_string(b.checkpoint()) + ".snap";
     std::vector<std::string> problems;
     std::size_t verified = 0;
+    std::size_t unsidecared = 0;
     for (const auto sub : *src.participants) {
-        const fs::path dir = state_dir_for(src.state_root, src.generation, sub);
-        const auto rel = b.inside((dir / name).string()).value_or((dir / name).string());
+        const auto it = held.find(sub);
+        if (it == held.end()) {
+            problems.push_back("participant " + std::to_string(sub) + ": not collected");
+            continue;
+        }
+        const auto& rel = it->second.path;
+        if (it->second.backend != "file") {
+            // A backend that keeps no sidecar: present, and checked when read.
+            c.evidence.push_back(rel);
+            if (!b.contains("state")) {
+                continue;
+            }
+            const bool present = it->second.backend == "changelog"
+                                     ? b.find(rel) != nullptr
+                                     : b.find(rel + "/CURRENT") != nullptr;
+            if (!present) {
+                problems.push_back("participant " + std::to_string(sub) + ": no " + rel);
+                continue;
+            }
+            ++unsidecared;
+            continue;
+        }
         c.evidence.push_back(rel + ".meta");
         if (b.find(rel + ".meta") == nullptr) {
             problems.push_back("participant " + std::to_string(sub) + ": no " + rel + ".meta");
@@ -1417,8 +1443,13 @@ Check checkpoint_participants_check(const Bundle& b) {
         return c;
     }
     if (b.contains("state")) {
-        c.reason = "every participant the marker records has its snapshot and sidecar, and all " +
-                   std::to_string(verified) + " snapshots verify against their sidecars";
+        c.reason = "every participant the marker records has its checkpoint in the bundle; " +
+                   std::to_string(verified) + " snapshot(s) verify against their sidecars";
+        if (unsidecared > 0) {
+            c.reason += ", and " + std::to_string(unsidecared) +
+                        " checkpoint(s) of a backend that keeps no sidecar (changelog, RocksDB) "
+                        "are checked as they are decoded (state.decode)";
+        }
     } else {
         c.reason =
             "every participant the marker records has its integrity sidecar; the "
@@ -1466,6 +1497,35 @@ Check state_decode_check(const Bundle& b) {
         } catch (const std::exception& e) {
             problems.push_back(a.path + ": " + e.what());
         }
+    }
+    // The participants whose checkpoints another backend wrote.
+    std::vector<std::string> unsupported;
+    for (const auto& ps : participant_states(b)) {
+        if (ps.backend == "file") {
+            continue;
+        }
+        c.evidence.push_back(ps.path);
+        try {
+            auto bytes = canonical_participant_state(b, ps);
+            InMemoryStateBackend backend;
+            backend.restore(Snapshot{.checkpoint_id = CheckpointId{0}, .bytes = std::move(bytes)});
+            c.details.push_back(ps.path + ": " + ps.backend + " checkpoint, " +
+                                std::to_string(backend.restored_state_versions().size()) +
+                                " versioned operator(s)");
+            ++decoded;
+        } catch (const StateUnsupported& e) {
+            unsupported.push_back(ps.path + ": " + e.what());
+        } catch (const std::exception& e) {
+            problems.push_back(ps.path + ": " + e.what());
+        }
+    }
+    if (problems.empty() && !unsupported.empty()) {
+        c.verdict = Verdict::Unsupported;
+        c.reason = std::to_string(unsupported.size()) +
+                   " participant checkpoint(s) are in a form this build cannot read";
+        c.details.insert(c.details.begin(), unsupported.begin(), unsupported.end());
+        c.next_action = "verify with a clink linked with the backend that wrote them";
+        return c;
     }
     if (decoded == 0 && problems.empty()) {
         c.verdict = Verdict::Unsupported;
@@ -1826,7 +1886,9 @@ std::vector<Check> verify_core(const Bundle& b, const VerifyOptions& o) {
         guarded("checkpoint.restore_rule", [&] { return checkpoint_restore_rule_check(b); }));
     out.push_back(
         guarded("checkpoint.participants", [&] { return checkpoint_participants_check(b); }));
-    out.push_back(guarded("state.decode", [&] { return state_decode_check(b); }));
+    if (o.decode_state) {
+        out.push_back(guarded("state.decode", [&] { return state_decode_check(b); }));
+    }
     if (o.profile == "full") {
         auto structure =
             guarded("protocol.trace_structure", [&] { return trace_structure_check(b); });

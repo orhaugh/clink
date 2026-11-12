@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from clink_audit.isolation import Isolation  # noqa: E402
+from clink_audit.isolation import Isolation, LoopbackIsolation  # noqa: E402
 
 
 class IsolationProof(unittest.TestCase):
@@ -50,6 +50,39 @@ class IsolationProof(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "ran")
         expected = {"Darwin": "sandbox-exec", "Linux": "unshare"}.get(platform.system())
         self.assertEqual(iso.mechanism, expected)
+
+
+class LoopbackIsolationProof(unittest.TestCase):
+    def test_no_mechanism_on_another_platform_is_unavailable(self):
+        iso = LoopbackIsolation(platform="Plan9")
+        self.assertEqual(iso.establish(), "unavailable")
+        with self.assertRaises(RuntimeError):
+            iso.wrap(["true"])
+
+    def test_a_wrapper_that_runs_nothing_isolates_nothing(self):
+        iso = LoopbackIsolation(wrapper=["false"])
+        self.assertEqual(iso.establish(), "unavailable")
+        self.assertFalse(iso.enforced)
+
+    def test_a_wrapper_that_lets_the_connection_through_is_not_enforced(self):
+        iso = LoopbackIsolation(wrapper=["env"])
+        state = iso.establish()
+        if state == "inconclusive":
+            self.skipTest("this machine cannot attempt a connection to 192.0.2.1: %s" % iso.detail)
+        self.assertEqual(state, "not-enforced", iso.detail)
+        self.assertFalse(iso.enforced)
+
+    def test_the_platform_mechanism_denies_the_network_and_keeps_loopback(self):
+        iso = LoopbackIsolation()
+        state = iso.establish()
+        if state in ("unavailable", "inconclusive"):
+            self.skipTest("loopback isolation cannot be proven here: %s" % iso.detail)
+        self.assertEqual(state, "enforced", iso.detail)
+        pair = ("import socket\ns = socket.socket()\ns.bind(('127.0.0.1', 0))\ns.listen(1)\n"
+                "c = socket.create_connection(s.getsockname(), timeout=2)\nprint('ok')")
+        r = subprocess.run(iso.wrap([sys.executable, "-I", "-c", pair]), capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.stdout.strip(), "ok")
 
 
 if __name__ == "__main__":

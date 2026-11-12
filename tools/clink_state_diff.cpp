@@ -304,7 +304,8 @@ void print_diff_json(const LoadedSide& a, const LoadedSide& b, const StateDiffRe
 }
 
 void diff_usage() {
-    std::cerr << "Usage: clink state-diff --a=<dataset> --b=<dataset> [--raw-bytes] "
+    std::cerr << "Usage: clink state-diff --a=<dataset> --b=<dataset> [--a-digest=<sha256>]\n"
+              << "           [--b-digest=<sha256>] [--raw-bytes] "
                  "[--max-samples=N]\n"
               << "           [--max-entries=N] [--timeout-s=N] [--allow-partial] [--json]\n"
               << "       clink state-diff --a=<f.snap> --b=<f.snap> [--json] [--max-rows=N]\n"
@@ -324,6 +325,8 @@ void diff_usage() {
               << "  --max-samples=N  differing entries shown per slot (default 20)\n"
               << "  --max-entries=N  entries read across both sides (default 100000000)\n"
               << "  --timeout-s=N    time limit (default 600)\n"
+              << "  --a-digest, --b-digest  refuse a side whose dataset.json does not have\n"
+              << "                   this SHA-256 (the digest state-export printed)\n"
               << "  --allow-partial  compare a partial dataset; the result is still not\n"
               << "                   established\n"
               << "\n"
@@ -343,7 +346,8 @@ void diff_usage() {
 }
 
 void cat_usage() {
-    std::cerr << "Usage: clink state-cat --dataset=<dataset> [--json] [--max-rows=N] "
+    std::cerr << "Usage: clink state-cat --dataset=<dataset> [--digest=<sha256>] [--json] "
+              << "[--max-rows=N] "
                  "[--allow-partial]\n"
               << "       clink state-cat --dir=<checkpoint-root> --id=N [--json] [--max-rows=N]\n"
               << "\n"
@@ -372,6 +376,8 @@ int diff_datasets_cmd(int argc, char** argv) {
                     argv,
                     {"a",
                      "b",
+                     "a-digest",
+                     "b-digest",
                      "raw-bytes",
                      "max-samples",
                      "max-entries",
@@ -407,8 +413,8 @@ int diff_datasets_cmd(int argc, char** argv) {
         o.timeout = std::chrono::seconds{static_cast<std::int64_t>(v)};
     }
     try {
-        const auto a = sp::open_dataset(get_arg(argc, argv, "a"));
-        const auto b = sp::open_dataset(get_arg(argc, argv, "b"));
+        const auto a = sp::open_dataset(get_arg(argc, argv, "a"), get_arg(argc, argv, "a-digest"));
+        const auto b = sp::open_dataset(get_arg(argc, argv, "b"), get_arg(argc, argv, "b-digest"));
         const auto r = sp::diff_datasets(a, b, o);
         std::cout << (has_flag(argc, argv, "json") ? r.render_json() : r.render_text());
         return r.exit_code();
@@ -419,7 +425,7 @@ int diff_datasets_cmd(int argc, char** argv) {
 }
 
 int cat_dataset_cmd(int argc, char** argv) {
-    if (!only_flags(argc, argv, {"dataset", "json", "max-rows", "allow-partial"})) {
+    if (!only_flags(argc, argv, {"dataset", "digest", "json", "max-rows", "allow-partial"})) {
         cat_usage();
         return 2;
     }
@@ -430,7 +436,8 @@ int cat_dataset_cmd(int argc, char** argv) {
     }
     const bool json = has_flag(argc, argv, "json");
     try {
-        const auto d = sp::open_dataset(get_arg(argc, argv, "dataset"));
+        const auto d =
+            sp::open_dataset(get_arg(argc, argv, "dataset"), get_arg(argc, argv, "digest"));
         if (!d.complete && !has_flag(argc, argv, "allow-partial")) {
             std::cerr << "clink state-cat: " << d.root.string()
                       << " is a PARTIAL dataset (see incomplete and unsupported in its "
@@ -463,7 +470,8 @@ int cat_dataset_cmd(int argc, char** argv) {
             return t;
         };
         if (json) {
-            std::cout << "{\"dataset\":" << json_text(d.root.string()) << ",\"job\":" << d.job
+            std::cout << "{\"dataset\":" << json_text(d.root.string())
+                      << ",\"digest\":" << json_text(d.digest) << ",\"job\":" << d.job
                       << ",\"checkpoint\":" << d.checkpoint << ",\"generation\":" << d.generation
                       << ",\"complete\":" << (d.complete ? "true" : "false")
                       << ",\"entries\":" << d.entries << ",\"slots\":[";
@@ -494,7 +502,8 @@ int cat_dataset_cmd(int argc, char** argv) {
         }
         std::cout << "state-cat: " << d.root.string() << " (job " << d.job << ", checkpoint "
                   << d.checkpoint << ", generation " << d.generation << ", "
-                  << (d.complete ? "complete" : "PARTIAL") << ", " << d.entries << " entries)\n";
+                  << (d.complete ? "complete" : "PARTIAL") << ", " << d.entries << " entries)\n"
+                  << "digest " << d.digest << "\n";
         for (const auto& [k, s] : shown) {
             const auto& [op, slot, scope] = k;
             std::cout << "\nop " << op << " slot \"" << slot << "\" (" << sp::scope_name(scope)
@@ -532,7 +541,9 @@ void export_dataset_usage() {
               << "under the engine's own rules and refused if anything changes meanwhile,\n"
               << "plus entries.parquet (every stored entry, exact bytes) and dataset.json (what\n"
               << "it holds, its provenance, and whether it is complete). Published by one\n"
-              << "rename; never written over. Read-only; local directories only.\n"
+              << "rename; never written over. Read-only; local directories only. It prints\n"
+              << "the dataset's digest (SHA-256 of dataset.json): recorded elsewhere, it\n"
+              << "proves the dataset unchanged later (--digest on the readers).\n"
               << "\n"
               << "  --restore-point     the checkpoint a restore of the job would choose now,\n"
               << "                      which needs --ha-dir or --commit-confirmation\n"
@@ -629,12 +640,14 @@ int export_dataset_cmd(int argc, char** argv) {
         j["entries"] = clink::config::JsonValue{static_cast<std::int64_t>(r.entries)};
         j["bytes"] = clink::config::JsonValue{static_cast<std::int64_t>(r.bytes)};
         j["seconds"] = clink::config::JsonValue{r.seconds};
+        j["digest"] = clink::config::JsonValue{r.digest};
         std::cout << clink::config::JsonValue{std::move(j)}.serialize(0) << "\n";
     } else {
         std::cout << "state-export: checkpoint " << r.checkpoint << " of job " << o.job << " -> "
                   << r.dataset.string() << " (" << (r.complete ? "complete" : "PARTIAL") << ", "
                   << r.participants << " participants, " << r.entries << " entries, " << r.bytes
-                  << " bytes, " << r.seconds << " s)\n";
+                  << " bytes, " << r.seconds << " s)\n"
+                  << "  digest " << r.digest << "\n";
         for (const auto& s : r.unsupported) {
             std::cout << "  unsupported: " << s << "\n";
         }

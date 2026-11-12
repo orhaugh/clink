@@ -208,22 +208,8 @@ std::shared_ptr<arrow::ipc::RecordBatchStreamReader> open_stream(const std::vect
     return *r;
 }
 
-ParsedSnapshot parse_snapshot(const fs::path& path, std::uint64_t max_rows) {
+ParsedSnapshot parse_snapshot(std::vector<std::byte> bytes, std::uint64_t max_rows) {
     ParsedSnapshot out;
-    std::vector<std::byte> bytes;
-    {
-        std::error_code ec;
-        const auto size = fs::file_size(path, ec);
-        if (ec) {
-            throw std::runtime_error("cannot size " + path.string());
-        }
-        bytes.resize(static_cast<std::size_t>(size));
-        std::ifstream in(path, std::ios::binary);
-        in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
-        if (!in) {
-            throw std::runtime_error("short read of " + path.string());
-        }
-    }
     if (bytes.empty()) {
         return out;
     }
@@ -246,7 +232,7 @@ ParsedSnapshot parse_snapshot(const fs::path& path, std::uint64_t max_rows) {
     }
     const auto schema = reader->schema();
     const auto md = schema->metadata();
-    verify_snapshot_format_version(md, path.filename().string());
+    verify_snapshot_format_version(md, "a participant's snapshot");
     if (md) {
         if (const auto i = md->FindKey(kSnapshotFormatVersionKey); i != -1) {
             out.format_version = static_cast<std::uint32_t>(std::stoul(md->value(i)));
@@ -483,13 +469,13 @@ void Exporter::build(const fs::path& root) {
     // The engine's own checks over what was collected.
     incident::VerifyOptions vo;
     vo.profile = "consistency";
+    vo.decode_state = false;  // every snapshot is decoded below, once
     const auto checks = incident::verify_core(b, vo);
     std::set<std::string> required = {"bundle.manifest",
                                       "bundle.artifacts",
                                       "bundle.completeness",
                                       "checkpoint.marker",
-                                      "checkpoint.participants",
-                                      "state.decode"};
+                                      "checkpoint.participants"};
     if (!overridden) {
         required.insert("checkpoint.restore_rule");
     }
@@ -534,6 +520,15 @@ void Exporter::build(const fs::path& root) {
             "unknown");
     }
 
+    // Which operator and subtask each participant is, as the checkpoint's own
+    // marker records it (a marker written before these lines records none).
+    std::map<std::uint32_t, cluster::ParticipantIdentity> layout;
+    if (const auto rel =
+            "checkpoint/_jobs/" + std::to_string(job) + "/COMPLETED-" + std::to_string(checkpoint);
+        b.find(rel) != nullptr) {
+        layout = cluster::parse_completed_marker(read_plain_file(b.root / rel, 1ULL << 20)).layout;
+    }
+
     auto [graph_sha, graph_ops] = read_graph(b, notes_);
     std::map<std::uint64_t, const GraphOp*> by_op;
     for (const auto& g : graph_ops) {
@@ -553,19 +548,44 @@ void Exporter::build(const fs::path& root) {
     std::set<std::pair<std::uint64_t, std::string>> conflicts;
     bool bound = false;
     bool missing_snapshot = false;
+    std::uint64_t decoded = 0;
+    std::uint64_t undecoded = 0;
     const std::set<std::uint32_t> participants =
         src.participants.value_or(std::set<std::uint32_t>{});
-    const auto name = "checkpoint-" + std::to_string(checkpoint) + ".snap";
+    std::map<std::uint32_t, incident::ParticipantState> held;
+    for (auto& ps : incident::participant_states(b)) {
+        held[ps.index] = std::move(ps);
+    }
     for (const auto p : participants) {
         ++participants_;
         JsonObject pj;
         pj["index"] = num(p);
-        const auto rel = clink::state_dir_for(state_rel, generation, p) + "/" + name;
-        const auto* art = b.find(rel);
-        pj["snapshot"] = art ? JsonValue{rel} : JsonValue{};
+        const auto hit = held.find(p);
+        const std::string backend = hit == held.end() ? "file" : hit->second.backend;
+        const std::string rel = hit == held.end() ? std::string{} : hit->second.path;
+        // What the bundle holds of this participant: the snapshot file, or
+        // every file of its checkpoint directory.
+        std::uint64_t held_bytes = 0;
+        bool present = false;
+        for (const auto& art : b.artifacts) {
+            if (!rel.empty() && (art.path == rel || art.path.starts_with(rel + "/"))) {
+                held_bytes += art.bytes;
+                present = present || art.path == rel || art.path == rel + "/CURRENT";
+            }
+        }
+        pj["backend"] = JsonValue{backend};
+        pj["snapshot"] = present ? JsonValue{rel} : JsonValue{};
         pj["row_group"] = JsonValue{static_cast<std::int64_t>(-1)};
         pj["rows"] = num(0);
-        if (art == nullptr || !b.contains("state")) {
+        if (const auto it = layout.find(p); it != layout.end()) {
+            JsonObject id;
+            id["graph_id"] = JsonValue{it->second.op};
+            id["subtask"] = num(it->second.subtask_in_op);
+            pj["operator"] = JsonValue{std::move(id)};
+        } else {
+            pj["operator"] = JsonValue{};
+        }
+        if (!present || !b.contains("state")) {
             const auto why = absent_reason(b, rel);
             pj["exported"] = JsonValue{false};
             pj["reason"] = JsonValue{why};
@@ -577,10 +597,10 @@ void Exporter::build(const fs::path& root) {
             parts.push_back(JsonValue{std::move(pj)});
             continue;
         }
-        pj["bytes"] = num(art->bytes);
-        pj["sha256"] = JsonValue{art->sha256};
-        const auto sidecar = state::verify_checkpoint(b.root / rel);
-        pj["sidecar"] = JsonValue{std::string{state::to_string(sidecar.status)}};
+        pj["bytes"] = num(held_bytes);
+        if (const auto* art = b.find(rel); art != nullptr) {
+            pj["sha256"] = JsonValue{art->sha256};
+        }
         if (bound || past_deadline()) {
             if (!bound) {
                 incomplete_.push_back(
@@ -593,19 +613,28 @@ void Exporter::build(const fs::path& root) {
             parts.push_back(JsonValue{std::move(pj)});
             continue;
         }
-        if (!sidecar.ok()) {
-            // A snapshot that does not match its sidecar is not read.
-            incomplete_.push_back("participant " + std::to_string(p) + ": " +
-                                  std::string{state::to_string(sidecar.status)} +
-                                  " snapshot: " + sidecar.detail);
-            pj["exported"] = JsonValue{false};
-            pj["reason"] = JsonValue{"the snapshot does not match its sidecar: " + sidecar.detail};
-            parts.push_back(JsonValue{std::move(pj)});
-            continue;
+        if (backend == "file") {
+            const auto sidecar = state::verify_checkpoint(b.root / rel);
+            pj["sidecar"] = JsonValue{std::string{state::to_string(sidecar.status)}};
+            if (!sidecar.ok()) {
+                // A snapshot that does not match its sidecar is not read.
+                incomplete_.push_back("participant " + std::to_string(p) + ": " +
+                                      std::string{state::to_string(sidecar.status)} +
+                                      " snapshot: " + sidecar.detail);
+                pj["exported"] = JsonValue{false};
+                pj["reason"] =
+                    JsonValue{"the snapshot does not match its sidecar: " + sidecar.detail};
+                parts.push_back(JsonValue{std::move(pj)});
+                continue;
+            }
+        } else {
+            pj["sidecar"] = JsonValue{std::string{
+                "none: the backend keeps none; its integrity is checked as it is decoded"}};
         }
         ParsedSnapshot snap;
         try {
-            snap = parse_snapshot(b.root / rel, o_.max_entries - entries_);
+            snap = parse_snapshot(incident::canonical_participant_state(b, hit->second),
+                                  o_.max_entries - entries_);
         } catch (const RowBound&) {
             incomplete_.push_back(
                 "the entry bound (--max-entries=" + std::to_string(o_.max_entries) +
@@ -616,20 +645,30 @@ void Exporter::build(const fs::path& root) {
             pj["reason"] = JsonValue{std::string{"past a bound"}};
             parts.push_back(JsonValue{std::move(pj)});
             continue;
+        } catch (const incident::StateUnsupported& e) {
+            ++undecoded;
+            unsupported_.push_back("participant " + std::to_string(p) + ": " + e.what());
+            pj["exported"] = JsonValue{false};
+            pj["reason"] = JsonValue{std::string{e.what()}};
+            parts.push_back(JsonValue{std::move(pj)});
+            continue;
         } catch (const SnapshotUnsupported& e) {
+            ++undecoded;
             unsupported_.push_back("participant " + std::to_string(p) + ": " + e.what());
             pj["exported"] = JsonValue{false};
             pj["reason"] = JsonValue{std::string{e.what()}};
             parts.push_back(JsonValue{std::move(pj)});
             continue;
         } catch (const std::exception& e) {
-            incomplete_.push_back("participant " + std::to_string(p) +
-                                  ": the snapshot does not decode: " + e.what());
+            ++undecoded;
+            incomplete_.push_back("participant " + std::to_string(p) + ": the " + backend +
+                                  " checkpoint does not decode: " + e.what());
             pj["exported"] = JsonValue{false};
             pj["reason"] = JsonValue{std::string{e.what()}};
             parts.push_back(JsonValue{std::move(pj)});
             continue;
         }
+        ++decoded;
         pj["format_version"] = num(snap.format_version);
         if (snap.replayed_changelog) {
             pj["changelog_replayed"] = JsonValue{true};
@@ -724,6 +763,15 @@ void Exporter::build(const fs::path& root) {
         parts.push_back(JsonValue{std::move(pj)});
     }
     writer.close();
+    {
+        JsonObject j;
+        j["id"] = JsonValue{std::string{"state.decode"}};
+        j["verdict"] = JsonValue{std::string{undecoded > 0 ? "failed" : "passed"}};
+        j["reason"] = JsonValue{"decoded by the export itself: " + std::to_string(decoded) +
+                                " snapshot(s) read in full, " + std::to_string(undecoded) +
+                                " that do not decode"};
+        verification.push_back(JsonValue{std::move(j)});
+    }
     // A check that found nothing it could decode is unsupported only when
     // every snapshot was there to decode; otherwise it is the absence.
     for (auto& line : unsupported_checks) {
@@ -823,7 +871,10 @@ void Exporter::build(const fs::path& root) {
 
     d["participants"] = JsonValue{std::move(parts)};
 
-    // Operators: every one that holds state, named from the graph where it can be.
+    // Operators: every one that holds state, named from the graph by its uid,
+    // or else from the marker's layout when that is unambiguous: every
+    // participant holding the operator's rows is a subtask of one graph
+    // operator, and no other operator's rows are in that operator's subtasks.
     std::set<std::uint64_t> state_ops;
     for (const auto& [k, n] : slot_rows) {
         state_ops.insert(std::get<0>(k));
@@ -831,17 +882,72 @@ void Exporter::build(const fs::path& root) {
     for (const auto& [k, s] : schema) {
         state_ops.insert(k.first);
     }
+    std::map<std::uint64_t, std::string> hosted_by;  // state operator -> graph operator
+    std::map<std::string, std::set<std::uint64_t>> hosting;
+    bool single_hosts = true;
+    for (const auto& [op, parts] : op_parts) {
+        std::set<std::string> graph;
+        bool known = true;
+        for (const auto p : parts) {
+            const auto it = layout.find(p);
+            known = known && it != layout.end();
+            if (it != layout.end()) {
+                graph.insert(it->second.op);
+            }
+        }
+        if (known && graph.size() == 1) {
+            hosted_by[op] = *graph.begin();
+            hosting[*graph.begin()].insert(op);
+        } else {
+            single_hosts = false;
+        }
+    }
+    std::map<std::string, std::uint32_t> graph_subtasks;  // graph operator -> its subtasks
+    for (const auto& [p, ident] : layout) {
+        ++graph_subtasks[ident.op];
+    }
+    bool layout_complete = !participants.empty();
+    for (const auto p : participants) {
+        layout_complete = layout_complete && layout.contains(p);
+    }
+    const bool by_subtask = layout_complete && single_hosts;
+    std::map<std::uint64_t, std::string> layout_named;
+    for (const auto& [op, graph] : hosted_by) {
+        if (hosting[graph].size() == 1 && !by_op.contains(op)) {
+            layout_named[op] = graph;
+        }
+        if (const auto it = by_op.find(op); it != by_op.end() && it->second->id != graph) {
+            notes_.push_back("operator " + std::to_string(op) + " is " + it->second->id +
+                             " by its uid, but its rows are in subtasks of " + graph);
+        }
+    }
     JsonArray ops;
     for (const auto op : state_ops) {
         JsonObject oj;
         oj["op_id"] = JsonValue{std::to_string(op)};
+        const GraphOp* g = nullptr;
         if (const auto it = by_op.find(op); it != by_op.end()) {
-            oj["graph_id"] = JsonValue{it->second->id};
-            oj["uid"] = it->second->uid.empty() ? JsonValue{} : JsonValue{it->second->uid};
-            oj["type"] = JsonValue{it->second->type};
-            oj["parallelism"] = num(it->second->parallelism);
+            g = it->second;
+            oj["graph_id"] = JsonValue{g->id};
+            oj["named_by"] = JsonValue{std::string{"uid"}};
+        } else if (const auto ln = layout_named.find(op); ln != layout_named.end()) {
+            oj["graph_id"] = JsonValue{ln->second};
+            oj["named_by"] = JsonValue{std::string{"layout"}};
+            for (const auto& gop : graph_ops) {
+                g = gop.id == ln->second ? &gop : g;
+            }
         } else {
             oj["graph_id"] = JsonValue{};
+            oj["named_by"] = JsonValue{};
+        }
+        if (g != nullptr) {
+            oj["uid"] = g->uid.empty() ? JsonValue{} : JsonValue{g->uid};
+            oj["type"] = JsonValue{g->type};
+            oj["parallelism"] = num(g->parallelism);
+        }
+        if (const auto h = hosted_by.find(op); h != hosted_by.end()) {
+            oj["hosted_by"] = JsonValue{h->second};
+            oj["subtasks"] = num(graph_subtasks[h->second]);
         }
         JsonArray ps;
         for (const auto p : op_parts[op]) {
@@ -905,6 +1011,21 @@ void Exporter::build(const fs::path& root) {
     }
     gj["operators"] = JsonValue{std::move(gops)};
     d["graph"] = JsonValue{std::move(gj)};
+
+    JsonObject lay;
+    lay["recorded"] = JsonValue{layout_complete};
+    lay["operator_subtasks"] = JsonValue{by_subtask};
+    lay["statement"] = JsonValue{std::string{
+        by_subtask ? "the marker records each participant's operator and subtask, and every "
+                     "operator's rows are in one graph operator's subtasks: operator state is "
+                     "identified by that subtask"
+        : layout_complete
+            ? "the marker records each participant's operator and subtask, but some operator's "
+              "rows are in subtasks of several graph operators: operator state is identified by "
+              "participant"
+            : "the marker does not record every participant's operator (an older marker): "
+              "operator state is identified by participant"}};
+    d["layout"] = JsonValue{std::move(lay)};
 
     JsonObject ej;
     ej["path"] = JsonValue{std::string{kEntriesFile}};
@@ -1017,6 +1138,7 @@ DatasetResult Exporter::run() {
         c.timeout = o_.timeout;
         c.out = staged.string();
         c.after_copy = o_.after_copy;
+        c.allow_new_markers = true;
         incident::CollectResult collected;
         try {
             collected = incident::collect(c);
@@ -1024,6 +1146,9 @@ DatasetResult Exporter::run() {
             throw DatasetRefused(e.what(), incident::collect_error_kind_name(e.kind));
         }
         r.checkpoint = collected.checkpoint;
+        for (const auto& n : collected.notes) {
+            notes_.push_back(n);
+        }
         build(staged);
         const bool complete = incomplete_.empty() && unsupported_.empty();
         if (!complete && !o_.allow_partial) {
@@ -1059,6 +1184,7 @@ DatasetResult Exporter::run() {
             std::string{"the export failed: "} + e.what() + "; nothing was published", "other");
     }
     r.dataset = out;
+    r.digest = incident::sha256_file(out / kDatasetFile);
     r.complete = incomplete_.empty() && unsupported_.empty();
     r.incomplete = incomplete_;
     r.unsupported = unsupported_;
@@ -1130,8 +1256,8 @@ int compare_identity(const DatasetEntry& x, const DatasetEntry& y) {
     if (x.key_group != y.key_group) {
         return x.key_group < y.key_group ? -1 : 1;
     }
-    if (x.scope != kKeyed && x.participant != y.participant) {
-        return x.participant < y.participant ? -1 : 1;
+    if (x.scope != kKeyed && x.owner != y.owner) {
+        return x.owner < y.owner ? -1 : 1;
     }
     if (const int c = x.user_key.compare(y.user_key); c != 0) {
         return c < 0 ? -1 : 1;
@@ -1142,8 +1268,8 @@ int compare_identity(const DatasetEntry& x, const DatasetEntry& y) {
 // One participant's row group, read a batch at a time.
 class GroupCursor {
 public:
-    GroupCursor(const fs::path& file, int row_group, std::uint32_t participant)
-        : participant_(participant) {
+    GroupCursor(const fs::path& file, int row_group, std::uint32_t participant, std::uint32_t owner)
+        : participant_(participant), owner_(owner) {
         parquet::arrow::FileReaderBuilder builder;
         check(builder.OpenFile(file.string()), "cannot open entries.parquet");
         parquet::ArrowReaderProperties props;
@@ -1209,6 +1335,7 @@ private:
         e.scope = scope_from(std::string{scope_->GetView(i)});
         e.key_group = kg_->IsNull(i) ? std::int16_t{-1} : kg_->Value(i);
         e.participant = part_->Value(i);
+        e.owner = owner_;
         e.user_key = std::string{uk_->GetView(i)};
         e.value = std::string{val_->GetView(i)};
         if (e.participant != participant_) {
@@ -1228,6 +1355,7 @@ private:
     }
 
     std::uint32_t participant_;
+    std::uint32_t owner_;
     std::unique_ptr<parquet::arrow::FileReader> reader_;
     std::unique_ptr<arrow::RecordBatchReader> batches_;
     std::shared_ptr<arrow::RecordBatch> batch_;
@@ -1252,8 +1380,9 @@ public:
             if (p.row_group < 0) {
                 continue;
             }
+            const auto owner = d.by_subtask ? d.layout.at(p.index).second : p.index;
             cursors_.push_back(std::make_unique<GroupCursor>(
-                d.root / kEntriesFile, static_cast<int>(p.row_group), p.index));
+                d.root / kEntriesFile, static_cast<int>(p.row_group), p.index, owner));
         }
         for (std::size_t i = 0; i < cursors_.size(); ++i) {
             if (!cursors_[i]->done()) {
@@ -1302,13 +1431,14 @@ JsonValue side_json(const DiffSide& s) {
     o["generation"] = num(s.generation);
     o["complete"] = JsonValue{s.complete};
     o["graph_sha256"] = s.graph_sha256.empty() ? JsonValue{} : JsonValue{s.graph_sha256};
+    o["digest"] = JsonValue{s.digest};
     return JsonValue{std::move(o)};
 }
 
 std::string side_text(const DiffSide& s) {
     return s.path + " (job " + std::to_string(s.job) + ", checkpoint " +
            std::to_string(s.checkpoint) + ", generation " + std::to_string(s.generation) + ", " +
-           (s.complete ? "complete" : "PARTIAL") + ")";
+           (s.complete ? "complete" : "PARTIAL") + ", digest " + s.digest.substr(0, 16) + ")";
 }
 
 }  // namespace
@@ -1346,7 +1476,7 @@ DatasetResult export_checkpoint_dataset(const DatasetOptions& options) {
 
 namespace {
 
-Dataset read_dataset(const fs::path& root_in) {
+Dataset read_dataset(const fs::path& root_in, const std::string& expect_digest) {
     std::error_code ec;
     const auto root = fs::absolute(root_in, ec).lexically_normal();
     if (!fs::is_directory(fs::symlink_status(root, ec))) {
@@ -1355,7 +1485,13 @@ Dataset read_dataset(const fs::path& root_in) {
     Dataset d;
     d.root = root;
     try {
-        d.doc = config::parse(read_plain_file(root / kDatasetFile, kMaxDatasetJsonBytes));
+        const auto text = read_plain_file(root / kDatasetFile, kMaxDatasetJsonBytes);
+        d.digest = sha256_text(text);
+        if (!expect_digest.empty() && d.digest != expect_digest) {
+            throw DatasetInvalid("dataset.json's SHA-256 is " + d.digest + ", not " +
+                                 expect_digest + ": this is not the dataset with that digest");
+        }
+        d.doc = config::parse(text);
     } catch (const DatasetInvalid&) {
         throw;
     } catch (const std::exception& e) {
@@ -1422,6 +1558,11 @@ Dataset read_dataset(const fs::path& root_in) {
         dp.index = static_cast<std::uint32_t>(uint_field(p, "index"));
         dp.row_group = p.at("row_group").as_int();
         dp.rows = uint_field(p, "rows");
+        if (p.contains("operator") && p.at("operator").is_object()) {
+            d.layout[dp.index] = {
+                p.at("operator").at("graph_id").as_string(),
+                static_cast<std::uint32_t>(uint_field(p.at("operator"), "subtask"))};
+        }
         if (dp.row_group >= 0) {
             if (!groups.insert(dp.row_group).second) {
                 throw DatasetInvalid("dataset.json: two participants name one row group");
@@ -1433,8 +1574,31 @@ Dataset read_dataset(const fs::path& root_in) {
     if (rows != d.entries || groups.size() != uint_field(ej, "row_groups")) {
         throw DatasetInvalid("dataset.json's participants do not account for its entry table");
     }
+    if (doc.contains("layout") && doc.at("layout").is_object()) {
+        d.by_subtask = doc.at("layout").bool_or("operator_subtasks", false);
+    }
+    if (d.by_subtask) {
+        // Every participant's identity is in the dataset, and no two
+        // participants of one operator claim one subtask.
+        std::set<std::pair<std::string, std::uint32_t>> seen;
+        for (const auto& p : d.participants) {
+            const auto it = d.layout.find(p.index);
+            if (it == d.layout.end() || !seen.insert(it->second).second) {
+                throw DatasetInvalid(
+                    "dataset.json says operator state is identified by subtask, but its "
+                    "participants' identities do not support it");
+            }
+        }
+    }
     for (const auto& o : doc.at("operators").as_array()) {
         const auto op = parse_u64(o.at("op_id").as_string(), "op_id");
+        if (o.contains("graph_id") && o.at("graph_id").is_string()) {
+            d.op_names[op] = o.at("graph_id").as_string();
+        }
+        if (o.contains("hosted_by") && o.at("hosted_by").is_string()) {
+            d.op_host[op] = o.at("hosted_by").as_string();
+            d.op_subtasks[op] = static_cast<std::uint32_t>(uint_field(o, "subtasks"));
+        }
         for (const auto& p : o.at("participants").as_array()) {
             d.operator_participants[op].insert(static_cast<std::uint32_t>(p.as_int()));
         }
@@ -1473,9 +1637,9 @@ Dataset read_dataset(const fs::path& root_in) {
 
 }  // namespace
 
-Dataset open_dataset(const fs::path& root) {
+Dataset open_dataset(const fs::path& root, const std::string& expect_digest) {
     try {
-        return read_dataset(root);
+        return read_dataset(root, expect_digest);
     } catch (const DatasetInvalid&) {
         throw;
     } catch (const std::exception& e) {
@@ -1520,7 +1684,8 @@ DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOpt
                         .checkpoint = d.checkpoint,
                         .generation = d.generation,
                         .complete = d.complete,
-                        .graph_sha256 = d.graph_sha256};
+                        .graph_sha256 = d.graph_sha256,
+                        .digest = d.digest};
     };
     r.a = side(a);
     r.b = side(b);
@@ -1604,6 +1769,68 @@ DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOpt
         }
         return out;
     };
+    // Whether an operator's operator-state and raw rows can be compared owner
+    // by owner, and if not why. With both sides recording each participant's
+    // operator and subtask, an owner is a subtask of its operator, so a rescale
+    // of another operator (which moves job-global indices) does not prevent it;
+    // a change of this operator's own parallelism does, since each subtask's
+    // rows are its own and a rescale reassigns them. Without that record on
+    // either side, an owner is a participant and the sets must be equal.
+    const auto set_text = [](const Dataset& d, std::uint64_t op) {
+        std::string s;
+        if (const auto it = d.operator_participants.find(op); it != d.operator_participants.end()) {
+            for (const auto p : it->second) {
+                s += (s.empty() ? "" : ",") + std::to_string(p);
+            }
+        }
+        return "{" + s + "}";
+    };
+    const auto owners_comparable = [&](std::uint64_t op, std::string& note) {
+        if (a.by_subtask && b.by_subtask) {
+            const auto ha = a.op_host.find(op);
+            const auto hb = b.op_host.find(op);
+            if (ha == a.op_host.end() || hb == b.op_host.end()) {
+                note = "not comparable: which operator's subtasks hold it is not recorded";
+                return false;
+            }
+            if (ha->second != hb->second) {
+                note = "not comparable: its rows are in subtasks of " + ha->second + " in a and " +
+                       hb->second + " in b";
+                return false;
+            }
+            if (a.op_subtasks.at(op) != b.op_subtasks.at(op)) {
+                note = "not comparable: " + ha->second + " has " +
+                       std::to_string(a.op_subtasks.at(op)) + " subtasks in a and " +
+                       std::to_string(b.op_subtasks.at(op)) +
+                       " in b, and each subtask's rows are its own";
+                return false;
+            }
+            if (set_text(a, op) != set_text(b, op)) {
+                note = "compared subtask by subtask of " + ha->second +
+                       " (its participants' job-global indices moved: " + set_text(a, op) + " -> " +
+                       set_text(b, op) + ")";
+            }
+            return true;
+        }
+        if (a.by_subtask != b.by_subtask) {
+            note =
+                "not comparable: only one side records which operator subtask each "
+                "participant is";
+            return false;
+        }
+        const bool same = a.operator_participants.count(op) != 0 &&
+                          b.operator_participants.count(op) != 0 &&
+                          a.operator_participants.at(op) == b.operator_participants.at(op) &&
+                          !(a.graph_ops.contains(op) && b.graph_ops.contains(op) &&
+                            a.graph_ops.at(op) != b.graph_ops.at(op));
+        if (!same) {
+            note = "not comparable: the operator's subtasks changed (" + set_text(a, op) + " -> " +
+                   set_text(b, op) +
+                   "), and its rows belong to the subtask that "
+                   "wrote them";
+        }
+        return same;
+    };
     for (const auto& k : keys) {
         const auto& [op, slot, scope] = k;
         SlotComparison c;
@@ -1624,26 +1851,8 @@ DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOpt
         } else if (!ops_a.contains(op)) {
             c.status = "operator-only-in-b";
             c.note = "operator " + std::to_string(op) + " is not in a";
-        } else if (scope != kKeyed &&
-                   (a.operator_participants.count(op) == 0 ||
-                    b.operator_participants.count(op) == 0 ||
-                    a.operator_participants.at(op) != b.operator_participants.at(op) ||
-                    (a.graph_ops.contains(op) && b.graph_ops.contains(op) &&
-                     a.graph_ops.at(op) != b.graph_ops.at(op)))) {
-            const auto set_text = [&](const Dataset& d) {
-                std::string s;
-                if (const auto it = d.operator_participants.find(op);
-                    it != d.operator_participants.end()) {
-                    for (const auto p : it->second) {
-                        s += (s.empty() ? "" : ",") + std::to_string(p);
-                    }
-                }
-                return "{" + s + "}";
-            };
+        } else if (scope != kKeyed && !owners_comparable(op, c.note)) {
             c.status = "subtasks-changed";
-            c.note = "not comparable: the operator's subtasks changed (" + set_text(a) + " -> " +
-                     set_text(b) + "), and its " + c.scope +
-                     " rows belong to the subtask that wrote them";
         } else if (!(sa == sb)) {
             c.schema_changed = true;
             if (options.raw_bytes) {
@@ -1658,9 +1867,9 @@ DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOpt
         } else {
             c.status = "compared";
             if (!r.same_graph && !sa.fingerprint && sa.versions.empty()) {
-                c.note =
-                    "neither side stamps this slot's schema and the graphs differ: compared as "
-                    "stored bytes, whose encoding is not recorded";
+                c.note += std::string{c.note.empty() ? "" : "; "} +
+                          "neither side stamps this slot's schema and the graphs differ: "
+                          "compared as stored bytes, whose encoding is not recorded";
             }
         }
         if (!c.compared() && c.status != "operator-only-in-a" && c.status != "operator-only-in-b") {

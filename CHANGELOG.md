@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**Checkpoint datasets read every local backend, name every operator, and
+prove themselves unchanged.** The export reads a changelog backend's
+checkpoints with the materialisation files they name, and RocksDB's
+checkpoint directories through the RocksDB the CLI links, so incident
+bundles carry them too. Each COMPLETED marker now records which operator
+and subtask every participant was deployed as (`participant.<index>`
+lines, which older readers skip), so an operator without a uid, every SQL
+operator among them, is named, a finished job's last checkpoint still names
+its operators, and `state-diff` compares operator state subtask by subtask
+when a rescale of another operator moved the job-global indices. An export
+no longer fails because a later checkpoint completed while it copied. It
+prints the dataset's digest, which `--digest` on the readers checks, so a
+rewrite that keeps every recorded hash is caught. Each snapshot is decoded
+once rather than twice. `clink_audit.isolation`
+gains `LoopbackIsolation`, the proven isolation `state-query` needs. And
+`state-query` now prints an aggregate's final row per group: it printed
+every running result when the input spanned more than one batch, and it
+refuses an aggregate whose final rows it cannot tell apart.
+
 **A completed checkpoint of a whole job exports as one verified dataset.**
 `clink state-export --checkpoint-dir=<dir> --job=<id> (--checkpoint=<N> |
 --restore-point) --out=<dataset>` collects the checkpoint through the

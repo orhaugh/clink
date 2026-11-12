@@ -198,6 +198,10 @@ struct VerifyOptions {
     // ${CLINK_DEPS_PREFIX:-~/.clink-deps}/formal-tools. Never downloaded.
     std::string formal_tools_dir;
     ReadLimits limits;
+    // false leaves state.decode out, for a caller that decodes every
+    // snapshot itself and reports that check in its place (a checkpoint
+    // dataset's export), so no snapshot is decoded twice.
+    bool decode_state{true};
 };
 
 // The checks that need no SQL runtime: bundle.*, checkpoint.*, state.decode,
@@ -244,6 +248,52 @@ struct EpochStart {
 [[nodiscard]] bool epoch_discarded(const std::vector<cluster::RestoredRecord>& restores,
                                    std::uint64_t epoch) noexcept;
 
+// ---- a participant's checkpoint, whatever backend wrote it -------------------
+
+// One participant's checkpoint as a bundle holds it. `backend` says what wrote
+// it and so what `path` (bundle-relative) is:
+//
+//   file       checkpoint-<id>.snap, the canonical stream, with its sidecar
+//   changelog  changelog-<id>.snap, the changelog variant, and beside it in the
+//              bundle the materialisation files its handles name; no sidecar
+//   rocksdb    the <subtask>.cp-<id> checkpoint directory; no sidecar, its
+//              integrity is RocksDB's own block checksums, checked as it is read
+struct ParticipantState {
+    std::uint32_t index{0};
+    std::string backend;
+    std::string path;
+};
+
+// From the manifest's selection.participant_state. A bundle collected before
+// that record holds the file backend's layout for every participant.
+[[nodiscard]] std::vector<ParticipantState> participant_states(const Bundle& b);
+
+// A participant's checkpoint this process cannot read: a backend no reader is
+// registered for, or a changelog handle outside the job's state root.
+struct StateUnsupported : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// The participant's checkpoint as the canonical snapshot stream, read from the
+// bundle alone: a file snapshot as it is, a changelog snapshot replayed with its
+// materialisation handles resolved to the bundle's copies, and a checkpoint
+// directory rendered by the registered reader from a scratch copy, so nothing
+// is written inside the bundle. Throws StateUnsupported, or std::exception for
+// a checkpoint that does not decode.
+[[nodiscard]] std::vector<std::byte> canonical_participant_state(const Bundle& b,
+                                                                 const ParticipantState& p);
+
+// The materialisation handles a changelog snapshot names (its row_kind 3 rows).
+[[nodiscard]] std::vector<std::string> changelog_materialization_handles(
+    const std::vector<std::byte>& bytes);
+
+// Renders one backend's checkpoint directory to the canonical stream. A process
+// linked with that backend registers one (the RocksDB-linked clink registers
+// "rocksdb"); clink_core links no backend that keeps its checkpoints this way.
+using DirectoryStateReader =
+    std::function<std::vector<std::byte>(const std::filesystem::path& checkpoint_dir)>;
+void register_directory_state_reader(const std::string& backend, DirectoryStateReader reader);
+
 // ---- collection -------------------------------------------------------------
 
 struct CollectOptions {
@@ -260,6 +310,13 @@ struct CollectOptions {
     std::optional<std::pair<std::uint64_t, std::uint64_t>> epochs;  // inclusive
     bool include_state{false};
     bool include_captures{false};
+    // Markers that appear while the evidence is copied (a later checkpoint
+    // completing, a restore recorded) do not refuse the collection: only a
+    // change to what was copied does (a marker it copied removed, a file
+    // changed or vanished). For a collection that is one checkpoint's state
+    // and nothing about the moment around it (a checkpoint dataset); an
+    // incident bundle, which describes a moment, keeps the strict rule.
+    bool allow_new_markers{false};
     std::uint64_t max_bytes{1ULL << 30};
     std::uint64_t max_files{10000};
     std::chrono::seconds timeout{600};
