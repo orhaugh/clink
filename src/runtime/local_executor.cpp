@@ -168,11 +168,13 @@ void LocalExecutor::start() {
             contexts_.back()->set_wait_final_committed(config_.wait_final_committed);
         }
         contexts_.back()->set_unaligned_checkpoints(config_.unaligned_checkpoints);
+        contexts_.back()->set_checkpointed(config_.checkpointed);
         contexts_.back()->set_adaptive_barrier_mode(config_.adaptive_barrier_mode);
         // Give operators the restore key-group range so timer restore can
         // route each timer to the subtask owning its key group on a rescale
-        // (full range = same-parallelism, keep all). See Operator::restore_timers.
-        contexts_.back()->set_restore_key_group_range(config_.restore_key_group_filter);
+        // (full range = same layout, keep all). See Operator::restore_timers.
+        contexts_.back()->set_restore_key_group_range(
+            config_.restore_keeps_key_groups ? KeyGroupRange{} : config_.restore_key_group_filter);
         // Stamp the per-operator mode override (if any)
         // so this operator's runner can stamp barriers passing
         // through with the override mode.

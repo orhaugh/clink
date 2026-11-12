@@ -17,7 +17,8 @@ into its logical state:
     idle_count   "idle_count": i64 account to i64 count
     timers       the "__clink_timers" operator rows: [u32 n][i64 time][u32
                  length][key]... for processing time, then the same for event
-                 time, each key an i64 account; the union over participants
+                 time, each key an i64 account (the job's encoding) or its
+                 decimal text; the union over participants
 
 and which operator holds each slot. A row it cannot decode is listed as
 undecoded, never dropped. Raw bytes are compared separately, by `clink
@@ -109,6 +110,17 @@ def owners_of(operators):
             if o.get("op_id") and o.get("subtasks")}
 
 
+def _account_key(key):
+    """A timer's key: the account's decimal text (as a job keying its timers
+    with std::to_string does), or its i64 in the keyed state's encoding."""
+    text = key.decode("ascii", errors="replace")
+    if key and all(c in "-0123456789" for c in text):
+        return int(text)
+    if len(key) == 8:
+        return _i64le(key)
+    raise ValueError("a timer key that is neither an i64 account nor its text: %r" % key[:16])
+
+
 def decode_state(catalog, owners=None):
     """Decodes `state-cat --dataset --json --max-rows=0` output.
 
@@ -159,9 +171,7 @@ def decode_state(catalog, owners=None):
                     if t["processing"]:
                         raise ValueError("processing-time timers this job never registers")
                     for ts, key in t["event"]:
-                        if len(key) != 8:
-                            raise ValueError("a timer key that is not an i64 account: %r" % key[:16])
-                        timers.add((ts, _i64le(key)))
+                        timers.add((ts, _account_key(key)))
                     st["slots"].setdefault("timers", set()).add(op)
                 else:
                     raise ValueError("a row this job does not write")

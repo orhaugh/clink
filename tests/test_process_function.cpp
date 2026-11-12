@@ -1084,6 +1084,89 @@ TEST(ProcessFunction, EventTimeTimersRouteByKeyGroupOnRescale) {
     EXPECT_FALSE(hi.empty());
 }
 
+namespace {
+
+// Records the restore key-group range it was given and every timer that fires.
+class TimerKeyProbe final : public Operator<int, int> {
+public:
+    void restore_timers(StateBackend& backend, OperatorId op_id, const std::string& slot) override {
+        restore_range = this->runtime()->restore_key_group_range();
+        Operator::restore_timers(backend, op_id, slot);
+    }
+    void process(const StreamElement<int>& el, Emitter<int>& out) override {
+        if (el.is_watermark()) {
+            this->on_watermark(el.as_watermark(), out);
+        } else if (el.is_barrier()) {
+            this->on_barrier(el.as_barrier(), out);
+        }
+    }
+    void on_event_time_timer(std::int64_t, const std::string& key, Emitter<int>&) override {
+        fired.push_back(key);
+    }
+    KeyGroupRange restore_range{};
+    std::vector<std::string> fired;
+};
+
+// A subtask restoring its own snapshot, with its own key-group range as the
+// filter (as every keyed subtask is given), fires `keys.size()` timers when the
+// restore keeps the layout and only those whose key bytes land in its range
+// when it does not.
+std::pair<std::size_t, KeyGroupRange> restore_text_keyed_timers(
+    const std::vector<std::string>& keys, bool keeps_layout) {
+    const OperatorId op_id = operator_id_from_uid("timer-key-probe");
+    InMemoryStateBackend seed;
+    TimerService ts;
+    for (const auto& k : keys) {
+        ts.register_event_time_timer(1000, k);
+    }
+    const auto blob = ts.serialize();
+    seed.put_operator_state(
+        op_id,
+        StateBackend::KeyView{"__clink_timers"},
+        StateBackend::ValueView{reinterpret_cast<const char*>(blob.data()), blob.size()});
+    auto snap = seed.snapshot(CheckpointId{1});
+
+    Dag dag;
+    auto src = std::make_shared<VectorSource<int>>(std::vector<Record<int>>{});
+    auto h_src = dag.add_source<int>(src);
+    auto probe = std::make_shared<TimerKeyProbe>();
+    probe->set_uid("timer-key-probe");
+    auto h = dag.add_operator<int, int>(h_src, probe);
+    dag.add_sink<int>(h, std::make_shared<CollectingSink<int>>());
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    cfg.restore_from = std::move(snap);
+    cfg.restore_key_group_filter = KeyGroupRange{KeyGroup{0}, KeyGroup{64}};
+    cfg.restore_keeps_key_groups = keeps_layout;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    return {probe->fired.size(), probe->restore_range};
+}
+
+}  // namespace
+
+// The upgrade validation workflow found this: every keyed subtask is given its
+// own key-group range as the restore filter, so a restore at the same
+// parallelism routed timers as a rescale does, by the key group of the timer
+// key's bytes, and dropped each one keyed as text rather than in its keyed
+// state's encoding (about half at parallelism 2). Restoring its own snapshot,
+// a subtask keeps every timer it checkpointed.
+TEST(ProcessFunction, ARestoreThatKeepsTheLayoutKeepsEveryTimerWhateverItsKeyEncoding) {
+    std::vector<std::string> keys;
+    for (int i = 0; i < 60; ++i) {
+        keys.push_back(std::to_string(i));
+    }
+    const auto [kept, range] = restore_text_keyed_timers(keys, /*keeps_layout=*/true);
+    EXPECT_EQ(kept, keys.size());
+    EXPECT_TRUE(range.covers_all());
+
+    // A rescale still routes them: only the keys whose bytes land in the range.
+    const auto [routed, narrowed] = restore_text_keyed_timers(keys, /*keeps_layout=*/false);
+    EXPECT_FALSE(narrowed.covers_all());
+    EXPECT_LT(routed, keys.size());
+    EXPECT_GT(routed, 0U);
+}
+
 // Two-input counterpart: a CoProcessFunction's event-time timer (both
 // inputs share one TimerService) survives a checkpoint/restore. Exercises
 // the CoOperator::snapshot_timers / restore_timers hooks and the co-op

@@ -26,8 +26,8 @@ It needs Python 3.10 or later and a built tree (`CLINK_BIN_DIR`, default `build/
 | `schema` | `uc-windows` declares state version 2 with no migration |
 | `uid_changed`, `uid_missing` | `uc-windows` has another uid, or none |
 | `crash_restore`, `crash_continue` | `uc-idle`'s process is killed (SIGKILL) while restoring its timers, or 40 events after the restore |
-| `memory_windows` | the accumulator type is not registered, so the windows are in memory only |
-| `string_timer_keys` | the timers are keyed by the account as text |
+| `memory_windows` | the accumulator type is not registered on the job's registry (no longer a defect: the window finds the built-in text codec and keeps its windows in keyed state) |
+| `string_timer_keys` | the timers are keyed by the account as text (no longer a defect: a restore that keeps the layout keeps them all) |
 
 ## The prior release
 
@@ -41,7 +41,9 @@ v0.15.0 at bbd63094 is the baseline of the `prior-release` scenario. `run.sh` bu
 | `compatible` | this build, the `compatible` variant | exit 0 |
 | `prior-release` | v0.15.0, this build | exit 0; both commits named; the baseline's operator-state copies (written by every restored subtask before 04963a61) reported and left out of the logical comparison |
 | each defect variant | this build, the variant | exit 1 with the check that names it: the aggregate and the boundary in `behaviour.output` and `reference.candidate` with the restore passed; lost timers, a changed or missing uid and a crash while restoring in `restore.candidate`; the schema in `schema.candidate` and as a refusal before anything ran, with no output written; a crash after the restore in `recovery.candidate` |
-| `memory-windows`, `string-timer-keys` | the variant, twice | `record` flags the savepoint against the reference; the check exits 1 with `behaviour.*` passed and `reference.candidate` failed: two builds that agree and are both wrong (with text timer keys, `evidence.readable` fails too: the timers are in none of the job's encodings) |
+| `agreeing-and-wrong` | `wrong_aggregate`, twice | `record` flags the baseline's output against the reference; the check exits 1 with `behaviour.*` passed and `reference.candidate` failed: two builds that agree and are both wrong |
+| `memory-windows` | the variant, twice | exit 0: the windows open at the savepoint survive the restore (until this release they were held in memory and lost, and this scenario failed like `agreeing-and-wrong`) |
+| `string-timer-keys` | the variant, twice | exit 0: timers keyed as text survive the restore (until this release about half were dropped, and this scenario failed like `memory-windows`) |
 | `fresh-run` | this build, a `clink` that drops `--restore-from-dir` | exit 1, `restore.candidate` names the position a fresh start holds |
 | `wrong-digest`, `truncated-evidence`, `other-test` | this build, twice | exit 1, `evidence.integrity` failed, no build ran |
 | `unsupported-version` | this build, twice | exit 3, `evidence.integrity` unsupported |

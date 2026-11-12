@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -19,6 +20,8 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/operator_registry.hpp"
+#include "clink/core/codec.hpp"
+#include "clink/core/derived_codec.hpp"
 #include "clink/core/fields.hpp"  // HasArrowFields, fields_fingerprint_v
 #include "clink/operators/async_co_process_function.hpp"
 #include "clink/operators/async_process_function.hpp"
@@ -32,6 +35,7 @@
 #include "clink/operators/tumbling_window_operator.hpp"
 #include "clink/operators/watermark_assigner_operator.hpp"
 #include "clink/operators/window_evictor.hpp"
+#include "clink/operators/window_state.hpp"
 #include "clink/operators/window_trigger.hpp"
 #include "clink/plugin/plugin.hpp"
 #include "clink/runtime/output_tag.hpp"
@@ -443,20 +447,139 @@ inline void note_untimed_record(RuntimeContext* rt, std::uint64_t op_id, bool& w
     }
 }
 
+// The codec a fluent stateful operator keeps its state with: the one the job
+// registered for T on its own registry, else the built-in codec of a built-in
+// type (int64, uint64, uint32, text) or the derived codec of a described type
+// (CLINK_FIELDS). nullopt for any other type, whose state can then be held in
+// memory only.
+template <typename T>
+std::optional<Codec<T>> fluent_state_codec(const ::clink::plugin::PluginRegistry& reg) {
+    if (auto c = reg.template codec_for<T>(); c != nullptr) {
+        return *c;
+    }
+    if constexpr (std::is_same_v<T, std::int64_t>) {
+        return int64_codec();
+    } else if constexpr (std::is_same_v<T, std::uint64_t>) {
+        return uint64_codec();
+    } else if constexpr (std::is_same_v<T, std::uint32_t>) {
+        return uint32_codec();
+    } else if constexpr (std::is_same_v<T, std::string>) {
+        return string_codec();
+    } else if constexpr (HasArrowFields<T>) {
+        return derived_codec<T>();
+    } else {
+        return std::nullopt;
+    }
+}
+
+// The codec of a fluent session operator's per-key sessions, from its
+// accumulator's (fluent_state_codec): the session row codec, in a list.
+template <typename Agg>
+std::optional<Codec<std::vector<SessionRow<Agg>>>> session_state_codec(
+    const ::clink::plugin::PluginRegistry& reg) {
+    if (auto a = fluent_state_codec<Agg>(reg)) {
+        return vector_codec(session_row_codec(*a));
+    }
+    return std::nullopt;
+}
+
+// An operator whose state type has no codec could keep that state in memory
+// only, and a restore would start it empty without a word. In a job that takes
+// checkpoints it refuses to run instead.
+inline void refuse_state_held_in_memory(const RuntimeContext* rt,
+                                        const std::string& op,
+                                        const char* what) {
+    if (rt != nullptr && rt->checkpointed()) {
+        throw std::runtime_error(
+            op + ": its " + what +
+            " type has no codec, so its state would be held in memory only and a restore would "
+            "start it empty. Register the type on the job's registry "
+            "(pipeline.registry().register_type<T>(name, codec)) or describe it with "
+            "CLINK_FIELDS.");
+    }
+}
+
+// Keyed state a fluent operator writes back at each barrier. The operator works
+// on its own in-memory map and marks each key it changes; before a barrier
+// passes, flush() writes those keys to keyed state, or erases the ones the map
+// no longer holds. The checkpoint is taken once the barrier has passed every
+// operator, so it holds the map as it was at the barrier, and open() reloads
+// the map from it after a restore. Without a codec it does nothing.
+template <typename V>
+class WriteBackKeyedMap {
+public:
+    void open(RuntimeContext* rt,
+              const char* slot,
+              const std::optional<Codec<V>>& codec,
+              std::unordered_map<std::int64_t, V>& map,
+              const std::string& op,
+              const char* what) {
+        if (!codec.has_value()) {
+            refuse_state_held_in_memory(rt, op, what);
+            return;
+        }
+        if (rt == nullptr || !rt->has_state_backend()) {
+            return;
+        }
+        store_.emplace(rt->template keyed_state<std::int64_t, V>(slot, int64_codec(), *codec));
+        store_->scan([&map](const std::int64_t& k, const V& v) { map.insert_or_assign(k, v); });
+    }
+    void mark(std::int64_t key) {
+        if (store_) {
+            dirty_.insert(key);
+        }
+    }
+    void flush(const std::unordered_map<std::int64_t, V>& map) {
+        if (!store_) {
+            return;
+        }
+        for (const auto k : dirty_) {
+            if (const auto it = map.find(k); it != map.end()) {
+                store_->put(k, it->second);
+            } else {
+                store_->erase(k);
+            }
+        }
+        dirty_.clear();
+    }
+    void close() {
+        store_.reset();
+        dirty_.clear();
+    }
+
+private:
+    std::optional<KeyedState<std::int64_t, V>> store_;
+    std::unordered_set<std::int64_t> dirty_;
+};
+
 // Helper operator used by KeyedDataStream<T>::reduce(). Maintains a
 // per-key running aggregate in T-shape (no pair<K, T> conversion) and
 // emits the latest accumulator on every input, matching // keyedStream.reduce(ReduceFunction).
-// State is in-memory per subtask; since the upstream OperatorSpec carries key_by, hash routing
-// guarantees a given key always lands on the same subtask, so the
-// per-subtask map is the complete state for that key.
+// Since the upstream OperatorSpec carries key_by, hash routing guarantees a
+// given key always lands on the same subtask, so the per-subtask map is the
+// complete state for that key. With a codec for T (fluent_state_codec) the map
+// is written back to keyed state (slot "reduce") at every barrier and
+// reloaded on open(), so it survives a restore; without one, a checkpointed
+// job refuses to run it.
 template <typename T>
 class KeyedReduceOperator final : public Operator<T, T> {
 public:
     using KeyFn = std::function<std::int64_t(const T&)>;
     using Reducer = std::function<T(const T&, const T&)>;
 
-    KeyedReduceOperator(KeyFn key_fn, Reducer reducer, std::string name)
-        : key_fn_(std::move(key_fn)), reducer_(std::move(reducer)), name_(std::move(name)) {}
+    KeyedReduceOperator(KeyFn key_fn,
+                        Reducer reducer,
+                        std::string name,
+                        std::optional<Codec<T>> codec = std::nullopt)
+        : key_fn_(std::move(key_fn)),
+          reducer_(std::move(reducer)),
+          name_(std::move(name)),
+          codec_(std::move(codec)) {}
+
+    void open() override {
+        durable_.open(this->runtime(), "reduce", codec_, state_, name_, "reduced value");
+    }
+    void close() override { durable_.close(); }
 
     void process(const StreamElement<T>& element, Emitter<T>& out) override {
         if (element.is_data()) {
@@ -469,6 +592,7 @@ public:
                 } else {
                     it->second = reducer_(it->second, rec.value());
                 }
+                durable_.mark(k);
                 if (rec.event_time().has_value()) {
                     batch_out.emplace(it->second, *rec.event_time());
                 } else {
@@ -481,6 +605,7 @@ public:
         } else if (element.is_watermark()) {
             this->on_watermark(element.as_watermark(), out);
         } else {
+            durable_.flush(state_);
             this->on_barrier(element.as_barrier(), out);
         }
     }
@@ -491,7 +616,9 @@ private:
     KeyFn key_fn_;
     Reducer reducer_;
     std::string name_;
+    std::optional<Codec<T>> codec_;
     std::unordered_map<std::int64_t, T> state_;
+    WriteBackKeyedMap<T> durable_;
 };
 
 // Keyed event-time sliding-window aggregator used by
@@ -746,16 +873,22 @@ public:
                                    CombinerFn combiner,
                                    std::chrono::milliseconds size,
                                    std::chrono::milliseconds slide,
-                                   std::string name)
+                                   std::string name,
+                                   std::optional<Codec<Agg>> agg_codec = std::nullopt)
         : key_fn_(std::move(key_fn)),
-          inner_(size, slide, std::move(initial), std::move(combiner), name + "_inner"),
-          name_(std::move(name)) {}
+          inner_(make_inner_(
+              size, slide, std::move(initial), std::move(combiner), name + "_inner", agg_codec)),
+          name_(std::move(name)),
+          durable_(agg_codec.has_value()) {}
 
     void set_allowed_lateness(std::chrono::milliseconds v) { inner_.allowed_lateness(v); }
     void set_late_output_tag(OutputTag<T> tag) { inner_.late_output_tag(std::move(tag)); }
     void set_trigger(TriggerPtr t) { inner_.with_trigger(std::move(t)); }
 
     void open() override {
+        if (!durable_) {
+            refuse_state_held_in_memory(this->runtime(), name_, "window accumulator");
+        }
         inner_.attach_runtime(this->runtime());
         inner_.open();
     }
@@ -799,8 +932,28 @@ public:
 
 private:
     KeyFn key_fn_;
-    clink::SlidingWindowOperator<std::int64_t, T, Agg> inner_;
+    using Inner = clink::SlidingWindowOperator<std::int64_t, T, Agg>;
+    // With a codec the windows live in keyed state a checkpoint holds.
+    static Inner make_inner_(std::chrono::milliseconds size,
+                             std::chrono::milliseconds slide,
+                             InitialFn initial,
+                             CombinerFn combiner,
+                             std::string name,
+                             const std::optional<Codec<Agg>>& agg_codec) {
+        if (agg_codec.has_value()) {
+            return Inner(size,
+                         slide,
+                         std::move(initial),
+                         std::move(combiner),
+                         int64_codec(),
+                         *agg_codec,
+                         std::move(name));
+        }
+        return Inner(size, slide, std::move(initial), std::move(combiner), std::move(name));
+    }
+    Inner inner_;
     std::string name_;
+    bool durable_{false};
 };
 
 // Emit-form sliding-window aggregator: like KeyedSlidingWindowFull, but
@@ -823,18 +976,24 @@ public:
                                    EmitFn emit_fn,
                                    std::chrono::milliseconds size,
                                    std::chrono::milliseconds slide,
-                                   std::string name)
+                                   std::string name,
+                                   std::optional<Codec<Agg>> agg_codec = std::nullopt)
         : key_fn_(std::move(key_fn)),
-          inner_(size, slide, std::move(initial), std::move(combiner), name + "_inner"),
+          inner_(make_inner_(
+              size, slide, std::move(initial), std::move(combiner), name + "_inner", agg_codec)),
           emit_fn_(std::move(emit_fn)),
           size_ms_(size.count()),
-          name_(std::move(name)) {}
+          name_(std::move(name)),
+          durable_(agg_codec.has_value()) {}
 
     void set_allowed_lateness(std::chrono::milliseconds v) { inner_.allowed_lateness(v); }
     void set_late_output_tag(OutputTag<T> tag) { inner_.late_output_tag(std::move(tag)); }
     void set_trigger(TriggerPtr t) { inner_.with_trigger(std::move(t)); }
 
     void open() override {
+        if (!durable_) {
+            refuse_state_held_in_memory(this->runtime(), name_, "window accumulator");
+        }
         inner_.attach_runtime(this->runtime());
         inner_.open();
     }
@@ -877,10 +1036,29 @@ public:
 
 private:
     KeyFn key_fn_;
-    clink::SlidingWindowOperator<std::int64_t, T, Agg> inner_;
+    using Inner = clink::SlidingWindowOperator<std::int64_t, T, Agg>;
+    static Inner make_inner_(std::chrono::milliseconds size,
+                             std::chrono::milliseconds slide,
+                             InitialFn initial,
+                             CombinerFn combiner,
+                             std::string name,
+                             const std::optional<Codec<Agg>>& agg_codec) {
+        if (agg_codec.has_value()) {
+            return Inner(size,
+                         slide,
+                         std::move(initial),
+                         std::move(combiner),
+                         int64_codec(),
+                         *agg_codec,
+                         std::move(name));
+        }
+        return Inner(size, slide, std::move(initial), std::move(combiner), std::move(name));
+    }
+    Inner inner_;
     EmitFn emit_fn_;
     std::int64_t size_ms_;
     std::string name_;
+    bool durable_{false};
 };
 
 // Wrapper around the full TumblingWindowOperator<int64_t, T, Agg>
@@ -908,16 +1086,22 @@ public:
                                     InitialFn initial,
                                     CombinerFn combiner,
                                     std::chrono::milliseconds size,
-                                    std::string name)
+                                    std::string name,
+                                    std::optional<Codec<Agg>> agg_codec = std::nullopt)
         : key_fn_(std::move(key_fn)),
-          inner_(size, std::move(initial), std::move(combiner), name + "_inner"),
-          name_(std::move(name)) {}
+          inner_(make_inner_(
+              size, std::move(initial), std::move(combiner), name + "_inner", agg_codec)),
+          name_(std::move(name)),
+          durable_(agg_codec.has_value()) {}
 
     void set_allowed_lateness(std::chrono::milliseconds v) { inner_.allowed_lateness(v); }
     void set_late_output_tag(OutputTag<T> tag) { inner_.late_output_tag(std::move(tag)); }
     void set_trigger(InnerTriggerPtr t) { inner_.with_trigger(std::move(t)); }
 
     void open() override {
+        if (!durable_) {
+            refuse_state_held_in_memory(this->runtime(), name_, "window accumulator");
+        }
         // Share the wrapper's runtime context with the inner. The
         // inner expects its runtime() to have a state backend etc;
         // attach_runtime threads it through.
@@ -964,8 +1148,26 @@ public:
 
 private:
     KeyFn key_fn_;
-    clink::TumblingWindowOperator<std::int64_t, T, Agg> inner_;
+    using Inner = clink::TumblingWindowOperator<std::int64_t, T, Agg>;
+    // With a codec the windows live in keyed state a checkpoint holds.
+    static Inner make_inner_(std::chrono::milliseconds size,
+                             InitialFn initial,
+                             CombinerFn combiner,
+                             std::string name,
+                             const std::optional<Codec<Agg>>& agg_codec) {
+        if (agg_codec.has_value()) {
+            return Inner(size,
+                         std::move(initial),
+                         std::move(combiner),
+                         int64_codec(),
+                         *agg_codec,
+                         std::move(name));
+        }
+        return Inner(size, std::move(initial), std::move(combiner), std::move(name));
+    }
+    Inner inner_;
     std::string name_;
+    bool durable_{false};
 };
 
 // Emit-form tumbling-window aggregator: like KeyedTumblingWindowFull,
@@ -1018,13 +1220,17 @@ public:
                  name + "_inner"),
           emit_fn_(std::move(emit_fn)),
           size_ms_(size.count()),
-          name_(std::move(name)) {}
+          name_(std::move(name)),
+          durable_(true) {}
 
     void set_allowed_lateness(std::chrono::milliseconds v) { inner_.allowed_lateness(v); }
     void set_late_output_tag(OutputTag<T> tag) { inner_.late_output_tag(std::move(tag)); }
     void set_trigger(TriggerPtr t) { inner_.with_trigger(std::move(t)); }
 
     void open() override {
+        if (!durable_) {
+            refuse_state_held_in_memory(this->runtime(), name_, "window accumulator");
+        }
         inner_.attach_runtime(this->runtime());
         inner_.open();
     }
@@ -1068,6 +1274,7 @@ private:
     EmitFn emit_fn_;
     std::int64_t size_ms_;
     std::string name_;
+    bool durable_{false};
 };
 
 // Keyed event-time tumbling aggregator - same shape as the sliding
@@ -1217,18 +1424,21 @@ public:
     using CombinerFn = std::function<Agg(const Agg&, const T&)>;
     using AggMerger = std::function<Agg(const Agg&, const Agg&)>;
 
-    KeyedSessionWindowAggregateOperator(KeyFn key_fn,
-                                        InitialFn initial,
-                                        CombinerFn combiner,
-                                        AggMerger merger,
-                                        std::chrono::milliseconds gap,
-                                        std::string name)
+    KeyedSessionWindowAggregateOperator(
+        KeyFn key_fn,
+        InitialFn initial,
+        CombinerFn combiner,
+        AggMerger merger,
+        std::chrono::milliseconds gap,
+        std::string name,
+        std::optional<Codec<std::vector<SessionRow<Agg>>>> codec = std::nullopt)
         : key_fn_(std::move(key_fn)),
           initial_(std::move(initial)),
           combiner_(std::move(combiner)),
           merger_(std::move(merger)),
           gap_ms_(gap.count()),
-          name_(std::move(name)) {
+          name_(std::move(name)),
+          codec_(std::move(codec)) {
         if (gap_ms_ <= 0) {
             throw std::invalid_argument(
                 "KeyedSessionWindowAggregateOperator: gap must be positive");
@@ -1237,6 +1447,16 @@ public:
 
     void set_allowed_lateness(std::chrono::milliseconds v) { allowed_lateness_ms_ = v.count(); }
     void set_late_output_tag(OutputTag<T> tag) { late_tag_ = std::move(tag); }
+
+    void open() override {
+        durable_.open(this->runtime(),
+                      "session_windows",
+                      codec_,
+                      sessions_by_key_,
+                      name_,
+                      "session accumulator");
+    }
+    void close() override { durable_.close(); }
 
     void process(const StreamElement<T>& element, Emitter<Agg>& out) override {
         if (element.is_data()) {
@@ -1268,26 +1488,40 @@ public:
             const auto wm = element.as_watermark();
             last_watermark_ms_ = wm.timestamp().millis();
             Batch<Agg> fired;
-            for (auto& [key, sessions] : sessions_by_key_) {
+            for (auto it = sessions_by_key_.begin(); it != sessions_by_key_.end();) {
+                const auto key = it->first;
+                auto& sessions = it->second;
                 std::vector<Session> remaining;
                 remaining.reserve(sessions.size());
+                bool changed = false;
                 for (auto& s : sessions) {
                     if (!s.fired && s.end + gap_ms_ <= last_watermark_ms_) {
                         fired.emplace(s.agg, EventTime{s.end - 1});
                         s.fired = true;
+                        changed = true;
                     }
                     if (s.end + gap_ms_ + allowed_lateness_ms_ <= last_watermark_ms_) {
+                        changed = true;
                         continue;  // purge
                     }
                     remaining.push_back(std::move(s));
                 }
-                sessions = std::move(remaining);
+                if (changed) {
+                    durable_.mark(key);
+                }
+                if (remaining.empty()) {
+                    it = sessions_by_key_.erase(it);
+                } else {
+                    sessions = std::move(remaining);
+                    ++it;
+                }
             }
             if (!fired.empty()) {
                 out.emit_data(std::move(fired));
             }
             out.emit_watermark(wm);
         } else {
+            durable_.flush(sessions_by_key_);
             out.emit_barrier(element.as_barrier());
         }
     }
@@ -1301,6 +1535,9 @@ public:
                 }
             }
         }
+        for (const auto& [key, sessions] : sessions_by_key_) {
+            durable_.mark(key);
+        }
         sessions_by_key_.clear();
         if (!fired.empty()) {
             out.emit_data(std::move(fired));
@@ -1311,15 +1548,12 @@ public:
 
 private:
     bool warned_untimed_{false};  // note_untimed_record warns once
-    struct Session {
-        std::int64_t start{0};
-        std::int64_t end{0};
-        Agg agg{};
-        bool fired{false};
-    };
+    // start, end, fired and the accumulator: the row the session codec writes.
+    using Session = SessionRow<Agg>;
 
     void add_record_(std::int64_t key, std::int64_t t, const T& v, Batch<Agg>& refires) {
         auto& sessions = sessions_by_key_[key];
+        durable_.mark(key);
         Session merged;
         merged.start = t;
         merged.end = t + 1;
@@ -1368,7 +1602,9 @@ private:
     std::int64_t last_watermark_ms_{std::numeric_limits<std::int64_t>::min()};
     std::optional<OutputTag<T>> late_tag_;
     std::string name_;
+    std::optional<Codec<std::vector<SessionRow<Agg>>>> codec_;
     std::unordered_map<std::int64_t, std::vector<Session>> sessions_by_key_;
+    WriteBackKeyedMap<std::vector<SessionRow<Agg>>> durable_;
 };
 
 // Emit-form session-window aggregator. Mirrors
@@ -1387,20 +1623,23 @@ public:
     using AggMerger = std::function<Agg(const Agg&, const Agg&)>;
     using EmitFn = std::function<Out(std::int64_t, const clink::TimeWindow&, const Agg&)>;
 
-    KeyedSessionWindowEmitOperator(KeyFn key_fn,
-                                   InitialFn initial,
-                                   CombinerFn combiner,
-                                   AggMerger merger,
-                                   EmitFn emit_fn,
-                                   std::chrono::milliseconds gap,
-                                   std::string name)
+    KeyedSessionWindowEmitOperator(
+        KeyFn key_fn,
+        InitialFn initial,
+        CombinerFn combiner,
+        AggMerger merger,
+        EmitFn emit_fn,
+        std::chrono::milliseconds gap,
+        std::string name,
+        std::optional<Codec<std::vector<SessionRow<Agg>>>> codec = std::nullopt)
         : key_fn_(std::move(key_fn)),
           initial_(std::move(initial)),
           combiner_(std::move(combiner)),
           merger_(std::move(merger)),
           emit_fn_(std::move(emit_fn)),
           gap_ms_(gap.count()),
-          name_(std::move(name)) {
+          name_(std::move(name)),
+          codec_(std::move(codec)) {
         if (gap_ms_ <= 0) {
             throw std::invalid_argument("KeyedSessionWindowEmitOperator: gap must be positive");
         }
@@ -1408,6 +1647,16 @@ public:
 
     void set_allowed_lateness(std::chrono::milliseconds v) { allowed_lateness_ms_ = v.count(); }
     void set_late_output_tag(OutputTag<T> tag) { late_tag_ = std::move(tag); }
+
+    void open() override {
+        durable_.open(this->runtime(),
+                      "session_windows",
+                      codec_,
+                      sessions_by_key_,
+                      name_,
+                      "session accumulator");
+    }
+    void close() override { durable_.close(); }
 
     void process(const StreamElement<T>& element, Emitter<Out>& out) override {
         if (element.is_data()) {
@@ -1437,27 +1686,41 @@ public:
             const auto wm = element.as_watermark();
             last_watermark_ms_ = wm.timestamp().millis();
             Batch<Out> fired;
-            for (auto& [key, sessions] : sessions_by_key_) {
+            for (auto it = sessions_by_key_.begin(); it != sessions_by_key_.end();) {
+                const auto key = it->first;
+                auto& sessions = it->second;
                 std::vector<Session> remaining;
                 remaining.reserve(sessions.size());
+                bool changed = false;
                 for (auto& s : sessions) {
                     if (!s.fired && s.end + gap_ms_ <= last_watermark_ms_) {
                         fired.emplace(emit_fn_(key, clink::TimeWindow{s.start, s.end}, s.agg),
                                       EventTime{s.end - 1});
                         s.fired = true;
+                        changed = true;
                     }
                     if (s.end + gap_ms_ + allowed_lateness_ms_ <= last_watermark_ms_) {
+                        changed = true;
                         continue;  // purge
                     }
                     remaining.push_back(std::move(s));
                 }
-                sessions = std::move(remaining);
+                if (changed) {
+                    durable_.mark(key);
+                }
+                if (remaining.empty()) {
+                    it = sessions_by_key_.erase(it);
+                } else {
+                    sessions = std::move(remaining);
+                    ++it;
+                }
             }
             if (!fired.empty()) {
                 out.emit_data(std::move(fired));
             }
             out.emit_watermark(wm);
         } else {
+            durable_.flush(sessions_by_key_);
             out.emit_barrier(element.as_barrier());
         }
     }
@@ -1472,6 +1735,9 @@ public:
                 }
             }
         }
+        for (const auto& [key, sessions] : sessions_by_key_) {
+            durable_.mark(key);
+        }
         sessions_by_key_.clear();
         if (!fired.empty()) {
             out.emit_data(std::move(fired));
@@ -1482,15 +1748,12 @@ public:
 
 private:
     bool warned_untimed_{false};  // note_untimed_record warns once
-    struct Session {
-        std::int64_t start{0};
-        std::int64_t end{0};
-        Agg agg{};
-        bool fired{false};
-    };
+    // start, end, fired and the accumulator: the row the session codec writes.
+    using Session = SessionRow<Agg>;
 
     void add_record_(std::int64_t key, std::int64_t t, const T& v, Batch<Out>& refires) {
         auto& sessions = sessions_by_key_[key];
+        durable_.mark(key);
         Session merged;
         merged.start = t;
         merged.end = t + 1;
@@ -1539,7 +1802,9 @@ private:
     std::int64_t last_watermark_ms_{std::numeric_limits<std::int64_t>::min()};
     std::optional<OutputTag<T>> late_tag_;
     std::string name_;
+    std::optional<Codec<std::vector<SessionRow<Agg>>>> codec_;
     std::unordered_map<std::int64_t, std::vector<Session>> sessions_by_key_;
+    WriteBackKeyedMap<std::vector<SessionRow<Agg>>> durable_;
 };
 
 // Wrapper around EvictingTumblingWindowOperator<int64_t, T, Out>.
@@ -1560,16 +1825,22 @@ public:
                                             std::chrono::milliseconds size,
                                             ProcessFn process_fn,
                                             EvictorPtr evictor,
-                                            std::string name)
+                                            std::string name,
+                                            std::optional<Codec<T>> value_codec = std::nullopt)
         : key_fn_(std::move(key_fn)),
-          inner_(size, std::move(process_fn), std::move(evictor), name + "_inner"),
-          name_(std::move(name)) {}
+          inner_(make_inner_(
+              size, std::move(process_fn), std::move(evictor), name + "_inner", value_codec)),
+          name_(std::move(name)),
+          durable_(value_codec.has_value()) {}
 
     void set_allowed_lateness(std::chrono::milliseconds v) { inner_.allowed_lateness(v); }
     void set_late_output_tag(OutputTag<T> tag) { inner_.late_output_tag(std::move(tag)); }
     void set_trigger(TriggerPtr t) { inner_.with_trigger(std::move(t)); }
 
     void open() override {
+        if (!durable_) {
+            refuse_state_held_in_memory(this->runtime(), name_, "buffered record");
+        }
         inner_.attach_runtime(this->runtime());
         inner_.open();
     }
@@ -1631,8 +1902,26 @@ public:
 
 private:
     KeyFn key_fn_;
-    clink::EvictingTumblingWindowOperator<std::int64_t, T, Out> inner_;
+    using Inner = clink::EvictingTumblingWindowOperator<std::int64_t, T, Out>;
+    // With a codec for the records the buffered windows live in keyed state.
+    static Inner make_inner_(std::chrono::milliseconds size,
+                             ProcessFn process_fn,
+                             EvictorPtr evictor,
+                             std::string name,
+                             const std::optional<Codec<T>>& value_codec) {
+        if (value_codec.has_value()) {
+            return Inner(size,
+                         std::move(process_fn),
+                         std::move(evictor),
+                         int64_codec(),
+                         *value_codec,
+                         std::move(name));
+        }
+        return Inner(size, std::move(process_fn), std::move(evictor), std::move(name));
+    }
+    Inner inner_;
     std::string name_;
+    bool durable_{false};
 };
 
 }  // namespace detail
@@ -2101,9 +2390,10 @@ public:
         // private static - which won't see registrations the host made
         // through us. Capturing the host's ref avoids that trap.
         auto* key_reg = &reg.key_extractor_registry();
+        const auto state_codec = detail::fluent_state_codec<T>(reg);
         reg.template register_operator<T, T>(
             op_type,
-            [fn = std::move(fn), op_type, channel, key_name, key_reg](
+            [state_codec, fn = std::move(fn), op_type, channel, key_name, key_reg](
                 const clink::plugin::BuildContext&) -> std::shared_ptr<Operator<T, T>> {
                 auto extractor = key_reg->template find<T>(channel, key_name);
                 if (!extractor) {
@@ -2112,7 +2402,7 @@ public:
                         "' is not registered (call .key_by(...) before .reduce(...))");
                 }
                 return std::make_shared<detail::KeyedReduceOperator<T>>(
-                    std::move(extractor), fn, op_type);
+                    std::move(extractor), fn, op_type, state_codec);
             });
         cluster::OperatorSpec op;
         op.id = std::move(id);
@@ -2369,9 +2659,11 @@ public:
         const auto trigger_factory = trigger_factory_;
         auto& reg = env_->registry();
         auto* key_reg = &reg.key_extractor_registry();
+        const auto state_codec = detail::fluent_state_codec<Agg>(reg);
         reg.template register_operator<T, Agg>(
             op_type,
-            [initial = std::move(initial),
+            [state_codec,
+             initial = std::move(initial),
              combiner = std::move(combiner),
              op_type,
              channel,
@@ -2389,7 +2681,7 @@ public:
                                              "' is not registered (call .key_by(...) first)");
                 }
                 auto op = std::make_shared<detail::KeyedSlidingWindowFullOperator<T, Agg>>(
-                    std::move(extractor), initial, combiner, size, slide, op_type);
+                    std::move(extractor), initial, combiner, size, slide, op_type, state_codec);
                 op->set_allowed_lateness(lateness);
                 if (late_tag.has_value()) {
                     op->set_late_output_tag(*late_tag);
@@ -2436,9 +2728,11 @@ public:
         const auto trigger_factory = trigger_factory_;
         auto& reg = env_->registry();
         auto* key_reg = &reg.key_extractor_registry();
+        const auto state_codec = detail::fluent_state_codec<Agg>(reg);
         reg.template register_operator<T, Out>(
             op_type,
-            [initial = std::move(initial),
+            [state_codec,
+             initial = std::move(initial),
              combiner = std::move(combiner),
              emit_fn = std::move(emit_fn),
              op_type,
@@ -2457,7 +2751,14 @@ public:
                                              "' is not registered (call .key_by(...) first)");
                 }
                 auto op = std::make_shared<detail::KeyedSlidingWindowEmitOperator<T, Agg, Out>>(
-                    std::move(extractor), initial, combiner, emit_fn, size, slide, op_type);
+                    std::move(extractor),
+                    initial,
+                    combiner,
+                    emit_fn,
+                    size,
+                    slide,
+                    op_type,
+                    state_codec);
                 op->set_allowed_lateness(lateness);
                 if (late_tag.has_value()) {
                     op->set_late_output_tag(*late_tag);
@@ -2562,9 +2863,11 @@ public:
         const auto trigger_factory = trigger_factory_;
         auto& reg = env_->registry();
         auto* key_reg = &reg.key_extractor_registry();
+        const auto state_codec = detail::fluent_state_codec<Agg>(reg);
         reg.template register_operator<T, Agg>(
             op_type,
-            [initial = std::move(initial),
+            [state_codec,
+             initial = std::move(initial),
              combiner = std::move(combiner),
              op_type,
              channel,
@@ -2581,7 +2884,7 @@ public:
                                              "' is not registered (call .key_by(...) first)");
                 }
                 auto op = std::make_shared<detail::KeyedTumblingWindowFullOperator<T, Agg>>(
-                    std::move(extractor), initial, combiner, size, op_type);
+                    std::move(extractor), initial, combiner, size, op_type, state_codec);
                 op->set_allowed_lateness(lateness);
                 if (late_tag.has_value()) {
                     op->set_late_output_tag(*late_tag);
@@ -2629,13 +2932,12 @@ public:
         const auto trigger_factory = trigger_factory_;
         auto& reg = env_->registry();
         auto* key_reg = &reg.key_extractor_registry();
-        // Resolve the Agg codec at registration time. If present
-        // (the user registered Agg via env.registry().register_type
-        // before this aggregate call), the operator's persistent
-        // ctor wires through a KeyedState<...> backed by the job's
-        // state_backend, giving per-record durability via the embedded
-        // RocksDB state backend. If absent, fall back to the in-memory ctor.
-        std::shared_ptr<const Codec<Agg>> agg_codec = reg.template codec_for<Agg>();
+        // Resolve the Agg codec at registration time (fluent_state_codec: the
+        // job's registered codec, a built-in type's or a described type's).
+        // With one, the operator's persistent ctor keeps its windows in a
+        // KeyedState<...> the job's checkpoints hold; without one it keeps
+        // them in memory, and a checkpointed job refuses to run it.
+        std::optional<Codec<Agg>> agg_codec = detail::fluent_state_codec<Agg>(reg);
         reg.template register_operator<T, Out>(
             op_type,
             [initial = std::move(initial),
@@ -2770,9 +3072,11 @@ public:
         const auto evictor_factory = evictor_factory_;
         auto& reg = env_->registry();
         auto* key_reg = &reg.key_extractor_registry();
+        const auto state_codec = detail::fluent_state_codec<T>(reg);
         reg.template register_operator<T, Out>(
             op_type,
-            [process_fn = std::move(process_fn),
+            [state_codec,
+             process_fn = std::move(process_fn),
              op_type,
              channel,
              key_name,
@@ -2794,7 +3098,12 @@ public:
                         "(call .evicting(factory) before .process(fn))");
                 }
                 auto op = std::make_shared<detail::KeyedEvictingTumblingWindowFullOperator<T, Out>>(
-                    std::move(extractor), size, process_fn, evictor_factory(), op_type);
+                    std::move(extractor),
+                    size,
+                    process_fn,
+                    evictor_factory(),
+                    op_type,
+                    state_codec);
                 op->set_allowed_lateness(lateness);
                 if (late_tag.has_value()) {
                     op->set_late_output_tag(*late_tag);
@@ -2892,9 +3201,11 @@ public:
         const auto late_tag = late_tag_;
         auto& reg = env_->registry();
         auto* key_reg = &reg.key_extractor_registry();
+        const auto state_codec = detail::session_state_codec<Agg>(reg);
         reg.template register_operator<T, Agg>(
             op_type,
-            [initial = std::move(initial),
+            [state_codec,
+             initial = std::move(initial),
              combiner = std::move(combiner),
              merger = std::move(merger),
              op_type,
@@ -2911,7 +3222,7 @@ public:
                                              "' is not registered (call .key_by(...) first)");
                 }
                 auto op = std::make_shared<detail::KeyedSessionWindowAggregateOperator<T, Agg>>(
-                    std::move(extractor), initial, combiner, merger, gap, op_type);
+                    std::move(extractor), initial, combiner, merger, gap, op_type, state_codec);
                 op->set_allowed_lateness(lateness);
                 if (late_tag.has_value()) {
                     op->set_late_output_tag(*late_tag);
@@ -2956,9 +3267,11 @@ public:
         const auto late_tag = late_tag_;
         auto& reg = env_->registry();
         auto* key_reg = &reg.key_extractor_registry();
+        const auto state_codec = detail::session_state_codec<Agg>(reg);
         reg.template register_operator<T, Out>(
             op_type,
-            [initial = std::move(initial),
+            [state_codec,
+             initial = std::move(initial),
              combiner = std::move(combiner),
              merger = std::move(merger),
              emit_fn = std::move(emit_fn),
@@ -2976,7 +3289,14 @@ public:
                                              "' is not registered (call .key_by(...) first)");
                 }
                 auto op = std::make_shared<detail::KeyedSessionWindowEmitOperator<T, Agg, Out>>(
-                    std::move(extractor), initial, combiner, merger, emit_fn, gap, op_type);
+                    std::move(extractor),
+                    initial,
+                    combiner,
+                    merger,
+                    emit_fn,
+                    gap,
+                    op_type,
+                    state_codec);
                 op->set_allowed_lateness(lateness);
                 if (late_tag.has_value()) {
                     op->set_late_output_tag(*late_tag);

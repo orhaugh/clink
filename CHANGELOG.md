@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+**The fluent API's windows and reduce survive a restore.** Every fluent
+window aggregate but the tumbling emit form with a type registered on the
+job's registry, the evicting window and `reduce` kept their state in memory
+only, so a restore, an ordinary failover included, started open windows and
+reduced values empty with no warning; the documented cluster job example's
+`aggregate<std::int64_t>` was one of them. Each now resolves a codec for its
+state type when the job is built (the job's registered codec, a built-in
+type's, or a `CLINK_FIELDS` type's derived codec) and keeps its state where a
+checkpoint holds it: the windows through their operators' persistent
+constructors, the session windows and `reduce` by writing the keys they
+changed to keyed state at each barrier. A type with no codec is refused in a
+job that takes checkpoints (`RuntimeContext::checkpointed()`, from
+`JobConfig::checkpointed`), naming the fix, instead of being lost at the next
+restore; a job without a checkpoint directory runs it in memory as before.
+Fluent windows now write their state through to the backend, which costs a
+keyed-state write per record. Upgrade validation found it.
+
+**A restore at the same parallelism keeps every timer.** Every keyed subtask
+is given its own key-group range as its restore filter, so a restore that
+reloaded a subtask's own snapshot routed its event-time timers as a rescale
+does, by the key group of each timer key's bytes, and dropped every timer
+keyed in another encoding than its keyed state: about half of those keyed as
+`std::to_string(key)`, as the `KeyedProcessFunction` example keys them, at
+parallelism 2, with no warning. A subtask whose timers had all fired could
+also restore a peer's. The cluster runner now marks a restore that keeps the
+layout (`JobConfig::restore_keeps_key_groups`), so operators see the full
+range and keep their own timers whole, and the restore takes no timer rows
+from peers unless it is a rescale. A watermark assigner in a keyed chain
+likewise restores its progress again. A rescale still routes timers by key
+group. Upgrade validation found it.
+
 **A candidate build is checked against a savepoint a baseline retained before
 an upgrade.** `clink-audit upgrade record` runs the supported job (a keyed
 event-time tumbling window and event-time timers over a controlled local
@@ -19,13 +50,12 @@ the baseline, and agreement with the reference as separate checks, passing
 only when every required check passed. Every build process runs under proven
 loopback-only isolation within explicit time, memory and output bounds; a
 crash, a limit or an interrupt is never a pass. Its qualification restores
-a v0.15.0 savepoint into this tree, and catches eleven controlled defects
-and two builds that agree and are both wrong. It found that a fluent window
-aggregate whose accumulator type is not registered on the job's registry
-keeps its windows in memory only, that a restore drops event-time timers
-keyed in another encoding than their keyed state, and that a restore keeps
-state whose operator left the job without refusing it; each is documented,
-not yet changed.
+a v0.15.0 savepoint into this tree, and catches nine controlled defects and
+two builds that agree and are both wrong. It found that the fluent API's
+windows and reduce kept their state in memory only and that a restore dropped
+event-time timers keyed in another encoding than their keyed state (both
+fixed, above), and that a restore keeps state whose operator left the job
+without refusing it.
 
 **A checkpoint directory given as a relative path collects and exports.**
 `clink state-export --checkpoint-dir` and `clink incident-collect` refused a

@@ -321,6 +321,14 @@ public:
     void set_unaligned_checkpoints(bool v) noexcept { unaligned_checkpoints_ = v; }
     bool unaligned_checkpoints() const noexcept { return unaligned_checkpoints_; }
 
+    // Whether this run takes checkpoints a later run restores from. An
+    // operator that could keep its state only in memory refuses to run in a
+    // checkpointed job rather than come back empty after a restore (the
+    // fluent window and reduce operators whose types have no codec). Set from
+    // JobConfig::checkpointed; false for an in-process run that never restores.
+    void set_checkpointed(bool v) noexcept { checkpointed_ = v; }
+    [[nodiscard]] bool checkpointed() const noexcept { return checkpointed_; }
+
     // Adaptive checkpoint mode: source runners leave the mode already
     // stamped on an injected barrier untouched (the coordinator's
     // per-trigger decision) instead of re-stamping the static default.
@@ -687,6 +695,7 @@ private:
     RequestFinalCheckpointFn request_final_ckpt_;
     WaitFinalCommittedFn wait_final_committed_;
     bool unaligned_checkpoints_{false};
+    bool checkpointed_{false};
     bool adaptive_barrier_mode_{false};
     KeyGroupRange restore_kg_range_{};  // default {0, kNumKeyGroups} = covers all
     std::optional<CheckpointBarrier::Mode> barrier_mode_override_;

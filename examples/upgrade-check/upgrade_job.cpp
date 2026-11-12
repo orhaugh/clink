@@ -52,14 +52,13 @@
 //      (SIGKILL rather than abort(): a crash all the same to the gate, and it
 //      raises no crash report on the host)
 //  10  memory-windows: the accumulator type is not registered on the job's
-//      registry, so the fluent window keeps its windows in memory only and a
-//      restore starts them empty (a baseline and candidate built alike agree;
-//      only the reference tells them apart)
+//      registry. The fluent window used to find no codec then and keep its
+//      windows in memory, so a restore started them empty; it now finds the
+//      built-in text codec
 //  11  string-timer-keys: uc-idle keys its timers by the account as text, as
-//      the KeyedProcessFunction example does, so a restore keeps each timer
-//      by the key group of the text rather than of the account, and loses
-//      those that land in another subtask's range (again only the reference
-//      tells a baseline and candidate built alike apart)
+//      the KeyedProcessFunction example does. A restore that keeps the
+//      layout keeps them all; before it did, it routed them by the key
+//      group of the text and dropped about half
 //
 // Environment, read by the process that submits the job:
 //   CLINK_UC_FEED  the directory of segments (required)

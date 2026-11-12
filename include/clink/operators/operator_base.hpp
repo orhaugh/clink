@@ -830,6 +830,8 @@ public:
             // parent RC would.
             a_rc_->set_restore_key_group_range(parent->restore_key_group_range());
             b_rc_->set_restore_key_group_range(parent->restore_key_group_range());
+            a_rc_->set_checkpointed(parent->checkpointed());
+            b_rc_->set_checkpointed(parent->checkpointed());
             // Propagate the ambient DLQ so a chained inner op can report bad
             // records through the same engine service as a top-level connector.
             a_rc_->set_dead_letter_queue(parent->dead_letter_queue());

@@ -250,6 +250,7 @@ add_executable(clink_core_tests
     test_process_window_lateness.cpp
     test_process_window_persistence.cpp
     test_fluent_window_config.cpp
+    test_fluent_state_durability.cpp
     test_fluent_side_outputs.cpp
     test_watermark_alignment.cpp
     test_throttle_map.cpp

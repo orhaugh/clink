@@ -31,6 +31,11 @@ namespace clink {
 
 namespace {
 
+// The operator-state key every operator's checkpointed timers live under
+// (detail::kTimerStateKey in operators/operator_base.hpp, which this library
+// layer does not include), with a ChainedOperator slot suffix after it.
+constexpr std::string_view kTimerStateKeyPrefix = "__clink_timers";
+
 // Split "scheme://body" into (scheme, body). Returns ("", uri) when no
 // "://" separator exists; callers treat that as "file://" by default.
 std::pair<std::string, std::string> split_uri(const std::string& uri) {
@@ -580,8 +585,28 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                 }
                 auto b = read_file(entry.path() / ckpt_name);
                 if (!b.empty()) {
-                    parts.push_back(
-                        InMemoryStateBackend::extract_operator_state_bytes(b, &own_keys));
+                    // A restore that keeps the layout takes no timers from its
+                    // peers. An operator's timers are its own subtask's, for
+                    // keys in its own key groups, so a peer's are never this
+                    // subtask's to fire; and a subtask whose timers had all
+                    // fired has no row of its own (snapshot_timers erases it),
+                    // which let a peer's fill the gap and its timers fire here
+                    // against keyed state this subtask does not hold. A
+                    // rescale still takes them, for restore_timers to route.
+                    auto skip = own_keys;
+                    if (!is_rescale) {
+                        for (const auto& k : InMemoryStateBackend::operator_state_keys(b)) {
+                            // The stored key: the operator-state byte, then the key.
+                            const std::string_view stored{k.second};
+                            if (stored.size() > 1 &&
+                                static_cast<std::uint8_t>(stored.front()) ==
+                                    kOperatorStateKeyPrefix &&
+                                stored.substr(1).starts_with(kTimerStateKeyPrefix)) {
+                                skip.insert(k);
+                            }
+                        }
+                    }
+                    parts.push_back(InMemoryStateBackend::extract_operator_state_bytes(b, &skip));
                 }
             }
         }

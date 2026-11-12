@@ -40,7 +40,7 @@ QUICK = os.environ.get("QUICK") == "1"
 ONLY = {s for s in os.environ.get("ONLY", "").split(",") if s}
 
 QUICK_SET = {"control", "wrong-aggregate", "lost-timers", "schema", "uid-changed", "wrong-digest",
-             "timeout"}
+             "timeout", "agreeing-and-wrong"}
 
 
 def head(job="upgrade_check_job"):
@@ -295,17 +295,42 @@ def scenarios(q):
                 if os.path.isdir(produced) else []
             q.expect(name, "the refused candidate wrote no output", "nothing", files or "nothing", not files)
 
-    for name, v in (("memory-windows", "memory_windows"), ("string-timer-keys", "string_timer_keys")):
-        if not run(name):
-            continue
-        print("%s: baseline and candidate both built from %s" % (name, v))
-        B = variant(v)
-        evv = q.record(name, B)
-        q.expect(name, "record flags the savepoint against the reference", 1, evv[2], evv[2] == 1)
-        code, r, _ = q.check(name, evv, B, B)
-        q.outcome(name, code, r, 1, {"behaviour.output": "passed", "behaviour.state": "passed",
-                                     "reference.candidate": "failed",
-                                     "evidence.readable": "passed" if v == "memory_windows" else "failed"})
+    if run("agreeing-and-wrong"):
+        # Two builds with the same defect agree with each other; only the
+        # independent reference tells them apart from a correct one.
+        print("agreeing-and-wrong: baseline and candidate both built from wrong_aggregate")
+        B = variant("wrong_aggregate")
+        evv = q.record("agreeing-and-wrong", B)
+        q.expect("agreeing-and-wrong", "record flags the baseline's output against the reference", 1,
+                 evv[2], evv[2] == 1)
+        code, r, _ = q.check("agreeing-and-wrong", evv, B, B)
+        q.outcome("agreeing-and-wrong", code, r, 1, {"behaviour.output": "passed",
+                                                     "behaviour.state": "passed",
+                                                     "reference.candidate": "failed"})
+
+    if run("memory-windows"):
+        # The accumulator type registered nowhere: the fluent window found no
+        # codec and kept its windows in memory, so a restore started them
+        # empty. It now finds the built-in text codec and keeps them.
+        print("memory-windows: a window whose accumulator type the job never registered")
+        B = variant("memory_windows")
+        evv = q.record("memory-windows", B)
+        q.expect("memory-windows", "record exit", 0, evv[2], evv[2] == 0)
+        code, r, _ = q.check("memory-windows", evv, B, B)
+        q.outcome("memory-windows", code, r, 0, {"restore.candidate": "passed",
+                                                 "reference.candidate": "passed"})
+
+    if run("string-timer-keys"):
+        # Timers keyed as text were routed by the key group of the text at a
+        # restore that kept the layout, and about half were dropped; a
+        # same-layout restore now keeps every timer the subtask checkpointed.
+        print("string-timer-keys: timers keyed as text survive a restore")
+        B = variant("string_timer_keys")
+        evv = q.record("string-timer-keys", B)
+        q.expect("string-timer-keys", "record exit", 0, evv[2], evv[2] == 0)
+        code, r, _ = q.check("string-timer-keys", evv, B, B)
+        q.outcome("string-timer-keys", code, r, 0, {"restore.candidate": "passed",
+                                                    "reference.candidate": "passed"})
 
     if run("fresh-run"):
         print("fresh-run: a candidate whose submission forgets the restore")

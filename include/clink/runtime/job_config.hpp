@@ -60,6 +60,23 @@ struct JobConfig {
     // narrower range scopes the load to one rescaled subtask's slice.
     KeyGroupRange restore_key_group_filter{};
 
+    // True when the restore reloads this subtask's own snapshot under the
+    // layout it was written with (not a rescale). Operators then see the full
+    // range as their restore key-group range, so restore_timers keeps every
+    // timer the subtask checkpointed, whatever its key's encoding, and a
+    // watermark assigner restores its progress. The keyed-state restore still
+    // uses restore_key_group_filter. False keeps the filter as the operators'
+    // range too, which routes timers by key group as a rescale needs. The
+    // cluster runner sets it; an in-process caller that narrows the filter to
+    // stand for a rescaled subtask leaves it false.
+    bool restore_keeps_key_groups{false};
+
+    // The run takes checkpoints a later run may restore from (the cluster
+    // runner sets it when the job has a checkpoint directory). Operators see
+    // it as RuntimeContext::checkpointed(): one whose state could only be held
+    // in memory refuses to run rather than lose that state at a restore.
+    bool checkpointed{false};
+
     // FOUND-3 (relocatable savepoints): the directory the savepoint's
     // checkpoint dirs now live under. When set, the executor hands it to the
     // backend (set_restore_base) before restore, so a savepoint moved to a new

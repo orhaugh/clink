@@ -258,6 +258,76 @@ TEST(StateBackendFactory, RescaleUnionsOperatorStateFromAllParents) {
     std::filesystem::remove_all(working_root);
 }
 
+// At the same layout a subtask's timers are its own. One whose timers had all
+// fired has no timer row (snapshot_timers erases it), and the peer union used
+// to fill that gap with a peer's timers, which then fired here against keyed
+// state this subtask does not hold. A rescale still takes them, for
+// restore_timers to route by key group.
+TEST(StateBackendFactory, ARestoreThatKeepsTheLayoutTakesNoTimersFromAPeer) {
+    const auto restore_root = make_temp_dir("timer_peers_src");
+    const std::uint64_t ckpt_id = 7;
+    const clink::OperatorId op{5};
+    using KV = clink::StateBackend::KeyView;
+    using VV = clink::StateBackend::ValueView;
+    {
+        clink::InMemoryStateBackend with_timers;
+        with_timers.put_operator_state(op, KV{"__clink_timers"}, VV{"T0"});
+        with_timers.put_operator_state(op, KV{"pos"}, VV{"P0"});
+        auto snap = with_timers.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(
+            gen_dir(restore_root, 0) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+            snap.bytes,
+            ckpt_id);
+    }
+    {
+        clink::InMemoryStateBackend without_timers;
+        without_timers.put(op, KV{"k"}, VV{"v"});
+        auto snap = without_timers.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(
+            gen_dir(restore_root, 1) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+            snap.bytes,
+            ckpt_id);
+    }
+    const auto restore = [&](std::uint32_t idx, std::optional<std::uint32_t> parent) {
+        const auto working_root = make_temp_dir("timer_peers_dst" + std::to_string(idx));
+        clink::StateBackendSpec spec;
+        spec.uri = "file://" + working_root.string();
+        spec.subtask_idx = idx;
+        spec.restore_uri = "file://" + restore_root.string();
+        spec.restore_checkpoint_id = ckpt_id;
+        spec.hosted_operators = {op.value()};
+        if (parent.has_value()) {
+            spec.restore_from_subtask_idx = *parent;
+        }
+        auto built = clink::StateBackendFactory::default_instance().build(spec);
+        EXPECT_TRUE(built.restore_from.has_value());
+        auto backend = std::make_shared<clink::InMemoryStateBackend>();
+        backend->restore(*built.restore_from);
+        std::filesystem::remove_all(working_root);
+        return backend;
+    };
+    const auto text = [](const std::optional<std::vector<std::byte>>& v) {
+        return v ? std::string(reinterpret_cast<const char*>(v->data()), v->size())
+                 : std::string{"<absent>"};
+    };
+
+    // Same layout: subtask 1 keeps its own keyed state, takes its peer's other
+    // operator rows as before, and no timers.
+    auto own = restore(1, std::nullopt);
+    EXPECT_EQ(text(own->get(op, KV{"k"})), "v");
+    EXPECT_EQ(text(own->get_operator_state(op, KV{"pos"})), "P0");
+    EXPECT_EQ(text(own->get_operator_state(op, KV{"__clink_timers"})), "<absent>");
+    // Subtask 0 keeps its own timers.
+    EXPECT_EQ(text(restore(0, std::nullopt)->get_operator_state(op, KV{"__clink_timers"})), "T0");
+
+    // A rescale: a new subtask whose assigned parent is 1 still takes parent
+    // 0's timers, for restore_timers to route.
+    auto rescaled = restore(2, 1u);
+    EXPECT_EQ(text(rescaled->get_operator_state(op, KV{"__clink_timers"})), "T0");
+
+    std::filesystem::remove_all(restore_root);
+}
+
 // A restore unions every participant's operator-state rows, because a source's
 // offsets must cross its subtasks, and then keeps only those of the operators
 // the restoring subtask runs. A sink subtask used to come back holding the

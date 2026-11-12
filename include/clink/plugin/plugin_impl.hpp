@@ -214,6 +214,8 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     // and the restore point receipts are judged against (a receipt newer
     // than the restore point marks an interval that is already published).
     cfg.commit_receipt_dir = rctx.commit_receipt_dir;
+    // A job with a checkpoint directory takes checkpoints a restore reads.
+    cfg.checkpointed = !rctx.checkpoint_dir.empty();
     cfg.restore_from_checkpoint_id = rctx.restore_from_checkpoint_id;
     // The id above which receipts and markers are this run's to read.
     cfg.run_checkpoint_floor = rctx.run_checkpoint_floor;
@@ -255,6 +257,13 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     if (built.restore_from.has_value()) {
         cfg.restore_from = *built.restore_from;
         cfg.restore_key_group_filter = rctx.restore_key_group_filter;
+        // Every keyed subtask is given its own key-group range as the filter,
+        // rescale or not. Restoring its own snapshot (no rescale parent named)
+        // it keeps the layout its timers were written under, so they are all
+        // its own: routing them by the key group of their key's bytes dropped
+        // every timer keyed in another encoding than its keyed state.
+        cfg.restore_keeps_key_groups =
+            rctx.restore_from_subtask_idx == clink::cluster::kRestoreFromSelf;
     }
     // Bridge the cluster's per-subtask checkpoint-ack callback (which
     // sends SubtaskCheckpointed back to the coordinator) onto JobConfig so the
