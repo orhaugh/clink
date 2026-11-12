@@ -241,6 +241,19 @@ CompletedMarker parse_completed_marker(std::string_view body) {
                 }
             } else if (key == "state" && !value.empty()) {
                 out.state = std::string{value};
+            } else if (key.starts_with("participant.")) {
+                const auto idx = parse_u64(key.substr(12));
+                const auto colon = value.find(':');
+                const auto sub = colon == std::string_view::npos
+                                     ? std::optional<std::uint64_t>{}
+                                     : parse_u64(value.substr(0, colon));
+                if (idx.has_value() && *idx <= std::numeric_limits<std::uint32_t>::max() &&
+                    sub.has_value() && *sub <= std::numeric_limits<std::uint32_t>::max() &&
+                    colon + 1 < value.size()) {
+                    out.layout[static_cast<std::uint32_t>(*idx)] =
+                        ParticipantIdentity{.op = std::string{value.substr(colon + 1)},
+                                            .subtask_in_op = static_cast<std::uint32_t>(*sub)};
+                }
             }
         }
         if (nl == std::string_view::npos) {
@@ -255,7 +268,8 @@ std::string completed_marker_body(JobId job,
                                   std::uint64_t checkpoint,
                                   std::uint32_t generation,
                                   const std::set<std::uint32_t>& subtasks,
-                                  std::string_view state) {
+                                  std::string_view state,
+                                  const std::map<std::uint32_t, ParticipantIdentity>& layout) {
     std::string list;
     for (const auto idx : subtasks) {
         list += (list.empty() ? "" : ",") + std::to_string(idx);
@@ -266,6 +280,16 @@ std::string completed_marker_body(JobId job,
         body += "state=";
         body += state;
         body += "\n";
+    }
+    // One line per participant whose identity is known; an operator id that
+    // could not survive the line format is left out rather than mangled.
+    for (const auto& [idx, ident] : layout) {
+        if (!subtasks.contains(idx) || ident.op.empty() ||
+            ident.op.find_first_of("\r\n") != std::string::npos) {
+            continue;
+        }
+        body += "participant." + std::to_string(idx) + "=" + std::to_string(ident.subtask_in_op) +
+                ":" + ident.op + "\n";
     }
     return body;
 }

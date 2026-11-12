@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@ namespace fs = std::filesystem;
 using clink::cluster::completed_marker_body;
 using clink::cluster::job_state_root;
 using clink::cluster::parse_completed_marker;
+using clink::cluster::ParticipantIdentity;
 using clink::cluster::recorded_state_location;
 using clink::cluster::resolve_restore_source;
 
@@ -83,6 +85,43 @@ TEST(CompletedMarker, AnUnparsableParticipantListIsNotHalfRead) {
     EXPECT_FALSE(parse_completed_marker("subtasks=0,x,2\n").subtasks.has_value());
     EXPECT_FALSE(parse_completed_marker("subtasks=\n").subtasks.has_value());
     EXPECT_FALSE(parse_completed_marker("job=1\nch").subtasks.has_value());
+}
+
+TEST(CompletedMarker, ParticipantIdentitiesRoundTripAfterEveryOtherField) {
+    const std::map<std::uint32_t, ParticipantIdentity> layout = {
+        {0, {.op = "source", .subtask_in_op = 0}},
+        {1, {.op = "source", .subtask_in_op = 1}},
+        {4, {.op = "agg:with=odd chars", .subtask_in_op = 0}}};
+    const auto body = completed_marker_body(3, 12, 2, {0, 1, 4}, "_state/3", layout);
+    EXPECT_EQ(
+        body,
+        "job=3\ncheckpoint=12\ngeneration=2\nsubtasks=0,1,4\nstate=_state/3\n"
+        "participant.0=0:source\nparticipant.1=1:source\nparticipant.4=0:agg:with=odd chars\n");
+    const auto m = parse_completed_marker(body);
+    EXPECT_EQ(m.layout, layout);
+    EXPECT_EQ(m.subtasks, (std::set<std::uint32_t>{0, 1, 4}));
+}
+
+TEST(CompletedMarker, AnIdentityTheLineFormatCannotHoldIsLeftOutNotMangled) {
+    const std::map<std::uint32_t, ParticipantIdentity> layout = {
+        {0, {.op = "two\nlines", .subtask_in_op = 0}},
+        {1, {.op = "", .subtask_in_op = 0}},
+        {7, {.op = "not a participant", .subtask_in_op = 0}},
+        {2, {.op = "fine", .subtask_in_op = 3}}};
+    const auto m = parse_completed_marker(completed_marker_body(1, 1, 1, {0, 1, 2}, "", layout));
+    EXPECT_EQ(
+        m.layout,
+        (std::map<std::uint32_t, ParticipantIdentity>{{2, {.op = "fine", .subtask_in_op = 3}}}));
+}
+
+TEST(CompletedMarker, AMalformedIdentityLineIsSkippedAndAnOlderMarkerHasNone) {
+    EXPECT_TRUE(parse_completed_marker("job=3\nsubtasks=0,1\n").layout.empty());
+    const auto m = parse_completed_marker(
+        "subtasks=0,1,2,3\nparticipant.x=0:a\nparticipant.1=y:a\nparticipant.2=0:\n"
+        "participant.3=1:ok\n");
+    EXPECT_EQ(
+        m.layout,
+        (std::map<std::uint32_t, ParticipantIdentity>{{3, {.op = "ok", .subtask_in_op = 1}}}));
 }
 
 TEST(RecordedStateLocation, TheCheckpointDirectorysOwnRootIsRelative) {

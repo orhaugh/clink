@@ -1190,6 +1190,8 @@ private:
         struct CheckpointParticipants {
             std::uint32_t generation{1};
             std::set<std::uint32_t> subtasks;
+            // Each participant's operator and subtask within it, for the marker.
+            std::map<std::uint32_t, ParticipantIdentity> layout;
         };
         std::unordered_map<std::uint64_t, CheckpointParticipants> checkpoint_participants;
         std::uint32_t state_generation{1};

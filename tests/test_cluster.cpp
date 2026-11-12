@@ -32,6 +32,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/plugin_cache.hpp"
 #include "clink/cluster/runner_registry.hpp"
+#include "clink/cluster/state_location.hpp"
 #include "clink/cluster/type_registry.hpp"
 #include "clink/cluster/worker.hpp"
 #include "clink/connectors/capability.hpp"
@@ -2789,6 +2790,40 @@ TEST(Cluster, ATrackedJobsCheckpointsGainConfirmedMarkers) {
     EXPECT_GT(confirmed, 0u)
         << "no CONFIRMED marker was written for a tracked job whose commits executed";
     EXPECT_LE(confirmed, completed) << "a checkpoint confirmed before it completed";
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::remove_all(out_dir);
+}
+
+TEST(Cluster, ACompletedMarkerNamesEachParticipantsOperatorAndSubtask) {
+    // The marker carries, for every participant, the operator and subtask the
+    // Coordinator deployed it as, so a reader of the checkpoint can tell whose
+    // state each participant holds without the job graph.
+    const auto tmp = std::filesystem::temp_directory_path();
+    const auto ckpt_dir = tmp / ("clink_layout_ckpt_" + std::to_string(::getpid()));
+    const auto out_dir = tmp / ("clink_layout_out_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(ckpt_dir);
+    std::filesystem::remove_all(out_dir);
+    clink_run_confirm_job(ckpt_dir, out_dir, "worker-layout");
+
+    const auto id = clink_latest_marker(ckpt_dir, 1, "COMPLETED-");
+    ASSERT_GT(id, 0u) << "the job never completed a checkpoint; the probe is vacuous";
+    std::ifstream in(ckpt_dir / "_jobs" / "1" / ("COMPLETED-" + std::to_string(id)));
+    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto m = clink::cluster::parse_completed_marker(body);
+    ASSERT_TRUE(m.subtasks.has_value());
+    EXPECT_EQ(m.layout.size(), m.subtasks->size()) << body;
+    std::set<std::pair<std::string, std::uint32_t>> seen;
+    std::map<std::string, std::uint32_t> per_op;
+    for (const auto& [idx, ident] : m.layout) {
+        EXPECT_TRUE(m.subtasks->contains(idx));
+        EXPECT_FALSE(ident.op.empty());
+        EXPECT_TRUE(seen.emplace(ident.op, ident.subtask_in_op).second)
+            << "two participants claim " << ident.op << "/" << ident.subtask_in_op;
+        ++per_op[ident.op];
+    }
+    for (const auto& [idx, ident] : m.layout) {
+        EXPECT_LT(ident.subtask_in_op, per_op[ident.op]);
+    }
     std::filesystem::remove_all(ckpt_dir);
     std::filesystem::remove_all(out_dir);
 }

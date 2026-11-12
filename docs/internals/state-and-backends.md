@@ -126,7 +126,7 @@ The `uri` a cluster subtask's backend is built from is its job's own state root,
 | Path | What |
 | --- | --- |
 | `/ckpt/_state/<job id>/v<generation>/<subtask>/checkpoint-<id>.snap` | Subtask snapshots, with their integrity sidecars |
-| `/ckpt/_jobs/<job id>/COMPLETED-<id>` | The completion marker, recording the generation, the participants and `state=_state/<job id>` |
+| `/ckpt/_jobs/<job id>/COMPLETED-<id>` | The completion marker, recording the generation, the participants, `state=_state/<job id>`, and for each participant the operator and subtask it was deployed as (`participant.<index>=<subtask>:<operator id>`, a line older readers skip) |
 | `/ckpt/_jobs/<job id>/receipts/` | Commit receipts of the job's two-phase-commit sinks |
 
 Jobs sharing a base never share a file. A restore reads the state root its restore point's marker records (`resolve_restore_source`): `DeployMsg::restore_from_dir` carries that root, and the builders read `StateBackendSpec::restore_uri` from it. A checkpoint written before state was namespaced by job (a marker with no `state=` line) is read where state lived then, under the base itself. Two builders cannot read another location in place and copy the checkpoint into their own first: `remote-read://` relocates it into its own prefix, and `s3sst+forst://` copies its metadata and objects into its own mapping (`copy_checkpoint_between`), each within one bucket. The full rules, and the compatibility reasoning, are design record [013](../design/013-state-namespaced-by-job.md).

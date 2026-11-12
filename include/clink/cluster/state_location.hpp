@@ -25,6 +25,7 @@
 // restored from where state lived then: the base itself.
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -46,6 +47,15 @@ using JobId = std::uint64_t;  // matches protocol.hpp without dragging it in
 // unchanged: it keeps nothing another job could share.
 [[nodiscard]] std::string job_state_root(std::string_view base, JobId job_id);
 
+// Which operator a participant hosts, and which of that operator's subtasks it
+// is: the Coordinator's deploy-time identity record for the task, captured with
+// the participant set when the checkpoint is triggered.
+struct ParticipantIdentity {
+    std::string op;  // the job graph's operator id
+    std::uint32_t subtask_in_op{0};
+    bool operator==(const ParticipantIdentity&) const = default;
+};
+
 // What a COMPLETED-<id> marker records. Every field is optional because
 // markers written by older builds lack the later ones.
 struct CompletedMarker {
@@ -58,15 +68,23 @@ struct CompletedMarker {
     // Where the checkpoint's state was written (recorded_state_location).
     // Absent for a marker written before state was namespaced by job.
     std::optional<std::string> state;
+    // Participant -> the operator and subtask it hosts, from its
+    // `participant.<index>=<subtask in op>:<operator id>` lines. Empty for a
+    // marker that predates them, or whose job has tasks with no identity
+    // record; a line that does not parse is left out. Readers that do not
+    // know these lines skip them, as they skip every key they do not know.
+    std::map<std::uint32_t, ParticipantIdentity> layout;
 };
 
 [[nodiscard]] CompletedMarker parse_completed_marker(std::string_view body);
 
-[[nodiscard]] std::string completed_marker_body(JobId job,
-                                                std::uint64_t checkpoint,
-                                                std::uint32_t generation,
-                                                const std::set<std::uint32_t>& subtasks,
-                                                std::string_view state);
+[[nodiscard]] std::string completed_marker_body(
+    JobId job,
+    std::uint64_t checkpoint,
+    std::uint32_t generation,
+    const std::set<std::uint32_t>& subtasks,
+    std::string_view state,
+    const std::map<std::uint32_t, ParticipantIdentity>& layout = {});
 
 // The state= value for a job whose state root is `root`: "_state/<job id>",
 // relative to the checkpoint directory, when the root is that directory's own

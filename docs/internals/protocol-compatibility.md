@@ -184,8 +184,13 @@ A checkpoint directory holds each job's markers under `_jobs/<job id>/` and, for
 the file backend, each job's state under `_state/<job id>/v<generation>/<subtask>/`
 (design record [013](../design/013-state-namespaced-by-job.md)). A `COMPLETED-<id>`
 marker is `key=value` lines: `job`, `checkpoint`, `generation`, `subtasks` (the
-participant set, since v0.7.0) and `state` (where the checkpoint's state is:
-`_state/<job id>` relative to the checkpoint directory, or an absolute location).
+participant set, since v0.7.0), `state` (where the checkpoint's state is:
+`_state/<job id>` relative to the checkpoint directory, or an absolute location),
+and since the release after v0.15.0 one `participant.<index>=<subtask>:<operator id>`
+line per participant: the operator and subtask the Coordinator deployed it as,
+captured with the participant set when the checkpoint was triggered. Readers
+before that release skip these lines; a marker without them names no identities,
+and a reader treats the identities as unknown.
 
 - **Compatible additions** are new keys: `parse_completed_marker` skips any it does
   not know.

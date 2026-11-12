@@ -60,6 +60,33 @@ namespace clink::cluster {
 
 namespace {
 
+// What a checkpoint consists of, for its COMPLETED marker, captured when it is
+// triggered: the state generation, every deployed task's job-global index, and
+// for each the operator and subtask its deploy-time identity record names.
+template <class Job, class Record>
+void capture_participants(const Job& job, Record& rec) {
+    rec.generation = job.state_generation;
+    rec.subtasks.clear();
+    rec.layout.clear();
+    for (const auto& [key, _unused] : job.task_records) {
+        const auto colon = key.rfind(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        std::uint32_t idx = 0;
+        try {
+            idx = static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1)));
+        } catch (const std::exception&) {
+            continue;
+        }
+        rec.subtasks.insert(idx);
+        if (const auto it = job.task_op_identity.find(key); it != job.task_op_identity.end()) {
+            rec.layout[idx] = clink::cluster::ParticipantIdentity{
+                .op = it->second.op_id, .subtask_in_op = it->second.subtask_idx_in_op};
+        }
+    }
+}
+
 // A frame for a worker's outbox: encoded once, and shared by every
 // connection it is posted to.
 [[nodiscard]] Outbox::Frame shared_frame(std::vector<std::byte> bytes) {
@@ -4207,19 +4234,7 @@ void Coordinator::hot_cutover_trigger_c_locked_(JobState& job,
     job.pending_checkpoint_acks[ckpt_id] = std::move(pending);
     {
         auto& rec = job.checkpoint_participants[ckpt_id];
-        rec.generation = job.state_generation;
-        rec.subtasks.clear();
-        for (const auto& [key, _unused] : job.task_records) {
-            const auto colon = key.rfind(':');
-            if (colon == std::string::npos) {
-                continue;
-            }
-            try {
-                rec.subtasks.insert(static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1))));
-            } catch (const std::exception&) {
-                continue;
-            }
-        }
+        capture_participants(job, rec);
     }
     job.pending_checkpoint_start_times[ckpt_id] = std::chrono::steady_clock::now();
     clink::metrics::ckpt::triggered();
@@ -4878,21 +4893,7 @@ SavepointAckMsg Coordinator::take_savepoint_(JobId job_id,
                     // Captured at TRIGGER because the ack set above is drained as
                     // acks arrive.
                     auto& rec = job.checkpoint_participants[ckpt_id];
-                    rec.generation = job.state_generation;
-                    auto& participants = rec.subtasks;
-                    participants.clear();
-                    for (const auto& [key, _unused] : job.task_records) {
-                        const auto colon = key.rfind(':');
-                        if (colon == std::string::npos) {
-                            continue;
-                        }
-                        try {
-                            participants.insert(
-                                static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1))));
-                        } catch (const std::exception&) {
-                            continue;
-                        }
-                    }
+                    capture_participants(job, rec);
                 }
                 job.pending_checkpoint_start_times[ckpt_id] = std::chrono::steady_clock::now();
                 clink::metrics::ckpt::triggered();
@@ -10006,21 +10007,7 @@ std::optional<FinalCheckpointAssignedMsg> Coordinator::decide_final_request_lock
             // every subtask being an outsider - three trigger sites, and the
             // check found the one that was forgotten.
             auto& rec = job->checkpoint_participants[final_id];
-            rec.generation = job->state_generation;
-            auto& participants = rec.subtasks;
-            participants.clear();
-            for (const auto& [tkey, _p] : job->task_records) {
-                const auto colon = tkey.rfind(':');
-                if (colon == std::string::npos) {
-                    continue;
-                }
-                try {
-                    participants.insert(
-                        static_cast<std::uint32_t>(std::stoul(tkey.substr(colon + 1))));
-                } catch (const std::exception&) {
-                    continue;
-                }
-            }
+            capture_participants(*job, rec);
         }
         job->pending_checkpoint_start_times[final_id] = std::chrono::steady_clock::now();
         clink::metrics::ckpt::triggered();
@@ -10292,6 +10279,9 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
         // Where the checkpoint's state was written, as its marker records it
         // (recorded_state_location).
         std::string state_location;
+        // Each participant's operator and subtask within it (the marker's
+        // participant.<index> lines).
+        std::map<std::uint32_t, ParticipantIdentity> layout;
     };
     std::vector<CompletedCheckpoint> just_completed;
     std::string completed_marker_dir;
@@ -10711,6 +10701,7 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                     // Both from the TRIGGER record - see CheckpointParticipants.
                     done.generation = pit->second.generation;
                     done.subtasks = pit->second.subtasks;
+                    done.layout = pit->second.layout;
                     job.checkpoint_participants.erase(pit);
                 }
                 done.suppress_commit = job.awaiting_restart;
@@ -10876,7 +10867,8 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                       subtasks,
                       suppress_commit,
                       completed_in_run,
-                      state_location] : just_completed) {
+                      state_location,
+                      layout] : just_completed) {
         // The COMPLETED-N marker is the authoritative record that a
         // checkpoint reached global completion, and the 2PC sinks key their
         // commit-on-restore on finding it. It therefore has to be durable
@@ -10939,8 +10931,9 @@ void Coordinator::handle_subtask_checkpointed_(MessageReader& r, const WorkerCon
                 // restore reads rather than guessing at a directory several
                 // jobs share.
                 make_coordination_store(completed_marker_dir)
-                    ->put(marker_key,
-                          completed_marker_body(jid, ckpt_id, gen, subtasks, state_location));
+                    ->put(
+                        marker_key,
+                        completed_marker_body(jid, ckpt_id, gen, subtasks, state_location, layout));
             } catch (const std::exception& e) {
                 clink::log::error(
                     "coordinator.checkpoint",
@@ -11318,21 +11311,7 @@ void Coordinator::checkpoint_trigger_loop_() {
                     // What this checkpoint consists of, for the COMPLETED marker. Captured at
                     // TRIGGER because the ack set above is drained as acks arrive.
                     auto& rec = job.checkpoint_participants[next_id];
-                    rec.generation = job.state_generation;
-                    auto& participants = rec.subtasks;
-                    participants.clear();
-                    for (const auto& [key, _unused] : job.task_records) {
-                        const auto colon = key.rfind(':');
-                        if (colon == std::string::npos) {
-                            continue;
-                        }
-                        try {
-                            participants.insert(
-                                static_cast<std::uint32_t>(std::stoul(key.substr(colon + 1))));
-                        } catch (const std::exception&) {
-                            continue;
-                        }
-                    }
+                    capture_participants(job, rec);
                 }
                 job.pending_checkpoint_start_times[next_id] = std::chrono::steady_clock::now();
                 clink::metrics::ckpt::triggered();
