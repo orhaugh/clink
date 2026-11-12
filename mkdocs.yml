@@ -146,6 +146,7 @@ nav:
       - internals/testing-framework.md
       - internals/replay-determinism.md
       - internals/incident-verification.md
+      - internals/upgrade-validation.md
       - internals/checkpointing.md
       - internals/exactly-once-specification.md
       - internals/sink-committer-framework.md

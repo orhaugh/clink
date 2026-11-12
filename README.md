@@ -57,7 +57,11 @@ offline, and a running job's state answers point lookups and scans over
 HTTP. A flight recorder can replay an incident
 deterministically and freeze it into a regression test, and, for a Kafka to
 ClickHouse job, say whether the table holds exactly what a completed
-checkpoint owed it, once or for every checkpoint of a running job.
+checkpoint owed it, once or for every checkpoint of a running job. Before an
+upgrade, a candidate build can be checked against a savepoint a baseline
+build retained: restored through the engine's own path, its state, output and
+final state compared with the baseline's and with an independent reference
+([Upgrade validation](https://orhaugh.github.io/clink/internals/upgrade-validation/)).
 
 clink is young and pre-1.0, written by one maintainer with extensive AI
 assistance. The specification, the qualification campaigns and the

@@ -1,0 +1,30 @@
+{
+ "format": "clink-upgrade-test",
+ "version": 1,
+ "kind": "keyed-windows-and-idle-timers",
+ "name": "upgrade-check",
+ "description": "examples/upgrade-check/upgrade_job.cpp: a 10 s keyed event-time tumbling window and a 30 s idle timer per account over the controlled segment source, at keyed parallelism 2",
+ "input": {
+  "start_ms": 1767225600000,
+  "accounts": 30,
+  "blocks": 60,
+  "block_ms": 2000,
+  "blocks_per_segment": 3,
+  "savepoint_after_segment": 9,
+  "seed": 7
+ },
+ "semantics": {
+  "window_ms": 10000,
+  "idle_ms": 30000,
+  "keyed_parallelism": 2
+ },
+ "uids": {
+  "source": "uc-source",
+  "windows": "uc-windows",
+  "idle": "uc-idle"
+ },
+ "requires": {
+  "build.checkpoint_meta_version": 1,
+  "build.allows_unverified_checkpoints": false
+ }
+}

@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+**A candidate build is checked against a savepoint a baseline retained before
+an upgrade.** `clink-audit upgrade record` runs the supported job (a keyed
+event-time tumbling window and event-time timers over a controlled local
+source, `examples/upgrade-check/`) on an explicitly named baseline build,
+takes a savepoint while windows are open and timers pending, and keeps it as
+a checkpoint dataset with the input, the output committed before it and an
+independent reference, every file bound by SHA-256 in `evidence.json`, whose
+digest is kept elsewhere. `clink-audit upgrade check` verifies that before
+anything runs, then restores the baseline and the candidate from their own
+copies through `clink run --restore-from-dir`, savepoints each restored job
+before it reads anything new, delivers the same continuation, and reports
+evidence integrity, build identity and capabilities, the candidate's own
+schema check, the restored state, recovery, output and final state against
+the baseline, and agreement with the reference as separate checks, passing
+only when every required check passed. Every build process runs under proven
+loopback-only isolation within explicit time, memory and output bounds; a
+crash, a limit or an interrupt is never a pass. Its qualification restores
+a v0.15.0 savepoint into this tree, and catches eleven controlled defects
+and two builds that agree and are both wrong. It found that a fluent window
+aggregate whose accumulator type is not registered on the job's registry
+keeps its windows in memory only, that a restore drops event-time timers
+keyed in another encoding than their keyed state, and that a restore keeps
+state whose operator left the job without refusing it; each is documented,
+not yet changed.
+
 **A checkpoint directory given as a relative path collects and exports.**
 `clink state-export --checkpoint-dir` and `clink incident-collect` refused a
 relative directory as if its state lived on another machine, because the

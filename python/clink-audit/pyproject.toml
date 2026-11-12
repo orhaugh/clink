@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "clink-audit"
 version = "0.1.0"
-description = "Audit a running clink job's completed checkpoints repeatedly, within explicit bounds: collect, reference, verify offline and reconcile each scope, and keep coverage, gaps and discrepancies"
+description = "Audit a running clink job's completed checkpoints repeatedly, within explicit bounds, and validate a candidate build against a baseline's retained savepoint before an upgrade"
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Ross Haugh", email = "orhaugh@gmail.com" }]

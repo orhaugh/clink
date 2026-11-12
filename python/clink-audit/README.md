@@ -131,3 +131,17 @@ One audit costs a collection, a reference read of the scope's source range, an o
 A windowed increment costs about the same as a record-wise audit, and stays flat as the job's history grows: in the example, a median of 2.0 s per increment over 42 checkpoints, its reference 0.14 s, where the whole lineage's reference at 72 checkpoints took 1.67 s and grows with every record. The chain also needs each checkpoint collected before the Workers purge the state at the newest held one: a runner that falls further behind than their retention breaks the chain.
 
 `examples/audit-runner/` qualifies the runner against Kafka and ClickHouse and measures its cost.
+
+## Upgrade validation
+
+`clink-audit upgrade` answers another question with the same discipline: can a candidate build read the state a baseline build retained, restore the supported job from it and reproduce its checked results?
+
+```bash
+clink-audit upgrade record --test=examples/upgrade-check/test.json --out=<fresh dir> --tools-clink=<clink> \
+    --baseline-clink=<clink> --baseline-node=<clink_node> --baseline-job=<job module>
+clink-audit upgrade check --test=... --evidence=<dir> --evidence-digest=<digest record printed> --out=<fresh dir> \
+    --tools-clink=<clink> --baseline-...=... --candidate-clink=... --candidate-node=... --candidate-job=...
+```
+
+Every path is explicit, and nothing the evidence names is run. The report keeps evidence integrity, build identity, schema, the restore, recovery, behaviour against the baseline and agreement with an independent reference as separate checks, and passes only when every required one passed (exit 0); a failure exits 1 and anything not established exits 3. The contract, the job it supports and what it does not establish are in [Upgrade validation](../../docs/internals/upgrade-validation.md); `examples/upgrade-check/` is its qualification.
+

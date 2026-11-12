@@ -45,6 +45,7 @@ SQL statements a 1.x release holds stable) is the published
 | Embedded C ABI | 2 (`CLINK_EMBED_ABI_VERSION`) | caller-checked; grows by appended functions and `struct_size`-gated fields | `include/clink/embed/clink.h`; symbol manifest `scripts/libclink-abi-symbols.txt` |
 | Incident capture (`.cap`) | 2 (`kCaptureVersion`) | header-gated | `include/clink/runtime/record_capture.hpp` |
 | Capabilities manifest JSON | 1 (`schema_version`) | additive-only within 1 | `include/clink/connectors/capability.hpp` |
+| Upgrade test definition, evidence and report | 1 each (`clink-upgrade-test`, `clink-upgrade-evidence`, `clink-upgrade-report`) | another version is refused by name, never read | `python/clink-audit/clink_audit/upgrade/`; `python/clink-audit/tests/test_upgrade.py` |
 | Derived record codec (described types) | 1 (layout specified in the header) | 1 | `include/clink/core/derived_codec.hpp`; fixture `derived-codec-v1.bin` |
 | State shape fingerprints | 1 (kind-tag table in `fields.hpp`) | additive: absence gates nothing | `clink.state_fingerprints` metadata key; fixture `state-fingerprints-v1.txt` |
 | Persisted SQL catalog (`--catalog-dir` JSON) | 1 (unversioned, additive-only) | readers ignore unknown keys | `Catalog::to_json` / `from_json`, `src/sql/catalog.cpp`; fixtures `catalog-{table,function,model}-v1.json` |
@@ -220,6 +221,12 @@ variant and the rule that readers must ignore unknown metadata keys, is
 - **Tests:** the snapshot round-trip and schema-evolution suites;
   `tests/fixtures/snapshot-v1.snap` is a frozen stream that must stay
   loadable by `state_processor::Savepoint`.
+- **Across two builds:** a frozen stream proves a reader, not a restore.
+  [Upgrade validation](upgrade-validation.md) restores a savepoint one build
+  wrote into another through `clink run --restore-from-dir`, and compares the
+  restored state, the continuation's output and the final state with the
+  first build and with an independent reference. Its qualification runs the
+  prior release v0.15.0 as the baseline and the tree as the candidate.
 
 ## Job plan (`JobGraphSpec` JSON)
 
@@ -333,3 +340,13 @@ are `docs/internals/replay-determinism.md`.
 renamed, removed or changes meaning; additions do not bump it. The build
 block carries `git_sha` and `git_clean` so a manifest maps back to code.
 Pinned by `ConnectorCapabilityTest.ManifestJsonDeclaresItsSchemaVersionAndOrigin`.
+
+## Upgrade evidence and reports
+
+`clink-upgrade-test`, `clink-upgrade-evidence` and `clink-upgrade-report`,
+each version 1 (`python/clink-audit/clink_audit/upgrade/__init__.py`). A
+reader refuses another version by name: a test definition or evidence set of
+another version is unsupported, and `check` reports it so (exit 3) rather
+than reading it. The evidence binds every file it holds by SHA-256 in
+`evidence.json`, whose own digest is recorded outside the set. Pinned by
+`python/clink-audit/tests/test_upgrade.py`.

@@ -6,6 +6,7 @@
     clink-audit acknowledge --config=FILE --audit=ID --note=TEXT
     clink-audit acknowledge --config=FILE --checkpoints=N[-M] --note=TEXT
     clink-audit check-config --config=FILE
+    clink-audit upgrade record|check ...      upgrade validation (clink-audit upgrade --help)
 
 Each cycle audits completed checkpoints of a Kafka -> clink -> ClickHouse
 record-wise job with the existing workflow: incident-collect, incident-scope,
@@ -96,6 +97,10 @@ def _cycle(cfg, isolation, interrupt):
 
 
 def main(argv=None, isolation=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["upgrade"]:
+        from .upgrade.cli import main as upgrade_main
+        return upgrade_main(argv[1:])
     args = _parser().parse_args(argv)
     try:
         if args.command == "check-config":
