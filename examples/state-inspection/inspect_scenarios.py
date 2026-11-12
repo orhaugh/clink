@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import duckdb
+import pyarrow.parquet as pq
 
 from inspect_demo import Cluster, Feed, Failed, expected_changes, fold, measure, read_dataset
 
@@ -305,9 +306,33 @@ def faults(demo):
             return r.returncode, {"stderr": r.stderr[-300:]}
 
     base = work / "base"
-    code, _ = export(ck, base)
+    code, exported = export(ck, base)
     demo.outcome(s, "the stopped job's final checkpoint exports complete", "exit 0", code, code == 0)
     demo.check_state(s, "the final checkpoint", base, topic)
+    # A finished job's manifest is gone, so the graph is not in the dataset;
+    # its operators are named from the identities the marker records.
+    named = {o.get("graph_id"): o.get("named_by")
+             for o in json.loads((base / "dataset.json").read_text())["operators"]}
+    demo.outcome(s, "the finished job's last checkpoint names its operators from the marker",
+                 "accounts and source, by layout", named,
+                 named == {"accounts": "layout", "source": "layout"})
+
+    # The digest the export printed identifies the dataset: a rewrite of
+    # dataset.json that keeps every hash it records is caught by it alone.
+    digest = exported.get("digest", "")
+    r = demo.offline(clink("state-cat", "--dataset=%s" % base, "--digest=%s" % digest), s)
+    demo.outcome(s, "the dataset is the one with the digest the export printed", "exit 0",
+                 r.returncode, r.returncode == 0 and len(digest) == 64)
+    rewritten = work / "base-rewritten"
+    shutil.copytree(base, rewritten)
+    doc = json.loads((rewritten / "dataset.json").read_text())
+    doc["in_doubt"]["external_outcomes"] = "verified"
+    (rewritten / "dataset.json").write_text(json.dumps(doc, indent=2))
+    plain = demo.offline(clink("state-cat", "--dataset=%s" % rewritten), s)
+    pinned = demo.offline(clink("state-cat", "--dataset=%s" % rewritten, "--digest=%s" % digest), s)
+    demo.outcome(s, "a rewritten dataset.json passes its own hashes but not the recorded digest",
+                 "exit 0 without, exit 2 with --digest", "exit %d / %d" % (plain.returncode, pinned.returncode),
+                 plain.returncode == 0 and pinned.returncode == 2 and "digest" in pinned.stderr)
     state_dir = ck / "_state" / str(job)
     gen = max(int(p.name[1:]) for p in state_dir.iterdir() if p.name.startswith("v"))
     snap = lambda root, p: root / "_state" / str(job) / ("v%d" % gen) / str(p) / ("checkpoint-%d.snap" % final)
@@ -431,42 +456,88 @@ def retention(demo):
         c.stop()
 
 
-# ---- state this release does not export -------------------------------------------
+# ---- one SQL job on each backend ---------------------------------------------------
 
-UNSUPPORTED_SQL = """CREATE TABLE events (account BIGINT, amount BIGINT) WITH (
+BACKEND_SQL = """CREATE TABLE events (account BIGINT, amount BIGINT) WITH (
     connector = 'kafka', format = 'json', brokers = '@BROKERS@', topic = '@TOPIC@',
-    group_id = '@TOPIC@-group', auto_offset_reset = 'earliest');
+    group_id = '@GROUP@', auto_offset_reset = 'earliest');
 CREATE TABLE totals (account BIGINT, n BIGINT, total BIGINT) WITH (connector = 'blackhole');
 INSERT INTO totals SELECT account, COUNT(*) AS n, SUM(amount) AS total FROM events GROUP BY account;
 """
 
+BACKENDS = [("file", None), ("rocksdb", "rocksdb://{dir}/rocksdb"),
+            ("changelog", "changelog+file://{dir}/changelog"),
+            ("changelog-rocksdb", "changelog+rocksdb://{dir}/changelog-rocksdb")]
 
-def unsupported(demo):
-    s = "inspect-unsupported"
-    topic = "si-rocksdb"
+
+def backends(demo):
+    """The same SQL job over the same records on four state backends. The file
+    backend's dataset is the reference: RocksDB's and the changelog's must hold
+    exactly its keyed entries. A changelog whose materialisations live in
+    RocksDB is the case this release does not export."""
+    import re
+    s = "inspect-backends"
+    topic = "si-backends"
     demo.kafka.create(topic)
+    demo.kafka.send_json(topic, ['{"account": %d, "amount": %d}' % (a, a * k)
+                                 for k in (1, 2, 3) for a in range(1, 51)])
     c = Cluster(demo, s, topic)
     c.start()
+    jobs = {}
     try:
-        sql = UNSUPPORTED_SQL.replace("@BROKERS@", "127.0.0.1:%d" % demo.kafka.kafka_port).replace("@TOPIC@", topic)
-        (c.dir / "job.sql").write_text(sql)
-        r = subprocess.run([str(demo.bin / "clink_submit_sql"), "--file", str(c.dir / "job.sql"),
-                            "--coordinator-host", "127.0.0.1", "--coordinator-port", str(c.http),
-                            "--name", s, "--checkpoint-dir", str(c.dir / "checkpoints"),
-                            "--checkpoint-interval-ms", "1000",
-                            "--state-backend", "rocksdb://%s" % (c.dir / "rocksdb")],
-                           capture_output=True, text=True, timeout=120)
-        (c.dir / "logs" / "submit.log").write_text(r.stdout + r.stderr)
-        demo.kafka.send_json(topic, ['{"account": %d, "amount": %d}' % (a, a) for a in range(1, 51)])
-        c.await_marker(1, lambda cid, m: cid >= 3, "for the RocksDB-backed job")
-        code, j = demo.export(c, 1, c.dir / "datasets" / "rocksdb")
-        demo.outcome(s, "a RocksDB-backed checkpoint is refused as unsupported", "exit 1, unsupported",
-                     "exit %d, %s" % (code, j.get("kind")), code == 1 and j.get("kind") == "unsupported")
-        code, j = demo.export(c, 1, c.dir / "datasets" / "rocksdb-partial", extra=("--allow-partial",))
-        doc = json.loads((c.dir / "datasets" / "rocksdb-partial" / "dataset.json").read_text()) if code == 3 else {}
+        for label, uri in BACKENDS:
+            sql = (BACKEND_SQL.replace("@BROKERS@", "127.0.0.1:%d" % demo.kafka.kafka_port)
+                   .replace("@TOPIC@", topic).replace("@GROUP@", "%s-%s" % (topic, label)))
+            path = c.dir / ("job-%s.sql" % label)
+            path.write_text(sql)
+            args = [str(demo.bin / "clink_submit_sql"), "--file", str(path), "--coordinator-host",
+                    "127.0.0.1", "--coordinator-port", str(c.http), "--name", "%s-%s" % (s, label),
+                    "--checkpoint-dir", str(c.dir / "checkpoints"), "--checkpoint-interval-ms", "1000"]
+            if uri:
+                args += ["--state-backend", uri.format(dir=c.dir)]
+            r = subprocess.run(args, capture_output=True, text=True, timeout=120)
+            (c.dir / "logs" / ("submit-%s.log" % label)).write_text(r.stdout + r.stderr)
+            m = re.search(r'"job_id":(\d+)', r.stdout)
+            if r.returncode != 0 or not m:
+                raise Failed("the %s job was refused: %s" % (label, (r.stdout + r.stderr)[-800:]))
+            jobs[label] = int(m.group(1))
+        datasets = {}
+        for label, _ in BACKENDS[:3]:
+            datasets[label] = demo.caught_up(c, jobs[label], label)
+        c.await_marker(jobs["changelog-rocksdb"], lambda cid, m: cid >= 3, "for changelog over RocksDB")
+        for label, path in datasets.items():
+            doc = json.loads((path / "dataset.json").read_text())
+            backends_seen = sorted({p["backend"] for p in doc["participants"]})
+            keys = set()
+            for row in pq.read_table(path / "entries.parquet").to_pylist():
+                if row["scope"] == "keyed" and row["slot"] == "agg":
+                    keys.add(row["user_key"].decode())
+            demo.outcome(s, "the %s backend's checkpoint exports complete, every account in it" % label,
+                         "complete, backend %s, accounts 1-50" % label.split("-")[0],
+                         "complete %s, backends %s, %d accounts" % (doc["complete"], backends_seen, len(keys)),
+                         doc["complete"] and backends_seen == [label] and
+                         keys == {str(a) for a in range(1, 51)})
+        for label in ("rocksdb", "changelog"):
+            code, report = demo.diff(s, "file-%s" % label, datasets["file"], datasets[label])
+            keyed = [x for x in (report or {}).get("slots", []) if x["scope"] == "keyed"]
+            demo.outcome(s, "the %s backend holds exactly the file backend's keyed entries" % label,
+                         "keyed slots compared, 0 added, removed or changed; never exit 1",
+                         "exit %d, %s" % (code, [(x["slot"], x["status"], x["added"] + x["removed"] + x["changed"],
+                                                  x["unchanged"]) for x in keyed]),
+                         code in (0, 3) and keyed and all(x["status"] == "compared" and
+                                                         x["added"] + x["removed"] + x["changed"] == 0 and
+                                                         x["unchanged"] == 50 for x in keyed))
+        code, j = demo.export(c, jobs["changelog-rocksdb"], c.dir / "datasets" / "changelog-rocksdb")
+        demo.outcome(s, "a changelog whose materialisations are in RocksDB is refused as unsupported",
+                     "exit 1, unsupported", "exit %d, %s" % (code, j.get("kind")),
+                     code == 1 and j.get("kind") == "unsupported")
+        code, j = demo.export(c, jobs["changelog-rocksdb"], c.dir / "datasets" / "changelog-rocksdb-partial",
+                              extra=("--allow-partial",))
+        doc = json.loads((c.dir / "datasets" / "changelog-rocksdb-partial" / "dataset.json").read_text()) \
+            if code == 3 else {}
         demo.outcome(s, "--allow-partial publishes it, never complete, saying why",
                      "exit 3, complete false, unsupported listed",
-                     "exit %d, complete %s, %s" % (code, doc.get("complete"), doc.get("unsupported")),
+                     "exit %d, complete %s, %d reason(s)" % (code, doc.get("complete"), len(doc.get("unsupported", []))),
                      code == 3 and doc.get("complete") is False and bool(doc.get("unsupported")))
     finally:
         c.stop()
@@ -517,8 +588,16 @@ def cost(demo):
     rep = json.loads(stdout) if stdout else {}
     diff_cost = {"exit": code, "seconds": round(secs, 3), "peak_rss_bytes": rss,
                  "entries_read": rep.get("entries_read"), "totals": rep.get("totals")}
-    code_q, _, _, secs_q, rss_q = measure(clink("state-query", "--dataset=%s" % (demo.work / s / "measured-first"),
-                                                "--sql=SELECT slot, COUNT(*) AS n FROM state GROUP BY slot"))
+    code_q, out_q, _, secs_q, rss_q = measure(clink("state-query", "--dataset=%s" % (demo.work / s / "measured-first"),
+                                                    "--sql=SELECT slot, COUNT(*) AS n FROM state GROUP BY slot"))
+    by_slot = {}
+    for line in out_q.splitlines():
+        row = json.loads(line)
+        by_slot[row["slot"]] = by_slot.get(row["slot"], []) + [row["n"]]
+    demo.outcome(s, "an aggregate over many input batches prints each group's final row once",
+                 "count and balance each %d, once" % accounts,
+                 {k: v for k, v in by_slot.items() if k in ("count", "balance")},
+                 by_slot.get("count") == [accounts] and by_slot.get("balance") == [accounts])
     demo.costs["export"] = runs
     demo.costs["diff"] = diff_cost
     demo.costs["query"] = {"exit": code_q, "seconds": round(secs_q, 3), "peak_rss_bytes": rss_q}
@@ -538,4 +617,4 @@ def cost(demo):
 
 
 ALL = [("inspect-running", running), ("inspect-schema", schema), ("inspect-faults", faults),
-       ("inspect-retention", retention), ("inspect-unsupported", unsupported), ("inspect-cost", cost)]
+       ("inspect-retention", retention), ("inspect-backends", backends), ("inspect-cost", cost)]

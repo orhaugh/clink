@@ -33,95 +33,11 @@ sys.path.insert(0, str(REPO / "python" / "clink-audit"))
 import duckdb  # noqa: E402
 import pyarrow  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
-from clink_audit.isolation import Isolation  # noqa: E402
+from clink_audit.isolation import Isolation, LoopbackIsolation  # noqa: E402
 from reconcile_demo import COMMANDS, Failed, Services, free_port, logged  # noqa: E402
 
 PARTITIONS = 2
 OFFSET_KEY = b"__kafka_off__:"
-
-
-# ---- isolation that leaves loopback ------------------------------------------------
-
-# `clink state-query` runs its SQL in an embedded engine whose Coordinator and
-# Workers talk over loopback, which the deny-all isolation blocks. It runs
-# under a second mechanism that denies every address but loopback, proven the
-# same way before it is relied on: a connect to TEST-NET-1 (192.0.2.1, a
-# documentation range nothing answers on) is attempted without it and denied
-# under it, before any packet leaves, and a loopback connection works under it.
-LOOPBACK_PROFILE = ('(version 1)(allow default)(deny network*)'
-                    '(allow network-bind (local ip "localhost:*"))'
-                    '(allow network-inbound (local ip "localhost:*"))'
-                    '(allow network-outbound (remote ip "localhost:*"))'
-                    '(allow network* (remote unix-socket))')
-_CONNECT_OUT = """
-import errno, socket
-s = socket.socket()
-s.settimeout(1.0)
-try:
-    s.connect(("192.0.2.1", 9))
-    print("connected")
-except socket.timeout:
-    print("timeout")
-except OSError as e:
-    print(errno.errorcode.get(e.errno, str(e.errno)))
-"""
-_LOOPBACK_SELF = """
-import socket
-srv = socket.socket()
-srv.bind(("127.0.0.1", 0))
-srv.listen(1)
-c = socket.create_connection(srv.getsockname(), timeout=2)
-a, _ = srv.accept()
-c.sendall(b"ok")
-print(a.recv(2).decode())
-"""
-DENIED = {"EPERM", "EACCES", "ENETUNREACH"}
-
-
-class LoopbackOnly:
-    def __init__(self):
-        self.state, self.detail, self.mechanism, self.wrapper = "", "", "", []
-
-    def establish(self):
-        system = platform.system()
-        if system == "Darwin" and shutil.which("sandbox-exec"):
-            self.mechanism = "sandbox-exec (loopback only)"
-            wrapper = [shutil.which("sandbox-exec"), "-p", LOOPBACK_PROFILE]
-        elif system == "Linux" and shutil.which("unshare") and shutil.which("ip"):
-            self.mechanism = "unshare -rn, loopback up"
-            wrapper = [shutil.which("unshare"), "-rn", "sh", "-c", 'ip link set lo up && exec "$@"', "sh"]
-        else:
-            self.state, self.detail = "unavailable", "no loopback-only isolation runs here"
-            return self.state
-
-        def run(argv):
-            try:
-                return subprocess.run(argv, capture_output=True, text=True, timeout=20).stdout.strip()
-            except (OSError, subprocess.SubprocessError):
-                return ""
-        plain = run([sys.executable, "-I", "-c", _CONNECT_OUT])
-        wrapped = run(wrapper + [sys.executable, "-I", "-c", _CONNECT_OUT])
-        loop = run(wrapper + [sys.executable, "-I", "-c", _LOOPBACK_SELF])
-        if loop != "ok":
-            self.state, self.detail = "unavailable", "loopback does not work under %s" % self.mechanism
-        elif plain in DENIED or plain == "":
-            self.state = "inconclusive"
-            self.detail = "a connect to 192.0.2.1 is already %s without isolation" % (plain or "not run")
-        elif wrapped not in DENIED:
-            self.state = "not-enforced"
-            self.detail = "a connect to 192.0.2.1 was %s under %s" % (wrapped, self.mechanism)
-        else:
-            self.state = "enforced"
-            self.detail = "192.0.2.1: %s without, %s under it; loopback works under it" % (plain, wrapped)
-        self.wrapper = wrapper if self.state == "enforced" else []
-        return self.state
-
-    @property
-    def enforced(self):
-        return self.state == "enforced"
-
-    def wrap(self, argv):
-        return list(self.wrapper) + list(argv)
 
 
 # ---- Kafka ------------------------------------------------------------------------
@@ -424,7 +340,7 @@ class Demo:
         self.costs = {}
         self.summary = open(self.results / "summary.txt", "a")
         self.iso = Isolation()
-        self.loopback = LoopbackOnly()
+        self.loopback = LoopbackIsolation()
 
     # -- reporting -----------------------------------------------------------------
     def say(self, text):
