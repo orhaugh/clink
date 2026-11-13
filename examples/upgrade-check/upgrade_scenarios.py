@@ -395,7 +395,11 @@ def scenarios(q):
         q.outcome("other-baseline", code, r, 1, {"builds.identity": "failed"},
                   (("builds.identity", "not the build that recorded"),))
 
-    for name, extra, kind in (("timeout", ["--run-timeout-s=2"], "timeout"),
+    # The time bound is below what any run needs. A run waits at least one of
+    # the cluster's polls (POLL_S, 0.2 s) each for the Coordinator, the Worker
+    # and its submission, so none finishes inside 0.6 s, and one takes about a
+    # second on an optimised Linux build: a bound of 2 s let such a run finish.
+    for name, extra, kind in (("timeout", ["--run-timeout-s=0.5"], "timeout"),
                               ("memory-limit", ["--max-rss-mib=24"], "memory"),
                               ("output-limit", ["--max-output-mib=0.1"], "output")):
         if not run(name):
