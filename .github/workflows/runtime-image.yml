@@ -272,7 +272,9 @@ jobs:
         # having compiled: both binaries must respond on their own. And the
         # native ClickHouse sink must be in it: a build against a client
         # older than the pin still compiles, and its record then says "not in
-        # this build" (impls/clickhouse/src/native/register_native.cpp).
+        # this build" (impls/clickhouse/src/native/register_native.cpp). So
+        # must the Relate connector, which docker/Dockerfile.runtime builds
+        # with CLINK_WITH_RELATE=ON.
         run: |
           set -euo pipefail
           ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
@@ -282,12 +284,13 @@ jobs:
           docker run --rm "${ref}" clink --capabilities-json | python3 -c '
           import json, sys
           caps = json.load(sys.stdin)
-          rec = [c for c in caps.get("connectors", []) if c.get("name") == "clickhouse_native"]
-          if not rec:
-              sys.exit("the image has no clickhouse_native connector")
-          if "not in this build" in json.dumps(rec[0]):
-              sys.exit("the image lists clickhouse_native as not in this build")
-          print("clickhouse_native present:", ", ".join(rec[0].get("build_dependencies", [])))
+          for name in ("clickhouse_native", "relate"):
+              rec = [c for c in caps.get("connectors", []) if c.get("name") == name]
+              if not rec:
+                  sys.exit("the image has no " + name + " connector")
+              if "not in this build" in json.dumps(rec[0]):
+                  sys.exit("the image lists " + name + " as not in this build")
+              print(name, "present:", ", ".join(rec[0].get("build_dependencies", [])))
           '
 
       - name: The manifest really covers both architectures

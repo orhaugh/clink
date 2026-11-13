@@ -167,8 +167,9 @@ fi
 # version versions.env pins, refuses it unless its sha256 matches, and installs
 # relate.h and librelate_ffi.a under /usr/local/relate-ffi. That is off every default
 # search path on purpose: a build links the connector only when it names the
-# directory (RELATE_FFI_ROOT), as CI's build does, so the runtime image built on this
-# one is unchanged. Both image architectures are pinned; a failure fails the image.
+# directory (RELATE_FFI_ROOT), as CI's build and docker/Dockerfile.runtime do, and
+# every other build in the image leaves it out. Both image architectures are pinned;
+# a failure fails the image.
 echo "▶ Installing Relate's C library ${RELATE_FFI_VERSION} (relate connector)..."
 CLINK_DEPS_PREFIX=/usr/local "${SCRIPT_DIR}/fetch-relate.sh"
 

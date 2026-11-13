@@ -24,7 +24,7 @@ What follows from Relate being embedded:
 | --- | --- | --- |
 | Relate's C library (`relate.h`, `librelate_ffi.a`) | a release asset of `relatedb/relate`, per platform, pinned by sha256 in [`scripts/versions.env`](https://github.com/orhaugh/clink/blob/main/scripts/versions.env) and installed by `scripts/fetch-relate.sh` | `1.0.1` (C ABI 2) |
 
-The library is linked statically, so a binary built with the connector needs nothing of Relate's at run time. On macOS it brings two system dependencies, CoreFoundation and libiconv, and adds about 26 MB to a binary. On Linux it needs only `libc`, `libm` and `libgcc_s`.
+The library is linked statically, so a binary built with the connector needs nothing of Relate's at run time. On macOS it brings two system dependencies, CoreFoundation and libiconv, and adds about 26 MB to a binary. On Linux it needs only `libc`, `libm` and `libgcc_s`, and a stripped program holding nothing else but it is 23 MB on aarch64.
 
 Relate's release signs a checksum list that covers its command-line binaries only. The library archives are not in it, so the sha256 in `scripts/versions.env` is the check: `scripts/fetch-relate.sh` refuses an archive that does not match, and a platform with no pin does not build the connector. Pins exist for macOS on arm64 and for Linux (glibc) on x86_64 and aarch64, and each equals the digest GitHub records for the asset. Relate's Intel macOS and Windows archives are not pinned.
 
@@ -37,7 +37,9 @@ scripts/fetch-relate.sh        # relate.h and librelate_ffi.a into ${CLINK_DEPS_
 cmake -S . -B build            # CLINK_WITH_RELATE=AUTO finds it there
 ```
 
-`CLINK_WITH_RELATE` (`AUTO` by default) builds the module when the library is under the dependency prefix or under `RELATE_FFI_ROOT`, and leaves it out otherwise; `ON` makes a missing library a configure error. `clink_node`, `clink run` and the embedded engine install it. `clink --capabilities` lists its record as `relate`.
+`CLINK_WITH_RELATE` (`AUTO` by default) builds the module when the library is under the dependency prefix or under `RELATE_FFI_ROOT`, and leaves it out otherwise; `ON` makes a missing library a configure error.
+
+The runtime image builds it in: `docker/Dockerfile.runtime` passes `CLINK_WITH_RELATE=ON` (a build argument, `ON` by default) with the library the toolchain image installs at `/usr/local/relate-ffi`, and its publishing workflow refuses an image whose `clink --capabilities-json` lacks the `relate` record. Images built from this change on run `connector='relate'` with nothing to install; v0.15.0 and earlier do not have it. `clink_node`, `clink run` and the embedded engine install it. `clink --capabilities` lists its record as `relate`.
 
 ## SQL usage
 

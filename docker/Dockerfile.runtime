@@ -58,6 +58,14 @@ ARG CLINK_WITH_FORST=OFF
 # 3.3 GB and stays there is one that gets OOM-killed on a small node.
 # Pass OFF to compare against the system allocator.
 ARG CLINK_WITH_JEMALLOC=ON
+# The Relate connector (connector='relate'), ON by default. The toolchain image
+# installs Relate's pinned C library at /usr/local/relate-ffi
+# (scripts/install-connector-deps.sh), off the default search paths, so the build
+# names it here. ON with a base image older than that fails the configure rather
+# than shipping an image without the connector: rebuild clink-build:latest, or
+# pass OFF. The library is linked statically and needs only libc, libm and
+# libgcc_s at run time.
+ARG CLINK_WITH_RELATE=ON
 # Raise the instruction-set baseline for compiled code, e.g. x86-64-v3 (AVX2) or
 # x86-64-v4 (AVX-512). Empty = the toolchain default, which on x86-64 is SSE2.
 # A PORTABILITY decision: an image built this way will not run on CPUs below the
@@ -103,6 +111,8 @@ RUN if [ "${CLINK_WITH_JEMALLOC}" != "OFF" ]; then \
         -DCLINK_ENABLE_FAULT_INJECTION=${CLINK_ENABLE_FAULT_INJECTION} \
         -DCLINK_WITH_FORST=${CLINK_WITH_FORST} \
         -DCLINK_WITH_JEMALLOC=${CLINK_WITH_JEMALLOC} \
+        -DCLINK_WITH_RELATE=${CLINK_WITH_RELATE} \
+        -DRELATE_FFI_ROOT=/usr/local/relate-ffi \
         -DCLINK_ISA_BASELINE=${CLINK_ISA_BASELINE} \
         -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
         -DCLINK_ABI_HASH=${CLINK_GIT_SHA} \
