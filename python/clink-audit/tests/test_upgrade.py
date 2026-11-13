@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -22,6 +23,8 @@ from clink_audit.upgrade import compare, definition, evidence, reference, worklo
 from clink_audit.upgrade import cli as upgrade_cli  # noqa: E402
 from clink_audit.upgrade.builds import Build  # noqa: E402
 from clink_audit.upgrade.cluster import Cluster, Limits, RunStopped  # noqa: E402
+from clink_audit.isolation import _CONNECT_OUT, _LOOPBACK_PAIR  # noqa: E402
+from clink_audit.upgrade import isolate  # noqa: E402
 from clink_audit.upgrade.isolate import NETNS_ENV, OUTSIDE_ENV, RunIsolation  # noqa: E402
 from clink_audit.upgrade.report import FAILED, PASSED, UNAVAILABLE, UNSUPPORTED, REQUIRED, Report  # noqa: E402
 
@@ -299,11 +302,22 @@ class TestClusterLimits(unittest.TestCase):
         self.assertEqual(e.kind, "interrupted")
 
 
+def namespace_answers(connect, loopback="ok"):
+    """The two probes answered as a namespace would answer them, so a state
+    does not depend on the network of the machine running the tests: the
+    upgrade gate runs them in a container whose only interface is lo, where
+    every real connection out is refused."""
+    answers = {_CONNECT_OUT: connect, _LOOPBACK_PAIR: loopback}
+    return mock.patch.object(isolate, "_run", lambda argv: answers[argv[-1]])
+
+
 class TestIsolationStates(unittest.TestCase):
     def setUp(self):
         self.saved = {k: os.environ.get(k) for k in (NETNS_ENV, OUTSIDE_ENV)}
+        self.net = Path(tempfile.mkdtemp(prefix="clink-upgrade-net-"))
 
     def tearDown(self):
+        shutil.rmtree(self.net, ignore_errors=True)
         for k, v in self.saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -312,20 +326,32 @@ class TestIsolationStates(unittest.TestCase):
 
     def test_linux_outside_the_namespace_must_reexecute(self):
         os.environ.pop(NETNS_ENV, None)
-        iso = RunIsolation(platform="Linux")
+        (self.net / "lo").mkdir()
+        (self.net / "eth0").mkdir()
+        iso = RunIsolation(platform="Linux", sysnet=str(self.net))
         self.assertTrue(iso.needs_reexec())
         self.assertEqual(iso.establish(), "unavailable")
 
     def test_inside_a_namespace_that_still_reaches_out_is_not_enforced_or_inconclusive(self):
-        # This host's own network stands in for a namespace that blocks nothing.
         os.environ[NETNS_ENV] = "1"
         os.environ[OUTSIDE_ENV] = "timeout"
-        iso = RunIsolation(platform="Linux")
-        self.assertFalse(iso.needs_reexec())
-        self.assertIn(iso.establish(), ("not-enforced", "unavailable"))
-        self.assertFalse(iso.enforced)
-        os.environ[OUTSIDE_ENV] = ""
-        self.assertIn(RunIsolation(platform="Linux").establish(), ("inconclusive", "unavailable"))
+        with namespace_answers(connect="timeout"):
+            iso = RunIsolation(platform="Linux")
+            self.assertFalse(iso.needs_reexec())
+            self.assertEqual(iso.establish(), "not-enforced")
+            self.assertFalse(iso.enforced)
+            os.environ[OUTSIDE_ENV] = ""
+            self.assertEqual(RunIsolation(platform="Linux").establish(), "inconclusive")
+
+    def test_inside_a_namespace_that_refuses_with_loopback_working_is_enforced(self):
+        os.environ[NETNS_ENV] = "1"
+        os.environ[OUTSIDE_ENV] = "timeout"
+        with namespace_answers(connect="ENETUNREACH"):
+            iso = RunIsolation(platform="Linux")
+            self.assertEqual(iso.establish(), "enforced")
+            self.assertEqual(iso.wrap(["clink_node"]), ["clink_node"])
+        with namespace_answers(connect="ENETUNREACH", loopback=""):
+            self.assertEqual(RunIsolation(platform="Linux").establish(), "unavailable")
 
 
 class TestAlreadyLoopbackOnly(unittest.TestCase):
@@ -343,9 +369,18 @@ class TestAlreadyLoopbackOnly(unittest.TestCase):
         iso = RunIsolation(platform="Linux", sysnet=str(self.net))
         self.assertTrue(iso.already_loopback_only())
         self.assertFalse(iso.needs_reexec())
-        # This host reaches out, so the proof refuses to call it enforced.
-        self.assertIn(iso.establish(), ("not-enforced", "unavailable"))
-        self.assertFalse(iso.enforced)
+        # The probes still decide: a connection that leaves is not enforced,
+        # one refused before it leaves with loopback working is.
+        with namespace_answers(connect="timeout"):
+            self.assertEqual(iso.establish(), "not-enforced")
+            self.assertFalse(iso.enforced)
+        with namespace_answers(connect="ENETUNREACH"):
+            iso = RunIsolation(platform="Linux", sysnet=str(self.net))
+            self.assertEqual(iso.establish(), "enforced")
+            self.assertEqual(iso.wrap(["clink_node"]), ["clink_node"])
+        with namespace_answers(connect="ENETUNREACH", loopback=""):
+            self.assertEqual(RunIsolation(platform="Linux", sysnet=str(self.net)).establish(),
+                             "unavailable")
 
     def test_another_interface_means_reexecution(self):
         (self.net / "lo").mkdir()
