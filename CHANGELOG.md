@@ -20,7 +20,8 @@ statement shape that decides on a node whether to create them, measured
 against concurrent writers. The module is built when Relate's library is installed
 (`scripts/fetch-relate.sh`, pinned by sha256 in `scripts/versions.env`) and left
 out otherwise. It is pinned for macOS arm64 and for Linux on x86_64 and aarch64,
-and tested on macOS arm64 and Linux aarch64; CI does not build it yet. See
+tested on macOS arm64 and Linux aarch64, and built and tested in CI on Linux
+x86_64, whose toolchain image installs the library. See
 `docs/connectors/relate.md`.
 
 **The fluent API's windows and reduce survive a restore.** Every fluent

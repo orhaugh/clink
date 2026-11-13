@@ -28,7 +28,7 @@ The library is linked statically, so a binary built with the connector needs not
 
 Relate's release signs a checksum list that covers its command-line binaries only. The library archives are not in it, so the sha256 in `scripts/versions.env` is the check: `scripts/fetch-relate.sh` refuses an archive that does not match, and a platform with no pin does not build the connector. Pins exist for macOS on arm64 and for Linux (glibc) on x86_64 and aarch64, and each equals the digest GitHub records for the asset. Relate's Intel macOS and Windows archives are not pinned.
 
-What is tested: Relate **1.0.1** on macOS arm64 and on Linux aarch64 (Debian 13, g++ 14.2, glibc 2.41), with stores of both layouts (a directory, and a single `.rl` file). The Linux x86_64 archive is pinned but has not been built against. CI does not build the connector yet, because its toolchain image does not install the library. Relate describes itself as experimental.
+What is tested: Relate **1.0.1** on macOS arm64 and on Linux aarch64 (Debian 13, g++ 14.2, glibc 2.41), with stores of both layouts (a directory, and a single `.rl` file). CI builds the connector on Linux x86_64 and runs both suites in its unit gate: its toolchain image installs the library at `/usr/local/relate-ffi` (`scripts/install-connector-deps.sh`), and its build names that directory with `-DCLINK_WITH_RELATE=ON`. Relate describes itself as experimental.
 
 ## Enabling it
 
@@ -221,7 +221,7 @@ Log lines, on the `sink.relate` channel: `relate sink open:` (subtask, store, th
 - A statement in flight cannot be interrupted.
 - Rows that arrive while no barrier comes and the input is idle wait for the next barrier or the end of the input.
 - No source, no lookup and no changelog input.
-- Tested on Relate 1.0.1, on macOS arm64 and Linux aarch64; not built on Linux x86_64 or in CI. No recovery cell kills a clink Worker around a commit yet; what Relate itself does when its process is killed is [measured above](#transactions-and-checkpoints).
+- Tested on Relate 1.0.1, on macOS arm64 and Linux aarch64, and in CI on Linux x86_64. No recovery cell kills a clink Worker around a commit yet; what Relate itself does when its process is killed is [measured above](#transactions-and-checkpoints).
 
 ## Testing
 
@@ -232,4 +232,4 @@ Two suites, both under `ctest --test-dir build -L relate`, and nothing in them i
 
 Every case reads the store back through Relate's C library on a connection of its own, so what it counts is what the store holds.
 
-Not yet covered: a recovery cell that kills a clink Worker around a commit, Linux x86_64, and CI, whose toolchain image does not install Relate's library.
+CI runs both suites on Linux x86_64 in its unit gate, against the library its toolchain image installs. Not yet covered: a recovery cell that kills a clink Worker around a commit.

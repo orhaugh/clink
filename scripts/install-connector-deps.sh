@@ -162,6 +162,16 @@ if [ ! -f "/usr/local/lib/cmake/etcd-cpp-api/etcd-cpp-api-config.cmake" ]; then
     ldconfig
 fi
 
+# -- Relate's C library (relate connector) --
+# A per-platform release asset, not an apt package: fetch-relate.sh downloads the
+# version versions.env pins, refuses it unless its sha256 matches, and installs
+# relate.h and librelate_ffi.a under /usr/local/relate-ffi. That is off every default
+# search path on purpose: a build links the connector only when it names the
+# directory (RELATE_FFI_ROOT), as CI's build does, so the runtime image built on this
+# one is unchanged. Both image architectures are pinned; a failure fails the image.
+echo "▶ Installing Relate's C library ${RELATE_FFI_VERSION} (relate connector)..."
+CLINK_DEPS_PREFIX=/usr/local "${SCRIPT_DIR}/fetch-relate.sh"
+
 # -- DuckDB CLI (test-time tool, not a connector dep) --
 # The reference implementation for the differential SQL oracle
 # (tests/test_sql_oracle.cpp): identical queries run through clink and

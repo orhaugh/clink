@@ -23,9 +23,10 @@ ENV CLINK_BUILD_JOBS=${CLINK_BUILD_JOBS}
 COPY scripts/versions.env scripts/build-arrow.sh scripts/build-iceberg-cpp.sh scripts/build-clickhouse-cpp.sh scripts/fetch-deps.sh scripts/deps-checksums.txt scripts/install-system-deps.sh /tmp/clink-sys/
 RUN chmod +x /tmp/clink-sys/*.sh && /tmp/clink-sys/install-system-deps.sh Debug && rm -rf /tmp/clink-sys
 
-# Layer 2 (CHEAP, volatile): optional connector client apt packages + the Pulsar .deb.
+# Layer 2 (CHEAP, volatile): optional connector client apt packages + the Pulsar .deb,
+# and Relate's pinned C library (fetch-relate.sh, into /usr/local/relate-ffi).
 # Re-runs in ~1-2 min when a connector adds a dep; the layer above stays cached.
-COPY scripts/versions.env scripts/install-connector-deps.sh /tmp/clink-conn/
+COPY scripts/versions.env scripts/install-connector-deps.sh scripts/fetch-relate.sh /tmp/clink-conn/
 RUN chmod +x /tmp/clink-conn/*.sh && /tmp/clink-conn/install-connector-deps.sh && rm -rf /tmp/clink-conn
 
 # Additional debugging tools, useful when shelling into the image to

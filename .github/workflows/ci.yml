@@ -245,6 +245,12 @@ jobs:
           # libprotoc-dev. Integer parallelism cap keeps cc1plus off the OOM
           # line on the heavy templated TUs.
           #
+          # CLINK_WITH_RELATE=ON names the Relate library the toolchain image
+          # installs at /usr/local/relate-ffi (scripts/install-connector-deps.sh),
+          # off every default search path, so the Relate connector and its
+          # tests are built here and a missing library fails the configure
+          # rather than leaving the connector out.
+          #
           # Debug info is dropped (-g0) and every binary is stripped at link
           # (-s): the pinned toolchain image already fills ~61 GB of the
           # runner's 72 GB disk, leaving ~12 GB, and a normal Debug build's
@@ -261,6 +267,8 @@ jobs:
             -DCLINK_WITH_WASM=ON \
             -DCLINK_WITH_AVRO=ON \
             -DCLINK_WITH_PROTOBUF=ON \
+            -DCLINK_WITH_RELATE=ON \
+            -DRELATE_FFI_ROOT=/usr/local/relate-ffi \
             -DCLINK_INTEGRATION_TESTS=ON \
             -DCMAKE_C_FLAGS_DEBUG=-g0 \
             -DCMAKE_CXX_FLAGS_DEBUG=-g0 \
