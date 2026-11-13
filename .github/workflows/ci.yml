@@ -386,8 +386,9 @@ jobs:
       - name: Upload the upgrade gate's builds
         # The upgrade-gate job runs clink-audit upgrade against this build's
         # clink, clink_node and the upgrade-check job and its variants, inside
-        # this toolchain image with no network but loopback. clink needs the
-        # fetched wasmtime library its runpath names, as the pins job does.
+        # this toolchain image with no network but loopback. clink and
+        # clink_node need the fetched wasmtime library, which that job installs
+        # in its container: the gate passes the builds no LD_LIBRARY_PATH.
         uses: actions/upload-artifact@v4
         with:
           name: upgrade-gate-builds
@@ -507,16 +508,20 @@ jobs:
           name: upgrade-gate-builds
           path: build
       - name: The gate, with loopback only
+        # The gate starts every build with a minimal environment, so an
+        # LD_LIBRARY_PATH would not reach clink or clink_node. Their runpath
+        # names the fetched wasmtime library by the build job's container path,
+        # which does not exist here, and then /usr/local/lib: the library is
+        # installed there, in this container only.
         run: |
           set -euo pipefail
           chmod +x build/clink build/clink_node
-          wasmtime_lib="$(find "${GITHUB_WORKSPACE}/build/_deps" -name libwasmtime.so -print -quit 2>/dev/null || true)"
+          test -f build/_deps/wasmtime_capi-src/lib/libwasmtime.so
           docker pull -q "${TOOLCHAIN}"
           docker run --rm --network none --user root \
             -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}" \
-            -e LD_LIBRARY_PATH="${wasmtime_lib:+$(dirname "${wasmtime_lib}")}" \
             -e WORK="${GITHUB_WORKSPACE}/upgrade-gate-work" -e CLINK_BIN_DIR="${GITHUB_WORKSPACE}/build" \
-            "${TOOLCHAIN}" scripts/upgrade-gate.sh
+            "${TOOLCHAIN}" bash -c 'cp build/_deps/wasmtime_capi-src/lib/libwasmtime.so /usr/local/lib/ && ldconfig && exec scripts/upgrade-gate.sh'
       - name: Upload the gate's qualification bundle on failure
         if: failure()
         uses: actions/upload-artifact@v4
