@@ -18,7 +18,7 @@ namespace {
 // diagnostic. test_connector_availability pins that every DECLARED
 // capability in a full build resolves through this table or is
 // always-built, so a new connector cannot land without its entry.
-constexpr std::array<ConnectorVocabularyEntry, 33> kVocabulary{{
+constexpr std::array<ConnectorVocabularyEntry, 34> kVocabulary{{
     {"webhdfs_parquet", "webhdfs_parquet", "CLINK_WITH_WEBHDFS"},
     {"azure_parquet", "azure_parquet", "CLINK_WITH_AZURE"},
     {"gcs_parquet", "gcs_parquet", "CLINK_WITH_GCS"},
@@ -41,6 +41,7 @@ constexpr std::array<ConnectorVocabularyEntry, 33> kVocabulary{{
     {"mongodb", "mongodb", "CLINK_WITH_MONGODB"},
     {"pulsar", "pulsar", "CLINK_WITH_PULSAR"},
     {"pubsub", "pubsub", "CLINK_WITH_HTTP"},
+    {"relate", "relate", "CLINK_WITH_RELATE"},
     {"mongo", "mongodb", "CLINK_WITH_MONGODB"},
     {"kafka", "kafka", "CLINK_WITH_KAFKA"},
     {"mysql", "mysql", "CLINK_WITH_MYSQL"},

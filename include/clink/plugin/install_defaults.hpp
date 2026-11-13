@@ -85,6 +85,9 @@
 #ifdef CLINK_HAS_NEO4J
 #include "clink/neo4j/install.hpp"
 #endif
+#ifdef CLINK_HAS_RELATE
+#include "clink/relate/install.hpp"
+#endif
 #ifdef CLINK_HAS_GCS
 #include "clink/gcs/install.hpp"
 #endif
@@ -161,6 +164,9 @@ inline void install_defaults(PluginRegistry& reg) {
 #endif
 #ifdef CLINK_HAS_NEO4J
     clink::neo4j::install(reg);
+#endif
+#ifdef CLINK_HAS_RELATE
+    clink::relate::install(reg);
 #endif
 #ifdef CLINK_HAS_GCS
     clink::gcs::install(reg);

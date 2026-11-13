@@ -95,11 +95,12 @@ bool is_object_store_parquet(const std::string& connector) {
 }
 
 Channel channel_for_table(const TableDef& table) {
-    // The Neo4j sink passes each row to its statement as typed parameters named
-    // after the declared columns, whatever their number, and a MongoDB table's
-    // columns are typed document fields: always the Row channel.
+    // The Neo4j and Relate sinks pass each row to their statement as typed
+    // parameters named after the declared columns, whatever their number, and a
+    // MongoDB table's columns are typed document fields: always the Row channel.
     if (const auto c = table.properties.find("connector");
-        c != table.properties.end() && (c->second == "neo4j" || c->second == "mongodb")) {
+        c != table.properties.end() &&
+        (c->second == "neo4j" || c->second == "relate" || c->second == "mongodb")) {
         return Channel::Row;
     }
     auto fmt = table.properties.find("format");
@@ -1671,6 +1672,35 @@ RowConnectorBinding row_sink_binding_for(const TableDef& table) {
         }
         return RowConnectorBinding{
             "neo4j_sink", kChannelRow, "", {{"sql_column_types", render_sql_column_types(table)}}};
+    }
+    if (connector == "relate") {
+        // The Relate sink takes Rows and passes each batch to the table's statement
+        // as typed parameters, in a transaction on a store this process holds open,
+        // so it needs the declared column types. It is at-least-once; the statement
+        // decides what a replay does. Refused here as well as by the sink, which a
+        // Dag-built job reaches directly.
+        if (exactly_once) {
+            unsupported(
+                "connector='relate' sink is at-least-once; exactly-once delivery is not "
+                "supported (see the connector page for replay-safe statements)");
+        }
+        if (upsert) {
+            unsupported(
+                "connector='relate' sink does not support mode='upsert': the statement decides "
+                "how a row changes the graph (MERGE on a stable key)");
+        }
+        if (const auto cl = table.properties.find("changelog");
+            cl != table.properties.end() && cl->second == "true") {
+            unsupported("connector='relate' sink does not support changelog='true'");
+        }
+        if (const auto wm = table.properties.find("write_mode");
+            wm != table.properties.end() && wm->second == "overwrite") {
+            unsupported(
+                "connector='relate' sink cannot back a full-refresh materialised view: each "
+                "refresh would run the statement over the whole result again");
+        }
+        return RowConnectorBinding{
+            "relate_sink", kChannelRow, "", {{"sql_column_types", render_sql_column_types(table)}}};
     }
     if (connector == "clickhouse") {
         // ClickHouse sinks, both at-least-once (a replayed INSERT re-inserts).

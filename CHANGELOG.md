@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+**A Relate sink: SQL rows into a graph store embedded in the engine.**
+`connector='relate'` writes each batch into a [Relate](https://github.com/relatedb/relate)
+store that the sink opens in its own process, through Relate's C library: one
+transaction of the table's Cypher statement per batch, the rows as a typed
+`$rows` parameter, committed at every checkpoint barrier. There is no server and
+no request whose reply can be lost. It follows the Neo4j sink's contract: at
+least once, the statement checked when the sink opens (run over no rows in a
+transaction that is rolled back), and replay-safe statements keyed by stable ids
+under uniqueness constraints, which a `schema` option declares since an embedded
+store has no server to create them on. Relate gives a store one writing process
+and one handle, so every sink on a store in a process shares one handle; two
+sinks that write the same node meet as a write-write conflict, which is rolled
+back and retried. Relate has no uniqueness for relationships, and two
+transactions that create the same one both commit it, so the page gives the
+statement shape that decides on a node whether to create them, measured
+against concurrent writers. The module is built when Relate's library is installed
+(`scripts/fetch-relate.sh`, pinned by sha256 in `scripts/versions.env`) and left
+out otherwise; it is pinned and tested on macOS arm64 only. See
+`docs/connectors/relate.md`.
+
 **The fluent API's windows and reduce survive a restore.** Every fluent
 window aggregate but the tumbling emit form with a type registered on the
 job's registry, the evicting window and `reduce` kept their state in memory

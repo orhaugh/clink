@@ -1035,6 +1035,31 @@ if(CLINK_BUILD_SQL)
         )
     endif()
 
+    # The Relate sink through the SQL frontend: the keys the planner puts on the
+    # sink op, the plans it refuses, and embedded SQL pipelines into real stores
+    # under the temporary directory, several jobs writing one store among them.
+    # Relate is embedded, so nothing is skipped. Its own binary, so -L relate
+    # reaches it.
+    if(TARGET clink::relate)
+        add_executable(clink_relate_sql_tests test_relate_sql.cpp)
+        target_link_libraries(clink_relate_sql_tests PRIVATE
+            clink::sql
+            clink::embed
+            clink::relate
+            ${CLINK_RELATE_LIBS_EXPORT}
+            GTest::gtest_main
+        )
+        target_include_directories(clink_relate_sql_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/impls/relate/src
+            ${CMAKE_SOURCE_DIR}/impls/relate/tests
+        )
+        clink_set_warnings(clink_relate_sql_tests)
+        gtest_discover_tests(clink_relate_sql_tests
+            DISCOVERY_MODE PRE_TEST
+            PROPERTIES TIMEOUT 120 LABELS relate
+        )
+    endif()
+
     # The MongoDB connector through the SQL frontend: the source and sink ops the
     # planner builds, the plans and options it refuses, and embedded SQL
     # pipelines against the replica set scripts/mongodb-live.sh starts, read back

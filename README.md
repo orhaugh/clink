@@ -15,9 +15,10 @@ double-counting a record.
 Pipelines read from and write to more than twenty systems: brokers (Kafka,
 Pulsar, NATS, MQTT, RabbitMQ), change data capture from PostgreSQL, databases
 (ClickHouse, MySQL, Cassandra, MongoDB, Redis), lakehouse tables (Iceberg,
-Delta Lake), object storage and Neo4j graphs. Each sink is held to the
-guarantee its table declares, and a job whose pipeline cannot give it is
-refused at submission. Beyond windows and joins, the SQL has `MATCH_RECOGNIZE`
+Delta Lake), object storage and graphs (Neo4j, and Relate stores embedded in
+the engine). Each sink is held to the guarantee its table declares, and a job
+whose pipeline cannot give it is refused at submission. Beyond windows and
+joins, the SQL has `MATCH_RECOGNIZE`
 for patterns across events, and `ML_PREDICT` and `VECTOR_SEARCH` to call a
 model or search an index from inside a query.
 
@@ -312,7 +313,7 @@ Everything below is published at
 - [Connectors](https://orhaugh.github.io/clink/connectors/): twenty-plus
   sources and sinks (Kafka, Postgres incl. CDC, ClickHouse, S3/GCS/Azure
   Parquet, Iceberg, Delta Lake, MQTT, NATS, Pulsar, RabbitMQ, Redis, MongoDB,
-  Cassandra, Neo4j, HTTP, Avro, WebSocket and more), each with dependencies,
+  Cassandra, Neo4j, Relate, HTTP, Avro, WebSocket and more), each with dependencies,
   options and delivery semantics; Kafka speaks the Confluent Schema Registry
   wire format (Avro, Protobuf, JSON Schema), and a new ClickHouse table should
   use the typed native sink, `insert_format='native'`.

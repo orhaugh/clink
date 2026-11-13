@@ -31,6 +31,7 @@ impls/postgres/include/clink/postgres/install.hpp
 impls/pulsar/include/clink/pulsar/install.hpp
 impls/rabbitmq/include/clink/rabbitmq/install.hpp
 impls/redis/include/clink/redis/install.hpp
+impls/relate/include/clink/relate/install.hpp
 impls/rocksdb-s3/include/clink/rocksdb_s3/install.hpp
 impls/rocksdb/include/clink/rocksdb/install.hpp
 impls/s3/include/clink/api/s3_builders.hpp
