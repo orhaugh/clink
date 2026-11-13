@@ -188,14 +188,35 @@ protected:
         }
         spill_file(dir / "job.sql", ddl(dir) + insert());
         std::string output;
+        // No periodic checkpoint (--checkpoint-interval-ms=0): the only one is
+        // the final checkpoint the bounded source asks for at its end, so epoch
+        // 1 holds every record and checkpoint 1 is the restore point. A
+        // periodic checkpoint is due as soon as the job is up and races that
+        // end; when it landed after the records, the final checkpoint was 2
+        // and the epochs collection picks around it, 2 and 3, held nothing.
         const auto rc = run_command(
             std::string{CLINK_CLI_BINARY} + " run " + (dir / "job.sql").string() +
                 " --checkpoint-dir=" + (dir / "ckpt").string() +
-                " --checkpoint-interval-ms=200 --capture-dir=" + (dir / "capture").string() + " " +
+                " --checkpoint-interval-ms=0 --capture-dir=" + (dir / "capture").string() + " " +
                 extra_flags,
             &output);
         if (rc != 0) {
             throw std::runtime_error("clink run failed: " + output);
+        }
+        std::vector<std::string> completed;
+        for (const auto& e : fs::recursive_directory_iterator(dir / "ckpt")) {
+            if (e.path().filename().string().starts_with("COMPLETED-")) {
+                completed.push_back(e.path().filename().string());
+            }
+        }
+        if (completed != std::vector<std::string>{"COMPLETED-1"}) {
+            std::string seen;
+            for (const auto& c : completed) {
+                seen += " " + c;
+            }
+            throw std::runtime_error(
+                "the fixture needs one checkpoint, the final one, and the run completed:" +
+                (seen.empty() ? std::string{" none"} : seen));
         }
         clink::sql::Catalog catalog;
         clink::sql::ScriptRunOptions opts;

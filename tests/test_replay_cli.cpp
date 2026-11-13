@@ -58,10 +58,14 @@ void write_file(const fs::path& p, const std::string& body) {
 }
 
 // Run `clink run <dir>/job.sql` with the flight recorder and checkpointing armed.
+// No periodic checkpoint (--checkpoint-interval-ms=0): the only one is the final
+// checkpoint the bounded source asks for at its end, so epoch 1 holds every
+// record. A periodic checkpoint is due as soon as the job is up, and whether it
+// lands before, among or after the records is a matter of timing.
 CmdResult run_captured(const std::string& cli, const fs::path& dir) {
     return run_cmd(cli + " run " + (dir / "job.sql").string() +
                    " --checkpoint-dir=" + (dir / "ckpt").string() +
-                   " --checkpoint-interval-ms=200 --capture-dir=" + (dir / "capture").string());
+                   " --checkpoint-interval-ms=0 --capture-dir=" + (dir / "capture").string());
 }
 
 // Whole-job replay --verify over a capture tree (default the `capture` subdir).
@@ -101,9 +105,10 @@ TEST(ReplayCli, WindowedEpochReplaysTheLiveEmissionsAndVerifiesDeterministic) {
                "GROUP BY TUMBLE(ts, 1000), usr;\n";
     }
 
-    // Live run with the flight recorder armed.
+    // Live run with the flight recorder armed, and only the final checkpoint,
+    // so epoch 1 holds every record (see run_captured).
     const auto run = run_cmd(cli + " run " + (dir / "job.sql").string() + " --checkpoint-dir=" +
-                             (dir / "ckpt").string() + " --checkpoint-interval-ms=200" +
+                             (dir / "ckpt").string() + " --checkpoint-interval-ms=0" +
                              " --capture-dir=" + (dir / "capture").string());
     ASSERT_EQ(run.exit_code, 0) << run.output;
     const auto live_out = read_file(dir / "out.jsonl");
