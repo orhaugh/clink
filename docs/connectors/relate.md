@@ -24,11 +24,11 @@ What follows from Relate being embedded:
 | --- | --- | --- |
 | Relate's C library (`relate.h`, `librelate_ffi.a`) | a release asset of `relatedb/relate`, per platform, pinned by sha256 in [`scripts/versions.env`](https://github.com/orhaugh/clink/blob/main/scripts/versions.env) and installed by `scripts/fetch-relate.sh` | `1.0.1` (C ABI 2) |
 
-The library is linked statically, so a binary built with the connector needs nothing of Relate's at run time. On macOS it brings two system dependencies, CoreFoundation and libiconv, and adds about 26 MB to a binary.
+The library is linked statically, so a binary built with the connector needs nothing of Relate's at run time. On macOS it brings two system dependencies, CoreFoundation and libiconv, and adds about 26 MB to a binary. On Linux it needs only `libc`, `libm` and `libgcc_s`.
 
-Relate's release signs a checksum list that covers its command-line binaries only. The library archives are not in it, so the sha256 in `scripts/versions.env` is the check: `scripts/fetch-relate.sh` refuses an archive that does not match, and a platform with no pin does not build the connector. A pin exists for macOS on arm64. Linux is not pinned or built yet.
+Relate's release signs a checksum list that covers its command-line binaries only. The library archives are not in it, so the sha256 in `scripts/versions.env` is the check: `scripts/fetch-relate.sh` refuses an archive that does not match, and a platform with no pin does not build the connector. Pins exist for macOS on arm64 and for Linux (glibc) on x86_64 and aarch64, and each equals the digest GitHub records for the asset. Relate's Intel macOS and Windows archives are not pinned.
 
-What is tested: Relate **1.0.1** on macOS arm64, with stores of both layouts (a directory, and a single `.rl` file). Relate describes itself as experimental.
+What is tested: Relate **1.0.1** on macOS arm64 and on Linux aarch64 (Debian 13, g++ 14.2, glibc 2.41), with stores of both layouts (a directory, and a single `.rl` file). The Linux x86_64 archive is pinned but has not been built against. CI does not build the connector yet, because its toolchain image does not install the library. Relate describes itself as experimental.
 
 ## Enabling it
 
@@ -221,7 +221,7 @@ Log lines, on the `sink.relate` channel: `relate sink open:` (subtask, store, th
 - A statement in flight cannot be interrupted.
 - Rows that arrive while no barrier comes and the input is idle wait for the next barrier or the end of the input.
 - No source, no lookup and no changelog input.
-- Tested on Relate 1.0.1, macOS arm64. Linux is not built yet. No recovery cell kills a clink Worker around a commit yet; what Relate itself does when its process is killed is [measured above](#transactions-and-checkpoints).
+- Tested on Relate 1.0.1, on macOS arm64 and Linux aarch64; not built on Linux x86_64 or in CI. No recovery cell kills a clink Worker around a commit yet; what Relate itself does when its process is killed is [measured above](#transactions-and-checkpoints).
 
 ## Testing
 
@@ -232,4 +232,4 @@ Two suites, both under `ctest --test-dir build -L relate`, and nothing in them i
 
 Every case reads the store back through Relate's C library on a connection of its own, so what it counts is what the store holds.
 
-Not yet covered: a recovery cell that kills a clink Worker around a commit, and Linux.
+Not yet covered: a recovery cell that kills a clink Worker around a commit, Linux x86_64, and CI, whose toolchain image does not install Relate's library.

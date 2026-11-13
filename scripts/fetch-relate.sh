@@ -75,7 +75,7 @@ fi
 
 got="$(sha256 "${archive}")"
 if [ "${got}" != "${pin}" ]; then
-    echo "fetch-relate: sha256 mismatch for ${asset}" >&2
+    echo "fetch-relate: ${archive} does not match the sha256 pinned for ${asset}" >&2
     echo "fetch-relate:   pinned ${pin}" >&2
     echo "fetch-relate:   got    ${got}" >&2
     exit 1

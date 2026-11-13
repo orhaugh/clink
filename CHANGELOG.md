@@ -19,7 +19,8 @@ transactions that create the same one both commit it, so the page gives the
 statement shape that decides on a node whether to create them, measured
 against concurrent writers. The module is built when Relate's library is installed
 (`scripts/fetch-relate.sh`, pinned by sha256 in `scripts/versions.env`) and left
-out otherwise; it is pinned and tested on macOS arm64 only. See
+out otherwise. It is pinned for macOS arm64 and for Linux on x86_64 and aarch64,
+and tested on macOS arm64 and Linux aarch64; CI does not build it yet. See
 `docs/connectors/relate.md`.
 
 **The fluent API's windows and reduce survive a restore.** Every fluent
