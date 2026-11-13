@@ -88,6 +88,7 @@ const std::map<std::string, std::vector<std::string>> kExpectedRecords = {
     {"azure", {"azure_parquet", "azure_parquet_2pc"}},
     {"webhdfs", {"webhdfs_parquet"}},
     {"neo4j", {"neo4j"}},
+    {"relate", {"relate"}},
     {"websocket", {"websocket"}},
 };
 
