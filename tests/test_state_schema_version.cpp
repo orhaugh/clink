@@ -38,6 +38,7 @@
 #include "clink/runtime/local_executor.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/keyed_state.hpp"
+#include "clink/state/restore_error.hpp"
 #include "clink/state/schema_version.hpp"
 #include "clink/state/state_migration_on_restore.hpp"
 
@@ -834,7 +835,9 @@ TEST(StateMigrationOnRestore, MigrateThrowsOnMissingPath) {
     clink::StateMigrationRegistry reg;  // no migration registered
     clink::StateVersionMap expected;
     expected.set(op, "T", 2);
-    EXPECT_THROW(clink::migrate_restored_state(*fresh, expected, reg), std::runtime_error);
+    // Refused, not retried: no restart can supply the missing migration.
+    EXPECT_THROW(clink::migrate_restored_state(*fresh, expected, reg),
+                 clink::state::RestoreRefused);
 }
 
 TEST(StateMigrationOnRestore, MigrateIsNoOpWhenVersionsAlreadyMatch) {

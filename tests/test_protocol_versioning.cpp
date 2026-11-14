@@ -46,6 +46,7 @@
 #include "clink/metrics/orchestration_metrics.hpp"
 #include "clink/runtime/network/connection.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/state/restore_error.hpp"
 #include "clink/state/snapshot_arrow_writer.hpp"
 
 using namespace clink::cluster;
@@ -474,7 +475,7 @@ TEST(SnapshotFormatVersion, ARestoreActuallyRunsTheGate) {
             clink::InMemoryStateBackend future_backend;
             future_backend.restore(from_the_future);
         },
-        std::runtime_error)
+        clink::state::RestoreRefused)
         << "a snapshot from a newer format was restored as though it were the current one";
 }
 

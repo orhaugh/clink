@@ -69,6 +69,7 @@
 #include "clink/metrics/disagg_metrics.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/remote_pool.hpp"
+#include "clink/state/restore_error.hpp"
 #include "clink/state/snapshot_arrow_writer.hpp"
 #include "clink/state/state_backend.hpp"
 
@@ -563,7 +564,7 @@ public:
             // in the memory of the process that wrote it, so a restore in any
             // other process lands here.
             if (snap.checkpoint_id.value() != 0 && !pool_->holds_checkpoint(snap.checkpoint_id)) {
-                throw std::runtime_error(
+                throw clink::state::RestoreRefused(
                     "remote-read restore: checkpoint " +
                     std::to_string(snap.checkpoint_id.value()) +
                     " is not in this backend's pool and the snapshot carries no state of its "

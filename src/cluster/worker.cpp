@@ -49,6 +49,7 @@
 #include "clink/runtime/network/network_socket.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
+#include "clink/state/restore_error.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
 namespace clink::cluster {
@@ -2062,10 +2063,14 @@ void Worker::run_task_(JobId job_id,
                 it->second(task);
             }
         }
-    } catch (const clink::state::CheckpointIntegrityError& e) {
+    } catch (const clink::state::NonRetryableRestoreError& e) {
         // Non-retryable by nature: the configured restore point itself is
-        // damaged, so a whole-job restart cannot succeed against it - and
-        // worse, the restart machinery restores the job's OWN latest
+        // damaged (CheckpointIntegrityError), or the engine refused it
+        // (RestoreRefused: state no operator here reads, a missing
+        // participant, no migration path, a format newer than this build).
+        // A whole-job restart restores the same point and meets the same
+        // refusal until the restart budget is spent - and for a damaged
+        // point the restart machinery restores the job's OWN latest
         // checkpoint (of which a fresh attempt has none) and comes back up
         // on empty state, converting this loud refusal into silently empty
         // output. Marked fatal so the coordinator fails the job with this

@@ -2036,6 +2036,14 @@ std::filesystem::path cluster_integrity_throw_job_path() {
 #endif
 }
 
+std::filesystem::path cluster_restore_refused_throw_job_path() {
+#ifdef CLINK_RESTORE_REFUSED_THROW_JOB_PATH
+    return std::filesystem::path{CLINK_RESTORE_REFUSED_THROW_JOB_PATH};
+#else
+    return {};
+#endif
+}
+
 }  // namespace
 
 // Content-addressed plugin shipping (item 30), end to end and in process:
@@ -2187,12 +2195,12 @@ TEST(Cluster, IncompatiblePluginIsRefusedBeforeAnyBytesShip) {
 // typeinfo NAME comparison for default-visibility types; that is exactly why
 // clink_add_job_module's HIDDEN_VISIBILITY option stays experimental until
 // this test also passes under it.
-TEST(Cluster, PluginThrownIntegrityErrorIsFatalAcrossTheDlopenSeam) {
-    const auto job_so = cluster_integrity_throw_job_path();
-    if (job_so.empty() || !std::filesystem::exists(job_so)) {
-        GTEST_SKIP() << "integrity_throw_job not built";
-    }
+namespace {
 
+// Submits the fixture job at `job_so`, whose source factory throws a
+// NonRetryableRestoreError from plugin code, and checks the job fails once with
+// `cause` among its errors and no restart spent.
+void expect_plugin_throw_is_fatal(const std::filesystem::path& job_so, const std::string& cause) {
     // The graph JSON lives inside the .so (its inline ops are minted by the
     // plugin's build_fn); extract it the way clink_submit_job does.
     void* handle = ::dlopen(job_so.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -2226,22 +2234,55 @@ TEST(Cluster, PluginThrownIntegrityErrorIsFatalAcrossTheDlopenSeam) {
     opts.wait_for_completion = true;
     opts.wait_timeout = clink::test_support::scale_slack(10s);
     opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
+    // A checkpoint directory, so a retryable failure would restart the whole
+    // job (the self-heal budget a checkpointed job gets) rather than fail it
+    // outright, as a job without one does: only then does an unchanged restart
+    // count show the failure was classified fatal.
+    const auto ckpt_dir =
+        std::filesystem::temp_directory_path() /
+        ("clink_fatal_plugin_throw_" + std::to_string(::getpid()) + "_" + job_so.stem().string());
+    std::filesystem::remove_all(ckpt_dir);
+    opts.checkpoint.checkpoint_dir = ckpt_dir.string();
+    opts.checkpoint.interval_ms = 600'000;
     auto r = submitter.submit(graph_json, {job_so.string()}, opts);
+    std::filesystem::remove_all(ckpt_dir);
     ASSERT_TRUE(r.completed) << r.reject_message;
     ASSERT_FALSE(r.ok) << "a job whose operator throws must not complete cleanly";
     bool named = false;
     for (const auto& e : r.errors) {
-        if (e.find("deliberately damaged restore point") != std::string::npos) {
+        if (e.find(cause) != std::string::npos) {
             named = true;
         }
     }
     EXPECT_TRUE(named) << "the typed exception's message must survive the boundary as the cause";
     EXPECT_EQ(counter_value("clink_coordinator_job_restarts_total"), restarts_before)
-        << "a fatal integrity error must fail the job, not spend restart budget";
+        << "a non-retryable restore error must fail the job, not spend restart budget";
 
     worker.stop();
     coordinator.stop();
     ::dlclose(handle);
+}
+
+}  // namespace
+
+TEST(Cluster, PluginThrownIntegrityErrorIsFatalAcrossTheDlopenSeam) {
+    const auto job_so = cluster_integrity_throw_job_path();
+    if (job_so.empty() || !std::filesystem::exists(job_so)) {
+        GTEST_SKIP() << "integrity_throw_job not built";
+    }
+    expect_plugin_throw_is_fatal(job_so, "deliberately damaged restore point");
+}
+
+// A refused restore is as deterministic as a damaged one: the restart restores
+// the same point and meets the same refusal. It used to be a plain
+// runtime_error, which the worker treats as retryable, so a checkpointed job
+// spent its whole restart budget repeating it.
+TEST(Cluster, PluginThrownRestoreRefusalIsFatalAcrossTheDlopenSeam) {
+    const auto job_so = cluster_restore_refused_throw_job_path();
+    if (job_so.empty() || !std::filesystem::exists(job_so)) {
+        GTEST_SKIP() << "restore_refused_throw_job not built";
+    }
+    expect_plugin_throw_is_fatal(job_so, "deliberately refused restore");
 }
 
 // A hash-only reference the worker cannot resolve fails the deploy LOUDLY

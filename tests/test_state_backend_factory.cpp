@@ -18,6 +18,7 @@
 #include "clink/state/file_backed_state_backend.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/remote_read_backend.hpp"
+#include "clink/state/restore_error.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
 namespace {
@@ -452,7 +453,7 @@ TEST(StateBackendFactory, KeyedStateOfAnOperatorTheSubtaskDoesNotRunRefusesTheRe
     try {
         (void)build(false, {kept.value()});
         ADD_FAILURE() << "a restore took keyed state of an operator the subtask does not run";
-    } catch (const std::runtime_error& e) {
+    } catch (const clink::state::RestoreRefused& e) {
         const std::string what = e.what();
         EXPECT_NE(what.find("refusing to restore subtask 0 from checkpoint 5"), std::string::npos)
             << what;
@@ -563,7 +564,7 @@ TEST(StateBackendFactory, AScaleDownJudgesEveryParentItInherits) {
     try {
         (void)clink::StateBackendFactory::default_instance().build(spec);
         ADD_FAILURE() << "a scale-down took keyed state of an operator the subtask does not run";
-    } catch (const std::runtime_error& e) {
+    } catch (const clink::state::RestoreRefused& e) {
         EXPECT_NE(std::string(e.what()).find("operator 42 (1 keyed row)"), std::string::npos)
             << e.what();
     }
@@ -1097,7 +1098,8 @@ TEST(StateBackendFactory, ASameSubtaskRestoreRefusesWhenItsOwnSnapshotIsAbsent) 
     // the default 15s here would test patience, not the refusal.
     ::setenv("CLINK_RESTORE_VERIFY_RETRY_MS", "0", 1);
     EXPECT_THROW(
-        { (void)clink::StateBackendFactory::default_instance().build(spec); }, std::runtime_error)
+        { (void)clink::StateBackendFactory::default_instance().build(spec); },
+        clink::state::RestoreRefused)
         << "a subtask whose own snapshot is missing came up with empty state instead of "
            "refusing. Its peers restore fully, so the job resumes with one operator's state "
            "silently gone.";

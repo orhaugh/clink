@@ -24,6 +24,18 @@ tested on macOS arm64 and Linux aarch64, and built and tested in CI on Linux
 x86_64, whose toolchain image installs the library. The runtime image builds
 it in. See `docs/connectors/relate.md`.
 
+**A refused restore fails the job once instead of restarting into it.** A
+subtask whose restore the engine refused threw a plain error, which a Worker
+treats as retryable, so a job that takes checkpoints restarted, restored the
+same point, met the same refusal and repeated it until its restart budget was
+spent, the cause buried under the restarts. Such refusals now throw
+`clink::state::RestoreRefused`, which, like a damaged checkpoint's
+`CheckpointIntegrityError`, derives from `NonRetryableRestoreError`; a Worker
+marks the subtask fatal and the job fails once with the refusal as its error.
+It covers keyed state of an operator the subtask does not run, a participant's
+missing snapshot, a schema with no migration path, a snapshot format newer than
+the build, and a remote-read checkpoint its backend cannot reach.
+
 **A restore refuses keyed state that no operator in the job reads.** State is
 stored under the id of the operator that wrote it, which comes from its uid, so
 an operator whose uid changed or was lost came back under a new id and started
@@ -31,7 +43,7 @@ empty, while the old operator's state was carried in every later checkpoint and
 read by nothing, without a warning. Each restoring subtask now compares the
 keyed rows of the snapshots it inherits with the operators it runs, and a row
 of any other operator refuses the restore, naming the subtask, the checkpoint
-and each operator with its row count; the job fails as it deploys. This
+and each operator with its row count; the job fails as it deploys, once. This
 changes behaviour: a job restored after removing a stateful operator, or after
 changing a query so that one goes away, used to drop that operator's state
 silently and is now refused. Submit with `--allow-unrestored-state` (on

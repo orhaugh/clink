@@ -182,6 +182,7 @@ include/clink/state/coalescing_backend.hpp
 include/clink/state/durable_file_write.hpp
 include/clink/state/in_memory_state_backend.hpp
 include/clink/state/keyed_state.hpp
+include/clink/state/restore_error.hpp
 include/clink/state/schema_version.hpp
 include/clink/state/state_backend.hpp
 include/clink/state/state_backend_factory.hpp

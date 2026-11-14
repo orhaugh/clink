@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "clink/state/restore_error.hpp"
+
 namespace clink {
 
 std::vector<StateIncompatibility> check_restore_compatibility(const StateVersionMap& stored,
@@ -37,10 +39,10 @@ void migrate_restored_state(StateBackend& backend,
             continue;
         }
         if (!reg.has_path(e.state_type, from, to)) {
-            throw std::runtime_error("migrate_restored_state: no migration path for op=" +
-                                     std::to_string(e.op_id.value()) + " state_type='" +
-                                     e.state_type + "' from v" + std::to_string(from) + " to v" +
-                                     std::to_string(to));
+            throw clink::state::RestoreRefused("migrate_restored_state: no migration path for op=" +
+                                               std::to_string(e.op_id.value()) + " state_type='" +
+                                               e.state_type + "' from v" + std::to_string(from) +
+                                               " to v" + std::to_string(to));
         }
         // Collect first - the StateBackend scan contract forbids
         // mutating during the visit - then write the migrated values

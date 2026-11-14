@@ -33,6 +33,7 @@
 
 #include <arrow/util/key_value_metadata.h>
 
+#include "clink/state/restore_error.hpp"
 #include "clink/state/schema_version.hpp"
 
 namespace clink {
@@ -106,7 +107,7 @@ inline void verify_snapshot_format_version(
                                  ": snapshot declares format version 0, which does not exist.");
     }
     if (version > kMaxReadableSnapshotFormatVersion) {
-        throw std::runtime_error(
+        throw clink::state::RestoreRefused(
             std::string(context) + ": snapshot is format version " + std::to_string(version) +
             " but this build reads at most version " +
             std::to_string(kMaxReadableSnapshotFormatVersion) +

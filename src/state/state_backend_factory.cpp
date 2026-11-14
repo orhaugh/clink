@@ -26,6 +26,7 @@
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/remote_pool.hpp"
 #include "clink/state/remote_read_backend.hpp"
+#include "clink/state/restore_error.hpp"
 #include "clink/state/sharded_in_memory_state_backend.hpp"
 
 namespace clink {
@@ -492,7 +493,7 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             const auto missing = std::filesystem::path{state_dir_for(
                                      restore_path, spec.restore_generation, src_first)} /
                                  ckpt_name;
-            throw std::runtime_error(
+            throw clink::state::RestoreRefused(
                 "refusing to restore subtask " + std::to_string(spec.subtask_idx) +
                 " with empty state: checkpoint " + std::to_string(spec.restore_checkpoint_id) +
                 " named it as a participant but " + missing.string() +
@@ -531,7 +532,7 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             if (!unread.empty()) {
                 const auto what = describe_unread_operators(unread);
                 if (!spec.allow_unrestored_state) {
-                    throw std::runtime_error(
+                    throw clink::state::RestoreRefused(
                         "refusing to restore subtask " + std::to_string(spec.subtask_idx) +
                         " from checkpoint " + std::to_string(spec.restore_checkpoint_id) +
                         ": it holds keyed state of " + what +

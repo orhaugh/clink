@@ -56,6 +56,7 @@
 #include <vector>
 
 #include "clink/state/durable_file_write.hpp"
+#include "clink/state/restore_error.hpp"
 
 namespace clink::state {
 
@@ -403,10 +404,10 @@ inline void write_checkpoint_meta(const std::filesystem::path& payload_path,
 
 // Thrown when a restore is asked for a checkpoint that exists but cannot be
 // trusted. Distinct from "no checkpoint here", which is not an error.
-class CheckpointIntegrityError : public std::runtime_error {
+class CheckpointIntegrityError : public NonRetryableRestoreError {
 public:
     CheckpointIntegrityError(CheckpointStatus status, const std::string& detail)
-        : std::runtime_error("checkpoint " + std::string(to_string(status)) + ": " + detail),
+        : NonRetryableRestoreError("checkpoint " + std::string(to_string(status)) + ": " + detail),
           status_(status) {}
 
     [[nodiscard]] CheckpointStatus status() const noexcept { return status_; }

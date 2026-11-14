@@ -30,6 +30,7 @@
 #include "clink/s3/install.hpp"
 #include "clink/s3/s3_remote_pool.hpp"
 #include "clink/state/remote_read_backend.hpp"
+#include "clink/state/restore_error.hpp"
 #include "clink/state/state_backend_factory.hpp"
 
 namespace clink::s3 {
@@ -159,7 +160,7 @@ clink::BuiltStateBackend build_remote_read(const clink::StateBackendSpec& spec) 
         if (rscheme == "remote-read") {
             restore_cfg = parse_cfg(rbase);
             if (restore_cfg.bucket != cfg.bucket) {
-                throw std::runtime_error(
+                throw clink::state::RestoreRefused(
                     "remote-read: checkpoint " + std::to_string(spec.restore_checkpoint_id) +
                     " is in bucket '" + restore_cfg.bucket + "' and this job writes bucket '" +
                     cfg.bucket +

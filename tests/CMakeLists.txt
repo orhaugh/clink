@@ -318,6 +318,12 @@ endforeach()
 clink_add_job_module(clink_integrity_throw_job
     SOURCES plugin_examples/integrity_throw_job.cpp
     OUTPUT_NAME integrity_throw_job)
+# The same job throwing clink::state::RestoreRefused: a refused restore is as
+# non-retryable as a damaged one.
+clink_add_job_module(clink_restore_refused_throw_job
+    SOURCES plugin_examples/integrity_throw_job.cpp
+    OUTPUT_NAME restore_refused_throw_job
+    DEFINES CLINK_THROW_RESTORE_REFUSED=1)
 
 # Make the plugin's on-disk path available to the test as a
 # preprocessor define. $<TARGET_FILE:...> resolves to the per-config
@@ -328,6 +334,7 @@ target_compile_definitions(clink_core_tests PRIVATE
     CLINK_MISMATCHED_TRIPLE_PLUGIN_PATH=\"$<TARGET_FILE:clink_mismatched_triple_plugin>\"
     CLINK_MISMATCHED_TOOLCHAIN_PLUGIN_PATH=\"$<TARGET_FILE:clink_mismatched_toolchain_plugin>\"
     CLINK_INTEGRITY_THROW_JOB_PATH=\"$<TARGET_FILE:clink_integrity_throw_job>\"
+    CLINK_RESTORE_REFUSED_THROW_JOB_PATH=\"$<TARGET_FILE:clink_restore_refused_throw_job>\"
     CLINK_CLI_BINARY=\"$<TARGET_FILE:clink>\"
     CLINK_SCHEMA_EVO_JOB_PATH=\"$<TARGET_FILE:clink_schema_evo_test_job>\"
     # A job module that registers its own source on a built-in channel type
@@ -356,7 +363,7 @@ target_compile_definitions(clink_core_tests PRIVATE
 add_dependencies(clink_core_tests
     clink_hello_plugin clink clink_schema_evo_test_job clink_cancel_test_job clink_fuzz_seeds
     clink_mismatched_fingerprint_plugin clink_mismatched_triple_plugin
-    clink_mismatched_toolchain_plugin clink_integrity_throw_job)
+    clink_mismatched_toolchain_plugin clink_integrity_throw_job clink_restore_refused_throw_job)
 target_include_directories(clink_core_tests PRIVATE ${CMAKE_SOURCE_DIR})
 
 # Sanitizer builds run 5-10x slower (the same ratio kTimingSlack in

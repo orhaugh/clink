@@ -294,7 +294,8 @@ ambiguous, or the two layouts happen to share an index set.
 
 ## A job refuses to start with "refusing to restore subtask N with empty state"
 
-Not an alert - a hard refusal at deploy. The coordinator named a completed checkpoint
+Not an alert - a hard refusal at deploy, which fails the job once rather than
+restarting it into the same refusal. The coordinator named a completed checkpoint
 to restore from, and that subtask's snapshot file is not in the checkpoint directory.
 
 **This is the engine declining to lose your state quietly.** It used to bring the
@@ -331,9 +332,10 @@ restore from and an older complete one is the better recovery point.
 
 ## A job fails as it deploys with "refusing to restore subtask N from checkpoint C: it holds keyed state of operator X"
 
-Not an alert - a refusal on the Worker as the restored job deploys. The subtask's
-snapshot holds keyed rows written by an operator the restored job no longer runs in
-that subtask, so nothing would ever read them.
+Not an alert - a refusal on the Worker as the restored job deploys, which fails the job
+once rather than restarting it into the same refusal. The subtask's snapshot holds
+keyed rows written by an operator the restored job no longer runs in that subtask, so
+nothing would ever read them.
 
 **This is the engine declining to start an operator empty without telling you.** It
 used to accept the restore: the operator came back under a new id with no state, and

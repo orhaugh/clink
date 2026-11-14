@@ -526,6 +526,7 @@ include/clink/state/file_backed_state_backend.hpp
 include/clink/state/file_materialization_store.hpp
 include/clink/state/remote_pool.hpp
 include/clink/state/remote_read_backend.hpp
+include/clink/state/restore_error.hpp
 include/clink/state/sharded_in_memory_state_backend.hpp
 include/clink/state/snapshot_arrow_writer.hpp
 include/clink/state/snapshot_canonicalise.hpp

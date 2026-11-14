@@ -1,4 +1,5 @@
-// A job whose SOURCE FACTORY throws clink::state::CheckpointIntegrityError.
+// A job whose SOURCE FACTORY throws clink::state::CheckpointIntegrityError, or,
+// built with CLINK_THROW_RESTORE_REFUSED, clink::state::RestoreRefused.
 // Fixture for the cross-boundary typed-catch contract (item 19): the factory
 // closure is compiled into this .so and invoked by the WORKER (host code)
 // while building the subtask chain, so the exception propagates raw across
@@ -20,6 +21,7 @@
 #include "clink/cluster/built_in_factories.hpp"
 #include "clink/job/register_job.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
+#include "clink/state/restore_error.hpp"
 
 namespace {
 
@@ -30,9 +32,14 @@ void define_job(clink::api::Pipeline& pipeline) {
     pipeline.registry().register_source<std::int64_t>(
         "integrity_throw_source",
         [](const clink::plugin::BuildContext&) -> std::shared_ptr<clink::Source<std::int64_t>> {
+#ifdef CLINK_THROW_RESTORE_REFUSED
+            throw clink::state::RestoreRefused(
+                "integrity_throw_job: deliberately refused restore (fixture)");
+#else
             throw clink::state::CheckpointIntegrityError(
                 clink::state::CheckpointStatus::Corrupt,
                 "integrity_throw_job: deliberately damaged restore point (fixture)");
+#endif
         });
     pipeline
         .source<std::int64_t>(clink::api::SourceDescriptor{.op_type = "integrity_throw_source"},
