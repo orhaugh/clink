@@ -71,6 +71,12 @@ struct JobConfig {
     // stand for a rescaled subtask leaves it false.
     bool restore_keeps_key_groups{false};
 
+    // State written under an operator id an older build derived, and the id
+    // this build derives for the same operator (OperatorIdAlias). After the
+    // restore, LocalExecutor moves the restored state to the new ids
+    // (StateBackend::remap_operator_ids). Empty moves nothing.
+    OperatorIdAliases operator_id_aliases;
+
     // The run takes checkpoints a later run may restore from (the cluster
     // runner sets it when the job has a checkpoint directory). Operators see
     // it as RuntimeContext::checkpointed(): one whose state could only be held

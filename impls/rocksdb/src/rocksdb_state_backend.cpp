@@ -6,11 +6,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -89,6 +91,53 @@ constexpr const char* kStateVersionsKey = "__clink.state_versions";
 // through on record/clear so the next checkpoint's memtable flush lands
 // it in the SSTs and restore/export recover it from any checkpoint dir.
 constexpr const char* kStateFingerprintsKey = "__clink.state_fingerprints";
+
+// Reserved keys in the default CF for operator ids. A restore that moved an
+// operator to a new id (remap_operator_ids) leaves its state in the column
+// family named after the old id and records the alias here, new id -> old id,
+// one "<new> <old>" decimal pair per line, so every later checkpoint of the
+// working DB, a restore from one and the offline export all reach the state
+// under the new id. The scheme key names the id scheme of the column families'
+// ids ("fnv1a-1" for stable ids; absent for the ids builds derived before).
+constexpr const char* kOperatorAliasesKey = "__clink.operator_aliases";
+constexpr const char* kOperatorIdSchemeKey = "__clink.operator_id_scheme";
+
+std::string pack_operator_aliases(const std::unordered_map<std::uint64_t, std::uint64_t>& aliases) {
+    std::string out;
+    for (const auto& [to, from] : aliases) {
+        out += std::to_string(to) + " " + std::to_string(from) + "\n";
+    }
+    return out;
+}
+
+std::unordered_map<std::uint64_t, std::uint64_t> unpack_operator_aliases(std::string_view packed) {
+    std::unordered_map<std::uint64_t, std::uint64_t> out;
+    std::size_t pos = 0;
+    while (pos < packed.size()) {
+        const auto nl = packed.find('\n', pos);
+        const auto line =
+            packed.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
+        pos = nl == std::string_view::npos ? packed.size() : nl + 1;
+        const auto sp = line.find(' ');
+        if (sp == std::string_view::npos) {
+            continue;
+        }
+        out[std::stoull(std::string(line.substr(0, sp)))] =
+            std::stoull(std::string(line.substr(sp + 1)));
+    }
+    return out;
+}
+
+// The new id each column family's state is reported under: its own id, or the
+// new id an alias names for it.
+std::unordered_map<std::uint64_t, std::uint64_t> labels_for(
+    const std::unordered_map<std::uint64_t, std::uint64_t>& aliases) {
+    std::unordered_map<std::uint64_t, std::uint64_t> out;
+    for (const auto& [to, from] : aliases) {
+        out[from] = to;
+    }
+    return out;
+}
 
 // List SST basenames currently in a RocksDB instance. RocksDB names
 // every SST file <N>.sst where N is a monotonically-increasing
@@ -268,6 +317,17 @@ struct RocksDBStateBackend::Impl {
     // it outlives any individual compaction.
     std::shared_ptr<ExpiryFilterSlot> expiry_slot_ = std::make_shared<ExpiryFilterSlot>();
     std::unordered_map<std::uint64_t, rocksdb::ColumnFamilyHandle*> cfs_;
+    // New operator id -> the id of the column family its state is in
+    // (kOperatorAliasesKey). Guarded by cf_mu_.
+    std::unordered_map<std::uint64_t, std::uint64_t> aliases_;
+    [[nodiscard]] std::uint64_t resolve_locked(std::uint64_t op) const {
+        const auto it = aliases_.find(op);
+        return it == aliases_.end() ? op : it->second;
+    }
+    // The id scheme of the column families' ids, and the identities of the
+    // operators the subtask runs. Guarded by versions_mu.
+    OperatorIdScheme scheme_{kCurrentOperatorIdScheme};
+    OperatorIdentities identities_;
     rocksdb::ColumnFamilyHandle* default_cf_{nullptr};
 
     // Buffered-write path: every Put appends to write_batch_ instead
@@ -323,6 +383,47 @@ struct RocksDBStateBackend::Impl {
         return StateVersionMap::unpack(out);
     }
 
+    [[nodiscard]] std::unordered_map<std::uint64_t, std::uint64_t> read_persisted_aliases() const {
+        if (default_cf_ == nullptr) {
+            return {};
+        }
+        std::string out;
+        if (!db->Get(rocksdb::ReadOptions{}, default_cf_, kOperatorAliasesKey, &out).ok()) {
+            return {};
+        }
+        return unpack_operator_aliases(out);
+    }
+
+    // The scheme the persisted marker names; a DB without one predates the
+    // stable ids, or was opened fresh by a build that writes legacy ids.
+    [[nodiscard]] OperatorIdScheme read_persisted_scheme(OperatorIdScheme fresh) const {
+        if (default_cf_ == nullptr) {
+            return fresh;
+        }
+        std::string out;
+        if (!db->Get(rocksdb::ReadOptions{}, default_cf_, kOperatorIdSchemeKey, &out).ok()) {
+            return OperatorIdScheme::Legacy;
+        }
+        return out == kStableOperatorIdSchemeName ? OperatorIdScheme::Stable
+                                                  : OperatorIdScheme::Legacy;
+    }
+
+    void write_operator_id_marker(OperatorIdScheme scheme) {
+        if (default_cf_ == nullptr) {
+            return;
+        }
+        auto st = scheme == OperatorIdScheme::Stable
+                      ? db->Put(keyed_state_write_options(),
+                                default_cf_,
+                                kOperatorIdSchemeKey,
+                                kStableOperatorIdSchemeName)
+                      : db->Delete(keyed_state_write_options(), default_cf_, kOperatorIdSchemeKey);
+        if (!st.ok()) {
+            throw std::runtime_error("RocksDBStateBackend: operator id scheme write failed: " +
+                                     st.ToString());
+        }
+    }
+
     // Shape fingerprints: authoritative in-memory copy under the same
     // versions_mu (identical call paths); persisted under
     // kStateFingerprintsKey beside the version map.
@@ -356,14 +457,14 @@ struct RocksDBStateBackend::Impl {
     }
 
     [[nodiscard]] rocksdb::ColumnFamilyHandle* cf_for(OperatorId op) {
-        const auto key = op.value();
         {
             std::shared_lock lk(cf_mu_);
-            if (auto it = cfs_.find(key); it != cfs_.end()) {
+            if (auto it = cfs_.find(resolve_locked(op.value())); it != cfs_.end()) {
                 return it->second;
             }
         }
         std::unique_lock lk(cf_mu_);
+        const auto key = resolve_locked(op.value());
         if (auto it = cfs_.find(key); it != cfs_.end()) {
             return it->second;
         }
@@ -383,7 +484,7 @@ struct RocksDBStateBackend::Impl {
     // returns empty instead of materialising an empty CF.
     [[nodiscard]] rocksdb::ColumnFamilyHandle* cf_lookup(OperatorId op) const {
         std::shared_lock lk(cf_mu_);
-        auto it = cfs_.find(op.value());
+        auto it = cfs_.find(resolve_locked(op.value()));
         return it == cfs_.end() ? nullptr : it->second;
     }
 
@@ -524,6 +625,15 @@ RocksDBStateBackend::RocksDBStateBackend(Options opts) : impl_(std::make_unique<
     // A restart over an existing working dir recovers the persisted stamps.
     impl_->versions = impl_->read_persisted_versions();
     impl_->fingerprints = impl_->read_persisted_fingerprints();
+    // And its operator-id aliases and scheme. A DB with no column family yet
+    // is fresh: its state will be in the ids this build derives.
+    impl_->aliases_ = impl_->read_persisted_aliases();
+    if (impl_->cfs_.empty()) {
+        impl_->scheme_ = kCurrentOperatorIdScheme;
+        impl_->write_operator_id_marker(impl_->scheme_);
+    } else {
+        impl_->scheme_ = impl_->read_persisted_scheme(kCurrentOperatorIdScheme);
+    }
 }
 
 void RocksDBStateBackend::set_restore_base(const std::string& dir) {
@@ -663,6 +773,70 @@ void RocksDBStateBackend::set_state_versions(StateVersionMap versions) {
 StateVersionMap RocksDBStateBackend::restored_state_versions() const {
     std::lock_guard lock(impl_->versions_mu);
     return impl_->versions;
+}
+
+// No row moves: each alias points the new id at the column family its state is
+// already in, persisted so later checkpoints and the offline export resolve it
+// too. The version stamps and fingerprints move to the new ids, and the scheme
+// marker is written.
+std::map<OperatorId, std::uint64_t> RocksDBStateBackend::remap_operator_ids(
+    const OperatorIdAliases& aliases, OperatorIdScheme scheme) {
+    std::map<OperatorId, std::uint64_t> moved;
+    {
+        std::lock_guard lock(impl_->buffer_mu_);
+        impl_->flush_write_batch_locked();
+    }
+    {
+        std::unique_lock lk(impl_->cf_mu_);
+        for (const auto& alias : aliases) {
+            if (alias.from == alias.to) {
+                continue;
+            }
+            const auto from = impl_->resolve_locked(alias.from.value());
+            const auto cf = impl_->cfs_.find(from);
+            if (cf == impl_->cfs_.end() || impl_->cfs_.count(alias.to.value()) != 0 ||
+                impl_->aliases_.count(alias.to.value()) != 0) {
+                continue;
+            }
+            impl_->aliases_[alias.to.value()] = from;
+            std::uint64_t keys = 0;
+            impl_->db->GetIntProperty(cf->second, "rocksdb.estimate-num-keys", &keys);
+            moved[alias.to] = keys;
+        }
+        if (impl_->default_cf_ != nullptr) {
+            auto st = impl_->db->Put(keyed_state_write_options(),
+                                     impl_->default_cf_,
+                                     kOperatorAliasesKey,
+                                     pack_operator_aliases(impl_->aliases_));
+            if (!st.ok()) {
+                throw std::runtime_error("RocksDBStateBackend::remap_operator_ids failed: " +
+                                         st.ToString());
+            }
+        }
+    }
+    std::lock_guard lock(impl_->versions_mu);
+    impl_->versions = remap_operators(impl_->versions, aliases);
+    impl_->fingerprints = remap_operators(impl_->fingerprints, aliases);
+    if (impl_->default_cf_ != nullptr) {
+        (void)impl_->db->Put(keyed_state_write_options(),
+                             impl_->default_cf_,
+                             kStateVersionsKey,
+                             impl_->versions.pack());
+        impl_->write_through_fingerprints();
+    }
+    impl_->scheme_ = scheme;
+    impl_->write_operator_id_marker(scheme);
+    return moved;
+}
+
+OperatorIdScheme RocksDBStateBackend::operator_id_scheme() const {
+    std::lock_guard lock(impl_->versions_mu);
+    return impl_->scheme_;
+}
+
+void RocksDBStateBackend::set_operator_identities(const OperatorIdentities& identities) {
+    std::lock_guard lock(impl_->versions_mu);
+    impl_->identities_ = identities;
 }
 
 void RocksDBStateBackend::record_state_fingerprint(OperatorId op,
@@ -880,6 +1054,12 @@ void RocksDBStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg_
         std::lock_guard vlock(impl_->versions_mu);
         impl_->versions = impl_->read_persisted_versions();
         impl_->fingerprints = impl_->read_persisted_fingerprints();
+        impl_->scheme_ = impl_->read_persisted_scheme(OperatorIdScheme::Legacy);
+    }
+    {
+        // And the operator-id aliases an earlier restore recorded in it.
+        std::unique_lock clock(impl_->cf_mu_);
+        impl_->aliases_ = impl_->read_persisted_aliases();
     }
 
     // Scale-down: merge any additional parent checkpoints into the live DB.
@@ -1053,7 +1233,9 @@ std::vector<std::byte> export_cfs_to_arrow(
     const std::vector<std::pair<std::uint64_t, rocksdb::ColumnFamilyHandle*>>& cfs,
     const rocksdb::ReadOptions& read_opts,
     const StateVersionMap& versions,
-    const StateFingerprintMap& fingerprints) {
+    const StateFingerprintMap& fingerprints,
+    OperatorIdScheme scheme,
+    const OperatorIdentities& identities) {
     auto sorted = cfs;
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
         return a.first < b.first;
@@ -1068,7 +1250,7 @@ std::vector<std::byte> export_cfs_to_arrow(
                 op_id, std::string_view(k.data(), k.size()), std::string_view(v.data(), v.size()));
         }
     }
-    return writer.finish(versions, fingerprints);
+    return writer.finish(versions, fingerprints, scheme, identities);
 }
 
 }  // namespace
@@ -1088,20 +1270,27 @@ std::vector<std::byte> RocksDBStateBackend::export_arrow_snapshot() const {
     {
         std::shared_lock lk(impl_->cf_mu_);
         cfs.reserve(impl_->cfs_.size());
+        const auto labels = labels_for(impl_->aliases_);
         for (const auto& [op_id, cf] : impl_->cfs_) {
-            cfs.emplace_back(op_id, cf);
+            const auto label = labels.find(op_id);
+            cfs.emplace_back(label == labels.end() ? op_id : label->second, cf);
         }
     }
     StateVersionMap versions;
     StateFingerprintMap fingerprints;
+    OperatorIdScheme scheme = OperatorIdScheme::Legacy;
+    OperatorIdentities identities;
     {
         std::lock_guard lock(impl_->versions_mu);
         versions = impl_->versions;
         fingerprints = impl_->fingerprints;
+        scheme = impl_->scheme_;
+        identities = impl_->identities_;
     }
     std::vector<std::byte> bytes;
     try {
-        bytes = export_cfs_to_arrow(*impl_->db, cfs, ro, versions, fingerprints);
+        bytes =
+            export_cfs_to_arrow(*impl_->db, cfs, ro, versions, fingerprints, scheme, identities);
     } catch (...) {
         impl_->db->ReleaseSnapshot(snap);
         throw;
@@ -1120,9 +1309,27 @@ std::vector<std::byte> rocksdb_checkpoint_to_arrow(const std::string& checkpoint
     cfs.reserve(handles.size());
     StateVersionMap versions;
     StateFingerprintMap fingerprints;
+    std::unordered_map<std::uint64_t, std::uint64_t> labels;
+    OperatorIdScheme scheme = OperatorIdScheme::Legacy;
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+        if (names[i] == rocksdb::kDefaultColumnFamilyName) {
+            std::string aliases_out;
+            if (db->Get(rocksdb::ReadOptions{}, handles[i], kOperatorAliasesKey, &aliases_out)
+                    .ok()) {
+                labels = labels_for(unpack_operator_aliases(aliases_out));
+            }
+            std::string scheme_out;
+            if (db->Get(rocksdb::ReadOptions{}, handles[i], kOperatorIdSchemeKey, &scheme_out)
+                    .ok() &&
+                scheme_out == kStableOperatorIdSchemeName) {
+                scheme = OperatorIdScheme::Stable;
+            }
+        }
+    }
     for (std::size_t i = 0; i < handles.size(); ++i) {
         if (auto op = op_from_cf_name(names[i])) {
-            cfs.emplace_back(op->value(), handles[i]);
+            const auto label = labels.find(op->value());
+            cfs.emplace_back(label == labels.end() ? op->value() : label->second, handles[i]);
         } else if (names[i] == rocksdb::kDefaultColumnFamilyName) {
             // The checkpoint's persisted stamps ride the default CF.
             std::string out;
@@ -1137,7 +1344,8 @@ std::vector<std::byte> rocksdb_checkpoint_to_arrow(const std::string& checkpoint
     }
     std::vector<std::byte> bytes;
     try {
-        bytes = export_cfs_to_arrow(*db, cfs, rocksdb::ReadOptions{}, versions, fingerprints);
+        bytes = export_cfs_to_arrow(
+            *db, cfs, rocksdb::ReadOptions{}, versions, fingerprints, scheme, {});
     } catch (...) {
         for (auto* h : handles) {
             (void)db->DestroyColumnFamilyHandle(h);

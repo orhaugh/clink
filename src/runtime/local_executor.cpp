@@ -85,6 +85,17 @@ void LocalExecutor::start() {
             dag_.set_memory_budget(config_.memory_budget);
         if (config_.memory_budget && config_.state_backend)
             config_.state_backend->set_memory_budget(config_.memory_budget);
+        // The identities of the operators this subtask runs, which a backend
+        // that writes canonical snapshots records beside their rows.
+        if (config_.state_backend) {
+            OperatorIdentities identities;
+            for (const auto& runner : dag_.runners()) {
+                if (!runner.spec_uid.empty() || !runner.spec_node_id.empty()) {
+                    identities[runner.id] = OperatorIdentity{runner.spec_uid, runner.spec_node_id};
+                }
+            }
+            config_.state_backend->set_operator_identities(identities);
+        }
         // Restore state from snapshot before any operator starts processing.
         if (config_.state_backend && config_.restore_from.has_value()) {
             // FOUND-3: hand the backend the relocated savepoint dir (if any) so it
@@ -104,6 +115,13 @@ void LocalExecutor::start() {
             // the backend's own read finished.
             const auto restore_started = std::chrono::steady_clock::now();
             config_.state_backend->restore(*config_.restore_from, config_.restore_key_group_filter);
+            // State an older build wrote under the operator ids it derived moves
+            // to the ids this build derives, version stamps with it, before the
+            // migration below reads the stamps or any operator reads its state.
+            if (!config_.operator_id_aliases.empty()) {
+                config_.state_backend->remap_operator_ids(config_.operator_id_aliases,
+                                                          kCurrentOperatorIdScheme);
+            }
             // State schema evolution: migrate the restored state up to the
             // versions the live job expects, before any operator reads it.
             // has_path-gated; throws on a missing path (the pre-deploy

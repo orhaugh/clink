@@ -1,14 +1,18 @@
 #include "clink/state/snapshot_arrow_writer.hpp"
 
 #include "clink/runtime/arrow_memory_pool.hpp"
+#include "clink/runtime/key_groups.hpp"
 
 #ifndef CLINK_HAS_ARROW
 #error "clink requires CLINK_BUILD_ARROW=ON. The state-snapshot format is Arrow-IPC-only."
 #endif
 
+#include <cstdio>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
@@ -32,6 +36,56 @@ std::shared_ptr<arrow::Schema> canonical_schema() {
     return schema;
 }
 
+std::string json_string(std::string_view in) {
+    std::string out = "\"";
+    for (const char c : in) {
+        switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    out += '"';
+    return out;
+}
+
+// The clink.operators entry: every operator id with rows, and every operator
+// named by an identity, in id order.
+std::string operators_json(
+    const std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>& per_op,
+    const OperatorIdentities& identities) {
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> all = per_op;
+    for (const auto& [op, _] : identities) {
+        all.try_emplace(op.value());
+    }
+    std::string out = "[";
+    bool first = true;
+    for (const auto& [op, counts] : all) {
+        out += first ? "" : ",";
+        first = false;
+        const auto it = identities.find(OperatorId{op});
+        out += "{\"op_id\":\"" + std::to_string(op) + "\",\"uid\":" +
+               json_string(it == identities.end() ? std::string_view{} : it->second.uid) +
+               ",\"node\":" +
+               json_string(it == identities.end() ? std::string_view{} : it->second.node) +
+               ",\"keyed_rows\":" + std::to_string(counts.first) +
+               ",\"operator_rows\":" + std::to_string(counts.second) + "}";
+    }
+    out += "]";
+    return out;
+}
+
 }  // namespace
 
 struct SnapshotArrowWriter::Impl {
@@ -47,6 +101,9 @@ struct SnapshotArrowWriter::Impl {
     arrow::BinaryBuilder key_b;
     arrow::BinaryBuilder val_b;
     std::int64_t rows{0};
+    // Keyed and operator-state rows appended per operator id, for the
+    // clink.operators entry.
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> per_op;
 };
 
 SnapshotArrowWriter::SnapshotArrowWriter(std::size_t reserve_rows,
@@ -85,10 +142,17 @@ void SnapshotArrowWriter::append(std::uint64_t op_id,
         throw_arrow("append (value)", s);
     }
     ++impl_->rows;
+    auto& counts = impl_->per_op[op_id];
+    const bool keyed =
+        key_bytes.empty() ||
+        static_cast<KeyGroup>(static_cast<std::uint8_t>(key_bytes.front())) < kNumKeyGroups;
+    ++(keyed ? counts.first : counts.second);
 }
 
 std::vector<std::byte> SnapshotArrowWriter::finish(const StateVersionMap& versions,
-                                                   const StateFingerprintMap& fingerprints) {
+                                                   const StateFingerprintMap& fingerprints,
+                                                   OperatorIdScheme scheme,
+                                                   const OperatorIdentities& identities) {
     std::shared_ptr<arrow::Array> op_arr, key_arr, val_arr;
     if (auto s = impl_->op_b.Finish(&op_arr); !s.ok()) {
         throw_arrow("finish (op)", s);
@@ -103,7 +167,15 @@ std::vector<std::byte> SnapshotArrowWriter::finish(const StateVersionMap& versio
     auto schema = canonical_schema();
     {
         auto meta = std::make_shared<arrow::KeyValueMetadata>();
-        meta->Append(kSnapshotFormatVersionKey, kSnapshotFormatVersion);
+        if (scheme == OperatorIdScheme::Stable) {
+            meta->Append(kSnapshotFormatVersionKey, kStableIdSnapshotFormatVersion);
+            meta->Append(kOperatorIdSchemeMetadataKey, kStableOperatorIdSchemeName);
+        } else {
+            meta->Append(kSnapshotFormatVersionKey, kSnapshotFormatVersion);
+        }
+        if (!impl_->per_op.empty() || !identities.empty()) {
+            meta->Append(kOperatorsMetadataKey, operators_json(impl_->per_op, identities));
+        }
         if (!versions.empty()) {
             meta->Append(kStateVersionsMetadataKey, versions.pack());
         }

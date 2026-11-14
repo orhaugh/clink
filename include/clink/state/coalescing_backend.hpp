@@ -76,6 +76,16 @@ public:
     [[nodiscard]] std::vector<CheckpointId> list_checkpoints() const override {
         return inner_->list_checkpoints();
     }
+    std::map<OperatorId, std::uint64_t> remap_operator_ids(const OperatorIdAliases& aliases,
+                                                           OperatorIdScheme scheme) override {
+        return inner_->remap_operator_ids(aliases, scheme);
+    }
+    [[nodiscard]] OperatorIdScheme operator_id_scheme() const override {
+        return inner_->operator_id_scheme();
+    }
+    void set_operator_identities(const OperatorIdentities& identities) override {
+        inner_->set_operator_identities(identities);
+    }
     void set_state_versions(StateVersionMap v) override {
         inner_->set_state_versions(std::move(v));
     }

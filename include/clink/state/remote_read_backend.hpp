@@ -160,7 +160,15 @@ public:
             if (ck == 0) {
                 return std::nullopt;
             }
-            return pool_->read(CheckpointId{ck}, op, key);
+            if (auto v = pool_->read(CheckpointId{ck}, op, key); v.has_value()) {
+                return v;
+            }
+            // A key not yet rewritten since the operator's id changed is still
+            // under its old id in the pool (remap_operator_ids).
+            if (const auto alias = pool_alias_.find(op.value()); alias != pool_alias_.end()) {
+                return pool_->read(CheckpointId{ck}, OperatorId{alias->second}, key);
+            }
+            return std::nullopt;
         };
     }
 
@@ -258,6 +266,13 @@ public:
             auto k = std::make_pair(op.value(), std::string(key));
             dirty_.erase(k);
             deleted_.insert(std::move(k));
+            // The pool may still hold the key under the operator's old id, which
+            // reads fall back to: delete it there too, or it would come back.
+            if (const auto alias = pool_alias_.find(op.value()); alias != pool_alias_.end()) {
+                auto legacy = std::make_pair(alias->second, std::string(key));
+                dirty_.erase(legacy);
+                deleted_.insert(std::move(legacy));
+            }
         }
         forget_hot_(op, key);  // drop from the hot-tier index + byte total
     }
@@ -320,12 +335,27 @@ public:
         // the backend (the base's scan_operator_state contract already
         // warns a visitor must not mutate, but reading is allowed).
         if (ck != 0) {
+            // Entries still under the operator's old id (remap_operator_ids) are
+            // held back and shown only where its new id has no entry.
+            const auto alias = pool_alias_.find(op.value());
+            const std::optional<std::uint64_t> legacy =
+                alias == pool_alias_.end() ? std::nullopt
+                                           : std::optional<std::uint64_t>{alias->second};
+            std::set<std::string> seen;
+            std::vector<Entry> legacy_entries;
             pool_->scan_checkpoint(
                 CheckpointId{ck},
                 [&](OperatorId scanned_op, const std::string& key, const Value& value) {
+                    if (legacy && scanned_op.value() == *legacy) {
+                        if (masked.count(std::make_pair(*legacy, key)) == 0) {
+                            legacy_entries.push_back(Entry{key, value});
+                        }
+                        return;
+                    }
                     if (scanned_op.value() != op.value()) {
                         return;
                     }
+                    seen.insert(key);
                     if (hot_keys.count(key) != 0 ||
                         masked.count(std::make_pair(op.value(), key)) != 0) {
                         return;  // hot value wins / logically erased
@@ -334,6 +364,15 @@ public:
                           std::string_view(reinterpret_cast<const char*>(value.data()),
                                            value.size()));
                 });
+            for (const auto& e : legacy_entries) {
+                if (seen.count(e.key) != 0 || hot_keys.count(e.key) != 0 ||
+                    masked.count(std::make_pair(op.value(), e.key)) != 0) {
+                    continue;
+                }
+                visit(e.key,
+                      std::string_view(reinterpret_cast<const char*>(e.value.data()),
+                                       e.value.size()));
+            }
         }
         for (const auto& e : hot_entries) {
             visit(e.key,
@@ -384,18 +423,44 @@ public:
         }
         SnapshotArrowWriter writer;
         if (ck != 0) {
+            // Entries still under an operator's old id are exported under its
+            // new one, where it has no entry of its own.
+            std::map<std::uint64_t, std::uint64_t> new_of;
+            for (const auto& [to, from] : pool_alias_) {
+                new_of.emplace(from, to);
+            }
+            std::set<std::pair<std::uint64_t, std::string>> seen;
+            std::vector<HotEntryCopy> relabelled;
             pool_->scan_checkpoint(
                 CheckpointId{ck},
                 [&](OperatorId op, const std::string& key, const StateBackend::Value& value) {
                     const auto id = std::make_pair(op.value(), key);
-                    if (hot_keys.count(id) != 0 || masked.count(id) != 0) {
-                        return;  // hot value wins / logically erased
+                    if (masked.count(id) != 0) {
+                        return;  // logically erased
+                    }
+                    if (const auto it = new_of.find(op.value()); it != new_of.end()) {
+                        relabelled.push_back(HotEntryCopy{it->second, key, value});
+                        return;
+                    }
+                    seen.insert(id);
+                    if (hot_keys.count(id) != 0) {
+                        return;  // hot value wins
                     }
                     writer.append(op.value(),
                                   key,
                                   std::string_view(reinterpret_cast<const char*>(value.data()),
                                                    value.size()));
                 });
+            for (const auto& e : relabelled) {
+                const auto id = std::make_pair(e.op, e.key);
+                if (seen.count(id) != 0 || hot_keys.count(id) != 0 || masked.count(id) != 0) {
+                    continue;
+                }
+                writer.append(e.op,
+                              e.key,
+                              std::string_view(reinterpret_cast<const char*>(e.value.data()),
+                                               e.value.size()));
+            }
         }
         for (const auto& e : hot_entries) {
             writer.append(
@@ -403,7 +468,41 @@ public:
                 e.key,
                 std::string_view(reinterpret_cast<const char*>(e.value.data()), e.value.size()));
         }
-        return writer.finish(hot_.restored_state_versions(), hot_.restored_state_fingerprints());
+        return writer.finish(hot_.restored_state_versions(),
+                             hot_.restored_state_fingerprints(),
+                             hot_.operator_id_scheme(),
+                             identities_);
+    }
+
+    // Operator ids. A snapshot that carried its state in bytes was loaded into
+    // the hot tier, which moves it. State in the pool stays where it is, under
+    // each operator's old id: no object is rewritten. Reads of the new id fall
+    // back to the old one, scans and exports fold the old entries in under the
+    // new id, an erase deletes the key under both, and a key written again goes
+    // to the new id, so the old entries thin out as state is rewritten. Every
+    // deploy of the job derives the same aliases from its operators, so the
+    // fallback holds across restores without being recorded anywhere. Called
+    // after restore() and before any runner reads.
+    std::map<OperatorId, std::uint64_t> remap_operator_ids(const OperatorIdAliases& aliases,
+                                                           OperatorIdScheme scheme) override {
+        std::lock_guard<std::mutex> lk(sync_mu_);
+        auto moved = hot_.remap_operator_ids(aliases, scheme);
+        if (pool_) {
+            for (const auto& alias : aliases) {
+                if (alias.from != alias.to) {
+                    pool_alias_[alias.to.value()] = alias.from.value();
+                }
+            }
+        }
+        return moved;
+    }
+    [[nodiscard]] OperatorIdScheme operator_id_scheme() const override {
+        return hot_.operator_id_scheme();
+    }
+    void set_operator_identities(const OperatorIdentities& identities) override {
+        std::lock_guard<std::mutex> lk(sync_mu_);
+        identities_ = identities;
+        hot_.set_operator_identities(identities);
     }
 
     // Version and shape-fingerprint stamps forward to the hot tier, so
@@ -1130,6 +1229,10 @@ private:
     mutable std::size_t hot_bytes_{0};
     mutable std::list<HotEntry> lru_;
     mutable std::unordered_map<std::string, std::list<HotEntry>::iterator> index_;
+    // New operator id -> the old id its state may still be under in the pool
+    // (remap_operator_ids). Written before any runner starts, then only read.
+    std::unordered_map<std::uint64_t, std::uint64_t> pool_alias_;
+    OperatorIdentities identities_;
     mutable std::atomic<std::uint64_t> hot_evictions_{0};
 };
 

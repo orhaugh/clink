@@ -4,9 +4,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace clink {
 
@@ -65,6 +67,35 @@ inline constexpr std::uint64_t stable_operator_id_hash(std::string_view tagged) 
 inline OperatorId stable_operator_id(std::string_view tagged) {
     return OperatorId{stable_operator_id_hash(tagged)};
 }
+
+// Which derivation a body of state's operator ids came from. Legacy ids are
+// std::hash of the id string, as every build derived them until the stable
+// ids (include/clink/core/legacy_operator_ids.hpp computes both libraries'
+// values); Stable ids are stable_operator_id_hash. Snapshots record it, so a
+// restore knows whether the state it reads needs its ids moved.
+enum class OperatorIdScheme : std::uint8_t { Legacy = 1, Stable = 2 };
+
+// The scheme this build derives operator ids in, and so the scheme of state a
+// fresh backend accumulates.
+inline constexpr OperatorIdScheme kCurrentOperatorIdScheme = OperatorIdScheme::Legacy;
+
+// State stored under operator id `from` that belongs to the operator now
+// called `to`: the id an older build derived for an operator, and the id this
+// build derives (include/clink/core/legacy_operator_ids.hpp).
+struct OperatorIdAlias {
+    OperatorId from{};
+    OperatorId to{};
+};
+using OperatorIdAliases = std::vector<OperatorIdAlias>;
+
+// What a snapshot records of each operator whose id it holds, so a reader can
+// name an operator without the job graph that took it: its uid (empty when it
+// has none) and its node id in the job graph.
+struct OperatorIdentity {
+    std::string uid;
+    std::string node;
+};
+using OperatorIdentities = std::map<OperatorId, OperatorIdentity>;
 
 // Derive the stable OperatorId for a user-assigned `.uid("...")`. The
 // runtime (Dag) uses this to key keyed-state and to stamp state-version

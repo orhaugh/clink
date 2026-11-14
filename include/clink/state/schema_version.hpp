@@ -186,6 +186,43 @@ private:
     std::unordered_map<Key, std::uint64_t, KeyHash> entries_;
 };
 
+// The same stamps with each alias's `from` operator renamed to its `to`, a stamp
+// already present under `to` winning. A restore moves state written under an
+// older build's operator ids to this build's (StateBackend::remap_operator_ids),
+// and its stamps move with it, or the migrator would find no stamp for the new
+// id, assume version 1, and migrate state that is already current.
+[[nodiscard]] inline StateVersionMap remap_operators(const StateVersionMap& in,
+                                                     const OperatorIdAliases& aliases) {
+    StateVersionMap out;
+    for (const auto& e : in.entries()) {
+        out.set(e.op_id, e.state_type, e.version, e.slot);
+    }
+    for (const auto& e : in.entries()) {
+        for (const auto& a : aliases) {
+            if (a.from == e.op_id && a.from != a.to && !in.get(a.to, e.state_type).has_value()) {
+                out.set(a.to, e.state_type, e.version, e.slot);
+            }
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] inline StateFingerprintMap remap_operators(const StateFingerprintMap& in,
+                                                         const OperatorIdAliases& aliases) {
+    StateFingerprintMap out;
+    for (const auto& e : in.entries()) {
+        out.set(e.op_id, e.slot, e.fingerprint);
+    }
+    for (const auto& e : in.entries()) {
+        for (const auto& a : aliases) {
+            if (a.from == e.op_id && a.from != a.to && !in.get(a.to, e.slot).has_value()) {
+                out.set(a.to, e.slot, e.fingerprint);
+            }
+        }
+    }
+    return out;
+}
+
 class StateMigrationRegistry {
 public:
     using MigrationFn = std::function<std::vector<std::byte>(std::span<const std::byte> input)>;

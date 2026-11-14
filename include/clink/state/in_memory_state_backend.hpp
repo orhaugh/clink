@@ -238,6 +238,20 @@ public:
         return state_fingerprints_;
     }
 
+    // Operator ids: the scheme of the rows held (set by restore from the
+    // snapshot, and by remap_operator_ids), recorded in every snapshot; and
+    // the identities of the operators the subtask runs, recorded beside them.
+    std::map<OperatorId, std::uint64_t> remap_operator_ids(const OperatorIdAliases& aliases,
+                                                           OperatorIdScheme scheme) override;
+    [[nodiscard]] OperatorIdScheme operator_id_scheme() const override {
+        std::lock_guard lock(mu_);
+        return id_scheme_;
+    }
+    void set_operator_identities(const OperatorIdentities& identities) override {
+        std::lock_guard lock(mu_);
+        identities_ = identities;
+    }
+
     std::string description() const override { return "in-memory state backend"; }
 
     // Enumerate OperatorIds that currently have any keyed entries. Cheap
@@ -340,6 +354,8 @@ private:
     std::map<std::uint64_t, std::unordered_map<OperatorId, PerOp>> staged_;
     StateVersionMap state_versions_;
     StateFingerprintMap state_fingerprints_;
+    OperatorIdScheme id_scheme_{kCurrentOperatorIdScheme};
+    OperatorIdentities identities_;
     // Set at snapshot(). Atomic and outside mu_ so the worker's heartbeat thread
     // can read it while an operator thread is mutating state, which is the whole
     // point of sampling a snapshot size rather than measuring live state.

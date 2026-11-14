@@ -1,7 +1,9 @@
 #pragma once
 
 #include <coroutine>
+#include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -403,6 +405,71 @@ public:
         throw std::runtime_error("live state export not supported by this backend (" +
                                  description() + "); export from a checkpoint instead");
     }
+
+    // Operator ids. State is keyed by the id of the operator that wrote it, and
+    // the ids a build derives changed (types.hpp: OperatorIdScheme). After a
+    // restore, LocalExecutor moves the state written under each alias's `from`
+    // id to its `to` id, version stamps and fingerprints with it, and the
+    // backend then records its state as keyed by `scheme`. A row already
+    // present under `to` wins over the one under `from`. Returns the rows moved,
+    // per target id.
+    //
+    // The default walks the backend: it collects each alias's keys with scan
+    // (keys only, so the walk holds one operator's keys, not its values), then
+    // moves each value with get, put and erase, which any backend supports; and
+    // it moves the version stamps through restored_state_versions and
+    // set_state_versions. Backends that can do better override it: the in-memory
+    // family rekeys its map, the RocksDB family records an alias so the stable
+    // id reaches the existing column family.
+    virtual std::map<OperatorId, std::uint64_t> remap_operator_ids(const OperatorIdAliases& aliases,
+                                                                   OperatorIdScheme scheme) {
+        (void)scheme;
+        std::map<OperatorId, std::uint64_t> moved;
+        bool versions_moved = false;
+        StateVersionMap versions = restored_state_versions();
+        for (const auto& alias : aliases) {
+            if (alias.from == alias.to) {
+                continue;
+            }
+            std::vector<std::string> keys;
+            scan(alias.from, [&](KeyView key, ValueView) { keys.emplace_back(key); });
+            for (const auto& key : keys) {
+                if (!get(alias.to, key).has_value()) {
+                    if (auto value = get(alias.from, key); value.has_value()) {
+                        put(alias.to,
+                            key,
+                            ValueView{reinterpret_cast<const char*>(value->data()), value->size()});
+                    }
+                }
+                erase(alias.from, key);
+            }
+            if (!keys.empty()) {
+                moved[alias.to] += keys.size();
+            }
+            for (const auto& e : versions.entries()) {
+                if (e.op_id == alias.from && !versions.get(alias.to, e.state_type).has_value()) {
+                    versions.set(alias.to, e.state_type, e.version, e.slot);
+                    versions_moved = true;
+                }
+            }
+        }
+        if (versions_moved) {
+            set_state_versions(std::move(versions));
+        }
+        return moved;
+    }
+
+    // The scheme the state this backend holds is keyed by. The default does not
+    // track it and answers Legacy; the backends that write canonical snapshots
+    // track it and record it in every snapshot.
+    [[nodiscard]] virtual OperatorIdScheme operator_id_scheme() const {
+        return OperatorIdScheme::Legacy;
+    }
+
+    // The identities of the operators the subtask runs, which a backend that
+    // writes canonical snapshots records beside the rows (`clink.operators`).
+    // LocalExecutor sets them before the job starts. The default ignores them.
+    virtual void set_operator_identities(const OperatorIdentities& /*identities*/) {}
 
     // FOUND-3 (relocatable savepoints): tell the backend where the savepoint's
     // artefacts now live, so restore() can rebase references that embed a

@@ -113,7 +113,7 @@ std::vector<std::byte> InMemoryStateBackend::export_arrow_snapshot() const {
                           std::string_view(reinterpret_cast<const char*>(v.data()), v.size()));
         }
     }
-    return writer.finish(state_versions_, state_fingerprints_);
+    return writer.finish(state_versions_, state_fingerprints_, id_scheme_, identities_);
 }
 
 Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
@@ -171,7 +171,7 @@ Snapshot InMemoryStateBackend::snapshot(CheckpointId id) {
                 }
             }
         }
-        bytes = writer.finish(state_versions_, state_fingerprints_);
+        bytes = writer.finish(state_versions_, state_fingerprints_, id_scheme_, identities_);
         // Consume: this id's staging is used up, and anything at or below it
         // (aborted or superseded checkpoints) will never be asked for again.
         staged_.erase(staged_.begin(), staged_.upper_bound(id.value()));
@@ -199,6 +199,7 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
     memory_.clear();
     state_versions_.clear();
     state_fingerprints_.clear();
+    id_scheme_ = kCurrentOperatorIdScheme;
     // Staged rows belong to the incarnation that staged them; a restored
     // instance must not let them substitute into its own checkpoints.
     staged_.clear();
@@ -221,6 +222,8 @@ void InMemoryStateBackend::restore(const Snapshot& snap, const KeyGroupRange& kg
         throw_arrow("restore (open reader)", reader_result.status());
     auto reader = *reader_result;
     verify_snapshot_format_version(reader->schema()->metadata(), "InMemoryStateBackend restore");
+    id_scheme_ =
+        snapshot_operator_id_scheme(reader->schema()->metadata(), "InMemoryStateBackend restore");
 
     // Validate schema matches what we wrote. The stream reader gives us
     // the schema for free; a mismatch means someone tried to restore
@@ -568,6 +571,48 @@ std::vector<std::byte> InMemoryStateBackend::drop_keyed_state_of(
         snapshot_bytes,
         [&](std::uint64_t op, bool keyed) { return !keyed || operators.count(op) == 0; },
         "drop_keyed_state_of");
+}
+
+std::map<OperatorId, std::uint64_t> InMemoryStateBackend::remap_operator_ids(
+    const OperatorIdAliases& aliases, OperatorIdScheme scheme) {
+    std::lock_guard lock(mu_);
+    std::map<OperatorId, std::uint64_t> moved;
+    for (const auto& alias : aliases) {
+        if (alias.from == alias.to) {
+            continue;
+        }
+        auto it = state_.find(alias.from);
+        if (it == state_.end()) {
+            continue;
+        }
+        PerOp rows = std::move(it->second);
+        state_.erase(it);
+        auto& dst = state_[alias.to];
+        std::uint64_t n = 0;
+        for (auto& [key, value] : rows) {
+            ++n;
+            const bool kept = dst.find(key) == dst.end();
+            if (memory_.enabled()) {
+                memory_.erase(memory_key_(alias.from, key));
+                if (kept) {
+                    memory_.update(memory_key_(alias.to, key),
+                                   key.size() + value.size() + sizeof(std::string) + sizeof(Value) +
+                                       4 * sizeof(void*));
+                }
+            }
+            if (kept) {
+                dst.emplace(key, std::move(value));
+            }
+        }
+        if (dst.empty()) {
+            state_.erase(alias.to);
+        }
+        moved[alias.to] += n;
+    }
+    state_versions_ = remap_operators(state_versions_, aliases);
+    state_fingerprints_ = remap_operators(state_fingerprints_, aliases);
+    id_scheme_ = scheme;
+    return moved;
 }
 
 std::map<std::uint64_t, std::uint64_t> InMemoryStateBackend::keyed_rows_by_operator(

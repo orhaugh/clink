@@ -987,3 +987,98 @@ TEST(ForStStateBackend, DeferredReadsCarryHotPathStateThroughRealRunner) {
     EXPECT_EQ(backend->deferred_reads(), input.size())
         << "every record's state read must ride the IO pool";
 }
+// A restore that moves an operator to a new id rewrites nothing: the new id is
+// pointed at the column family the state is already in, and the alias is kept
+// in the database, so a checkpoint taken after it restores under the new id and
+// the offline export reports the state under it.
+TEST(ForStStateBackend, AMovedOperatorIdReachesItsColumnFamilyThroughAnAlias) {
+    const auto base_dir = std::filesystem::temp_directory_path() / "clink_forst_remap";
+    std::filesystem::remove_all(base_dir);
+    std::filesystem::create_directories(base_dir);
+    const OperatorId old_id{1001};
+    const OperatorId new_id{2002};
+    const auto db_path = base_dir / "db";
+    {
+        ForStStateBackend backend(
+            ForStStateBackend::Options{.path = db_path.string(), .create_if_missing = true});
+        backend.put(old_id,
+                    sv(std::string{"\x03"
+                                   "a",
+                                   2}),
+                    sv(std::string{"A"}));
+        StateVersionMap versions;
+        versions.set(old_id, "window", 4, "w");
+        backend.set_state_versions(versions);
+        (void)backend.snapshot(CheckpointId{1});
+    }
+    const auto as_snapshot = [](const std::string& path, std::uint64_t id) {
+        Snapshot snap;
+        snap.checkpoint_id = CheckpointId{id};
+        snap.bytes.assign(reinterpret_cast<const std::byte*>(path.data()),
+                          reinterpret_cast<const std::byte*>(path.data() + path.size()));
+        return snap;
+    };
+    const auto moved_path = base_dir / "moved";
+    {
+        ForStStateBackend moved(
+            ForStStateBackend::Options{.path = moved_path.string(), .create_if_missing = true});
+        moved.restore(as_snapshot(db_path.string() + ".cp-1", 1));
+        EXPECT_EQ(moved.operator_id_scheme(), OperatorIdScheme::Legacy);
+        moved.remap_operator_ids({OperatorIdAlias{old_id, new_id}}, OperatorIdScheme::Stable);
+        ASSERT_TRUE(moved
+                        .get(new_id,
+                             sv(std::string{"\x03"
+                                            "a",
+                                            2}))
+                        .has_value());
+        EXPECT_EQ(to_string(*moved.get(new_id,
+                                       sv(std::string{"\x03"
+                                                      "a",
+                                                      2}))),
+                  "A");
+        moved.put(new_id,
+                  sv(std::string{"\x03"
+                                 "b",
+                                 2}),
+                  sv(std::string{"B"}));
+        EXPECT_EQ(moved.restored_state_versions().get(new_id, "window"), 4U);
+        (void)moved.snapshot(CheckpointId{2});
+    }
+    // A restore of the later checkpoint reaches both keys under the new id
+    // without being told the alias again.
+    ForStStateBackend again(ForStStateBackend::Options{.path = (base_dir / "again").string(),
+                                                       .create_if_missing = true});
+    const auto cp2 = moved_path.string() + ".cp-2";
+    again.restore(as_snapshot(cp2, 2));
+    EXPECT_EQ(again.operator_id_scheme(), OperatorIdScheme::Stable);
+    ASSERT_TRUE(again
+                    .get(new_id,
+                         sv(std::string{"\x03"
+                                        "a",
+                                        2}))
+                    .has_value());
+    ASSERT_TRUE(again
+                    .get(new_id,
+                         sv(std::string{"\x03"
+                                        "b",
+                                        2}))
+                    .has_value());
+
+    // The offline export names the state by the new id.
+    InMemoryStateBackend exported;
+    exported.restore(Snapshot{CheckpointId{2}, forst_checkpoint_to_arrow(cp2)});
+    EXPECT_TRUE(exported
+                    .get(new_id,
+                         sv(std::string{"\x03"
+                                        "a",
+                                        2}))
+                    .has_value());
+    EXPECT_FALSE(exported
+                     .get(old_id,
+                          sv(std::string{"\x03"
+                                         "a",
+                                         2}))
+                     .has_value());
+    EXPECT_EQ(exported.operator_id_scheme(), OperatorIdScheme::Stable);
+    std::filesystem::remove_all(base_dir);
+}

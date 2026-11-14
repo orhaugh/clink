@@ -147,6 +147,26 @@ public:
     // key), so a restore that replays a materialisation recovers them.
     // A restore of a log-only snapshot (no materialisation yet) has no
     // stamps to recover, matching a fresh backend.
+    // The moves go through this backend's own put and erase (the default walk),
+    // so the log records them: a restore replays the log over a materialisation
+    // that may still hold the old ids, and an erase of a moved key that was not
+    // logged against the old id would bring the old value back. The inner
+    // backend's own remap then finds no rows left to move, and moves the version
+    // stamps and fingerprints and records the scheme, which its materialisations
+    // carry.
+    std::map<OperatorId, std::uint64_t> remap_operator_ids(const OperatorIdAliases& aliases,
+                                                           OperatorIdScheme scheme) override {
+        auto moved = StateBackend::remap_operator_ids(aliases, scheme);
+        inner_->remap_operator_ids(aliases, scheme);
+        return moved;
+    }
+    [[nodiscard]] OperatorIdScheme operator_id_scheme() const override {
+        return inner_->operator_id_scheme();
+    }
+    void set_operator_identities(const OperatorIdentities& identities) override {
+        inner_->set_operator_identities(identities);
+    }
+
     void set_state_versions(StateVersionMap versions) override {
         inner_->set_state_versions(std::move(versions));
     }

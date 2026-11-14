@@ -140,6 +140,27 @@ public:
         }
     }
 
+    // Every shard holds a share of each operator's keys, so a remap moves each
+    // shard's share; identities and the scheme are the same in every shard.
+    std::map<OperatorId, std::uint64_t> remap_operator_ids(const OperatorIdAliases& aliases,
+                                                           OperatorIdScheme scheme) override {
+        std::map<OperatorId, std::uint64_t> moved;
+        for (auto& shard : shards_) {
+            for (const auto& [op, n] : shard.remap_operator_ids(aliases, scheme)) {
+                moved[op] += n;
+            }
+        }
+        return moved;
+    }
+    [[nodiscard]] OperatorIdScheme operator_id_scheme() const override {
+        return shards_.front().operator_id_scheme();
+    }
+    void set_operator_identities(const OperatorIdentities& identities) override {
+        for (auto& shard : shards_) {
+            shard.set_operator_identities(identities);
+        }
+    }
+
     std::string description() const override {
         return "sharded in-memory state backend (" + std::to_string(kNumShards) + " shards)";
     }

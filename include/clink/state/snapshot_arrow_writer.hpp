@@ -60,7 +60,28 @@ inline constexpr char kSnapshotFormatVersion[] = "1";
 // version would MISREAD - never for one it would merely miss. Adding a
 // metadata key or a derived projection is a compatible change and must
 // not bump either.
-inline constexpr std::uint32_t kMaxReadableSnapshotFormatVersion = 1;
+inline constexpr std::uint32_t kMaxReadableSnapshotFormatVersion = 2;
+
+// Format version 2 is version 1 with its op_id column in the stable operator id
+// scheme (types.hpp: OperatorIdScheme). The column shape is the same, but a
+// version-1 reader would take the ids for ones it derives itself and drop or
+// misattribute every row, which is exactly the misreading a version bump is for:
+// such a reader refuses the stream instead. A writer stamps 2 only for state
+// whose ids are stable, and 1 (kSnapshotFormatVersion) for legacy state.
+inline constexpr char kStableIdSnapshotFormatVersion[] = "2";
+
+// Schema-metadata key naming the operator id scheme of a version-2 stream, and
+// the one scheme defined: FNV-1a 64 over the tagged id string.
+inline constexpr char kOperatorIdSchemeMetadataKey[] = "clink.operator_id_scheme";
+inline constexpr char kStableOperatorIdSchemeName[] = "fnv1a-1";
+
+// Schema-metadata key carrying the operators a stream holds state for, as a
+// JSON array: one object per operator id present in the rows or recorded as an
+// identity, {"op_id": "<decimal>", "uid": "...", "node": "...",
+// "keyed_rows": N, "operator_rows": N}. Additive: readers that do not know it
+// ignore it. A restore and the dataset tools read it to name an operator
+// without the job graph that took the stream.
+inline constexpr char kOperatorsMetadataKey[] = "clink.operators";
 
 // Enforce the format version on a snapshot about to be read.
 //
@@ -117,6 +138,28 @@ inline void verify_snapshot_format_version(
     }
 }
 
+// The operator id scheme of a stream, from its metadata: Legacy for version 1
+// (and for a stream with no version marker), Stable for version 2, which must
+// name the stable scheme. Call after verify_snapshot_format_version.
+[[nodiscard]] inline OperatorIdScheme snapshot_operator_id_scheme(
+    const std::shared_ptr<const arrow::KeyValueMetadata>& metadata, std::string_view context) {
+    if (!metadata) {
+        return OperatorIdScheme::Legacy;
+    }
+    const auto version_idx = metadata->FindKey(kSnapshotFormatVersionKey);
+    if (version_idx == -1 || metadata->value(version_idx) != kStableIdSnapshotFormatVersion) {
+        return OperatorIdScheme::Legacy;
+    }
+    const auto scheme_idx = metadata->FindKey(kOperatorIdSchemeMetadataKey);
+    if (scheme_idx == -1 || metadata->value(scheme_idx) != kStableOperatorIdSchemeName) {
+        throw clink::state::RestoreRefused(
+            std::string(context) +
+            ": snapshot is format version 2 but names no operator id scheme this build knows ('" +
+            (scheme_idx == -1 ? std::string{} : metadata->value(scheme_idx)) + "')");
+    }
+    return OperatorIdScheme::Stable;
+}
+
 class SnapshotArrowWriter {
 public:
     // `reserve_rows` pre-sizes the column builders (0 = grow on demand).
@@ -133,9 +176,15 @@ public:
 
     // Build the complete IPC stream. A non-empty versions map is embedded
     // in the schema metadata; an empty one leaves the schema bare (the
-    // reader treats absence as "no stamps recorded"). Call once.
+    // reader treats absence as "no stamps recorded"). `scheme` is the
+    // operator id scheme of the rows appended: Stable stamps format version 2
+    // and the scheme, Legacy version 1. `identities` name the operators;
+    // with the per-operator row counts the appends accumulate they make the
+    // `clink.operators` entry. Call once.
     std::vector<std::byte> finish(const StateVersionMap& versions = {},
-                                  const StateFingerprintMap& fingerprints = {});
+                                  const StateFingerprintMap& fingerprints = {},
+                                  OperatorIdScheme scheme = OperatorIdScheme::Legacy,
+                                  const OperatorIdentities& identities = {});
 
 private:
     struct Impl;

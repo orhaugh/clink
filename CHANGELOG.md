@@ -24,6 +24,24 @@ tested on macOS arm64 and Linux aarch64, and built and tested in CI on Linux
 x86_64, whose toolchain image installs the library. The runtime image builds
 it in. See `docs/connectors/relate.md`.
 
+**Snapshots name their operators and the scheme of their operator ids, and
+every backend can move restored state to new ids.** Each canonical snapshot
+now carries `clink.operators`, a JSON list of the operator ids it holds rows
+for, each with the uid and graph node id of the operator that ran under it and
+its keyed and operator-state row counts, so a reader can name an operator
+without the job graph that took the snapshot. Readers accept snapshot format
+version 2: version 1 with its `op_id` column in the stable operator id scheme,
+named by `clink.operator_id_scheme`, which a reader that knows only version 1
+refuses rather than misattribute every row. `StateBackend` gains
+`remap_operator_ids`, which `LocalExecutor` calls after a restore to move state
+written under one operator id to another (`JobConfig::operator_id_aliases`),
+version stamps and fingerprints with it: the in-memory family rekeys its map,
+RocksDB and ForSt record an alias to the existing column family, the changelog
+logs the move, remote-read reads its pool through the alias, and any other
+backend is walked with scan, get, put and erase. These prepare the switch to
+operator ids that are the same on every platform; this build still derives and
+writes the ids it did, so nothing moves yet.
+
 **A chained operator with a uid keeps its timers across a restore.** The
 cluster's chain dispatcher, and the in-process `LocalSubmitter`, stamped an
 operator's uid on its runner after the builder had added the operator, and

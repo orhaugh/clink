@@ -137,6 +137,7 @@ add_executable(clink_core_tests
     test_wire_protocol.cpp
     test_job_graph.cpp
     test_operator_ids.cpp
+    test_operator_id_remap.cpp
     test_lineage.cpp
     test_openlineage_config.cpp
     test_job_planner.cpp

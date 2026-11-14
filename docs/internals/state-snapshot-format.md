@@ -26,7 +26,9 @@ The schema's `KeyValueMetadata` carries:
 
 | Key | Value | Presence |
 | --- | --- | --- |
-| `clink.format_version` | `"1"` | Stamped on every stream the writer produces. A reader MUST treat absence as version 1 (streams written before the marker existed). |
+| `clink.format_version` | `"1"` or `"2"` | Stamped on every stream the writer produces. A reader MUST treat absence as version 1 (streams written before the marker existed). Version 2 is version 1 with its `op_id` column in the stable operator id scheme (below). |
+| `clink.operator_id_scheme` | `"fnv1a-1"` | Present on every version-2 stream, naming the scheme of its operator ids: FNV-1a 64 over the tagged id string (`stable_operator_id_hash`, `include/clink/core/types.hpp`). A version-2 stream without it, or naming another scheme, is refused. Version-1 streams carry the ids builds derived before, `std::hash` of the id string, which differs between libc++ and libstdc++ (`include/clink/core/legacy_operator_ids.hpp`). |
+| `clink.operators` | JSON array | One object per operator id present in the rows or recorded as an identity: `{"op_id": "<decimal>", "uid": "...", "node": "...", "keyed_rows": N, "operator_rows": N}`, the uid and graph node id the subtask's runners carried (`StateBackend::set_operator_identities`, set by `LocalExecutor`) and the rows each id holds. Names an operator without the job graph that took the stream. Absent on older streams. |
 | `clink.state_versions` | packed `StateVersionMap` | Present when the job registered schema-evolution stamps; absent means "no stamps recorded" (the control plane then assumes version 1 per state type). |
 | `clink.state_fingerprints` | packed `StateFingerprintMap` (`<op>\|<slot>\|<fp-hex>` lines) | Shape fingerprints of described types, stamped at KeyedState bind. Absent on older snapshots and for undescribed types; absence gates nothing. A stored fingerprint differing from the live type's with no schema-version bump refuses the restore at bind. |
 
@@ -91,7 +93,7 @@ Three derived layouts exist for analytics; they decode `key_bytes` into columns 
 
 ## Stability and evolution policy
 
-Version 1 (current) guarantees:
+Versions 1 and 2 guarantee:
 
 1. The three-column shape, column names, types and non-nullability are stable.
 2. The `key_bytes` layout (kg byte, slot, `'|'`, user key; `0xFF` operator-state prefix; 128 key groups) is stable.
@@ -99,6 +101,8 @@ Version 1 (current) guarantees:
 4. Metadata is open for additive extension; readers ignore unknown keys.
 
 A change that any version-1 reader would misread (column changes, key-layout changes, container changes) bumps `clink.format_version`, and readers reject a version above the highest they know rather than guess. Absence of the marker always reads as version 1. Compatible changes (new metadata keys, new derived projections, new writers) do not bump the version.
+
+Version 2 is such a change without a new column shape: the same three columns, with every `op_id` in the stable scheme. A reader that knows only version 1 would take those ids for the ones it derives itself, misattribute or drop every row, and so refuses the stream, which is what makes a rollback after the switch refuse loudly instead of starting operators empty. A writer stamps the version of the state it holds, not of the build: a backend tracks the scheme of its rows (`StateBackend::operator_id_scheme`), legacy after restoring a version-1 stream, stable once a restore has moved its rows to the stable ids (`StateBackend::remap_operator_ids`) or when it started empty under a build that derives stable ids.
 
 That rejection is `verify_snapshot_format_version` (`include/clink/state/snapshot_arrow_writer.hpp`), called at every read site: the three `InMemoryStateBackend` paths, changelog restore, state migration, and canonicalisation. `kMaxReadableSnapshotFormatVersion` is the ceiling and is bumped alongside `kSnapshotFormatVersion`. The parse is strict - the value must be a plain decimal number, so a stream carrying `" 1"` or `"1.0"` is treated as corrupt rather than leniently read as version 1.
 
