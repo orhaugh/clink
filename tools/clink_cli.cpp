@@ -19,9 +19,9 @@
 #include "clink/plugin/plugin.hpp"
 #ifdef CLINK_CLI_HAS_SQL
 #include "clink/sql/install.hpp"
+#endif
 #ifdef CLINK_LINKED_ROCKSDB
 #include "clink/state/rocksdb_state_backend.hpp"
-#endif
 #endif
 
 // Subcommand entry points. Each lives in its own .cpp under tools/.
