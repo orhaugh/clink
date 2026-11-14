@@ -60,6 +60,18 @@ inline bool has_arg(int argc, char** argv, std::string_view flag) {
     return false;
 }
 
+// Was the bare switch `--<flag>` given? For the boolean flags that take no
+// value.
+inline bool has_switch(int argc, char** argv, std::string_view flag) {
+    const std::string needle = "--" + std::string{flag};
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view{argv[i]} == needle) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Translate --state-backend=<scheme>[:<path>] into a checkpoint-dir
 // URI compatible with the StateBackendFactory. Returns the composed
 // URI, or std::nullopt + writes to stderr on unknown schemes.
@@ -130,6 +142,9 @@ inline cluster::CheckpointConfig build_checkpoint_config(int argc,
     c.restore_from_dir = get_arg(argc, argv, "restore-from-dir", "");
     c.restore_from_checkpoint_id = static_cast<std::uint64_t>(
         std::stoull(get_arg(argc, argv, "restore-from-checkpoint-id", "0")));
+    // A restore refuses keyed state of operators the restored job does not run;
+    // this drops it instead.
+    c.allow_unrestored_state = has_switch(argc, argv, "allow-unrestored-state");
     // "auto" rather than "0", which is what this defaulted to and why the
     // documented recovery default never applied.
     //

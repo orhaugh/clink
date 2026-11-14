@@ -207,6 +207,10 @@ struct RunnerContext {
     std::uint32_t restore_from_subtask_idx{kRestoreFromSelf};
     std::uint32_t restore_from_parent_count{1};
     KeyGroupRange restore_key_group_filter{};
+    // The restore drops the keyed state of operators the subtask does not run
+    // instead of refusing (DeployMsg::allow_unrestored_state, from the submit's
+    // --allow-unrestored-state). StateBackendSpec::allow_unrestored_state.
+    bool allow_unrestored_state{false};
     // The previous run's subtasks (per-operator indices) this subtask
     // succeeds, with the topology generations; unset on in-process paths.
     std::optional<RestoreSuccession> restore_succession;

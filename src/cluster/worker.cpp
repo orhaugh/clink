@@ -1848,6 +1848,7 @@ void Worker::handle_deploy_(MessageReader& r) {
             .capture_dir = msg.capture_dir,
             .capture_records = msg.capture_records,
             .run_checkpoint_floor = msg.run_checkpoint_floor,
+            .allow_unrestored_state = msg.allow_unrestored_state,
         };
     }
     for (auto& task : msg.tasks) {
@@ -2255,6 +2256,8 @@ void Worker::run_generic_subtask_(JobId job_id,
     // The run's checkpoint-id floor, for the 2PC sinks' receipts (unset when the
     // coordinator sent none).
     std::optional<std::uint64_t> run_checkpoint_floor;
+    // Whether a restore drops keyed state no operator here reads (from the Deploy).
+    bool allow_unrestored_state = false;
     {
         std::lock_guard lock(mu_);
         auto it = per_job_bundle_.find(job_id);
@@ -2271,6 +2274,7 @@ void Worker::run_generic_subtask_(JobId job_id,
             capture_dir = ck->second.capture_dir;
             capture_records = ck->second.capture_records;
             run_checkpoint_floor = ck->second.run_checkpoint_floor;
+            allow_unrestored_state = ck->second.allow_unrestored_state;
         }
     }
     const auto& bundle_tr = *job_tr;
@@ -2844,6 +2848,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .restore_from_subtask_idx = rescale_parent_idx,
                 .restore_from_parent_count = rescale_parent_count,
                 .restore_key_group_filter = kg_filter,
+                .allow_unrestored_state = allow_unrestored_state,
                 .restore_succession = succession_for(
                     task, chain.subtask_idx_in_op, generation, restore_from_generation),
                 .on_checkpoint_ack = std::move(ack_cb),
@@ -3306,6 +3311,7 @@ void Worker::run_generic_subtask_(JobId job_id,
             .restore_from_parent_count =
                 task.restore_from_parent_count == 0 ? 1 : task.restore_from_parent_count,
             .restore_key_group_filter = {},
+            .allow_unrestored_state = allow_unrestored_state,
             .restore_succession =
                 succession_for(task, chain.subtask_idx_in_op, generation, restore_from_generation),
             // Wire the checkpoint-ack callback so chained subtasks report

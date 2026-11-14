@@ -67,7 +67,7 @@ The evidence is verified before anything runs. Each build then gets a scratch co
 | `builds.capabilities` | yes | both builds report what the definition requires; a capability not reported is `unsupported` |
 | `evidence.readable` | yes | the tools build verifies the dataset against its digest and every row decodes in the job's documented encodings |
 | `schema.candidate` | yes | the candidate's own `clink check-savepoint --expected=<its job>` accepts every snapshot |
-| `restore.baseline`, `restore.candidate` | yes | the build accepted the restore, and its restored savepoint holds the evidence's state logically, every operator that holds state present under the same id and uid |
+| `restore.baseline`, `restore.candidate` | yes | the build accepted the restore, the restored job deployed without failing, and its restored savepoint holds the evidence's state logically, every operator that holds state present under the same id and uid |
 | `recovery.baseline`, `recovery.candidate` | yes | the continuation ran to `END` with a checkpoint after the restored savepoint |
 | `behaviour.output` | yes | the candidate's continuation rows equal the baseline's |
 | `behaviour.state` | yes | the candidate's final logical state equals the baseline's |
@@ -97,11 +97,11 @@ A run is bounded by `--run-timeout-s`, the resident memory of its processes (`--
 
 The result is compatibility of this candidate for this job, this evidence and this configuration. It is not a claim that every job, every operator or every checkpoint upgrades, and the input is synthetic. It covers the file state backend on one Worker; other backends, rescales across the upgrade, SQL jobs and external connectors are outside the contract. It runs no migration: a candidate whose state needs one is refused by the engine, and the report says so. Replay determinism is not checked for this job.
 
-The workflow found these in the engine, each reproduced by a variant of the job in the example; the first two are fixed:
+The workflow found these in the engine, each reproduced by a variant of the job in the example; all three are fixed:
 
 - **The fluent API's stateful operators kept their state in memory.** Every fluent window aggregate but the tumbling emit form with a type registered on the job's registry, the evicting window and `reduce` held their state in memory only, so a restore, an ordinary failover included, started open windows and reduced values empty without a warning. The documented cluster job example's `aggregate<std::int64_t>` was one of them. Fixed in this release: each finds a codec for a built-in, registered or described type and keeps its state where a checkpoint holds it, and a type with none is refused in a job that takes checkpoints. Variant `memory_windows` now passes.
 - **A restore dropped event-time timers keyed in another encoding than their keyed state.** Every keyed subtask was given its own key-group range as its restore filter, so a restore at the same parallelism routed its timers by the key group of their key's bytes, as a rescale does: a timer keyed as `std::to_string(key)` over an int64 key, as the `KeyedProcessFunction` example keys them, landed outside its subtask's range for about half the keys at parallelism 2 and was dropped. Fixed in this release: a restore that keeps the layout keeps every timer, and takes none from its peers. Variant `string_timer_keys` now passes.
-- **A restore does not refuse state whose operator is not in the new job.** A changed or missing uid leaves the old operator's state in every later checkpoint, read by nothing. Variants `uid_changed` and `uid_missing`; the gate's `restore.candidate` names the operator.
+- **A restore did not refuse state whose operator is not in the new job.** A changed or missing uid gives the operator a new id, so it started empty while the old operator's state rode along in every later checkpoint, read by nothing. Fixed in this release for keyed state: a restoring subtask refuses keyed rows of an operator it does not run, naming the operator, unless the submit passes `--allow-unrestored-state` to drop them (see [fault tolerance](fault-tolerance-and-rescale.md)). Variants `uid_changed` and `uid_missing` are now refused by the candidate as its job deploys, with no output written. An operator that held only operator state is still not caught.
 
 ## The example and the gate
 

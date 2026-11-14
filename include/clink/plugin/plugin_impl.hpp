@@ -236,6 +236,7 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     spec.restore_from_subtask_idx = rctx.restore_from_subtask_idx;
     spec.restore_from_parent_count = rctx.restore_from_parent_count;
     spec.hosted_operators = std::move(hosted_operators);
+    spec.allow_unrestored_state = rctx.allow_unrestored_state;
     // Build through the HOST's factory when provided (rctx.state_backend_factory):
     // a dlopen'd plugin's .so-local StateBackendFactory singleton only has the
     // ctor builtins (memory/file/changelog), NOT the dynamically-registered

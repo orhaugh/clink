@@ -274,10 +274,14 @@ def scenarios(q):
         ("schema", "schema", {"schema.candidate": "failed", "restore.candidate": "failed",
                               "recovery.candidate": "unavailable"},
          (("restore.candidate", "before running anything"), ("restore.candidate", "no migration path"))),
-        ("uid-changed", "uid_changed", {"restore.candidate": "failed", "reference.candidate": "failed"},
-         (("restore.candidate", "not in the restored job"),)),
-        ("uid-missing", "uid_missing", {"restore.candidate": "failed"},
-         (("restore.candidate", "not in the restored job"),)),
+        # The window's state sits under its old id. The engine now refuses the
+        # restore on the Worker, naming the operator, so the candidate writes
+        # nothing and recovery cannot run.
+        ("uid-changed", "uid_changed", {"restore.candidate": "failed", "recovery.candidate": "unavailable"},
+         (("restore.candidate", "restored job failed"), ("restore.candidate", "does not run"),
+          ("restore.candidate", "--allow-unrestored-state"))),
+        ("uid-missing", "uid_missing", {"restore.candidate": "failed", "recovery.candidate": "unavailable"},
+         (("restore.candidate", "restored job failed"), ("restore.candidate", "does not run"))),
         ("crash-restore", "crash_restore", {"restore.candidate": "failed", "recovery.candidate": "unavailable"},
          (("restore.candidate", "SIGKILL"),)),
         ("crash-continue", "crash_continue", {"restore.candidate": "passed", "recovery.candidate": "failed"},
@@ -289,7 +293,7 @@ def scenarios(q):
         print("%s: candidate %s" % (name, v))
         code, r, out = q.check(name, evidence_head(), H, variant(v))
         q.outcome(name, code, r, 1, want, reasons)
-        if name == "schema":
+        if name in ("schema", "uid-changed", "uid-missing"):
             produced = os.path.join(out, "runs", "candidate", "cluster", "out")
             files = [f for f in os.listdir(produced) if os.path.getsize(os.path.join(produced, f))] \
                 if os.path.isdir(produced) else []

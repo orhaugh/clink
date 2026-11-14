@@ -169,6 +169,21 @@ TEST(ConfigLint, ACaptureBoundWithNoCaptureDirectoryIsRefused) {
     EXPECT_FALSE(has_any_error(lint_checkpoint_config(c)));
 }
 
+// Dropping unrestored state applies to a restore. Set without one it drops
+// nothing, and the submitter believes the job restores: warned, not refused.
+TEST(ConfigLint, AllowingUnrestoredStateWithoutARestoreWarns) {
+    auto c = coherent();
+    c.allow_unrestored_state = true;
+    auto ps = lint_checkpoint_config(c);
+    EXPECT_TRUE(has_warning_for(ps, "allow_unrestored_state")) << render_problems(ps);
+    EXPECT_FALSE(has_any_error(ps)) << render_problems(ps);
+
+    c.restore_from_dir = "/var/clink/ckpt";
+    c.restore_from_checkpoint_id = 12;
+    ps = lint_checkpoint_config(c);
+    EXPECT_FALSE(has_warning_for(ps, "allow_unrestored_state")) << render_problems(ps);
+}
+
 TEST(ConfigLint, UnalignedWithoutCheckpointingWarnsRatherThanRefuses) {
     // Harmless, but it means the setting was misunderstood. Not an error:
     // nothing breaks, and refusing it would block a job that merely has a

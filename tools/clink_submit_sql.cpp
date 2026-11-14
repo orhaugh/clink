@@ -48,6 +48,8 @@ struct Args {
     // docs/internals/fault-tolerance-and-rescale.md.
     std::string capture_dir;
     std::uint64_t capture_records = 0;
+    // Drop the keyed state of operators the restored job does not run.
+    bool allow_unrestored_state = false;
     bool explain = false;
     std::uint32_t parallelism = 1;      // uniform op parallelism (>1 fans the plan out)
     std::uint32_t max_parallelism = 0;  // opt-in rescale bounds (0: none)
@@ -86,6 +88,9 @@ void print_usage() {
         << "                      from one job's marker directory in it, <dir>/_jobs/<job id>,\n"
         << "                      when several jobs checkpoint there.\n"
         << "  --restore-from-checkpoint-id <n>  Which checkpoint id in that dir to restore.\n"
+        << "  --allow-unrestored-state      Drop the keyed state of operators the job no longer\n"
+        << "                      runs (one removed, or whose uid changed). Without it such a\n"
+        << "                      restore is refused.\n"
         << "  --max-restarts-on-worker-loss <n>  Worker-loss restart budget. The default\n"
         << "                      resolves to a LIFETIME cap of 10 when checkpointing is on;\n"
         << "                      the count is never reset, so a job under repeated faults\n"
@@ -176,6 +181,8 @@ Args parse_args(int argc, char** argv) {
                 std::exit(2);
             }
             a.restore_from_dir = argv[i];
+        } else if (arg == "--allow-unrestored-state") {
+            a.allow_unrestored_state = true;
         } else if (arg == "--restore-from-checkpoint-id") {
             if (++i >= argc) {
                 std::cerr << "error: --restore-from-checkpoint-id requires a number\n";
@@ -315,6 +322,7 @@ int main(int argc, char** argv) {
                                 .max_restarts_on_worker_loss = args.max_restarts,
                                 .capture_dir = args.capture_dir,
                                 .capture_records = args.capture_records,
+                                .allow_unrestored_state = args.allow_unrestored_state,
                             },
                             std::cout,
                             std::cerr)

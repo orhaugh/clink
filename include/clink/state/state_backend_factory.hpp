@@ -81,7 +81,16 @@ struct StateBackendSpec {
     // operator the subtask does not run is never read, and every later snapshot
     // of the subtask would carry it as a stale copy. Empty keeps every row, for
     // a caller that does not say.
+    //
+    // A restore also checks its KEYED rows against them. Keyed state is read
+    // back only by the subtask that wrote it, so a keyed row of an operator the
+    // subtask does not run is read by nothing: the operator left the job, or its
+    // id changed with its uid. The restore is refused, naming the operators,
+    // unless `allow_unrestored_state` drops their rows. Empty skips the check.
     std::vector<std::uint64_t> hosted_operators;
+    // Drop the keyed state of operators the subtask does not run instead of
+    // refusing the restore (`--allow-unrestored-state` on submit).
+    bool allow_unrestored_state{false};
 };
 
 // The ONE place a state path is composed, so eleven call sites across six backends
@@ -119,6 +128,11 @@ struct StateBackendSpec {
 struct BuiltStateBackend {
     std::shared_ptr<StateBackend> backend;
     std::optional<Snapshot> restore_from;
+    // The builder checked the restored keyed state against the operators the
+    // subtask runs (StateBackendSpec::hosted_operators). A builder that cannot
+    // list the operators in its restored state leaves it false, and the factory
+    // logs that the check was not made.
+    bool unrestored_state_checked{false};
 };
 
 // Process-wide registry that maps a URI scheme to a builder closure.

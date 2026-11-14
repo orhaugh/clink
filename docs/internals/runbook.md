@@ -329,6 +329,37 @@ silent state loss for every subtask, not just the new one. Confirm which subtask
 missing and why first; if the answer is not case 3, the checkpoint is not safe to
 restore from and an older complete one is the better recovery point.
 
+## A job fails as it deploys with "refusing to restore subtask N from checkpoint C: it holds keyed state of operator X"
+
+Not an alert - a refusal on the Worker as the restored job deploys. The subtask's
+snapshot holds keyed rows written by an operator the restored job no longer runs in
+that subtask, so nothing would ever read them.
+
+**This is the engine declining to start an operator empty without telling you.** It
+used to accept the restore: the operator came back under a new id with no state, and
+the old rows rode along in every later checkpoint.
+
+**Look at:** the operator ids in the message, against the uids of the job's stateful
+operators. An operator's id is derived from its uid (`operator_id_from_uid`), or from
+its position in its subtask when it has none. `clink state-cat` on the checkpoint shows
+the slots those ids hold.
+
+**Likely causes, in order:**
+
+1. **A uid changed, or was dropped.** Renaming `.uid("...")`, or removing it so the
+   operator falls back to a position-derived id, gives the operator a new id. Put the
+   old uid back and resubmit: the state restores.
+2. **The operator left the job on purpose.** A stateful operator removed from the
+   graph, or a SQL query changed so that one goes away. If its state is not wanted,
+   resubmit with `--allow-unrestored-state`: the restore drops those rows, logs a
+   warning naming them, and the job's manifest keeps the choice for a takeover.
+3. **The job was rebuilt on another platform.** The id hash is the standard library's
+   string hash, so a build with a different standard library derives different ids
+   from the same uids. Restore with a build like the one that took the checkpoint.
+
+**Do not pass the flag to make a restore start** unless the answer is case 2: it drops
+the state for good.
+
 ## A submit is refused with "refusing to restore checkpoint N ... this plan deploys M"
 
 Not an alert - a refusal before anything deploys. The submitter gets it as a failed

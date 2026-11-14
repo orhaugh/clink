@@ -4037,6 +4037,61 @@ TEST(CheckpointCompletion, ATakeoverKeepsTheFlightRecorderArmed) {
     std::filesystem::remove_all(root, ec);
 }
 
+// Whether a restore drops the keyed state of operators the job no longer runs is
+// part of the manifest too. A takeover before the job's first new checkpoint
+// restores the same point the submit did, and must decide about that state as
+// the submit did, rather than refuse what the submitter allowed.
+TEST(CheckpointCompletion, ATakeoverKeepsTheChoiceToDropUnrestoredState) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_ckpt_takeover_unrestored_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    const auto ha_dir = root / "ha";
+    std::filesystem::create_directories(ha_dir);
+    {
+        Coordinator a;
+        a.set_ha_dir(ha_dir.string());
+        const auto port = a.start();
+        a.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(a.await_registrations(2s));
+        CheckpointConfig ckpt;
+        ckpt.checkpoint_dir = (root / "ckpt").string();
+        ckpt.interval_ms = 600'000;
+        ckpt.allow_unrestored_state = true;
+        (void)a.submit_job(
+            two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+        auto first = w.await_frame(MessageKind::Deploy);
+        ASSERT_TRUE(first.has_value());
+        EXPECT_TRUE(decode_deploy(*first).allow_unrestored_state);
+        a.stop();
+        w.close();
+    }
+    std::optional<DeployMsg> taken_over;
+    {
+        Coordinator b;
+        b.set_ha_dir(ha_dir.string());
+        const auto port = b.start();
+        b.expect_workers({"w"});
+        FakeWorker w(port, "w");
+        ASSERT_TRUE(w.valid());
+        ASSERT_TRUE(w.register_and_ack());
+        ASSERT_TRUE(b.await_registrations(2s));
+        b.recover_persisted_jobs();
+        if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+            taken_over = decode_deploy(*deploy);
+        }
+        b.stop();
+        w.close();
+    }
+    ASSERT_TRUE(taken_over.has_value()) << "the new leader dropped the job";
+    EXPECT_TRUE(taken_over->allow_unrestored_state)
+        << "the takeover refuses the state the submit allowed it to drop";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 // The alignment a job was submitted with is part of its manifest: a takeover
 // redeploys it, and an incident bundle reads it, since what an operator has
 // seen of its inputs when a barrier passes depends on it. Before it was

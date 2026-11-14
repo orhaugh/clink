@@ -587,9 +587,9 @@ TEST(WireProtocol, DeployCarriesTheRunsCheckpointIdFloorAfterTheEpoch) {
 
 // The Deploy's tail after the fencing epoch, in order: the per-task succession
 // (8 bytes a task), then the run's checkpoint-id floor (a presence byte and 8
-// bytes). Each must decode with and without what follows it, and a frame that
-// ends at the epoch is what v0.10.0 sends (tests/fixtures/deploy-msg-v0.10.0.bin
-// pins those bytes from that release's own writer).
+// bytes), then whether a restore drops unrestored state (1 byte). Each must decode with and without
+// what follows it, and a frame that ends at the epoch is what v0.10.0 sends
+// (tests/fixtures/deploy-msg-v0.10.0.bin pins those bytes from that release's own writer).
 TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
     DeployMsg in;
     in.job_id = 9;
@@ -606,10 +606,12 @@ TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
     second.succeeds_count = 0;
     in.tasks = {first, second};
     in.run_checkpoint_floor = 57;
+    in.allow_unrestored_state = true;
     const auto full = body_of(encode_frame(MessageKind::Deploy, in));
     constexpr std::size_t kSuccession = 2 * 8;
     constexpr std::size_t kFloor = 1 + 8;
-    ASSERT_GT(full.size(), kSuccession + kFloor + 8);
+    constexpr std::size_t kAllow = 1;
+    ASSERT_GT(full.size(), kSuccession + kFloor + kAllow + 8);
     const auto decode_prefix = [&](std::size_t drop) {
         std::vector<std::byte> body(full.begin(), full.end() - static_cast<std::ptrdiff_t>(drop));
         MessageReader r(std::move(body));
@@ -625,9 +627,15 @@ TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
     EXPECT_EQ(out.tasks[1].succeeds_first, 5U);
     EXPECT_EQ(out.tasks[1].succeeds_count, 0U);
     EXPECT_EQ(out.run_checkpoint_floor, std::optional<std::uint64_t>{57});
+    EXPECT_TRUE(out.allow_unrestored_state);
+
+    // A sender that stopped after the floor: the restore refuses.
+    out = decode_prefix(kAllow);
+    EXPECT_EQ(out.run_checkpoint_floor, std::optional<std::uint64_t>{57});
+    EXPECT_FALSE(out.allow_unrestored_state);
 
     // A sender that stopped after the succession: no floor.
-    out = decode_prefix(kFloor);
+    out = decode_prefix(kAllow + kFloor);
     EXPECT_EQ(out.coordinator_epoch, 41U);
     EXPECT_EQ(out.tasks[0].succeeds_first, 3U);
     EXPECT_EQ(out.tasks[1].succeeds_count, 0U);
@@ -635,7 +643,7 @@ TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
 
     // A sender that stopped at the epoch, as v0.10.0 does: every task succeeds
     // itself, no floor, and the epoch is the one sent.
-    out = decode_prefix(kSuccession + kFloor);
+    out = decode_prefix(kSuccession + kFloor + kAllow);
     EXPECT_EQ(out.coordinator_epoch, 41U);
     for (const auto& task : out.tasks) {
         EXPECT_EQ(task.succeeds_first, kRestoreFromSelf);
@@ -651,8 +659,9 @@ TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
         task.succeeds_count = 1;
     }
     bare.run_checkpoint_floor.reset();
+    bare.allow_unrestored_state = false;
     const auto bare_body = body_of(encode_frame(MessageKind::Deploy, bare));
-    const auto through_epoch = full.size() - kSuccession - kFloor;
+    const auto through_epoch = full.size() - kSuccession - kFloor - kAllow;
     ASSERT_EQ(bare_body.size(), full.size());
     EXPECT_TRUE(std::equal(
         full.begin(), full.begin() + static_cast<std::ptrdiff_t>(through_epoch), bare_body.begin()))
@@ -1217,10 +1226,11 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
         in.coordinator_epoch = 9;
         // Deploy's tail has grown past the epoch: the per-task succession (8
         // bytes for this one task), then the run's checkpoint-id floor (a
-        // presence byte and 8 bytes). A peer that predates all three sends
-        // none, so 25 bytes come off, not 8.
+        // presence byte and 8 bytes), then whether a restore drops unrestored
+        // state (1 byte). A peer that predates them all sends none, so 26
+        // bytes come off, not 8.
         auto out = round_trip_without_epoch_field(
-            MessageKind::Deploy, in, decode_deploy, /*tail_bytes=*/25);
+            MessageKind::Deploy, in, decode_deploy, /*tail_bytes=*/26);
         EXPECT_EQ(out.job_id, 11U);
         ASSERT_EQ(out.tasks.size(), 1U);
         EXPECT_EQ(out.tasks[0].subtask_idx, 3U);
@@ -1577,6 +1587,29 @@ TEST(WireProtocol, SubmitJobWithoutAdvertTailDecodesToNoAdverts) {
     EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::SubmitJob);
     auto out = decode_submit_job(r);
     EXPECT_TRUE(out.plugin_abi_adverts.empty());
+    EXPECT_FALSE(out.checkpoint.allow_unrestored_state);
+}
+
+// Whether a restore drops the keyed state of operators the job no longer runs
+// rides after the plugin ABI adverts. A client that stops before it leaves it
+// false, so the restore refuses rather than drops.
+TEST(WireProtocol, SubmitJobCarriesAllowUnrestoredStateAfterTheAdverts) {
+    SubmitJobMsg in;
+    in.graph_json = R"({"ops":[]})";
+    in.checkpoint.restore_from_dir = "/tmp/save";
+    in.checkpoint.restore_from_checkpoint_id = 7;
+    in.checkpoint.allow_unrestored_state = true;
+    auto out = round_trip(MessageKind::SubmitJob, in, decode_submit_job);
+    EXPECT_TRUE(out.checkpoint.allow_unrestored_state);
+    EXPECT_EQ(out.checkpoint.restore_from_checkpoint_id, 7U);
+
+    const auto full = body_of(encode_frame(MessageKind::SubmitJob, in));
+    std::vector<std::byte> cut(full.begin(), full.end() - 1);
+    MessageReader r(std::move(cut));
+    EXPECT_EQ(static_cast<MessageKind>(r.read_u8()), MessageKind::SubmitJob);
+    const auto older = decode_submit_job(r);
+    EXPECT_FALSE(older.checkpoint.allow_unrestored_state);
+    EXPECT_EQ(older.checkpoint.restore_from_checkpoint_id, 7U);
 }
 
 TEST(WireProtocol, SubmitJobAckRoundTripsClusterAbiIdentity) {

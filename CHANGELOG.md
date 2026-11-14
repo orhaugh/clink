@@ -24,6 +24,26 @@ tested on macOS arm64 and Linux aarch64, and built and tested in CI on Linux
 x86_64, whose toolchain image installs the library. The runtime image builds
 it in. See `docs/connectors/relate.md`.
 
+**A restore refuses keyed state that no operator in the job reads.** State is
+stored under the id of the operator that wrote it, which comes from its uid, so
+an operator whose uid changed or was lost came back under a new id and started
+empty, while the old operator's state was carried in every later checkpoint and
+read by nothing, without a warning. Each restoring subtask now compares the
+keyed rows of the snapshots it inherits with the operators it runs, and a row
+of any other operator refuses the restore, naming the subtask, the checkpoint
+and each operator with its row count; the job fails as it deploys. This
+changes behaviour: a job restored after removing a stateful operator, or after
+changing a query so that one goes away, used to drop that operator's state
+silently and is now refused. Submit with `--allow-unrestored-state` (on
+`clink run --job` and SQL submits, `allow_unrestored_state=true` over HTTP,
+`CheckpointConfig::allow_unrestored_state`) to drop it instead; the choice is
+kept in the job's HA manifest and sent to Workers as trailing fields of
+`SubmitJob` and `Deploy` (a coordinator or client older than the field reads
+it as false). Operator-state rows are not judged, since they cross subtasks
+at a restore, so an operator that held only operator state is not caught; the
+check is made by the file backend, and other backends log that they did not
+make it. Upgrade validation found it.
+
 **The fluent API's windows and reduce survive a restore.** Every fluent
 window aggregate but the tumbling emit form with a type registered on the
 job's registry, the evicting window and `reduce` kept their state in memory
@@ -75,9 +95,9 @@ crash, a limit or an interrupt is never a pass. Its qualification restores
 a v0.15.0 savepoint into this tree, and catches nine controlled defects and
 two builds that agree and are both wrong. It found that the fluent API's
 windows and reduce kept their state in memory only and that a restore dropped
-event-time timers keyed in another encoding than their keyed state (both
-fixed, above), and that a restore keeps state whose operator left the job
-without refusing it.
+event-time timers keyed in another encoding than their keyed state, and that
+a restore kept state whose operator left the job without refusing it (all
+three fixed, above).
 
 **A checkpoint directory given as a relative path collects and exports.**
 `clink state-export --checkpoint-dir` and `clink incident-collect` refused a

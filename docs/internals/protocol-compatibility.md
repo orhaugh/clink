@@ -81,7 +81,9 @@ may differ as long as each side can speak something the other accepts.
   `succeeds_count` (two u32s; absent, every task succeeds itself,
   `kRestoreFromSelf` and 1); then the run's checkpoint-id floor, a presence
   byte and the id (u8, u64; absent, unset, and a 2PC sink keeps its older
-  rule at restore point 0). A decoder reads each in turn while bytes remain,
+  rule at restore point 0); then `allow_unrestored_state` (u8; absent, false,
+  so a restore refuses keyed state of an operator the subtask does not run, and
+  a worker older than the check makes none). A decoder reads each in turn while bytes remain,
   so a frame from any sender since v0.10.0 decodes with the fields it carried
   and defaults for the rest, and a v0.10.0 worker reads the leading bytes it
   always read. `tests/fixtures/deploy-msg-v0.10.0.bin`, written by v0.10.0's
@@ -109,6 +111,11 @@ may differ as long as each side can speak something the other accepts.
 - **Known limitation:** client enforcement is one-directional. The
   coordinator sends no hello ack on success, so a CLI never learns the
   coordinator's version.
+- **SubmitJob tail.** After the plugin ABI adverts, `allow_unrestored_state`
+  (u8; absent, false). A coordinator older than the field reads no further and
+  never passes it on, so its workers refuse such a restore; an older client
+  sends none and gets the refusal. Pinned by
+  `WireProtocol.SubmitJobCarriesAllowUnrestoredStateAfterTheAdverts`.
 - **Tests:** `tests/test_protocol_versioning.cpp` (both refusal directions
   end to end, pre-versioning decode, refusal legibility);
   `fuzz/fuzz_cluster_frame.cpp` with its committed-reproducer replay;

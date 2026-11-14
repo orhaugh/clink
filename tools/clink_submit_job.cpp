@@ -64,6 +64,8 @@ void usage() {
         << "                          [--checkpoint-interval-ms=N] "
            "[--max-restarts-on-worker-loss=auto|N]\n"
         << "                          [--capture-dir=<dir>] [--capture-records=N]\n"
+        << "                          [--restore-from-dir=<dir> --restore-from-checkpoint-id=N\n"
+        << "                           [--allow-unrestored-state]]\n"
         << "       clink run <file>.sql | -e \"<sql>\"   (embedded SQL: run with --help for "
            "flags)\n"
         << "\n"
@@ -81,7 +83,17 @@ void usage() {
         << "  --state-backend=file[:<path>]    file-backed (default path: /var/lib/clink/state)\n"
         << "  --state-backend=rocksdb[:<path>] RocksDB-backed (default: /var/lib/clink/state)\n"
         << "  --checkpoint-dir=<uri>           low-level escape hatch (sets the raw URI "
-           "directly)\n";
+           "directly)\n"
+        << "\n"
+        << "Restore:\n"
+        << "  --restore-from-dir=<dir> --restore-from-checkpoint-id=N\n"
+        << "                                   start from that completed checkpoint or "
+           "savepoint\n"
+        << "  --allow-unrestored-state         drop the keyed state of operators the job no "
+           "longer\n"
+        << "                                   runs (an operator removed, or whose uid "
+           "changed);\n"
+        << "                                   without it such a restore is refused\n";
 }
 
 }  // namespace

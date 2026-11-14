@@ -423,11 +423,25 @@ def _continuation(build, doc, ev_root, ev_ds, ev_state, ref, tools, gate, report
                        "running anything: %s" % (name, ckpt["id"], why), submission=text[-4000:])
             report.set("recovery." + name, UNAVAILABLE, "the restore was refused")
             return run
-        c.wait(lambda: c.operators(job), "the restored job's operators")
-        ops = _ops(c.operators(job))
+        # A restore the engine refuses on the Workers fails the job as it
+        # deploys, before its operators report: waiting for them would wait out
+        # the run's time limit and hide the refusal.
+        state, got = c.wait(lambda: _restore_progress(c, job), "the restored job's operators")
+        if state == "failed":
+            report.set("restore." + name, FAILED, "the %s's restored job failed as it deployed: %s"
+                       % (name, got))
+            report.set("recovery." + name, UNAVAILABLE, "the restore failed")
+            return run
+        ops = _ops(got)
         sp, text = c.savepoint(job)
         if sp is None:
-            report.set("restore." + name, FAILED, "the restored job took no savepoint: %s" % text[-800:])
+            done = c.finished(job)
+            if done is not None and not done[0]:
+                report.set("restore." + name, FAILED, "the %s's restored job failed before its "
+                           "savepoint: %s" % (name, done[1]))
+            else:
+                report.set("restore." + name, FAILED, "the restored job took no savepoint: %s"
+                           % text[-800:])
             report.set("recovery." + name, UNAVAILABLE, "the restore could not be confirmed")
             return run
         restored_ds = os.path.join(root, "restored-dataset")
@@ -489,6 +503,16 @@ def _continuation(build, doc, ev_root, ev_ds, ev_state, ref, tools, gate, report
         return run
     finally:
         c.stop()
+
+
+def _restore_progress(c, job):
+    """("failed", why) once the restored job has failed; ("running", operators)
+    once its operators report; None while neither."""
+    done = c.finished(job)
+    if done is not None and not done[0]:
+        return "failed", done[1]
+    ops = c.operators(job)
+    return ("running", ops) if ops else None
 
 
 def _identity(recorded_ops, ops, ev_state, restored):

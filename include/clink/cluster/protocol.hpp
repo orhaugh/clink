@@ -487,6 +487,12 @@ struct DeployMsg {
     // the epoch and the per-task succession, an additive tail: an older
     // worker stops reading before it.
     std::optional<std::uint64_t> run_checkpoint_floor;
+    // Drop the keyed state of operators a restoring subtask does not run
+    // instead of refusing the restore (CheckpointConfig::allow_unrestored_state).
+    // After the floor on the wire; an older worker stops reading before it and
+    // makes no such check, and a worker reading an older coordinator's Deploy
+    // leaves it false and refuses.
+    bool allow_unrestored_state{false};
 };
 
 struct StartJobMsg {
@@ -735,6 +741,13 @@ struct CheckpointConfig {
     // completed checkpoint.
     std::string restore_from_dir;
     std::uint64_t restore_from_checkpoint_id{0};
+    // A restore refuses keyed state of an operator the restoring subtask does
+    // not run: the operator left the job, or its id changed with its uid, and
+    // nothing would read that state. True drops it instead
+    // (--allow-unrestored-state). Kept in the job's manifest, so an HA takeover
+    // that restores the same point decides the same way. Trailing wire field
+    // on the submit; a coordinator that predates it leaves it false.
+    bool allow_unrestored_state{false};
     // Max times the coordinator will automatically re-deploy this job's subtasks after a
     // worker goes lost or a subtask errors. Each restart starts from
     // latest_completed_checkpoint_id (so keyed state is preserved; source replay

@@ -133,6 +133,9 @@ SubmitFn make_http_submit(std::string coordinator_host,
         if (checkpoint.capture_records > 0) {
             add_param("capture_records", std::to_string(checkpoint.capture_records));
         }
+        if (checkpoint.allow_unrestored_state) {
+            add_param("allow_unrestored_state", "true");
+        }
         auto resp = client.post(path, spec.to_json());
         if (resp.status == 0) {
             err << "error: HTTP transport failure: " << resp.error << "\n";

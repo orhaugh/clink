@@ -409,6 +409,168 @@ TEST(StateBackendFactory, ARestoreKeepsOnlyTheOperatorRowsOfTheOperatorsTheSubta
     std::filesystem::remove_all(restore_root);
 }
 
+// Keyed state is read back only by the subtask that wrote it, under the id of
+// the operator that wrote it. A keyed row in a subtask's own snapshot under an
+// operator it does not run, as when an operator's uid changed and it came back
+// under a new id, is read by nothing. The restore used to take it silently and
+// carry it in every later checkpoint; it now refuses, naming the operator, and
+// drops it only when the submit allowed that.
+TEST(StateBackendFactory, KeyedStateOfAnOperatorTheSubtaskDoesNotRunRefusesTheRestore) {
+    const auto restore_root = make_temp_dir("unread_src");
+    const std::uint64_t ckpt_id = 5;
+    const clink::OperatorId kept{11};
+    const clink::OperatorId gone{22};
+    using KV = clink::StateBackend::KeyView;
+    using VV = clink::StateBackend::ValueView;
+    {
+        clink::InMemoryStateBackend subtask;
+        subtask.put(kept, KV{"k1"}, VV{"A"});
+        subtask.put_operator_state(kept, KV{"pos"}, VV{"KP"});
+        subtask.put(gone, KV{"k1"}, VV{"B"});
+        subtask.put(gone, KV{"k2"}, VV{"C"});
+        auto snap = subtask.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(restore_root, 0) / "checkpoint-5.snap", snap.bytes, ckpt_id);
+    }
+    const auto build = [&](bool allow, std::vector<std::uint64_t> hosted) {
+        const auto working_root = make_temp_dir("unread_dst");
+        clink::StateBackendSpec spec;
+        spec.uri = "file://" + working_root.string();
+        spec.subtask_idx = 0;
+        spec.restore_uri = "file://" + restore_root.string();
+        spec.restore_checkpoint_id = ckpt_id;
+        spec.hosted_operators = std::move(hosted);
+        spec.allow_unrestored_state = allow;
+        auto built = clink::StateBackendFactory::default_instance().build(spec);
+        std::filesystem::remove_all(working_root);
+        return built;
+    };
+    const auto text = [](const std::optional<std::vector<std::byte>>& v) {
+        return v ? std::string(reinterpret_cast<const char*>(v->data()), v->size())
+                 : std::string{"<absent>"};
+    };
+
+    try {
+        (void)build(false, {kept.value()});
+        ADD_FAILURE() << "a restore took keyed state of an operator the subtask does not run";
+    } catch (const std::runtime_error& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("refusing to restore subtask 0 from checkpoint 5"), std::string::npos)
+            << what;
+        EXPECT_NE(what.find("operator 22 (2 keyed rows)"), std::string::npos) << what;
+        EXPECT_NE(what.find("uid"), std::string::npos) << what;
+        EXPECT_NE(what.find("--allow-unrestored-state"), std::string::npos) << what;
+    }
+
+    // Allowed: that operator's keyed rows are dropped and the rest restore.
+    auto built = build(true, {kept.value()});
+    ASSERT_TRUE(built.restore_from.has_value());
+    EXPECT_TRUE(built.unrestored_state_checked);
+    EXPECT_EQ(clink::InMemoryStateBackend::keyed_rows_by_operator(built.restore_from->bytes)
+                  .count(gone.value()),
+              0U);
+    clink::InMemoryStateBackend restored;
+    restored.restore(*built.restore_from);
+    EXPECT_EQ(text(restored.get(kept, KV{"k1"})), "A");
+    EXPECT_EQ(text(restored.get_operator_state(kept, KV{"pos"})), "KP");
+    EXPECT_EQ(text(restored.get(gone, KV{"k1"})), "<absent>");
+    EXPECT_EQ(text(restored.get(gone, KV{"k2"})), "<absent>");
+
+    // A caller that does not say what the subtask runs is not checked, as before.
+    auto unsaid = build(false, {});
+    ASSERT_TRUE(unsaid.restore_from.has_value());
+    EXPECT_FALSE(unsaid.unrestored_state_checked);
+    clink::InMemoryStateBackend all;
+    all.restore(*unsaid.restore_from);
+    EXPECT_EQ(text(all.get(gone, KV{"k2"})), "C");
+
+    std::filesystem::remove_all(restore_root);
+}
+
+// Only the keyed rows of the snapshots the subtask inherits are judged. Its
+// peers' keyed rows are never its own to read, and operator-state rows cross
+// subtasks at a restore: older snapshots carry copies of their peers', timers
+// among them, which belong to operators other subtasks run.
+TEST(StateBackendFactory, OperatorStateAndAPeersKeyedStateAreNotRefused) {
+    const auto restore_root = make_temp_dir("unread_peer_src");
+    const std::uint64_t ckpt_id = 6;
+    const clink::OperatorId window{31};
+    const clink::OperatorId source{32};
+    using KV = clink::StateBackend::KeyView;
+    using VV = clink::StateBackend::ValueView;
+    {
+        clink::InMemoryStateBackend own;
+        own.put(window, KV{"k1"}, VV{"W"});
+        own.put_operator_state(source, KV{"off:0"}, VV{"STALE"});
+        own.put_operator_state(source, KV{"__clink_timers"}, VV{"T"});
+        auto snap = own.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(restore_root, 0) / "checkpoint-6.snap", snap.bytes, ckpt_id);
+    }
+    {
+        clink::InMemoryStateBackend peer;
+        peer.put(source, KV{"k9"}, VV{"S"});
+        peer.put_operator_state(source, KV{"off:1"}, VV{"FRESH"});
+        auto snap = peer.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(restore_root, 1) / "checkpoint-6.snap", snap.bytes, ckpt_id);
+    }
+    const auto working_root = make_temp_dir("unread_peer_dst");
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + working_root.string();
+    spec.subtask_idx = 0;
+    spec.restore_uri = "file://" + restore_root.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    spec.hosted_operators = {window.value()};
+    clink::BuiltStateBackend built;
+    EXPECT_NO_THROW(built = clink::StateBackendFactory::default_instance().build(spec));
+    EXPECT_TRUE(built.restore_from.has_value());
+    EXPECT_TRUE(built.unrestored_state_checked);
+    std::filesystem::remove_all(working_root);
+    std::filesystem::remove_all(restore_root);
+}
+
+// A scale-down inherits several parents, and each of them is the subtask's to
+// read: a keyed row of an operator the new subtask does not run in any one of
+// them is refused.
+TEST(StateBackendFactory, AScaleDownJudgesEveryParentItInherits) {
+    const auto restore_root = make_temp_dir("unread_parents_src");
+    const std::uint64_t ckpt_id = 8;
+    const clink::OperatorId kept{41};
+    const clink::OperatorId renamed{42};
+    using KV = clink::StateBackend::KeyView;
+    using VV = clink::StateBackend::ValueView;
+    {
+        clink::InMemoryStateBackend first;
+        first.put(kept, KV{"k1"}, VV{"A"});
+        auto snap = first.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(restore_root, 0) / "checkpoint-8.snap", snap.bytes, ckpt_id);
+    }
+    {
+        clink::InMemoryStateBackend second;
+        second.put(kept, KV{"k2"}, VV{"B"});
+        second.put(renamed, KV{"k3"}, VV{"C"});
+        auto snap = second.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(restore_root, 1) / "checkpoint-8.snap", snap.bytes, ckpt_id);
+    }
+    const auto working_root = make_temp_dir("unread_parents_dst");
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + working_root.string();
+    spec.subtask_idx = 0;
+    spec.generation = 2;
+    spec.restore_uri = "file://" + restore_root.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    spec.restore_from_subtask_idx = 0;
+    spec.restore_from_parent_count = 2;
+    spec.hosted_operators = {kept.value()};
+    try {
+        (void)clink::StateBackendFactory::default_instance().build(spec);
+        ADD_FAILURE() << "a scale-down took keyed state of an operator the subtask does not run";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("operator 42 (1 keyed row)"), std::string::npos)
+            << e.what();
+    }
+    std::filesystem::remove_all(working_root);
+    std::filesystem::remove_all(restore_root);
+}
+
 TEST(StateBackendFactory, RestoreUriEmptyLeavesRestoreFromUnset) {
     const auto dir = make_temp_dir("no_restore");
     clink::StateBackendSpec spec;

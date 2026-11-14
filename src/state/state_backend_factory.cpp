@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -135,6 +136,28 @@ std::pair<std::string, std::string> split_uri(const std::string& uri) {
             break;
         }
         start = comma + 1;
+    }
+    return out;
+}
+
+// "operator 123 (40 keyed rows)", or "3 operators: 1 (2 keyed rows), ...",
+// naming at most a few of them.
+std::string describe_unread_operators(const std::map<std::uint64_t, std::uint64_t>& unread) {
+    constexpr std::size_t kNamed = 5;
+    std::string out =
+        unread.size() == 1 ? "operator " : std::to_string(unread.size()) + " operators: ";
+    std::size_t named = 0;
+    for (const auto& [op, rows] : unread) {
+        if (named == kNamed) {
+            out += ", and " + std::to_string(unread.size() - kNamed) + " more";
+            break;
+        }
+        if (named > 0) {
+            out += ", ";
+        }
+        out += std::to_string(op) + " (" + std::to_string(rows) +
+               (rows == 1 ? " keyed row)" : " keyed rows)");
+        ++named;
     }
     return out;
 }
@@ -480,6 +503,62 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                 "CLINK_ALLOW_MISSING_RESTORE_STATE=1.");
         }
 
+        // Keyed state of an operator this subtask does not run.
+        //
+        // Keyed rows are read back only by the subtask that wrote them, or on a
+        // rescale by the children of its operator, and only under the id of the
+        // operator that wrote them. A keyed row in an assigned parent's snapshot
+        // whose operator this subtask does not run is therefore read by nothing:
+        // the operator left the job, or its id changed with its uid (an
+        // operator's id is derived from its uid, and from its position when it
+        // has none). The restore used to accept it without a word, so the
+        // operator under its new id started empty while the old rows rode along
+        // in every later checkpoint. Upgrade validation found it. Only keyed
+        // rows are judged: operator-state rows cross subtasks at a restore, and
+        // older snapshots carry copies of their peers', so whether some subtask
+        // runs their operator is not this subtask's to say.
+        const std::set<std::uint64_t> hosted(spec.hosted_operators.begin(),
+                                             spec.hosted_operators.end());
+        if (!hosted.empty()) {
+            std::map<std::uint64_t, std::uint64_t> unread;
+            for (const auto& own : parts) {
+                for (const auto& [op, rows] : InMemoryStateBackend::keyed_rows_by_operator(own)) {
+                    if (hosted.count(op) == 0) {
+                        unread[op] += rows;
+                    }
+                }
+            }
+            if (!unread.empty()) {
+                const auto what = describe_unread_operators(unread);
+                if (!spec.allow_unrestored_state) {
+                    throw std::runtime_error(
+                        "refusing to restore subtask " + std::to_string(spec.subtask_idx) +
+                        " from checkpoint " + std::to_string(spec.restore_checkpoint_id) +
+                        ": it holds keyed state of " + what +
+                        " that the subtask does not run, so nothing would read it and every "
+                        "later checkpoint would carry it. An operator whose uid changed, or "
+                        "that has lost its uid, has a new id: give it back the uid it had and "
+                        "its state restores. If the operator left the job on purpose, resubmit "
+                        "with --allow-unrestored-state to drop its state.");
+                }
+                std::set<std::uint64_t> drop;
+                for (const auto& [op, rows] : unread) {
+                    (void)rows;
+                    drop.insert(op);
+                }
+                for (auto& own : parts) {
+                    own = InMemoryStateBackend::drop_keyed_state_of(own, drop);
+                }
+                clink::log::warn("state.restore",
+                                 "subtask " + std::to_string(spec.subtask_idx) +
+                                     ": dropping the keyed state of " + what +
+                                     " that it does not run, from checkpoint " +
+                                     std::to_string(spec.restore_checkpoint_id) +
+                                     ", as the submit allowed (--allow-unrestored-state)");
+            }
+            out.unrestored_state_checked = true;
+        }
+
         // OPERATOR state (source offsets, broadcast slots) is broadcast, not
         // partitioned: every restoring subtask must see all parents' operator
         // rows, then narrow at the source (Kafka's apply-once rebalance cb).
@@ -627,11 +706,8 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             // that only ever lost a collision, but that a reader of the
             // snapshots had to know to discard. Its own snapshot's copies from
             // before this rule go the same way.
-            if (!spec.hosted_operators.empty()) {
-                final_bytes = InMemoryStateBackend::retain_operator_state_of(
-                    final_bytes,
-                    std::set<std::uint64_t>(spec.hosted_operators.begin(),
-                                            spec.hosted_operators.end()));
+            if (!hosted.empty()) {
+                final_bytes = InMemoryStateBackend::retain_operator_state_of(final_bytes, hosted);
             }
             // Handed over IN MEMORY, deliberately not staged as a file here.
             //
@@ -715,7 +791,16 @@ BuiltStateBackend StateBackendFactory::build(const StateBackendSpec& spec) const
         }
         builder = it->second;
     }
-    return builder(spec);
+    auto built = builder(spec);
+    if (!spec.restore_uri.empty() && spec.restore_checkpoint_id != 0 &&
+        !spec.hosted_operators.empty() && !built.unrestored_state_checked) {
+        clink::log::info("state.restore",
+                         "subtask " + std::to_string(spec.subtask_idx) + ": the '" + scheme +
+                             "' state backend does not check its restored keyed state against "
+                             "the operators the subtask runs, so state of an operator that left "
+                             "the job, or whose uid changed, is not refused");
+    }
+    return built;
 }
 
 }  // namespace clink

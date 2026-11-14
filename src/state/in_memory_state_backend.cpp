@@ -481,39 +481,40 @@ std::set<std::pair<std::uint64_t, std::string>> InMemoryStateBackend::operator_s
     return out;
 }
 
-std::vector<std::byte> InMemoryStateBackend::retain_operator_state_of(
-    std::span<const std::byte> snapshot_bytes, const std::set<std::uint64_t>& operators) {
+std::vector<std::byte> InMemoryStateBackend::filter_snapshot_rows(
+    std::span<const std::byte> snapshot_bytes,
+    const std::function<bool(std::uint64_t op, bool keyed)>& keep,
+    const char* what) {
     if (snapshot_bytes.empty()) {
         return {};
     }
+    const std::string label = std::string{"InMemoryStateBackend "} + what;
     auto buffer =
         std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(snapshot_bytes.data()),
                                         static_cast<int64_t>(snapshot_bytes.size()));
     auto input = std::make_shared<arrow::io::BufferReader>(buffer);
     auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
     if (!reader_result.ok())
-        throw_arrow("retain_operator_state (open reader)", reader_result.status());
+        throw_arrow(std::string{what} + " (open reader)", reader_result.status());
     auto reader = *reader_result;
-    verify_snapshot_format_version(reader->schema()->metadata(),
-                                   "InMemoryStateBackend retain_operator_state_of");
+    verify_snapshot_format_version(reader->schema()->metadata(), label);
     if (!reader->schema()->Equals(*snapshot_schema(), /*check_metadata=*/false)) {
-        throw std::runtime_error(
-            "InMemoryStateBackend retain_operator_state_of: input schema mismatch");
+        throw std::runtime_error(label + ": input schema mismatch");
     }
     // Written under the input's own schema, so its metadata (the state versions
     // and fingerprints) survives, as merge_snapshot_bytes keeps it.
     auto sink_result = arrow::io::BufferOutputStream::Create();
     if (!sink_result.ok())
-        throw_arrow("retain_operator_state (create sink)", sink_result.status());
+        throw_arrow(std::string{what} + " (create sink)", sink_result.status());
     auto sink = *sink_result;
     auto writer_result = arrow::ipc::MakeStreamWriter(sink, reader->schema());
     if (!writer_result.ok())
-        throw_arrow("retain_operator_state (make writer)", writer_result.status());
+        throw_arrow(std::string{what} + " (make writer)", writer_result.status());
     auto writer = *writer_result;
     std::shared_ptr<arrow::RecordBatch> batch;
     while (true) {
         if (auto s = reader->ReadNext(&batch); !s.ok())
-            throw_arrow("retain_operator_state (read batch)", s);
+            throw_arrow(std::string{what} + " (read batch)", s);
         if (!batch)
             break;
         const auto* op_arr = static_cast<const arrow::UInt64Array*>(batch->column(0).get());
@@ -524,14 +525,14 @@ std::vector<std::byte> InMemoryStateBackend::retain_operator_state_of(
             if (run < 0)
                 return;
             if (auto s = writer->WriteRecordBatch(*batch->Slice(run, end - run)); !s.ok())
-                throw_arrow("retain_operator_state (write batch)", s);
+                throw_arrow(std::string{what} + " (write batch)", s);
             run = -1;
         };
         for (int64_t i = 0; i < batch->num_rows(); ++i) {
             int32_t klen = 0;
             const uint8_t* kptr = key_arr->GetValue(i, &klen);
             const bool keyed = klen == 0 || static_cast<KeyGroup>(kptr[0]) < kNumKeyGroups;
-            if (keyed || operators.count(op_arr->Value(i)) != 0) {
+            if (keep(op_arr->Value(i), keyed)) {
                 if (run < 0)
                     run = i;
             } else {
@@ -541,16 +542,67 @@ std::vector<std::byte> InMemoryStateBackend::retain_operator_state_of(
         write_run(batch->num_rows());
     }
     if (auto s = writer->Close(); !s.ok())
-        throw_arrow("retain_operator_state (close writer)", s);
+        throw_arrow(std::string{what} + " (close writer)", s);
     auto buf_result = sink->Finish();
     if (!buf_result.ok())
-        throw_arrow("retain_operator_state (finish sink)", buf_result.status());
+        throw_arrow(std::string{what} + " (finish sink)", buf_result.status());
     const auto& buf = *buf_result;
     std::vector<std::byte> bytes(static_cast<std::size_t>(buf->size()));
     if (buf->size() > 0) {
         std::memcpy(bytes.data(), buf->data(), static_cast<std::size_t>(buf->size()));
     }
     return bytes;
+}
+
+std::vector<std::byte> InMemoryStateBackend::retain_operator_state_of(
+    std::span<const std::byte> snapshot_bytes, const std::set<std::uint64_t>& operators) {
+    return filter_snapshot_rows(
+        snapshot_bytes,
+        [&](std::uint64_t op, bool keyed) { return keyed || operators.count(op) != 0; },
+        "retain_operator_state_of");
+}
+
+std::vector<std::byte> InMemoryStateBackend::drop_keyed_state_of(
+    std::span<const std::byte> snapshot_bytes, const std::set<std::uint64_t>& operators) {
+    return filter_snapshot_rows(
+        snapshot_bytes,
+        [&](std::uint64_t op, bool keyed) { return !keyed || operators.count(op) == 0; },
+        "drop_keyed_state_of");
+}
+
+std::map<std::uint64_t, std::uint64_t> InMemoryStateBackend::keyed_rows_by_operator(
+    std::span<const std::byte> snapshot_bytes) {
+    std::map<std::uint64_t, std::uint64_t> out;
+    if (snapshot_bytes.empty()) {
+        return out;
+    }
+    auto buffer =
+        std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(snapshot_bytes.data()),
+                                        static_cast<int64_t>(snapshot_bytes.size()));
+    auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+    auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+    if (!reader_result.ok())
+        throw_arrow("keyed_rows_by_operator (open reader)", reader_result.status());
+    auto reader = *reader_result;
+    verify_snapshot_format_version(reader->schema()->metadata(),
+                                   "InMemoryStateBackend keyed_rows_by_operator");
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+        if (auto s = reader->ReadNext(&batch); !s.ok())
+            throw_arrow("keyed_rows_by_operator (read batch)", s);
+        if (!batch)
+            break;
+        const auto* op_arr = static_cast<const arrow::UInt64Array*>(batch->column(0).get());
+        const auto* key_arr = static_cast<const arrow::BinaryArray*>(batch->column(1).get());
+        for (int64_t i = 0; i < batch->num_rows(); ++i) {
+            int32_t klen = 0;
+            const uint8_t* kptr = key_arr->GetValue(i, &klen);
+            if (klen == 0 || static_cast<KeyGroup>(kptr[0]) < kNumKeyGroups) {
+                ++out[op_arr->Value(i)];
+            }
+        }
+    }
+    return out;
 }
 
 std::vector<std::byte> InMemoryStateBackend::extract_operator_state_bytes(

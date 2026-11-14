@@ -189,13 +189,15 @@ TEST(FormatFixtures, DeployMsgV0100FrameStaysDecodableAndPrefixesTheCurrentFrame
     now.tasks[0].succeeds_first = 1;
     now.tasks[0].succeeds_count = 2;
     now.run_checkpoint_floor = 4;
+    now.allow_unrestored_state = true;
     const auto written = encode_frame(MessageKind::Deploy, now);
     ASSERT_GT(written.size(), frame.size());
     EXPECT_TRUE(std::equal(frame.begin() + 4, frame.end(), written.begin() + 4))
         << "the current Deploy no longer begins with the v0.10.0 frame: a v0.10.0 worker reads "
            "its epoch from the wrong bytes";
-    EXPECT_EQ(written.size() - frame.size(), 2u * 8u + 9u)
-        << "the tail after the epoch is the per-task succession, then the run's floor";
+    EXPECT_EQ(written.size() - frame.size(), 2u * 8u + 9u + 1u)
+        << "the tail after the epoch is the per-task succession, then the run's floor, then "
+           "whether a restore drops unrestored state";
 }
 
 // --- job plan JSON (additive-only, absent-tolerant) ---------------------------

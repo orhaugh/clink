@@ -100,6 +100,9 @@ struct SubmitCheckpointOptions {
     // the same script handed to a cluster recorded nothing.
     std::string capture_dir;
     std::uint64_t capture_records{0};
+    // Drop the keyed state of operators the restored job does not run instead
+    // of refusing the restore (CheckpointConfig::allow_unrestored_state).
+    bool allow_unrestored_state{false};
 };
 
 // SubmitFn that POSTs the spec JSON to a Coordinator's HTTP submit

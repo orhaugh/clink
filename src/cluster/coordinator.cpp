@@ -572,6 +572,10 @@ void persist_job_manifest_(const std::string& ha_dir,
     manifest += requires_commit_confirmation ? "true" : "false";
     manifest +=
         ",\"restore_from_checkpoint_id\":" + std::to_string(checkpoint.restore_from_checkpoint_id);
+    // Whether the restore drops keyed state no subtask's operator reads, so a
+    // takeover that restores the same point decides as the submit did.
+    manifest += ",\"allow_unrestored_state\":";
+    manifest += checkpoint.allow_unrestored_state ? "true" : "false";
     // The run's checkpoint-id floor, which a takeover keeps: the job it takes
     // over is the same run. Absent when the job has none.
     if (checkpoint.run_checkpoint_floor.has_value()) {
@@ -826,6 +830,10 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         ckpt.interval_ms = static_cast<std::int64_t>(read_uint_field(body, "interval_ms"));
         ckpt.restore_from_dir = read_string_field(body, "restore_from_dir");
         ckpt.restore_from_checkpoint_id = read_uint_field(body, "restore_from_checkpoint_id");
+        // A manifest written before the field existed reads false: the
+        // takeover refuses state no operator reads, as a new submit would.
+        ckpt.allow_unrestored_state =
+            body.find("\"allow_unrestored_state\":true") != std::string::npos;
         // The run's checkpoint-id floor its first submit fixed. A manifest
         // written before the floor existed has none, and the takeover deploys
         // without one: its sinks keep the rule they had before it.
@@ -4459,6 +4467,7 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
         dm.restore_from_dir = job.state_root;
         dm.restore_from_checkpoint_id = hot.cutover_checkpoint;
         dm.run_checkpoint_floor = job.run_checkpoint_floor;
+        dm.allow_unrestored_state = job.checkpoint.allow_unrestored_state;
         dm.generation = job.state_generation;
         dm.restore_generation = job.state_generation;
         dm.unaligned_checkpoints = job.checkpoint.alignment == CheckpointAlignment::Unaligned;
@@ -6471,6 +6480,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.capture_records = checkpoint.capture_records;
         deploy_msg.restore_from_checkpoint_id = checkpoint.restore_from_checkpoint_id;
         deploy_msg.run_checkpoint_floor = job->run_checkpoint_floor;
+        deploy_msg.allow_unrestored_state = checkpoint.allow_unrestored_state;
         // Generation 1 is an initial deploy. A restore here reads a checkpoint
         // this deploy did not write (a savepoint, an explicit
         // --restore-from-checkpoint-id, the job's own before a takeover or a
@@ -8721,6 +8731,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         deploy_msg.restore_from_checkpoint_id = restore_from_checkpoint_id;
         // The same run: the floor its first submit fixed.
         deploy_msg.run_checkpoint_floor = job.run_checkpoint_floor;
+        deploy_msg.allow_unrestored_state = job.checkpoint.allow_unrestored_state;
         // Which generation this deploy WRITES, and which one produced the restore
         // point. They differ exactly when the restore crosses a rescale, and the
         // boundary is the same one that decides whether the parent INDEX needs
@@ -9007,6 +9018,7 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         deploy_msg.restore_from_dir = job.state_root;
         deploy_msg.restore_from_checkpoint_id = status->cutover_checkpoint;
         deploy_msg.run_checkpoint_floor = job.run_checkpoint_floor;
+        deploy_msg.allow_unrestored_state = job.checkpoint.allow_unrestored_state;
         deploy_msg.unaligned_checkpoints =
             job.checkpoint.alignment == CheckpointAlignment::Unaligned;
         deploy_msg.adaptive_barrier_mode =

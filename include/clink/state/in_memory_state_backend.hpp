@@ -296,7 +296,27 @@ public:
     static std::vector<std::byte> retain_operator_state_of(
         std::span<const std::byte> snapshot_bytes, const std::set<std::uint64_t>& operators);
 
+    // How many KEYED rows each operator holds in a snapshot (OperatorId value
+    // -> rows). A restoring subtask compares these with the operators it runs:
+    // keyed state is read back only by the subtask that wrote it, so a keyed
+    // row of an operator it does not run is read by nothing.
+    static std::map<std::uint64_t, std::uint64_t> keyed_rows_by_operator(
+        std::span<const std::byte> snapshot_bytes);
+
+    // The snapshot without the KEYED rows of `operators`. Operator-state rows
+    // and the schema metadata pass through unchanged.
+    static std::vector<std::byte> drop_keyed_state_of(std::span<const std::byte> snapshot_bytes,
+                                                      const std::set<std::uint64_t>& operators);
+
 private:
+    // The snapshot with only the rows `keep(op, keyed)` accepts, written under
+    // the input's own schema so its metadata survives. `what` names the caller
+    // in errors.
+    static std::vector<std::byte> filter_snapshot_rows(
+        std::span<const std::byte> snapshot_bytes,
+        const std::function<bool(std::uint64_t op, bool keyed)>& keep,
+        const char* what);
+
     static std::string memory_key_(OperatorId op, KeyView key) {
         return std::to_string(op.value()) + ":" + std::string(key);
     }

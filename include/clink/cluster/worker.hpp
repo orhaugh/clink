@@ -448,6 +448,9 @@ private:
         // The run's checkpoint-id floor (echoed from DeployMsg); unset when the
         // coordinator sent none.
         std::optional<std::uint64_t> run_checkpoint_floor;
+        // A restore drops the keyed state of operators a subtask does not run
+        // instead of refusing (echoed from DeployMsg).
+        bool allow_unrestored_state{false};
     };
     std::unordered_map<JobId, JobCheckpointState> per_job_checkpoint_;
 

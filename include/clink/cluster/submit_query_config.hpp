@@ -69,6 +69,18 @@ namespace clink::cluster {
     // what `clink replay` reproduces an incident from.
     ckpt.capture_dir = str_param("capture_dir");
     parse_int("capture_records", ckpt.capture_records);
+    // Drop the keyed state of operators the restored job does not run instead
+    // of refusing the restore. Only "true" and "false": a misspelt value that
+    // quietly meant "false" would refuse a restore the submitter meant to allow,
+    // and one that meant "true" would drop state they meant to keep.
+    if (const auto allow = str_param("allow_unrestored_state"); !allow.empty()) {
+        if (allow == "true") {
+            ckpt.allow_unrestored_state = true;
+        } else if (allow != "false") {
+            *error = "query parameter allow_unrestored_state must be 'true' or 'false' (got '" +
+                     allow + "')";
+        }
+    }
     if (const auto alignment = str_param("alignment"); !alignment.empty()) {
         if (alignment == "aligned") {
             ckpt.alignment = CheckpointAlignment::Aligned;

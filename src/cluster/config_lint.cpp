@@ -81,6 +81,16 @@ std::vector<ConfigProblem> lint_checkpoint_config(const CheckpointConfig& c) {
                        "restore_from_dir was set but restore_from_checkpoint_id is 0, so nothing "
                        "is restored and the job starts from scratch. Both are required."});
     }
+    // Dropping unrestored state applies to a restore; without one it applies to
+    // nothing, and a submitter who set it believes the job restores.
+    if (c.allow_unrestored_state &&
+        (c.restore_from_dir.empty() || c.restore_from_checkpoint_id == 0)) {
+        out.push_back({LintSeverity::Warning,
+                       "allow_unrestored_state",
+                       "allow_unrestored_state was set but no restore is configured "
+                       "(restore_from_dir and restore_from_checkpoint_id), so it drops nothing "
+                       "and the job starts from scratch."});
+    }
 
     // capture_records bounds an epoch of the record capture; with no
     // capture_dir there is no capture to bound.

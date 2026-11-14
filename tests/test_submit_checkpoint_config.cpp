@@ -44,6 +44,7 @@ TEST(SubmitCheckpointConfig, EveryDurabilityParameterReachesTheConfig) {
             {"alignment", "adaptive"},
             {"capture_dir", "/var/clink/capture"},
             {"capture_records", "25000"},
+            {"allow_unrestored_state", "true"},
         },
         &error);
     ASSERT_TRUE(error.empty()) << error;
@@ -59,6 +60,18 @@ TEST(SubmitCheckpointConfig, EveryDurabilityParameterReachesTheConfig) {
     // need replaying is recorded from its first epoch, not re-run.
     EXPECT_EQ(ckpt.capture_dir, "/var/clink/capture");
     EXPECT_EQ(ckpt.capture_records, 25000U);
+    EXPECT_TRUE(ckpt.allow_unrestored_state);
+}
+
+// Dropping state is not something a misspelt value should decide either way.
+TEST(SubmitCheckpointConfig, AllowUnrestoredStateTakesOnlyTrueOrFalse) {
+    std::string error;
+    auto ckpt = checkpoint_config_from_query({{"allow_unrestored_state", "false"}}, &error);
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_FALSE(ckpt.allow_unrestored_state);
+    ckpt = checkpoint_config_from_query({{"allow_unrestored_state", "yes"}}, &error);
+    EXPECT_NE(error.find("allow_unrestored_state must be 'true' or 'false'"), std::string::npos)
+        << error;
 }
 
 TEST(SubmitCheckpointConfig, AnEmptyQueryLeavesEveryDefault) {
@@ -130,6 +143,7 @@ TEST(SubmitCheckpointConfig, TheClientSendsWhatTheServerParses) {
                                                    .alignment = "adaptive",
                                                    .capture_dir = "/var/clink/capture",
                                                    .capture_records = 25000,
+                                                   .allow_unrestored_state = true,
                                                },
                                                out,
                                                err);
@@ -156,6 +170,7 @@ TEST(SubmitCheckpointConfig, TheClientSendsWhatTheServerParses) {
     EXPECT_EQ(ckpt.alignment, CheckpointAlignment::Adaptive);
     EXPECT_EQ(ckpt.capture_dir, "/var/clink/capture");
     EXPECT_EQ(ckpt.capture_records, 25000U);
+    EXPECT_TRUE(ckpt.allow_unrestored_state);
 }
 
 TEST(SubmitCheckpointConfig, UnsetClientOptionsSendNoParameters) {
@@ -189,6 +204,7 @@ TEST(SubmitCheckpointConfig, UnsetClientOptionsSendNoParameters) {
     EXPECT_EQ(seen_query.count("state_backend"), 0U);
     EXPECT_EQ(seen_query.count("capture_dir"), 0U);
     EXPECT_EQ(seen_query.count("capture_records"), 0U);
+    EXPECT_EQ(seen_query.count("allow_unrestored_state"), 0U);
 }
 
 // The Coordinator holds a submission while it waits for free slots (15 s by

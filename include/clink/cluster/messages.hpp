@@ -144,6 +144,9 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // had before it.
     b.put_u8(m.run_checkpoint_floor.has_value() ? 1 : 0);
     b.put_u64_be(m.run_checkpoint_floor.value_or(0));
+    // Whether a restore drops the keyed state of operators a subtask does not
+    // run. A peer that stops reading earlier makes no such check.
+    b.put_u8(m.allow_unrestored_state ? 1 : 0);
 }
 
 inline void encode_body(MessageBuilder& b, const StartJobMsg& m) {
@@ -268,6 +271,9 @@ inline void encode_body(MessageBuilder& b, const SubmitJobMsg& m) {
         b.put_string(ad.target_triple);
         b.put_string(ad.toolchain);
     }
+    // Trailing: whether a restore drops the keyed state of operators a subtask
+    // does not run. Older coordinators see EOF before it and never drop.
+    b.put_u8(m.checkpoint.allow_unrestored_state ? 1 : 0);
 }
 
 inline void encode_body(MessageBuilder& b, const SubmitJobAckMsg& m) {
@@ -667,6 +673,11 @@ inline DeployMsg decode_deploy(MessageReader& r) {
             m.run_checkpoint_floor = floor;
         }
     }
+    // Absent from older coordinator peers -> false: the restore refuses the
+    // keyed state of operators a subtask does not run.
+    if (!r.eof()) {
+        m.allow_unrestored_state = r.read_u8() != 0;
+    }
     return m;
 }
 
@@ -882,6 +893,10 @@ inline SubmitJobMsg decode_submit_job(MessageReader& r) {
             ad.toolchain = r.read_string();
             m.plugin_abi_adverts.push_back(std::move(ad));
         }
+    }
+    // Trailing. Absent from older clients -> false, so the restore refuses.
+    if (!r.eof()) {
+        m.checkpoint.allow_unrestored_state = r.read_u8() != 0;
     }
     return m;
 }

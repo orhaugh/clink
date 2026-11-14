@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 from clink_audit.upgrade import compare, definition, evidence, reference, workload  # noqa: E402
+from clink_audit.upgrade import gate  # noqa: E402
 from clink_audit.upgrade import cli as upgrade_cli  # noqa: E402
 from clink_audit.upgrade.builds import Build  # noqa: E402
 from clink_audit.upgrade.cluster import Cluster, Limits, RunStopped  # noqa: E402
@@ -245,6 +246,33 @@ class TestVerdict(unittest.TestCase):
         r.set("state.raw", FAILED, "raw bytes differ")
         self.assertEqual(r.result(), ("passed", 0))
         self.assertIn("state.raw", [c["id"] for c in r.document()["checks"]])
+
+
+class TestRestoreProgress(unittest.TestCase):
+    """A restore the engine refuses on the Workers fails the job as it deploys,
+    before its operators report; the gate says so instead of waiting out the
+    run's time limit."""
+
+    class _Cluster:
+        def __init__(self, finished, operators):
+            self._finished, self._operators = finished, operators
+
+        def finished(self, job):
+            return self._finished
+
+        def operators(self, job):
+            return self._operators
+
+    def test_a_failed_job_is_reported_before_its_operators(self):
+        c = self._Cluster((False, "refusing to restore subtask 1"), [{"op_id": "7"}])
+        self.assertEqual(gate._restore_progress(c, 1), ("failed", "refusing to restore subtask 1"))
+
+    def test_a_running_job_reports_its_operators(self):
+        c = self._Cluster(None, [{"op_id": "7"}])
+        self.assertEqual(gate._restore_progress(c, 1), ("running", [{"op_id": "7"}]))
+
+    def test_neither_yet_keeps_waiting(self):
+        self.assertIsNone(gate._restore_progress(self._Cluster(None, []), 1))
 
 
 class TestClusterLimits(unittest.TestCase):
