@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -416,13 +417,28 @@ public:
     // Deliberately not checked against assigned_uids_: the add_* paths already
     // registered the uid when the operator carried one, so re-stamping the same
     // uid here is expected rather than a duplicate.
+    //
+    // It records identity; it does not change the id. The id is fixed when the
+    // runner is added, and the runner's closure already holds it for timers,
+    // capture and the emitter, so re-deriving it here split one operator across
+    // two ids. A uid that derives a different id from the one the runner was
+    // added under is refused: the builder must apply the uid before add_*
+    // (plugin::BuildContext::uid).
     void set_runner_identity(std::size_t runner_index, std::string spec_node_id, std::string uid) {
         if (runner_index < runners_.size()) {
-            runners_[runner_index].spec_node_id = std::move(spec_node_id);
-            if (!uid.empty()) {
-                runners_[runner_index].id = derive_id_from_uid_(uid);
+            auto& runner = runners_[runner_index];
+            if (!uid.empty() && runner.id != derive_id_from_uid_(uid)) {
+                throw std::logic_error(
+                    "Dag::set_runner_identity: runner '" + runner.name +
+                    "' was added under "
+                    "operator id " +
+                    std::to_string(runner.id.value()) + ", but its uid '" + uid + "' derives " +
+                    std::to_string(derive_id_from_uid_(uid).value()) +
+                    ". The uid must reach the operator before it is added, or its timers and "
+                    "keyed state end up under different ids.");
             }
-            runners_[runner_index].spec_uid = std::move(uid);
+            runner.spec_node_id = std::move(spec_node_id);
+            runner.spec_uid = std::move(uid);
         }
     }
 

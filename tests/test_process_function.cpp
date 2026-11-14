@@ -21,10 +21,13 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/cluster/built_in_factories.hpp"
+#include "clink/cluster/dag_builder_registry.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/operators/process_function.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
+#include "clink/plugin/plugin.hpp"
 #include "clink/runtime/dag.hpp"
 #include "clink/runtime/job_config.hpp"
 #include "clink/runtime/local_executor.hpp"
@@ -1165,6 +1168,100 @@ TEST(ProcessFunction, ARestoreThatKeepsTheLayoutKeepsEveryTimerWhateverItsKeyEnc
     EXPECT_FALSE(narrowed.covers_all());
     EXPECT_LT(routed, keys.size());
     EXPECT_GT(routed, 0U);
+}
+
+namespace {
+
+// An int64 operator that records the event-time timers it fires, built through
+// the plugin registry's DagBuilder as the cluster builds a chained operator.
+class ChainedTimerProbe final : public Operator<std::int64_t, std::int64_t> {
+public:
+    void process(const StreamElement<std::int64_t>& el, Emitter<std::int64_t>& out) override {
+        if (el.is_watermark()) {
+            this->on_watermark(el.as_watermark(), out);
+        } else if (el.is_barrier()) {
+            this->on_barrier(el.as_barrier(), out);
+        }
+    }
+    void on_event_time_timer(std::int64_t,
+                             const std::string& key,
+                             Emitter<std::int64_t>&) override {
+        fired->push_back(key);
+    }
+    std::shared_ptr<std::vector<std::string>> fired = std::make_shared<std::vector<std::string>>();
+};
+
+}  // namespace
+
+// A chained operator with a uid kept its keyed state under the uid's id, but
+// its timers under the id of its position. The chain dispatcher stamped the
+// uid on the runner after the builder had added the operator, and the runner's
+// closure still held the position id for its timers, so the timers it
+// checkpointed were written under one id and looked for under the other, and
+// none survived a restore. The builder now applies the uid before the add, so
+// the operator has one id and its timers come back.
+TEST(ProcessFunction, AChainedOperatorWithAUidRestoresItsTimers) {
+    clink::cluster::ensure_built_ins_registered();
+    const std::string uid = "chained-timer-probe";
+    const OperatorId op_id = operator_id_from_uid(uid);
+    InMemoryStateBackend seed;
+    TimerService ts;
+    for (const auto* k : {"a", "b", "c"}) {
+        ts.register_event_time_timer(1000, k);
+    }
+    const auto blob = ts.serialize();
+    seed.put_operator_state(
+        op_id,
+        StateBackend::KeyView{"__clink_timers"},
+        StateBackend::ValueView{reinterpret_cast<const char*>(blob.data()), blob.size()});
+    auto snap = seed.snapshot(CheckpointId{1});
+
+    auto probe = std::make_shared<ChainedTimerProbe>();
+    plugin::PluginRegistry reg;
+    reg.register_operator<std::int64_t, std::int64_t>(
+        "chained_timer_probe",
+        [probe](const plugin::BuildContext&)
+            -> std::shared_ptr<Operator<std::int64_t, std::int64_t>> { return probe; });
+    const auto* builder =
+        clink::cluster::DagBuilderRegistry::default_instance().find("chained_timer_probe");
+    ASSERT_NE(builder, nullptr);
+
+    Dag dag;
+    auto h_src = dag.add_source<std::int64_t>(
+        std::make_shared<VectorSource<std::int64_t>>(std::vector<Record<std::int64_t>>{}));
+    plugin::BuildContext bctx;
+    bctx.uid = uid;
+    bctx.spec_node_id = "op_1";
+    auto built = (*builder)(dag, std::vector<std::any>{std::any{h_src}}, bctx);
+    // As the chain dispatcher does after the build.
+    dag.set_runner_identity(built.runner_index, "op_1", uid);
+    EXPECT_EQ(dag.runner_id_at(built.runner_index), op_id.value());
+    EXPECT_EQ(probe->id(), op_id) << "the operator and its runner disagree on its id";
+    dag.add_sink<std::int64_t>(std::any_cast<StageHandle<std::int64_t>>(built.main_handle),
+                               std::make_shared<CollectingSink<std::int64_t>>());
+
+    JobConfig cfg;
+    cfg.state_backend = std::make_shared<InMemoryStateBackend>();
+    cfg.restore_from = std::move(snap);
+    cfg.restore_keeps_key_groups = true;
+    auto fired = probe->fired;
+    LocalExecutor exec(std::move(dag), std::move(cfg));
+    exec.run();
+    EXPECT_EQ(fired->size(), 3U) << "the chained operator's timers did not come back";
+}
+
+// Stamping a uid on a runner after it was added under another id is refused:
+// the runner's closure holds the id it was added under, so re-deriving it
+// would split the operator across two ids.
+TEST(ProcessFunction, AUidStampedAfterTheAddIsRefused) {
+    Dag dag;
+    auto h_src = dag.add_source<std::int64_t>(
+        std::make_shared<VectorSource<std::int64_t>>(std::vector<Record<std::int64_t>>{}));
+    auto h =
+        dag.add_operator<std::int64_t, std::int64_t>(h_src, std::make_shared<ChainedTimerProbe>());
+    EXPECT_THROW(dag.set_runner_identity(h.runner_index, "op_1", "late-uid"), std::logic_error);
+    // Recording the node id alone, or the uid it was added under, is fine.
+    EXPECT_NO_THROW(dag.set_runner_identity(h.runner_index, "op_1", ""));
 }
 
 // Two-input counterpart: a CoProcessFunction's event-time timer (both

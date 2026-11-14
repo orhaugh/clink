@@ -161,6 +161,21 @@ inline void apply_chain_identity(OpPtr& op, const clink::cluster::RunnerContext&
     }
 }
 
+// Apply the graph identity a DagBuilder was given (BuildContext::uid and
+// spec_node_id) to the operator it built, before it is added to the Dag: the
+// Dag fixes the operator's id at the add, from its uid when it has one, and
+// that one id then serves its keyed state, timers and capture alike. A uid the
+// operator's factory set itself is kept when the graph gives none.
+template <typename OpPtr>
+inline void apply_build_identity(OpPtr& op, const BuildContext& ctx) {
+    if (!ctx.uid.empty()) {
+        op->set_uid(ctx.uid);
+    }
+    if (!ctx.spec_node_id.empty()) {
+        op->set_spec_node_id(ctx.spec_node_id);
+    }
+}
+
 // Look up TypeOps for a channel name; throw with a clear message if
 // missing. Used by the runners to construct typed output bridges.
 inline const clink::cluster::TypeOps& require_type_ops(const clink::cluster::TypeRegistry& reg,
@@ -676,6 +691,7 @@ void PluginRegistry::register_source(
                     std::any{std::move(ph)}, /*runner_index=*/0, ctx.parallelism};
             }
             auto src = factory(ctx);
+            detail::apply_build_identity(src, ctx);
             auto h = dag.template add_source<T>(src);
             return clink::cluster::DagOpHandle{std::any{h}, h.runner_index, /*parallelism=*/1};
         });
@@ -876,6 +892,7 @@ void PluginRegistry::register_sink(
             }
             auto in_handle = std::any_cast<clink::StageHandle<T>>(upstream[0]);
             auto sink = factory(ctx);
+            detail::apply_build_identity(sink, ctx);
             auto h = dag.template add_sink<T>(in_handle, sink);
             // Sinks have no downstream main handle to chain from, but
             // their runner_index is still needed for side-output
@@ -1016,6 +1033,7 @@ void PluginRegistry::register_operator(
         }
         auto in_handle = std::any_cast<clink::StageHandle<In>>(upstream[0]);
         auto op = factory(ctx);
+        detail::apply_build_identity(op, ctx);
         // capture_codec arms the record-capture tee for this op when the
         // job names a capture_dir (the chain-dispatch path builds ops
         // through this DagBuilder, so chained subtasks capture too).
@@ -1172,6 +1190,7 @@ void PluginRegistry::register_co_operator(
             auto h1 = std::any_cast<clink::StageHandle<In1>>(upstream[0]);
             auto h2 = std::any_cast<clink::StageHandle<In2>>(upstream[1]);
             auto op = factory(ctx);
+            detail::apply_build_identity(op, ctx);
             auto h_out = dag.template add_co_operator<In1, In2, Out>(
                 h1, h2, op, in1_codec_opt, in2_codec_opt);
             return clink::cluster::DagOpHandle{std::any{h_out}, h_out.runner_index};

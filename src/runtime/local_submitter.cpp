@@ -213,6 +213,10 @@ void LocalSubmitter::submit(api::Pipeline& env, JobConfig config) {
         ctx.params = op.params;
         ctx.parallelism = op.parallelism;
         ctx.subtask_idx = 0;
+        // The identity goes in with the build, so the Dag fixes the operator's
+        // id from its uid when it is added (see BuildContext::uid).
+        ctx.uid = op.uid;
+        ctx.spec_node_id = op.id;
 
         auto built = (*builder)(dag, upstream, ctx);
         // Make sure builder reported the same parallelism we asked for -
@@ -227,11 +231,13 @@ void LocalSubmitter::submit(api::Pipeline& env, JobConfig config) {
                                      "'). The builder probably predates the parallel-mode "
                                      "extension; recompile against the latest plugin.hpp.");
         }
-        // Stamp the spec node id and uid onto the runner the builder just made.
-        // The DagBuilder closures know nothing about either, so without this a
-        // stateful operator's OperatorId comes from its position in the graph
-        // instead of from its uid, and its state does not restore.
-        dag.set_runner_identity(built.runner_index, op.id, op.uid);
+        // Record the spec node id and uid on the runner the builder just made
+        // (the builder applied them before the add). A parallel stage has a
+        // runner per subtask and reports runner index 0, which is not one of
+        // them, so it is not stamped here.
+        if (built.parallelism <= 1) {
+            dag.set_runner_identity(built.runner_index, op.id, op.uid);
+        }
         handles.emplace(op.id, built);
 
         // Wire any declared side outputs. The DagBuilder returns the

@@ -460,6 +460,36 @@ JobGraphSpec JobGraphSpec::from_json(std::string_view json_text) {
 }
 
 void JobGraphSpec::validate() const {
+    // Unique uids. An operator's state is stored under an id derived from its
+    // uid, so two operators with one uid share one id and read each other's
+    // state. A sink without a uid takes its node id as its uid, so a uid equal
+    // to another operator's node id collides with that operator if it is a
+    // sink; refused for any operator, which is simpler to state and costs
+    // nothing a graph needs.
+    {
+        std::unordered_map<std::string, const OperatorSpec*> node_ids;
+        for (const auto& op : ops) {
+            node_ids.emplace(op.id, &op);
+        }
+        std::unordered_map<std::string, const OperatorSpec*> uids;
+        for (const auto& op : ops) {
+            if (op.uid.empty()) {
+                continue;
+            }
+            if (const auto [it, fresh] = uids.emplace(op.uid, &op); !fresh) {
+                throw std::runtime_error("JobGraphSpec::validate: ops '" + it->second->id +
+                                         "' and '" + op.id + "' share uid '" + op.uid +
+                                         "'; a uid names one operator's state");
+            }
+            if (const auto it = node_ids.find(op.uid); it != node_ids.end() && it->second != &op) {
+                throw std::runtime_error(
+                    "JobGraphSpec::validate: op '" + op.id + "' has uid '" + op.uid +
+                    "', which is op '" + it->second->id +
+                    "''s node id; a sink without a uid takes its node id as its uid, so the two "
+                    "would share state. Choose another uid.");
+            }
+        }
+    }
     // Unique ids.
     std::unordered_set<std::string> ids;
     for (const auto& op : ops) {

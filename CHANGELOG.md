@@ -24,6 +24,22 @@ tested on macOS arm64 and Linux aarch64, and built and tested in CI on Linux
 x86_64, whose toolchain image installs the library. The runtime image builds
 it in. See `docs/connectors/relate.md`.
 
+**A chained operator with a uid keeps its timers across a restore.** The
+cluster's chain dispatcher, and the in-process `LocalSubmitter`, stamped an
+operator's uid on its runner after the builder had added the operator, and
+`Dag::set_runner_identity` re-derived the runner's id from it. The runner's
+closure still held the id of the operator's position for its timers, record
+capture and emitter, so the operator's keyed state was stored under its uid's
+id and its timers under the position's; a restore keeps only the operator-state
+rows of the ids a subtask runs, so every timer of a chained operator with a uid
+was dropped at every restore, and its capture could not be replayed. The
+graph's uid and node id now travel in `plugin::BuildContext` (`uid`,
+`spec_node_id`), every builder applies them before the add, and
+`set_runner_identity` only records identity, refusing a uid that would derive
+another id. `JobGraphSpec::validate` now also rejects two operators that share a
+uid, and a uid equal to another operator's node id, which a sink without a uid
+takes as its uid.
+
 **A refused restore fails the job once instead of restarting into it.** A
 subtask whose restore the engine refused threw a plain error, which a Worker
 treats as retryable, so a job that takes checkpoints restarted, restored the

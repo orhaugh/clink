@@ -79,6 +79,15 @@ struct BuildContext {
     std::map<std::string, std::string> params;
     std::uint32_t subtask_idx{0};
     std::uint32_t parallelism{1};
+    // The graph's identity for the operator being built: its uid (empty when
+    // it has none) and its node id in the JobGraphSpec. A builder applies them
+    // to the operator BEFORE adding it to a Dag, because the Dag fixes an
+    // operator's id when it is added, and its timers, capture and keyed state
+    // all use that id. Stamped after the add, they split: the runner's keyed
+    // state took the uid's id while its timers stayed under the position id
+    // and were dropped at every restore.
+    std::string uid;
+    std::string spec_node_id;
 
     std::string param_or(const std::string& key, std::string fallback = {}) const {
         auto it = params.find(key);

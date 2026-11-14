@@ -98,6 +98,8 @@ ScalarBufferResult run_scalar_buffer(const std::string& type,
     const auto* builder = cluster::DagBuilderRegistry::default_instance().find(type);
     if (!builder)
         throw std::runtime_error("missing scalar buffer test builder");
+    build.uid = "memory-test-scalar";
+    build.spec_node_id = "scalar";
     auto built = (*builder)(dag, {std::any{main}, std::any{scalar}}, build);
     auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
     dag.set_runner_identity(output.runner_index, "scalar", "memory-test-scalar");
@@ -854,6 +856,8 @@ TEST(SqlMemoryBudget, JoinPartitionsSpillAcrossBarrierRecoveryAndOuterExpiry) {
                                 {"null_aware", "1"}};
                 const auto* builder = cluster::DagBuilderRegistry::default_instance().find(type);
                 ASSERT_NE(builder, nullptr);
+                build.uid = "memory-test-join";
+                build.spec_node_id = "join";
                 auto built = (*builder)(dag, {std::any{left}, std::any{right}}, build);
                 auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
                 dag.set_runner_identity(output.runner_index, "join", "memory-test-join");
@@ -959,6 +963,8 @@ TEST(SqlMemoryBudget, JoinMapsAndNullWildcardRowsRefuseOverBudget) {
                                 {"null_aware", "1"}};
                 const auto* builder = cluster::DagBuilderRegistry::default_instance().find(type);
                 ASSERT_NE(builder, nullptr);
+                build.uid = "memory-test-join";
+                build.spec_node_id = "join";
                 auto built = (*builder)(dag, {std::any{left}, std::any{right}}, build);
                 auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
                 dag.set_runner_identity(output.runner_index, "join", "memory-test-join");
@@ -1196,6 +1202,8 @@ TEST(SqlMemoryBudget, NullWildcardEntriesSpillAndRecoverWithoutWholeIndexHydrati
             const auto* builder =
                 cluster::DagBuilderRegistry::default_instance().find("semi_join_row");
             ASSERT_NE(builder, nullptr);
+            build.uid = "memory-test-wildcards";
+            build.spec_node_id = "wildcards";
             auto built = (*builder)(dag, {std::any{left}, std::any{right}}, build);
             auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
             dag.set_runner_identity(output.runner_index, "wildcards", "memory-test-wildcards");
@@ -1436,6 +1444,8 @@ TEST(SqlMemoryBudget, OneJoinPartitionExceedsBudgetAcrossRecoveryAndOuterExpiry)
                                 {"null_aware", "1"}};
                 const auto* builder = cluster::DagBuilderRegistry::default_instance().find(type);
                 ASSERT_NE(builder, nullptr);
+                build.uid = "memory-test-join";
+                build.spec_node_id = "join";
                 auto built = (*builder)(dag, {std::any{left}, std::any{right}}, build);
                 auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
                 dag.set_runner_identity(output.runner_index, "join", "memory-test-join");
@@ -2011,6 +2021,8 @@ TEST(SqlMemoryBudget, NullAwareExactBucketExceedsBudgetAndRecoversPoisonedFlags)
                                 {"null_aware", "1"}};
                 const auto* builder = cluster::DagBuilderRegistry::default_instance().find(type);
                 ASSERT_NE(builder, nullptr);
+                build.uid = "memory-test-join";
+                build.spec_node_id = "join";
                 auto built = (*builder)(dag, {std::any{left}, std::any{right}}, build);
                 auto output = std::any_cast<StageHandle<Row>>(built.main_handle);
                 dag.set_runner_identity(output.runner_index, "join", "memory-test-join");

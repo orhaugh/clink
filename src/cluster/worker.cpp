@@ -3132,16 +3132,21 @@ void Worker::run_generic_subtask_(JobId job_id,
             bctx.params = co.params;
             bctx.subtask_idx = chain.subtask_idx_in_op;
             bctx.parallelism = 1;  // chain dispatch is per-subtask
+            // The chained op's identity goes in with the build, so the Dag
+            // fixes its id from its uid when it is added: stamped afterwards,
+            // its keyed state took the uid's id while its timers and capture
+            // kept the position id, and the timers were dropped at every
+            // restore.
+            bctx.uid = co.uid;
+            bctx.spec_node_id = co.id;
             auto handle = (*builder)(dag, std::vector<std::any>{std::move(prev)}, bctx);
             runner_indexes.push_back(handle.runner_index);
-            // Stamp the spec node id + uid so LocalExecutor emits the
-            // op_id<->node mapping (clink_op_info). The DagBuilder doesn't carry
-            // the chain identity, so do it here where co.id/co.uid are known.
+            // Record the spec node id + uid on the runner so LocalExecutor
+            // emits the op_id<->node mapping (clink_op_info); it refuses an id
+            // the builder fixed differently.
             dag.set_runner_identity(handle.runner_index, co.id, co.uid);
             // Record-capture op-spec sidecar: persist each chained op's build
             // spec next to its epochs so `clink replay` can rebuild it offline.
-            // NOTE: set_runner_identity above can re-derive the OperatorId from
-            // the uid, so read the id AFTER stamping.
             if (!capture_dir.empty()) {
                 clink::capture::write_op_spec(
                     capture_dir,

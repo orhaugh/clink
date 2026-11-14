@@ -334,6 +334,31 @@ TEST(JobGraphSpec, OperatorIdFromUidIsStableAndNonzero) {
     EXPECT_NE(clink::operator_id_from_uid("agg").value(), 0u);
 }
 
+// A uid names one operator's state: two operators sharing one would read each
+// other's. A sink without a uid takes its node id as its uid, so a uid equal to
+// another operator's node id is refused too.
+TEST(JobGraphSpec, RejectsAUidTwoOperatorsWouldShare) {
+    JobGraphSpec spec;
+    OperatorSpec a;
+    a.type = "int64_range_source";
+    a.id = "src";
+    a.uid = "shared";
+    OperatorSpec b;
+    b.type = "int64_file_sink";
+    b.id = "out";
+    b.inputs = {"src"};
+    b.uid = "shared";
+    spec.ops = {a, b};
+    EXPECT_THROW(spec.validate(), std::runtime_error);
+
+    spec.ops[1].uid.clear();
+    spec.ops[0].uid = "out";  // the sink's node id, which it takes as its uid
+    EXPECT_THROW(spec.validate(), std::runtime_error);
+
+    spec.ops[0].uid = "src";  // an operator's own node id is its own
+    EXPECT_NO_THROW(spec.validate());
+}
+
 TEST(JobGraphSpec, RejectsHalfSpecifiedBounds) {
     // Either both bounds are set or neither - having only one is a
     // configuration mistake that's better surfaced at parse time
