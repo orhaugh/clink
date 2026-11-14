@@ -45,6 +45,27 @@ using OperatorId = detail::StrongId<OperatorIdTag>;
 using PartitionId = detail::StrongId<PartitionIdTag>;
 using CheckpointId = detail::StrongId<CheckpointIdTag>;
 
+// The hash every operator id is derived from: FNV-1a 64 over a domain-tagged
+// string ("uid/<uid>", "node/<graph node id>", "stage<idx>/<name>"), 0 mapped
+// to 1 (0 is the default-constructed sentinel). Frozen: state is stored under
+// these ids, so a change to this function orphans every checkpoint ever taken.
+// Unlike std::hash it is the same in every build, on every platform and with
+// either standard library, so a checkpoint restores wherever clink runs. Inline
+// because job plugins compute ids in their own code (fluent expected-version
+// declarations), and they link no clink library that could supply it.
+inline constexpr std::uint64_t stable_operator_id_hash(std::string_view tagged) noexcept {
+    std::uint64_t h = 0xcbf29ce484222325ULL;
+    for (const char c : tagged) {
+        h ^= static_cast<std::uint8_t>(c);
+        h *= 0x100000001b3ULL;
+    }
+    return h == 0 ? std::uint64_t{1} : h;
+}
+
+inline OperatorId stable_operator_id(std::string_view tagged) {
+    return OperatorId{stable_operator_id_hash(tagged)};
+}
+
 // Derive the stable OperatorId for a user-assigned `.uid("...")`. The
 // runtime (Dag) uses this to key keyed-state and to stamp state-version
 // metadata; the SQL/API env uses the same transform to record a job's

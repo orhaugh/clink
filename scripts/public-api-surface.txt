@@ -402,6 +402,7 @@ include/clink/core/allocator_info.hpp
 include/clink/core/arrow_compute.hpp
 include/clink/core/base64.hpp
 include/clink/core/hash_map.hpp
+include/clink/core/legacy_operator_ids.hpp
 include/clink/core/sha256.hpp
 include/clink/embed/arrow_pool_pin.hpp
 include/clink/embed/collect_hub.hpp
