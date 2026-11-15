@@ -238,12 +238,17 @@ TEST(RelateTypes, AValueThatDoesNotFitItsColumnIsRefusedWithoutBeingQuoted) {
                                                     "b")});
     EXPECT_EQ(utf8.code, code::kValueInvalid);
     EXPECT_NE(utf8.message.find("Relate refused the value"), std::string::npos) << utf8.message;
+    // Relate's own reason is carried, read after the putter set it (GCC lost
+    // it, and leaked it, when the error was read as a sibling argument).
+    EXPECT_EQ(utf8.message.find("Relate gave no detail"), std::string::npos) << utf8.message;
 
     EXPECT_EQ(refusal("DATE", JsonValue{std::int64_t{3000000}}).code, code::kValueInvalid);
     EXPECT_EQ(refusal("DATE", JsonValue{std::string("10/11/2026")}).code, code::kValueInvalid);
     const auto february = refusal("DATE", JsonValue{std::string("2026-02-30")});
     EXPECT_EQ(february.code, code::kValueInvalid);
     EXPECT_NE(february.message.find("Relate refused the value"), std::string::npos)
+        << february.message;
+    EXPECT_EQ(february.message.find("Relate gave no detail"), std::string::npos)
         << february.message;
     EXPECT_EQ(refusal("TIMESTAMP(3)", JsonValue{std::int64_t{400000000000000}}).code,
               code::kValueInvalid);

@@ -261,12 +261,17 @@ constexpr std::int64_t kMsPerDay = 86'400'000;
 // A name Relate's builder takes: a C string of at most 4096 bytes.
 constexpr std::size_t kMaxNameBytes = 4096;
 
-// Reports a putter's refusal as the column's, with Relate's reason.
-void settled(relate_status status, char* err, const std::string& path, const SqlType& t) {
+// Reports a putter's refusal as the column's, with Relate's reason. `err` is
+// taken by reference and read here, after the putter has run: in a call
+// `settled(put(..., &err), err, ...)` the order the arguments are evaluated in
+// is unspecified, and GCC copies `err` before the putter sets it, which lost
+// the reason and leaked Relate's string.
+void settled(relate_status status, char*& err, const std::string& path, const SqlType& t) {
+    std::string reason = take(std::exchange(err, nullptr));
     if (status == RELATE_OK) {
         return;
     }
-    wrong(path, t, "Relate refused the value: " + parse_engine_error(take(err)).message);
+    wrong(path, t, "Relate refused the value: " + parse_engine_error(reason).message);
 }
 
 // Puts `v` as a value of type `t` under `name` in `into`; inside a list `name`

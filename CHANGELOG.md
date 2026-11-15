@@ -24,6 +24,13 @@ tested on macOS arm64 and Linux aarch64, and built and tested in CI on Linux
 x86_64, whose toolchain image installs the library. The runtime image builds
 it in. See `docs/connectors/relate.md`.
 
+**A value Relate refuses is reported with Relate's reason on every compiler.**
+The sink read Relate's error string as a sibling argument of the call that set
+it, and C++ leaves the order of a call's arguments unspecified: GCC read it
+before the call, so on Linux a refused value said "Relate gave no detail" and
+the string leaked (found by the nightly ASan run). It is now read after the
+call.
+
 **A restore is judged over the whole job before a record flows.** The keyed
 check below is made by each subtask on what it inherits, and could not see
 operator state, which crosses subtasks at a restore: a source whose uid changed
