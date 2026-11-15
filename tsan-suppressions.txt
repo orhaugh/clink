@@ -105,3 +105,55 @@ called_from_lib:libgpr.so
 # client / cpprest - no clink frame in the report.
 race:libetcd-cpp-api.so
 race:libcpprest.so
+
+# Relate (impls/relate) is a Rust library linked statically, not built with
+# TSan. Its standard library hands work and results between the caller and the
+# library's own query worker thread through atomics and futex waits, which TSan
+# cannot see, so the copies either side are reported as races on every Relate
+# test: on x86_64 relate::query_worker::ErasedJob::new::invoke writing and
+# relate::connection::Connection::run_cancellable reading, on aarch64
+# alloc::str::join_generic_copy on the worker and relate_model::wire:: frames on
+# the caller. Relate's C interface takes no callback and shares nothing of
+# clink's with that thread: each call returns before clink touches its result.
+# The rules match the library's frames by name, as there is no module to match
+# for a static library. Relate's crates are relate, relate_executor,
+# relate_model, relate_parser and others; it also bundles Rust crates whose names
+# clink's C++ uses (parquet, std), which are deliberately not matched.
+#   ^relate:: and ^relate_*::   a frame in one of Relate's own crates
+#   relate.. and relate_*..     one of its types inside a generic or trait-impl
+#               frame, as legacy mangling prints them
+#               (drop_in_place<...relate..plan_node..PlanArtifacts>,
+#               <relate_executor..graph..ConstraintKeyScope as core..clone..Clone>)
+#   ^core::, ^alloc:: and ^hashbrown::   Rust crates monomorphised into the
+#               library; clink declares no namespace with any of these names
+#   core.. and alloc..   the same inside a generic or trait-impl frame
+#               (<core..iter..GenericShunt as core..iter..Iterator>::next), which
+#               is all a worker's side may show when the caller's side is a C
+#               entry point such as relate_query_params, deliberately not matched
+# Each requires `::` or `..` after the name, so clink's own frames do not match:
+# `clink::relate::RelateSink::...`, relate_sink.cpp, the test binary
+# clink_relate_tests, or an anonymous-namespace helper named relate_..., which
+# TSan prints without its namespace (checked by planting such a race beside the
+# Relate tests). A race in the sink itself is still reported.
+race:^relate::
+race:^relate_*::
+race:relate..
+race:relate_*..
+race:^hashbrown::
+race:^core::
+race:^alloc::
+race:core..
+race:alloc..
+
+# libmosquitto 2.0.21 (Debian trixie, the build image) unlocks a mutex it never
+# locked: do_client_disconnect (lib/connect.c) ends with
+# pthread_mutex_unlock(&mosq->current_out_packet_mutex) and takes no lock on it.
+# handle__disconnect reaches it whenever a broker sends an MQTT 5 DISCONNECT,
+# which MqttSinkLogic.ABrokerThatEndsTheConnectionGivesItsReason does on
+# purpose. Confirmed against the CI build's library (build id feaf517a...) by
+# disassembly: the function makes three locks and four unlocks, the last a tail
+# call. The library is stripped, so the module is the only frame to match. The
+# MQTT sink drives libmosquitto from one thread with the synchronous loop and its
+# callbacks take no lock, so nothing of clink's is hidden; revisit this rule if
+# a callback ever takes one.
+mutex:libmosquitto.so
