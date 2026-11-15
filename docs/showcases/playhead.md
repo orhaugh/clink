@@ -14,8 +14,7 @@ Storage, and write finance's billing ledger to Azure. Once the half hour is
 over, the CDN job scales to zero: it parks itself, holding no slots, until the
 vendor's next batch of logs wakes it.
 
-[Repository](https://github.com/orhaugh/playhead) · needs clink after 0.15.0
-(a runtime image built from `main` until the next release)
+[Repository](https://github.com/orhaugh/playhead) · pinned to clink v0.16.0
 
 ## What it does
 
@@ -130,13 +129,15 @@ recorded.
 
 You need Docker with about 8 GB of memory, kind, kubectl, Python 3 and OpenSSL,
 and a clink checkout beside the repository, from which the run builds the
-operator. Until a clink release carries what playhead uses, run it against a
-runtime image built from clink's `main`.
+operator at the v0.16.0 tag. It runs clink's published v0.16.0 runtime image.
 
 ```bash
 git clone https://github.com/orhaugh/playhead && cd playhead
-CLINK_IMAGE=clink-runtime:<tag> CLINK_REF=<commit> ./run.sh
+./run.sh
 ```
+
+`CLINK_IMAGE=<image> CLINK_REF=<commit> ./run.sh` runs it against another
+build of clink and the operator from that commit.
 
 `DEPLOY=chart` runs the same cluster from clink's Helm chart instead, and needs
 Helm; `PARK=0` leaves the scale-to-zero scene out. The
