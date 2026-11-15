@@ -1226,6 +1226,11 @@ private:
         // Stamped onto the Deploy frames only; task_records keep the
         // unstamped extra_config, so a redeploy decides it again.
         std::uint32_t row_layout{1};
+        // The job runs on workers that derive the stable operator ids (protocol
+        // v4 or later), or on older ones that do not. Its subtasks read each
+        // other's operator state, so every later placement - a restart, a
+        // rescale's new subtasks - stays on the same kind (scheme_fits_locked_).
+        bool stable_operator_ids{true};
         // Where this job's state lives: job_state_root over its state base
         // (state_location.hpp). Fixed for the job's life, since neither its id
         // nor its base changes, and sent to every Deploy in place of the base,
@@ -2215,6 +2220,9 @@ private:
     // restore_from set to the coordinator's latest_completed_checkpoint_id.
     // Returns the new Deploy frames to post outside the lock.
     std::vector<PendingDeploy> restart_job_locked_(JobState& job);
+    // A worker of the kind the job was placed on (JobState::stable_operator_ids).
+    [[nodiscard]] static bool scheme_fits_locked_(const JobState& job,
+                                                  const WorkerConnection& worker);
     // Begin a whole-job restart under mu_: drain bookkeeping, budget count,
     // the restart log line, and either an immediate redeploy (nothing in
     // flight, no in-doubt hold - the returned deploys) or CancelJob frames

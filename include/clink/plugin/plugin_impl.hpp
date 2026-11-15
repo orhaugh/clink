@@ -60,6 +60,14 @@ inline clink::cluster::ReplayDriver make_replay_driver(
                 .checkpoint_id = clink::CheckpointId{state_id},
                 .bytes = std::vector<std::byte>(snapshot->begin(), snapshot->end())};
             backend->restore(snap);
+            // A checkpoint from before the stable operator ids holds the
+            // operator's state under one of its old ids (op.json legacy_ids).
+            clink::OperatorIdAliases aliases;
+            for (const auto legacy : spec.legacy_ids) {
+                aliases.push_back(
+                    clink::OperatorIdAlias{clink::OperatorId{legacy}, clink::OperatorId{op_id}});
+            }
+            backend->remap_operator_ids(aliases, clink::kCurrentOperatorIdScheme);
         }
         BuildContext bctx;
         bctx.params = spec.params;
@@ -189,6 +197,26 @@ inline const clink::cluster::TypeOps& require_type_ops(const clink::cluster::Typ
     return *ops;
 }
 
+// The ids builds before the stable operator ids gave a subtask's runners, each
+// with the runner's new id: from their uid strings, then from their positions
+// (StateBackendSpec::uid_aliases, position_aliases).
+struct SubtaskOperatorAliases {
+    std::vector<clink::OperatorIdAlias> uid;
+    std::vector<clink::OperatorIdAlias> position;
+};
+inline SubtaskOperatorAliases operator_aliases_of(const clink::Dag& dag) {
+    SubtaskOperatorAliases out;
+    for (const auto& runner : dag.runners()) {
+        for (const auto legacy : runner.legacy_uid_ids) {
+            out.uid.push_back(clink::OperatorIdAlias{legacy, runner.id});
+        }
+        for (const auto legacy : runner.legacy_position_ids) {
+            out.position.push_back(clink::OperatorIdAlias{legacy, runner.id});
+        }
+    }
+    return out;
+}
+
 // The OperatorId values of the runners a subtask's Dag hosts, whose
 // operator-state rows its restore keeps (StateBackendSpec::hosted_operators).
 inline std::vector<std::uint64_t> hosted_operator_ids(const clink::Dag& dag) {
@@ -217,7 +245,8 @@ inline std::vector<std::uint64_t> hosted_operator_ids(const clink::Dag& dag) {
 // `hosted_operators` names the operators the subtask runs (hosted_operator_ids),
 // so its restore keeps their operator-state rows and no others.
 inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerContext& rctx,
-                                                std::vector<std::uint64_t> hosted_operators = {}) {
+                                                std::vector<std::uint64_t> hosted_operators = {},
+                                                SubtaskOperatorAliases aliases = {}) {
     clink::JobConfig cfg;
     // Record-capture flight recorder: thread the job's capture config through
     // to the runner contexts (the operator runner tees input records into
@@ -252,6 +281,15 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     spec.restore_from_parent_count = rctx.restore_from_parent_count;
     spec.hosted_operators = std::move(hosted_operators);
     spec.allow_unrestored_state = rctx.allow_unrestored_state;
+    // The state an older build wrote under the ids it derived is rewritten to
+    // the new ids as the restore reads it. The chain head's node id says which
+    // peers' snapshots this subtask's position aliases may be trusted for.
+    spec.uid_aliases = aliases.uid;
+    spec.position_aliases = aliases.position;
+    spec.graph_op = rctx.chain.ops.empty() ? std::string{} : rctx.chain.ops.front().id;
+    cfg.operator_id_aliases = aliases.uid;
+    cfg.operator_id_aliases.insert(
+        cfg.operator_id_aliases.end(), aliases.position.begin(), aliases.position.end());
     // Build through the HOST's factory when provided (rctx.state_backend_factory):
     // a dlopen'd plugin's .so-local StateBackendFactory singleton only has the
     // ctor builtins (memory/file/changelog), NOT the dynamically-registered
@@ -632,7 +670,8 @@ void PluginRegistry::register_source(
                     [stop_signal]() { stop_signal->store(true, std::memory_order_release); },
                 });
             }
-            auto cfg = detail::make_subtask_job_config(rctx, detail::hosted_operator_ids(dag));
+            auto cfg = detail::make_subtask_job_config(
+                rctx, detail::hosted_operator_ids(dag), detail::operator_aliases_of(dag));
             cfg.drain_target = drain_signal;
             cfg.drain_at_checkpoint = arm_signal;
             cfg.stop_requested = stop_signal;
@@ -810,12 +849,14 @@ void PluginRegistry::register_sink(
                         .out_channel = co.out_channel,
                         .uid = co.uid,
                         .params = clink::capture::redact_credentials(co.params),
+                        .legacy_ids = dag.legacy_ids_at(hs.runner_index),
                     });
             }
             // This subtask hosts one logical operator (the sink); its input network
             // bridges' bytes are the sink's bytes_received.
             dag.set_all_runners_attributed_op_id(dag.runner_id_at(hs.runner_index));
-            auto cfg = detail::make_subtask_job_config(rctx, detail::hosted_operator_ids(dag));
+            auto cfg = detail::make_subtask_job_config(
+                rctx, detail::hosted_operator_ids(dag), detail::operator_aliases_of(dag));
             clink::LocalExecutor exec(std::move(dag), std::move(cfg));
             // Constructed after exec so reverse destruction retires the commit
             // dispatch gate before the executor and the StateBackend the sink's
@@ -950,6 +991,7 @@ void PluginRegistry::register_operator(
                                                   .out_channel = co.out_channel,
                                                   .uid = co.uid,
                                                   .params = co.params,
+                                                  .legacy_ids = dag.legacy_ids_at(h1.runner_index),
                                               });
             }
             clink::cluster::attach_typed_output_groups<Out>(
@@ -967,7 +1009,8 @@ void PluginRegistry::register_operator(
             // bridges' bytes to it (bytes_received) and its output bridges'
             // bytes to it (bytes_sent).
             dag.set_all_runners_attributed_op_id(dag.runner_id_at(h1.runner_index));
-            auto cfg = detail::make_subtask_job_config(rctx, detail::hosted_operator_ids(dag));
+            auto cfg = detail::make_subtask_job_config(
+                rctx, detail::hosted_operator_ids(dag), detail::operator_aliases_of(dag));
             clink::LocalExecutor exec(std::move(dag), std::move(cfg));
             detail::run_subtask_to_completion(exec, rctx.cancel_token);
         };
@@ -1165,7 +1208,8 @@ void PluginRegistry::register_co_operator(
         // bridges' bytes (bytes_received) and output bridges' bytes (bytes_sent)
         // to it.
         dag.set_all_runners_attributed_op_id(dag.runner_id_at(h_out.runner_index));
-        auto cfg = detail::make_subtask_job_config(rctx, detail::hosted_operator_ids(dag));
+        auto cfg = detail::make_subtask_job_config(
+            rctx, detail::hosted_operator_ids(dag), detail::operator_aliases_of(dag));
         clink::LocalExecutor exec(std::move(dag), std::move(cfg));
         detail::run_subtask_to_completion(exec, rctx.cancel_token);
     };

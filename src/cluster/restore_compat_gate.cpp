@@ -11,6 +11,7 @@
 #include <system_error>
 
 #include "clink/cluster/state_location.hpp"
+#include "clink/core/legacy_operator_ids.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/state_backend.hpp"
 #include "clink/state/state_backend_factory.hpp"
@@ -38,7 +39,8 @@ struct StoredStamps {
 // before state was namespaced by job, so it found nothing and let every restore
 // through unchecked.
 std::optional<StoredStamps> read_stored_stamps(const std::string& restore_from_dir,
-                                               std::uint64_t checkpoint_id) {
+                                               std::uint64_t checkpoint_id,
+                                               const std::vector<std::string>& operator_uids) {
     namespace fs = std::filesystem;
     RestoreSource source;
     try {
@@ -80,8 +82,21 @@ std::optional<StoredStamps> read_stored_stamps(const std::string& restore_from_d
         clink::InMemoryStateBackend backend;
         backend.restore(clink::Snapshot{.checkpoint_id = clink::CheckpointId{checkpoint_id},
                                         .bytes = std::move(bytes)});
-        return StoredStamps{.versions_packed = backend.restored_state_versions().pack(),
-                            .fingerprints_packed = backend.restored_state_fingerprints().pack()};
+        auto versions = backend.restored_state_versions();
+        auto fingerprints = backend.restored_state_fingerprints();
+        if (backend.operator_id_scheme() == clink::OperatorIdScheme::Legacy) {
+            clink::OperatorIdAliases aliases;
+            for (const auto& uid : operator_uids) {
+                for (const auto legacy : clink::legacy_ids::legacy_operator_ids("uid/" + uid)) {
+                    aliases.push_back(
+                        clink::OperatorIdAlias{legacy, clink::operator_id_from_uid(uid)});
+                }
+            }
+            versions = clink::remap_operators(versions, aliases);
+            fingerprints = clink::remap_operators(fingerprints, aliases);
+        }
+        return StoredStamps{.versions_packed = versions.pack(),
+                            .fingerprints_packed = fingerprints.pack()};
     } catch (...) {
         return std::nullopt;
     }
@@ -160,11 +175,12 @@ std::string counted(std::size_t n, const char* noun) {
 
 std::string check_restore_compatibility_via_plugins(const std::vector<std::string>& plugin_so_paths,
                                                     const std::string& restore_from_dir,
-                                                    std::uint64_t restore_checkpoint_id) {
+                                                    std::uint64_t restore_checkpoint_id,
+                                                    const std::vector<std::string>& operator_uids) {
     if (restore_from_dir.empty()) {
         return "";  // fresh start - nothing to gate
     }
-    const auto stamps = read_stored_stamps(restore_from_dir, restore_checkpoint_id);
+    const auto stamps = read_stored_stamps(restore_from_dir, restore_checkpoint_id, operator_uids);
     if (!stamps.has_value()) {
         return "";  // best-effort: savepoint not coordinator-readable -> rely on C at worker start
     }

@@ -573,6 +573,95 @@ std::vector<std::byte> InMemoryStateBackend::drop_keyed_state_of(
         "drop_keyed_state_of");
 }
 
+std::vector<std::byte> InMemoryStateBackend::remap_snapshot_operator_ids(
+    std::span<const std::byte> snapshot_bytes,
+    const std::map<std::uint64_t, std::uint64_t>& to_of) {
+    if (snapshot_bytes.empty() || to_of.empty()) {
+        return {snapshot_bytes.begin(), snapshot_bytes.end()};
+    }
+    auto buffer =
+        std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(snapshot_bytes.data()),
+                                        static_cast<int64_t>(snapshot_bytes.size()));
+    auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(
+        std::make_shared<arrow::io::BufferReader>(buffer));
+    if (!reader_result.ok())
+        throw_arrow("remap_snapshot_operator_ids (open reader)", reader_result.status());
+    auto reader = *reader_result;
+    verify_snapshot_format_version(reader->schema()->metadata(),
+                                   "InMemoryStateBackend remap_snapshot_operator_ids");
+    if (!reader->schema()->Equals(*snapshot_schema(), /*check_metadata=*/false)) {
+        throw std::runtime_error(
+            "InMemoryStateBackend remap_snapshot_operator_ids: input schema mismatch");
+    }
+    // The stamps move with the rows.
+    OperatorIdAliases aliases;
+    for (const auto& [from, to] : to_of) {
+        aliases.push_back(OperatorIdAlias{OperatorId{from}, OperatorId{to}});
+    }
+    std::shared_ptr<arrow::Schema> schema = reader->schema();
+    if (const auto& metadata = schema->metadata(); metadata) {
+        auto rewritten = std::make_shared<arrow::KeyValueMetadata>();
+        for (int64_t i = 0; i < metadata->size(); ++i) {
+            const auto& key = metadata->key(i);
+            if (key == kStateVersionsMetadataKey) {
+                rewritten->Append(
+                    key,
+                    remap_operators(StateVersionMap::unpack(metadata->value(i)), aliases).pack());
+            } else if (key == kStateFingerprintsMetadataKey) {
+                rewritten->Append(
+                    key,
+                    remap_operators(StateFingerprintMap::unpack(metadata->value(i)), aliases)
+                        .pack());
+            } else {
+                rewritten->Append(key, metadata->value(i));
+            }
+        }
+        schema = schema->WithMetadata(rewritten);
+    }
+    auto sink_result = arrow::io::BufferOutputStream::Create();
+    if (!sink_result.ok())
+        throw_arrow("remap_snapshot_operator_ids (create sink)", sink_result.status());
+    auto sink = *sink_result;
+    auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
+    if (!writer_result.ok())
+        throw_arrow("remap_snapshot_operator_ids (make writer)", writer_result.status());
+    auto writer = *writer_result;
+    std::shared_ptr<arrow::RecordBatch> batch;
+    while (true) {
+        if (auto st = reader->ReadNext(&batch); !st.ok())
+            throw_arrow("remap_snapshot_operator_ids (read batch)", st);
+        if (!batch)
+            break;
+        const auto* op_arr = static_cast<const arrow::UInt64Array*>(batch->column(0).get());
+        arrow::UInt64Builder ops;
+        if (auto st = ops.Reserve(batch->num_rows()); !st.ok())
+            throw_arrow("remap_snapshot_operator_ids (reserve)", st);
+        for (int64_t i = 0; i < batch->num_rows(); ++i) {
+            const auto op = op_arr->Value(i);
+            const auto it = to_of.find(op);
+            ops.UnsafeAppend(it == to_of.end() ? op : it->second);
+        }
+        std::shared_ptr<arrow::Array> new_ops;
+        if (auto st = ops.Finish(&new_ops); !st.ok())
+            throw_arrow("remap_snapshot_operator_ids (finish ops)", st);
+        auto out = arrow::RecordBatch::Make(
+            schema, batch->num_rows(), {new_ops, batch->column(1), batch->column(2)});
+        if (auto st = writer->WriteRecordBatch(*out); !st.ok())
+            throw_arrow("remap_snapshot_operator_ids (write batch)", st);
+    }
+    if (auto st = writer->Close(); !st.ok())
+        throw_arrow("remap_snapshot_operator_ids (close writer)", st);
+    auto buf_result = sink->Finish();
+    if (!buf_result.ok())
+        throw_arrow("remap_snapshot_operator_ids (finish sink)", buf_result.status());
+    const auto& buf = *buf_result;
+    std::vector<std::byte> bytes(static_cast<std::size_t>(buf->size()));
+    if (buf->size() > 0) {
+        std::memcpy(bytes.data(), buf->data(), static_cast<std::size_t>(buf->size()));
+    }
+    return bytes;
+}
+
 std::map<OperatorId, std::uint64_t> InMemoryStateBackend::remap_operator_ids(
     const OperatorIdAliases& aliases, OperatorIdScheme scheme) {
     std::lock_guard lock(mu_);

@@ -77,8 +77,8 @@ std::pair<std::string, std::string> split_uri(const std::string& uri) {
 // marker for this id, several jobs sharing the checkpoint root, or a marker with no
 // subtasks= line. The caller then falls back to directory listing and says so, rather
 // than treating "unknown" as "nobody participated" and restoring nothing.
-[[nodiscard]] std::optional<std::set<std::uint32_t>> completed_participants(
-    const std::string& restore_path, std::uint64_t checkpoint_id) {
+[[nodiscard]] std::optional<std::string> completed_marker_body(const std::string& restore_path,
+                                                               std::uint64_t checkpoint_id) {
     const auto marker_name = "COMPLETED-" + std::to_string(checkpoint_id);
     std::error_code ec;
     std::vector<std::filesystem::path> markers;
@@ -110,7 +110,46 @@ std::pair<std::string, std::string> split_uri(const std::string& uri) {
     if (!in) {
         return std::nullopt;
     }
-    const std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// Which graph operator each participant hosted, from the marker's
+// `participant.<index>=<subtask in op>:<operator id>` lines; empty for a marker
+// that predates them (cluster/state_location.hpp, CompletedMarker::layout).
+[[nodiscard]] std::map<std::uint32_t, std::string> completed_layout(const std::string& body) {
+    std::map<std::uint32_t, std::string> out;
+    constexpr std::string_view kKey = "participant.";
+    std::size_t pos = 0;
+    while (pos < body.size()) {
+        const auto nl = body.find('\n', pos);
+        const std::string_view line(body.data() + pos,
+                                    (nl == std::string::npos ? body.size() : nl) - pos);
+        pos = nl == std::string::npos ? body.size() : nl + 1;
+        if (!line.starts_with(kKey)) {
+            continue;
+        }
+        const auto eq = line.find('=');
+        const auto colon = line.find(':', eq == std::string_view::npos ? 0 : eq);
+        if (eq == std::string_view::npos || colon == std::string_view::npos) {
+            continue;
+        }
+        try {
+            const auto idx = std::stoul(std::string(line.substr(kKey.size(), eq - kKey.size())));
+            out[static_cast<std::uint32_t>(idx)] = std::string(line.substr(colon + 1));
+        } catch (const std::exception&) {
+            continue;  // a line that does not parse is left out, as the reader does
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::optional<std::set<std::uint32_t>> completed_participants(
+    const std::string& restore_path, std::uint64_t checkpoint_id) {
+    const auto read = completed_marker_body(restore_path, checkpoint_id);
+    if (!read.has_value()) {
+        return std::nullopt;
+    }
+    const std::string& body = *read;
     constexpr std::string_view kKey = "subtasks=";
     const auto at = body.find(kKey);
     if (at == std::string::npos) {
@@ -454,6 +493,18 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             }
         };
 
+        // State written under the ids builds before the stable operator ids
+        // derived is rewritten to the new ids as each snapshot is read, before
+        // anything is judged or merged (StateBackendSpec::uid_aliases).
+        std::map<std::uint64_t, std::uint64_t> uid_aliases;
+        for (const auto& a : spec.uid_aliases) {
+            uid_aliases.emplace(a.from.value(), a.to.value());
+        }
+        std::map<std::uint64_t, std::uint64_t> own_aliases = uid_aliases;
+        for (const auto& a : spec.position_aliases) {
+            own_aliases.emplace(a.from.value(), a.to.value());
+        }
+
         std::vector<std::vector<std::byte>> parts;
         parts.reserve(parent_count);
         for (std::uint32_t i = 0; i < parent_count; ++i) {
@@ -464,7 +515,8 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                          ? read_with_visibility_retry(snap_path)
                          : read_file(snap_path);
             if (!b.empty()) {
-                parts.push_back(std::move(b));
+                // This subtask's operator wrote it: every alias applies.
+                parts.push_back(InMemoryStateBackend::remap_snapshot_operator_ids(b, own_aliases));
             }
         }
 
@@ -613,6 +665,9 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             }
             const auto participants =
                 completed_participants(restore_path, spec.restore_checkpoint_id);
+            const auto marker = completed_marker_body(restore_path, spec.restore_checkpoint_id);
+            const auto layout = marker.has_value() ? completed_layout(*marker)
+                                                   : std::map<std::uint32_t, std::string>{};
             std::error_code dec;
             const std::filesystem::path restore_gen_dir =
                 std::filesystem::path{restore_path} /
@@ -665,6 +720,16 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                 }
                 auto b = read_file(entry.path() / ckpt_name);
                 if (!b.empty()) {
+                    // A peer's rows under a position alias are this subtask's
+                    // only if the peer ran the same graph operator: another
+                    // operator can share the alias (StateBackendSpec::
+                    // position_aliases). A marker that does not say leaves the
+                    // alias applied, as every restore before the stable ids did.
+                    const auto ran = layout.find(pidx);
+                    const bool sibling = ran == layout.end() || spec.graph_op.empty() ||
+                                         ran->second == spec.graph_op;
+                    b = InMemoryStateBackend::remap_snapshot_operator_ids(
+                        b, sibling ? own_aliases : uid_aliases);
                     // A restore that keeps the layout takes no timers from its
                     // peers. An operator's timers are its own subtask's, for
                     // keys in its own key groups, so a peer's are never this

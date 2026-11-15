@@ -17,6 +17,7 @@
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/core/codec.hpp"
+#include "clink/core/legacy_operator_ids.hpp"
 #include "clink/core/stream_element.hpp"
 #include "clink/core/types.hpp"
 #include "clink/fault/fault_injection.hpp"
@@ -162,6 +163,17 @@ struct OperatorRunner {
     // metrics scraper can map the numeric op_id back to a graph node.
     std::string spec_node_id;
     std::string spec_uid;
+    // The ids builds before the stable operator ids gave this runner: std::hash
+    // of the string they hashed, as libstdc++ and as libc++ compute it
+    // (legacy_operator_ids.hpp). State a checkpoint holds under them is this
+    // runner's (JobConfig::operator_id_aliases). Uid aliases come from
+    // "uid/<uid>" and follow the operator wherever it runs; position aliases
+    // come from "stage<idx>/<name>", which two operators in different subtasks
+    // can share, so they are trusted only for snapshots this runner's own
+    // operator wrote. A runner with a uid has both: before its id was fixed at
+    // the add, a chained operator's timers went under its position.
+    std::vector<OperatorId> legacy_uid_ids;
+    std::vector<OperatorId> legacy_position_ids;
     // For network-bridge runners: the op id of the chain's primary operator
     // this bridge's bytes are attributed to (sink -> bytes_sent, source ->
     // bytes_received). 0 for non-bridge runners (they ignore it). Set by the
@@ -397,6 +409,22 @@ public:
         }
         const auto& p = side_channels_by_runner_[runner_index];
         return p ? *p : kEmpty;
+    }
+
+    // Every id builds before the stable operator ids gave runner `runner_index`
+    // (OperatorRunner::legacy_uid_ids, legacy_position_ids), for a record
+    // written beside its state, such as the capture's op.json.
+    [[nodiscard]] std::vector<std::uint64_t> legacy_ids_at(std::size_t runner_index) const {
+        std::vector<std::uint64_t> out;
+        if (runner_index < runners_.size()) {
+            for (const auto id : runners_[runner_index].legacy_uid_ids) {
+                out.push_back(id.value());
+            }
+            for (const auto id : runners_[runner_index].legacy_position_ids) {
+                out.push_back(id.value());
+            }
+        }
+        return out;
     }
 
     // Stamp the spec graph node id + uid onto a runner after construction.
@@ -724,7 +752,7 @@ public:
         runner.input_capacity = [] { return std::size_t{0}; };
         runner.input_high_water = [] { return std::size_t{0}; };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         return StageHandle<T>{channel, runners_.size() - 1};
     }
 
@@ -1319,7 +1347,7 @@ public:
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
         runner.input_high_water = [in_channel] { return in_channel->high_water_mark(); };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         operators_.push_back(op);
         return StageHandle<Out>{out_channel, runners_.size() - 1};
     }
@@ -1384,6 +1412,7 @@ public:
             }
             assigned_uids_.insert(uid);
             id = derive_id_from_uid_(uid);
+            note_legacy_ids_("uid/" + uid, "sharded_keyed_stage");
         } else {
             id = derive_id("sharded_keyed_stage");
         }
@@ -1508,7 +1537,7 @@ public:
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
         runner.input_high_water = [in_channel] { return in_channel->high_water_mark(); };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         return StageHandle<Out>{out_channel, runners_.size() - 1};
     }
 
@@ -1569,7 +1598,7 @@ public:
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
         runner.input_high_water = [in_channel] { return in_channel->high_water_mark(); };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
 
         std::vector<StageHandle<T>> handles;
         handles.reserve(n);
@@ -1735,7 +1764,7 @@ public:
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
         runner.input_high_water = [in_channel] { return in_channel->high_water_mark(); };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
 
         std::vector<StageHandle<T>> handles;
         handles.reserve(branch_count);
@@ -1937,7 +1966,7 @@ public:
             return hw;
         };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         return StageHandle<T>{out_channel, runners_.size() - 1};
     }
 
@@ -2189,7 +2218,7 @@ public:
         runner.input_high_water = [external, feedback] {
             return std::max(external->high_water_mark(), feedback->high_water_mark());
         };
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         return IterationStream<T>{StageHandle<T>{merged, runners_.size() - 1}, feedback, this};
     }
 
@@ -2242,7 +2271,7 @@ public:
         runner.input_depth = [body_out] { return body_out->size(); };
         runner.input_capacity = [body_out] { return body_out->capacity(); };
         runner.input_high_water = [body_out] { return body_out->high_water_mark(); };
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
     }
 
     // ---- Interval Join (keyed, two heterogeneous streams) --------------
@@ -2871,7 +2900,7 @@ public:
             return std::max(left_ch->high_water_mark(), right_ch->high_water_mark());
         };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         return StageHandle<C>{out_channel, runners_.size() - 1};
     }
 
@@ -3179,7 +3208,7 @@ public:
             return std::max(main_ch->high_water_mark(), brod_ch->high_water_mark());
         };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         return StageHandle<Out>{out_channel, runners_.size() - 1};
     }
 
@@ -3763,7 +3792,7 @@ public:
             return std::max(left_ch->high_water_mark(), right_ch->high_water_mark());
         };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         operators_.push_back(op);
         return StageHandle<Out>{out_channel, runners_.size() - 1};
     }
@@ -4037,7 +4066,7 @@ public:
             runner.input_capacity = [] { return std::size_t{0}; };
             runner.input_high_water = [] { return std::size_t{0}; };
 
-            runners_.push_back(std::move(runner));
+            push_runner_(std::move(runner));
         }
         return handle;
     }
@@ -4298,7 +4327,7 @@ public:
                 }
                 return hw;
             };
-            runners_.push_back(std::move(runner));
+            push_runner_(std::move(runner));
         }
     }
 
@@ -4422,7 +4451,7 @@ public:
             runner.input_capacity = [in_ch] { return in_ch->capacity(); };
             runner.input_high_water = [in_ch] { return in_ch->high_water_mark(); };
 
-            runners_.push_back(std::move(runner));
+            push_runner_(std::move(runner));
         }
 
         return branches;
@@ -4878,7 +4907,7 @@ public:
         runner.input_capacity = [in_channel] { return in_channel->capacity(); };
         runner.input_high_water = [in_channel] { return in_channel->high_water_mark(); };
 
-        runners_.push_back(std::move(runner));
+        push_runner_(std::move(runner));
         return StageHandle<In>{nullptr, runners_.size() - 1};
     }
 
@@ -5189,30 +5218,33 @@ private:
                 return hw;
             };
 
-            runners_.push_back(std::move(runner));
+            push_runner_(std::move(runner));
         }
 
         return handle;
     }
 
-    // OperatorId derivation. Two paths:
+    // OperatorId derivation, by the stable hash (stable_operator_id_hash,
+    // core/types.hpp), the same on every platform:
     //
-    //   * If the operator has a non-empty uid (set via op->set_uid(...)
-    //     before add_*), the id is hash("uid/" + uid). Stable across
-    //     topology edits - keyed state restores correctly even when
-    //     operators are renamed, reordered, or added/removed around
-    //     this one. This is the "stable identifier" path
-    //     and is recommended for any stateful operator.
+    //   * A uid (set via op->set_uid(...), or the graph's, applied by the
+    //     builder before add_*) gives "uid/<uid>". Stable across topology
+    //     edits: state restores even when operators are renamed, reordered,
+    //     or added and removed around this one. Recommended for any stateful
+    //     operator.
     //
-    //   * Otherwise (legacy path) the id is hash("stage<idx>/<name>"),
-    //     so renaming or adding upstream ops changes ids and stale
-    //     state is silently abandoned. Fine for stateless ops, but
-    //     fragile for stateful ones - that's exactly the trap uid
-    //     was added to solve.
+    //   * Otherwise the operator's graph node id (spec_node_id) gives
+    //     "node/<node>". It does not move with the operator's position in its
+    //     subtask, which counts one input bridge per upstream subtask, so it
+    //     survives an upstream rescale; SQL operators, which have no uid, keep
+    //     their state that way.
     //
-    // We use std::hash<std::string> because all we need is "stable
-    // across runs in the same process build" - not cryptographic
-    // resistance.
+    //   * Otherwise (internal runners, which hold no state, and operators added
+    //     to a Dag directly) "stage<idx>/<name>": renaming or adding upstream
+    //     operators changes it.
+    //
+    // Each derivation also notes the ids builds before the stable ids gave the
+    // runner (note_legacy_ids_), attached by push_runner_.
     OperatorId derive_id_from_uid_(const std::string& uid) noexcept {
         // Shared with the API env's expect_state_version (see
         // operator_id_from_uid in core/types.hpp) so the runtime - which
@@ -5221,17 +5253,31 @@ private:
         return operator_id_from_uid(uid);
     }
 
-    OperatorId derive_id(const std::string& op_name) noexcept {
-        const std::string keyed = "stage" + std::to_string(runners_.size()) + "/" + op_name;
-        const std::uint64_t h = std::hash<std::string>{}(keyed);
-        // Avoid id 0 (reserved/sentinel for default-constructed StrongId).
-        return OperatorId{h == 0 ? std::uint64_t{1} : h};
+    [[nodiscard]] std::string position_string_(const std::string& op_name) const {
+        return "stage" + std::to_string(runners_.size()) + "/" + op_name;
     }
 
-    // Uid-aware id derivation: honor the operator's uid when set,
-    // fall back to the stage/name hash otherwise. The duplicate-uid
-    // check throws - two ops sharing a uid is a programmer error
-    // (state collisions, undefined behaviour).
+    // The legacy ids of the runner being added: of "uid/<uid>" when it has a
+    // uid (`uid_string` non-empty), and always of its position string.
+    void note_legacy_ids_(const std::string& uid_string, const std::string& op_name) {
+        pending_legacy_uid_.clear();
+        if (!uid_string.empty()) {
+            const auto ids = legacy_ids::legacy_operator_ids(uid_string);
+            pending_legacy_uid_.assign(ids.begin(), ids.end());
+        }
+        const auto ids = legacy_ids::legacy_operator_ids(position_string_(op_name));
+        pending_legacy_position_.assign(ids.begin(), ids.end());
+    }
+
+    OperatorId derive_id(const std::string& op_name) {
+        note_legacy_ids_({}, op_name);
+        return stable_operator_id(position_string_(op_name));
+    }
+
+    // Uid-aware id derivation: the operator's uid when set, else its graph
+    // node id, else its position. The duplicate-uid check throws - two ops
+    // sharing a uid is a programmer error (state collisions, undefined
+    // behaviour).
     template <typename Op>
     OperatorId derive_id_with_uid_(const Op& op) {
         if (!op.uid().empty()) {
@@ -5240,10 +5286,27 @@ private:
                 throw std::runtime_error("Dag: duplicate operator uid '" + op.uid() + "'");
             }
             assigned_uids_.insert(op.uid());
+            note_legacy_ids_("uid/" + op.uid(), op.name());
             return id;
+        }
+        if (!op.spec_node_id().empty()) {
+            note_legacy_ids_({}, op.name());
+            return stable_operator_id("node/" + op.spec_node_id());
         }
         return derive_id(op.name());
     }
+
+    // Every runner is added through here, so the legacy ids its derivation
+    // noted travel with it.
+    void push_runner_(detail::OperatorRunner&& runner) {
+        runner.legacy_uid_ids = std::move(pending_legacy_uid_);
+        runner.legacy_position_ids = std::move(pending_legacy_position_);
+        pending_legacy_uid_.clear();
+        pending_legacy_position_.clear();
+        runners_.push_back(std::move(runner));
+    }
+    std::vector<OperatorId> pending_legacy_uid_;
+    std::vector<OperatorId> pending_legacy_position_;
 
     // Lookup-or-create the side output map for runner `idx`. Operator
     // runners grab the shared_ptr at construction time (so the closure

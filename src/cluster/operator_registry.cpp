@@ -434,10 +434,13 @@ KeyExtractorRegistry& KeyExtractorRegistry::default_instance() {
         // hash("int64") = the value itself.
         registry.register_extractor<std::int64_t>(
             std::string{kChannelInt64}, "identity", [](const std::int64_t& v) { return v; });
-        // hash("string") = std::hash<std::string>{}.
+        // hash("string") = FNV-1a 64 of the bytes. It was std::hash, which
+        // libc++ and libstdc++ compute differently, so the same key went to a
+        // different subtask on each platform and a checkpoint taken on one
+        // restored its keyed state where the other routed nobody's records.
         registry.register_extractor<std::string>(
             std::string{kChannelString}, "identity", [](const std::string& v) -> std::int64_t {
-                return static_cast<std::int64_t>(std::hash<std::string>{}(v));
+                return static_cast<std::int64_t>(stable_operator_id_hash(v));
             });
     });
     return registry;

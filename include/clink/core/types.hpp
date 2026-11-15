@@ -77,7 +77,7 @@ enum class OperatorIdScheme : std::uint8_t { Legacy = 1, Stable = 2 };
 
 // The scheme this build derives operator ids in, and so the scheme of state a
 // fresh backend accumulates.
-inline constexpr OperatorIdScheme kCurrentOperatorIdScheme = OperatorIdScheme::Legacy;
+inline constexpr OperatorIdScheme kCurrentOperatorIdScheme = OperatorIdScheme::Stable;
 
 // State stored under operator id `from` that belongs to the operator now
 // called `to`: the id an older build derived for an operator, and the id this
@@ -97,17 +97,15 @@ struct OperatorIdentity {
 };
 using OperatorIdentities = std::map<OperatorId, OperatorIdentity>;
 
-// Derive the stable OperatorId for a user-assigned `.uid("...")`. The
-// runtime (Dag) uses this to key keyed-state and to stamp state-version
-// metadata; the SQL/API env uses the same transform to record a job's
-// expected state versions, so both sides agree on the key. std::hash is
-// only "stable across runs in the same process build", which is
-// sufficient here: the plugin ABI gate pins the same toolchain + commit
-// across the submit and deploy processes that must agree.
+// Derive the OperatorId for a user-assigned `.uid("...")`: the stable hash of
+// "uid/<uid>". The runtime (Dag) uses it to key keyed state and to stamp
+// state-version metadata; the SQL/API env uses the same transform to record a
+// job's expected state versions, so both sides agree on the key. Builds up to
+// v0.15.0 hashed the same string with std::hash, which libc++ and libstdc++
+// compute differently; legacy_operator_ids.hpp computes those ids, and a
+// restore moves state found under them to this one.
 inline OperatorId operator_id_from_uid(std::string_view uid) {
-    const std::string keyed = "uid/" + std::string{uid};
-    const std::uint64_t h = std::hash<std::string>{}(keyed);
-    return OperatorId{h == 0 ? std::uint64_t{1} : h};
+    return stable_operator_id("uid/" + std::string{uid});
 }
 
 // Which of the previous run's subtasks a subtask succeeds after a restore, for

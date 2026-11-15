@@ -34,10 +34,17 @@ namespace clink::cluster {
 // incompatibility; "" if compatible, no restore is configured
 // (restore_from_dir empty), the savepoint is unreadable, or no .so
 // exports clink_job_check_restore_compatibility.
+//
+// `operator_uids` are the uids of the job's operators (a sink without one by its
+// node id, which it takes as its uid). A savepoint an older build wrote stamped
+// its versions under the operator ids that build derived (std::hash of
+// "uid/<uid>"); the gate moves those stamps to this build's ids before asking,
+// or the job would find no stamp for its operators and take them for v1.
 [[nodiscard]] std::string check_restore_compatibility_via_plugins(
     const std::vector<std::string>& plugin_so_paths,
     const std::string& restore_from_dir,
-    std::uint64_t restore_checkpoint_id);
+    std::uint64_t restore_checkpoint_id,
+    const std::vector<std::string>& operator_uids = {});
 
 // Pre-deploy restore LAYOUT gate.
 //

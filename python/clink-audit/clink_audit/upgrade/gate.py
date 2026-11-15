@@ -517,25 +517,38 @@ def _restore_progress(c, job):
 
 def _identity(recorded_ops, ops, ev_state, restored):
     """Every operator that holds state in the evidence must be in the restored
-    job under the same id and uid, and hold its slots there."""
+    job under the same uid (or node, for one without), and hold its slots there.
+    Operators are matched by uid, not by id: a build since the stable operator
+    ids derives other ids than v0.15.0 did for the same uid, and a restore moves
+    the state to them."""
     out = []
+
+    def name(o):
+        return ("uid", o.get("uid")) if o.get("uid") else ("node", o.get("node"))
+
     by_id = {str(o.get("op_id")): o for o in ops if o.get("op_id")}
+    by_name = {name(o): o for o in ops if o.get("op_id")}
     rec_by_id = {str(o.get("op_id")): o for o in recorded_ops if o.get("op_id")}
     holders = sorted({op for ids in ev_state["slots"].values() for op in ids})
     for op in holders:
-        uid = (rec_by_id.get(op) or {}).get("uid") or "?"
-        if op not in by_id:
-            now = [o.get("uid") or "(no uid)" for o in ops if o.get("node") == (rec_by_id.get(op) or {}).get("node")]
+        rec = rec_by_id.get(op) or {}
+        uid = rec.get("uid") or "?"
+        if name(rec) not in by_name:
+            now = [o.get("uid") or "(no uid)" for o in ops if o.get("node") == rec.get("node")]
             out.append("operator %s (uid %s) holds state in the evidence and is not in the restored "
                        "job%s: the restore was accepted, and no operator reads that state" % (
-                           op, uid, (" (its node %s has uid %s now)" % ((rec_by_id.get(op) or {}).get("node"), now[0]))
+                           op, uid, (" (its node %s has uid %s now)" % (rec.get("node"), now[0]))
                            if now else ""))
-        elif (by_id[op].get("uid") or "") != (rec_by_id.get(op) or {}).get("uid", by_id[op].get("uid") or ""):
-            out.append("operator %s has uid %r, the evidence's %r" % (op, by_id[op].get("uid"), uid))
+
+    def names(ids, table):
+        return sorted("%s=%s" % name(table[i]) if i in table else i for i in ids)
+
     for slot, ids in ev_state["slots"].items():
-        if restored["slots"].get(slot) and sorted(restored["slots"][slot]) != sorted(ids):
-            out.append("slot %s is held by operator(s) %s after the restore, %s in the evidence"
-                       % (slot, ",".join(restored["slots"][slot]), ",".join(ids)))
+        if restored["slots"].get(slot):
+            before, after = names(ids, rec_by_id), names(restored["slots"][slot], by_id)
+            if before != after:
+                out.append("slot %s is held by operator(s) %s after the restore, %s in the evidence"
+                           % (slot, ",".join(after), ",".join(before)))
     return out
 
 

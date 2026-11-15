@@ -148,6 +148,21 @@ public:
                     from_run_start = true;
                 }
             }
+            // A build before the stable operator ids named the run's marker
+            // after the operator's old id.
+            if (!from_run_start && marker) {
+                for (const auto legacy : this->runtime()->legacy_operator_ids()) {
+                    const auto old_marker =
+                        marker->parent_path() /
+                        ("mongo-cdc-start-op" + std::to_string(legacy.value()) + "-run" +
+                         std::to_string(*this->runtime()->run_checkpoint_floor()));
+                    if (auto token = read_start_marker_(old_marker)) {
+                        restored_token_ = std::move(*token);
+                        from_run_start = true;
+                        break;
+                    }
+                }
+            }
             // A restored run without a token would start at the current time and
             // skip what happened since its checkpoint.
             if (const auto* rt = this->runtime();

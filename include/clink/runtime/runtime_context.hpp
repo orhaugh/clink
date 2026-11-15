@@ -223,6 +223,17 @@ public:
         return run_checkpoint_floor_;
     }
 
+    // The ids builds before the stable operator ids gave this operator
+    // (OperatorRunner::legacy_uid_ids, legacy_position_ids), for state an
+    // operator names after its id outside the state backend, such as a file
+    // it wrote under the run's receipt directory before the upgrade.
+    void set_legacy_operator_ids(std::vector<OperatorId> ids) {
+        legacy_operator_ids_ = std::move(ids);
+    }
+    [[nodiscard]] const std::vector<OperatorId>& legacy_operator_ids() const noexcept {
+        return legacy_operator_ids_;
+    }
+
     // The previous run's subtasks this subtask succeeds (see RestoreSuccession):
     // set by the cluster's executor on every deploy. Unset on in-process paths,
     // where a subtask succeeds only itself.
@@ -685,6 +696,7 @@ private:
     std::string commit_receipt_dir_;
     std::uint64_t restore_from_checkpoint_id_{0};
     std::optional<std::uint64_t> run_checkpoint_floor_;
+    std::vector<OperatorId> legacy_operator_ids_;
     std::optional<RestoreSuccession> restore_succession_;
     std::string runner_role_;
     std::size_t runner_subtask_idx_{0};

@@ -1,5 +1,7 @@
 #include "clink/state_processor/checkpoint_dataset.hpp"
 
+#include "clink/core/legacy_operator_ids.hpp"
+
 #ifndef CLINK_HAS_ARROW
 #error "clink requires CLINK_BUILD_ARROW=ON. The state-snapshot format is Arrow-IPC-only."
 #endif
@@ -386,14 +388,21 @@ struct GraphOp {
     std::string uid;
     std::string type;
     std::uint32_t parallelism{1};
-    std::optional<std::uint64_t> op_id;  // when it has a uid
+    std::optional<std::uint64_t> op_id;  // the id this build derives for it
+    // Every id its state may be under, with how it was derived: this build's
+    // (from its uid, or from its node id, or from its node id as the uid a sink
+    // without one takes), then the ids builds before the stable operator ids
+    // derived from the same uid strings, as libstdc++ and as libc++ did.
+    std::vector<std::pair<std::uint64_t, std::string>> candidates;
 };
 
 // The job graph the bundle holds: its SHA-256 (over the graph text as the
 // bundle records it, credential-like parameters redacted) and its operators.
-// An operator with a uid stores its state under operator_id_from_uid(uid);
-// one without has an id the runtime derives from its place in its chain,
-// which is not recomputed here, so it is listed without one.
+// An operator with a uid stores its state under operator_id_from_uid(uid), and
+// one without under the stable hash of its node id (a sink without a uid takes
+// its node id as its uid). A checkpoint taken before the stable ids holds them
+// under std::hash of the same strings, which is recomputed too; an operator
+// without a uid there had an id from its place in its chain, which is not.
 std::pair<std::string, std::vector<GraphOp>> read_graph(const incident::Bundle& b,
                                                         std::vector<std::string>& notes) {
     if (b.find("job/manifest.json") == nullptr) {
@@ -416,13 +425,22 @@ std::pair<std::string, std::vector<GraphOp>> read_graph(const incident::Bundle& 
     try {
         const auto spec = cluster::JobGraphSpec::from_json(graph_text);
         for (const auto& op : spec.ops) {
-            GraphOp g{.id = op.id,
-                      .uid = op.uid,
-                      .type = op.type,
-                      .parallelism = op.parallelism,
-                      .op_id = op.uid.empty() ? std::nullopt
-                                              : std::optional<std::uint64_t>{
-                                                    operator_id_from_uid(op.uid).value()}};
+            GraphOp g{.id = op.id, .uid = op.uid, .type = op.type, .parallelism = op.parallelism};
+            const auto add_legacy = [&g](const std::string& uid, const std::string& how) {
+                const auto legacy = legacy_ids::legacy_operator_ids("uid/" + uid);
+                g.candidates.emplace_back(legacy[0].value(), how + " (libstdc++ legacy id)");
+                g.candidates.emplace_back(legacy[1].value(), how + " (libc++ legacy id)");
+            };
+            if (!op.uid.empty()) {
+                g.op_id = operator_id_from_uid(op.uid).value();
+                g.candidates.emplace_back(*g.op_id, "uid");
+                add_legacy(op.uid, "uid");
+            } else {
+                g.op_id = stable_operator_id("node/" + op.id).value();
+                g.candidates.emplace_back(*g.op_id, "node");
+                g.candidates.emplace_back(operator_id_from_uid(op.id).value(), "node as uid");
+                add_legacy(op.id, "node as uid");
+            }
             ops.push_back(std::move(g));
         }
     } catch (const std::exception& e) {
@@ -531,9 +549,14 @@ void Exporter::build(const fs::path& root) {
 
     auto [graph_sha, graph_ops] = read_graph(b, notes_);
     std::map<std::uint64_t, const GraphOp*> by_op;
+    std::map<std::uint64_t, std::string> named_how;
     for (const auto& g : graph_ops) {
-        if (g.op_id && !by_op.emplace(*g.op_id, &g).second) {
-            notes_.push_back("two graph operators share operator id " + std::to_string(*g.op_id));
+        for (const auto& [id, how] : g.candidates) {
+            if (const auto [it, fresh] = by_op.emplace(id, &g); !fresh && it->second != &g) {
+                notes_.push_back("two graph operators share operator id " + std::to_string(id));
+            } else {
+                named_how.emplace(id, how);
+            }
         }
     }
 
@@ -929,7 +952,7 @@ void Exporter::build(const fs::path& root) {
         if (const auto it = by_op.find(op); it != by_op.end()) {
             g = it->second;
             oj["graph_id"] = JsonValue{g->id};
-            oj["named_by"] = JsonValue{std::string{"uid"}};
+            oj["named_by"] = JsonValue{named_how[op]};
         } else if (const auto ln = layout_named.find(op); ln != layout_named.end()) {
             oj["graph_id"] = JsonValue{ln->second};
             oj["named_by"] = JsonValue{std::string{"layout"}};
@@ -1005,8 +1028,19 @@ void Exporter::build(const fs::path& root) {
         o["uid"] = g.uid.empty() ? JsonValue{} : JsonValue{g.uid};
         o["type"] = JsonValue{g.type};
         o["parallelism"] = num(g.parallelism);
-        o["op_id"] = g.op_id ? JsonValue{std::to_string(*g.op_id)} : JsonValue{};
-        o["holds_state"] = g.op_id ? JsonValue{state_ops.contains(*g.op_id)} : JsonValue{};
+        // The id its state is under in this checkpoint, when any candidate holds
+        // state; else the id this build derives.
+        std::optional<std::uint64_t> held;
+        for (const auto& [id, how] : g.candidates) {
+            (void)how;
+            if (state_ops.contains(id)) {
+                held = id;
+                break;
+            }
+        }
+        const auto shown = held ? held : g.op_id;
+        o["op_id"] = shown ? JsonValue{std::to_string(*shown)} : JsonValue{};
+        o["holds_state"] = JsonValue{held.has_value()};
         gops.push_back(JsonValue{std::move(o)});
     }
     gj["operators"] = JsonValue{std::move(gops)};

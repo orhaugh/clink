@@ -60,6 +60,22 @@ namespace clink::cluster {
 
 namespace {
 
+// The uids a job's operators keep their state under: each operator's uid, or,
+// for one without, its node id, which a sink takes as its uid. Used to move a
+// savepoint's version stamps from the ids an older build derived from them.
+// An unparseable graph names none (the gate is best-effort).
+std::vector<std::string> operator_uids_of(const std::string& graph_json) {
+    std::vector<std::string> out;
+    try {
+        for (const auto& op : JobGraphSpec::from_json(graph_json).ops) {
+            out.push_back(op.uid.empty() ? op.id : op.uid);
+        }
+    } catch (const std::exception&) {
+        out.clear();
+    }
+    return out;
+}
+
 // What a checkpoint consists of, for its COMPLETED marker, captured when it is
 // triggered: the state generation, every deployed task's job-global index, and
 // for each the operator and subtask its deploy-time identity record names.
@@ -1080,8 +1096,10 @@ void Coordinator::recover_one_persisted_job_(JobId job_id) {
         // Schema-evolution D: skip recovering a job whose persisted
         // savepoint can't migrate to the (possibly newer) binary's
         // expected versions. Best-effort, same contract as the submit gate.
-        if (auto reject = check_restore_compatibility_via_plugins(
-                plugin_so_paths, ckpt.restore_from_dir, ckpt.restore_from_checkpoint_id);
+        if (auto reject = check_restore_compatibility_via_plugins(plugin_so_paths,
+                                                                  ckpt.restore_from_dir,
+                                                                  ckpt.restore_from_checkpoint_id,
+                                                                  operator_uids_of(graph_json));
             !reject.empty()) {
             log::warn("coordinator.ha",
                       "recovery skipped for job_id=" + std::to_string(job_id) + ": " + reject);
@@ -4383,6 +4401,9 @@ void Coordinator::hot_cutover_deploy_locked_(JobState& job,
             effective_protocol_version(worker->protocol_version) < kRowLayoutV2ProtocolVersion) {
             continue;
         }
+        if (!scheme_fits_locked_(job, *worker)) {
+            continue;  // derives other operator ids than the job's subtasks
+        }
         const std::uint32_t free = worker->slot_capacity > worker->slots_in_use
                                        ? worker->slot_capacity - worker->slots_in_use
                                        : 0;
@@ -5271,7 +5292,8 @@ void Coordinator::handle_submit_(network::Connection& conn, MessageReader& r) {
         if (auto reject =
                 check_restore_compatibility_via_plugins(plugin_so_paths,
                                                         sj.checkpoint.restore_from_dir,
-                                                        sj.checkpoint.restore_from_checkpoint_id);
+                                                        sj.checkpoint.restore_from_checkpoint_id,
+                                                        operator_uids_of(sj.graph_json));
             !reject.empty()) {
             throw std::runtime_error(reject);
         }
@@ -5754,19 +5776,63 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             }
         }
     } release_unless_published{*this, targets, charged};
+    bool placed_on_stable_ids = true;
     {
         std::lock_guard lock(mu_);
-        std::vector<PlacementWorker> pool;
+        // One job's subtasks all derive operator ids one way: they read each
+        // other's operator state at a restore, and a worker older than the
+        // stable ids (protocol v4) derives other ids for the same operators.
+        // Workers that derive the stable ids take the job if they can; a
+        // cluster of older workers still runs it among themselves.
+        std::vector<PlacementWorker> stable_pool;
+        std::vector<PlacementWorker> legacy_pool;
+        // (placed_on_stable_ids, declared before this block, records which.)
+        std::vector<std::string> legacy_ids;
         for (auto& [_, worker] : registered_) {
             if (!worker->lost) {
-                pool.push_back(
-                    PlacementWorker{.worker_id = worker->worker_id,
-                                    .free_slots = worker->slots_in_use < worker->slot_capacity
-                                                      ? worker->slot_capacity - worker->slots_in_use
-                                                      : 0U});
+                const PlacementWorker candidate{
+                    .worker_id = worker->worker_id,
+                    .free_slots = worker->slots_in_use < worker->slot_capacity
+                                      ? worker->slot_capacity - worker->slots_in_use
+                                      : 0U};
+                if (effective_protocol_version(worker->protocol_version) >=
+                    kStableOperatorIdsProtocolVersion) {
+                    stable_pool.push_back(candidate);
+                } else {
+                    legacy_pool.push_back(candidate);
+                    legacy_ids.push_back(worker->worker_id);
+                }
             }
         }
-        if (!assign_task_placement(resolved_plan.tasks, pool)) {
+        // A failed attempt leaves some tasks assigned, and assign_task_placement
+        // treats an assigned task as pinned: start the second from the plan's
+        // own pins.
+        std::vector<std::string> pins;
+        pins.reserve(resolved_plan.tasks.size());
+        for (const auto& t : resolved_plan.tasks) {
+            pins.push_back(t.worker_id);
+        }
+        const auto place_in = [&](std::vector<PlacementWorker>& pool) {
+            for (std::size_t i = 0; i < resolved_plan.tasks.size(); ++i) {
+                resolved_plan.tasks[i].worker_id = pins[i];
+            }
+            return assign_task_placement(resolved_plan.tasks, pool);
+        };
+        placed_on_stable_ids = place_in(stable_pool);
+        if (!placed_on_stable_ids && !place_in(legacy_pool)) {
+            if (!stable_pool.empty() && !legacy_pool.empty()) {
+                std::string older;
+                for (const auto& id : legacy_ids) {
+                    older += (older.empty() ? "" : ", ") + id;
+                }
+                throw std::runtime_error(
+                    "Coordinator::deploy: no one kind of worker has free slots for every task in "
+                    "the plan. Workers " +
+                    older + " run a protocol older than v" +
+                    std::to_string(kStableOperatorIdsProtocolVersion) +
+                    " and derive other operator ids than the rest, so one job is not placed "
+                    "across both; upgrade them, or add capacity of one kind.");
+            }
             throw std::runtime_error(
                 "Coordinator::deploy: no worker with free slots for every "
                 "task in the plan");
@@ -5805,6 +5871,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
     const JobId job_id = allocate_job_id_(/*fresh=*/!checkpoint.taken_over);
     auto job = std::make_shared<JobState>();
     job->id = job_id;
+    job->stable_operator_ids = placed_on_stable_ids;
     // The job's own state location, apart from every other job's that shares
     // its base (state_location.hpp).
     job->state_root = job_state_root(
@@ -7889,6 +7956,11 @@ JobPlan Coordinator::replan_at_new_parallelism_(const JobState& job,
     return plan_job(graph, OperatorRegistry::default_instance());
 }
 
+bool Coordinator::scheme_fits_locked_(const JobState& job, const WorkerConnection& worker) {
+    return (effective_protocol_version(worker.protocol_version) >=
+            kStableOperatorIdsProtocolVersion) == job.stable_operator_ids;
+}
+
 std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobState& job) {
     // A fatal cause recorded during the drain means this restart cannot
     // succeed - the restore point itself is damaged - so redeploying would
@@ -8109,6 +8181,9 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
     for (const auto& [worker_id, worker] : registered_) {
         if (worker->lost || !worker->conn)
             continue;
+        if (!scheme_fits_locked_(job, *worker)) {
+            continue;  // derives other operator ids than the job's subtasks
+        }
         if (worker->slots_in_use < worker->slot_capacity) {
             survivors.push_back(worker);
             total_free += (worker->slot_capacity - worker->slots_in_use);
@@ -8876,6 +8951,9 @@ void Coordinator::dispatch_cutover_deploy_locked_(JobState& job,
         if (job.row_layout == kRowLayoutV2 &&
             effective_protocol_version(worker->protocol_version) < kRowLayoutV2ProtocolVersion) {
             continue;
+        }
+        if (!scheme_fits_locked_(job, *worker)) {
+            continue;  // derives other operator ids than the job's subtasks
         }
         const std::uint32_t free_slots = worker->slot_capacity > worker->slots_in_use
                                              ? (worker->slot_capacity - worker->slots_in_use)

@@ -59,11 +59,21 @@ namespace clink::cluster {
 // a deployment only when every worker hosting it registered at v3 or later
 // (row_layout_admission.hpp). Every other frame is as v2 left it, so v1 and v2
 // peers remain wire-compatible and simply never receive the second layout.
-inline constexpr std::uint32_t kClusterProtocolVersion = 3;
+//
+// v4 changes what an operator id means under an unchanged encoding: a v4 worker
+// derives operator ids with the stable hash (types.hpp, stable_operator_id_hash)
+// where an earlier worker used std::hash, and writes snapshots in format 2. The
+// subtasks of one job read each other's operator state at a restore, so one job
+// is never placed across workers of both kinds (Coordinator::deploy). Every
+// frame is as v3 left it.
+inline constexpr std::uint32_t kClusterProtocolVersion = 4;
 inline constexpr std::uint32_t kMinCompatibleClusterProtocolVersion = 1;
 
 // The first version whose workers read the Row sidecar's second layout.
 inline constexpr std::uint32_t kRowLayoutV2ProtocolVersion = 3;
+
+// The first version whose workers derive the stable operator ids.
+inline constexpr std::uint32_t kStableOperatorIdsProtocolVersion = 4;
 
 // What a peer that predates versioning looks like on the wire: the field
 // is absent, so it decodes as 0. Treated as version 1 rather than as an

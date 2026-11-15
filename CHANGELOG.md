@@ -24,6 +24,37 @@ tested on macOS arm64 and Linux aarch64, and built and tested in CI on Linux
 x86_64, whose toolchain image installs the library. The runtime image builds
 it in. See `docs/connectors/relate.md`.
 
+**Operator ids are the same on every platform, and a savepoint restores
+wherever clink runs.** An operator's id was `std::hash` of `"uid/<uid>"`, or of
+`"stage<idx>/<name>"` for an operator without a uid, and libc++ and libstdc++
+compute `std::hash` differently, so a savepoint taken on Linux restored on macOS
+with every operator empty (and, since the keyed-state refusal, was refused). Ids
+are now FNV-1a 64 of `"uid/<uid>"`, or, without a uid, of `"node/<graph node
+id>"`, which unlike the position does not change when an upstream operator is
+rescaled (a subtask has one input bridge per upstream subtask, so every
+stateful SQL operator's id used to move with its upstream's parallelism). A
+restore moves state an older build wrote under the old ids, computed as both
+libraries did (`include/clink/core/legacy_operator_ids.hpp`), to the new ones:
+existing checkpoints migrate on their first restore, on every backend, version
+stamps and fingerprints with them, and a savepoint from either platform
+restores on the other. The file backend applies a position alias to another
+subtask's snapshot only when the checkpoint's marker shows that subtask ran the
+same graph operator, which ends a collision in which two Kafka sources of one
+SQL job, both `stage0/kafka_source`, mixed their offsets at a restore. The
+built-in string `identity` key extractor hashes with FNV-1a too, so a string key
+routes to the same subtask everywhere.
+
+What changes for users: every plugin job must be rebuilt (the plugin ABI
+fingerprint changes), and an HA takeover of a plugin job submitted before the
+upgrade needs it resubmitted with the rebuilt module; operator ids in metrics
+labels, datasets, captures and incident bundles change; checkpoints taken after
+the upgrade are snapshot format 2, which earlier builds refuse, so a rollback
+restores a checkpoint taken before the upgrade. The cluster protocol is v4: a
+worker older than v4 derives the old ids, so one job is never placed across
+workers of both kinds, on a submit, a restart or a rescale. An in-process job
+whose PostgreSQL 2PC sink has no uid names its transactions after the sink's
+id, which changes, so give such a sink a uid before upgrading.
+
 **Snapshots name their operators and the scheme of their operator ids, and
 every backend can move restored state to new ids.** Each canonical snapshot
 now carries `clink.operators`, a JSON list of the operator ids it holds rows

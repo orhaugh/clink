@@ -468,8 +468,9 @@ TEST(StateExportParquet, RoundTripsAllColumns) {
 #include "clink/state/snapshot_arrow_writer.hpp"
 
 // The format contract (docs/internals/state-snapshot-format.md): every
-// stream the canonical writer produces is stamped clink.format_version=1,
-// and version stamps ride clink.state_versions when present.
+// stream the canonical writer produces is stamped clink.format_version, 2 for
+// state in the stable operator ids a fresh backend holds, and version stamps
+// ride clink.state_versions when present.
 TEST(StateSnapshotFormat, StreamsCarryTheFormatVersionMarker) {
     InMemoryStateBackend backend;
     backend.put(OperatorId{1}, "k", std::string_view{"v"});
@@ -487,7 +488,7 @@ TEST(StateSnapshotFormat, StreamsCarryTheFormatVersionMarker) {
     ASSERT_TRUE(meta != nullptr);
     auto v = meta->Get(kSnapshotFormatVersionKey);
     ASSERT_TRUE(v.ok());
-    EXPECT_EQ(*v, std::string{kSnapshotFormatVersion});
+    EXPECT_EQ(*v, std::string{kStableIdSnapshotFormatVersion});
     auto sv = meta->Get(kStateVersionsMetadataKey);
     ASSERT_TRUE(sv.ok());
     EXPECT_EQ(StateVersionMap::unpack(*sv).pack(), versions.pack());

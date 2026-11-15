@@ -102,6 +102,14 @@ may differ as long as each side can speak something the other accepts.
   changes on the control wire; the version is the gate the coordinator uses
   to admit that layout per deployment. v1 and v2 peers remain compatible and
   never receive it.
+- **Version 4 capability:** a v4 worker derives operator ids with the stable
+  hash (`stable_operator_id_hash`) where an earlier worker used `std::hash`,
+  and writes snapshots in format 2; the encoding of every frame is unchanged.
+  One job's subtasks read each other's operator state at a restore, so the
+  coordinator places a job on v4 workers when it can and on older ones
+  otherwise, never across both, and keeps every later placement of the job (a
+  restart, a rescale's new subtasks) on the kind it started on
+  (`JobState::stable_operator_ids`). v1 to v3 peers remain compatible.
 - **Visibility:** the coordinator keeps the version each worker registered
   with, and `GET /api/v1/workers` and `GET /api/v1/cluster` report it per
   worker as `protocol_version` (0 for a peer that declared none), so a

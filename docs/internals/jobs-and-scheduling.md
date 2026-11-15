@@ -102,7 +102,7 @@ These in-process stages take no part in a checkpoint, and `LocalExecutor` refuse
 
 `wire_stage_` is the shared body of the two operator variants: it allocates the edge channels (N for forward, `N x M` for shuffle), attaches the upstream emitters, and builds the per-subtask runners with their input channels and a fresh `SubtaskEmitter` for the next stage to wire onto.
 
-`OperatorId` derivation matters for state survival. With a uid set (`derive_id_from_uid_`), the id is a hash of `"uid/" + uid`, stable across topology edits so keyed state restores even when ops are renamed or reordered. Without a uid the legacy path hashes `"stage<idx>/<name>"`, which changes when upstream ops change, silently abandoning stale state. A uid is strongly recommended for any stateful op; duplicate uids within a `Dag` throw.
+`OperatorId` derivation matters for state survival. With a uid set (`derive_id_from_uid_`), the id is the stable hash of `"uid/" + uid`, stable across topology edits so keyed state restores even when ops are renamed or reordered. Without a uid it is the hash of `"node/" + <graph node id>`, which does not depend on the operator's position in its subtask (and so on upstream parallelism, since a subtask gets one input bridge per upstream subtask), and for an operator added to a `Dag` directly `"stage<idx>/<name>"`, which changes when upstream ops change. The hash is FNV-1a, the same on every platform ([operator model](operator-model.md)). A uid is strongly recommended for any stateful op; duplicate uids within a `Dag` throw, and so do two graph operators sharing one (`JobGraphSpec::validate`).
 
 ### The slot model and deployment
 

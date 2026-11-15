@@ -91,6 +91,20 @@ struct StateBackendSpec {
     // Drop the keyed state of operators the subtask does not run instead of
     // refusing the restore (`--allow-unrestored-state` on submit).
     bool allow_unrestored_state{false};
+    // The ids builds before the stable operator ids gave the subtask's
+    // operators, each mapped to its new id (Dag runner legacy_uid_ids,
+    // legacy_position_ids). A restore rewrites the snapshots it reads with them
+    // before it judges or merges anything. Uid aliases apply to every snapshot
+    // read. Position aliases apply to the subtask's own snapshot and its
+    // parents', and to a peer's only when the checkpoint's COMPLETED marker
+    // shows the peer ran the same graph operator (`graph_op`, the chain head's
+    // node id), or does not say: two operators in different subtasks can share
+    // a position alias (two Kafka sources of one SQL job both were
+    // "stage0/kafka_source"), and a peer's rows under it are not this
+    // subtask's.
+    std::vector<OperatorIdAlias> uid_aliases;
+    std::vector<OperatorIdAlias> position_aliases;
+    std::string graph_op;
 };
 
 // The ONE place a state path is composed, so eleven call sites across six backends

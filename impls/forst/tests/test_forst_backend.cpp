@@ -1001,6 +1001,8 @@ TEST(ForStStateBackend, AMovedOperatorIdReachesItsColumnFamilyThroughAnAlias) {
     {
         ForStStateBackend backend(
             ForStStateBackend::Options{.path = db_path.string(), .create_if_missing = true});
+        // As a database a build before the stable operator ids wrote.
+        backend.remap_operator_ids({}, OperatorIdScheme::Legacy);
         backend.put(old_id,
                     sv(std::string{"\x03"
                                    "a",

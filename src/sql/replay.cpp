@@ -70,6 +70,13 @@ capture::OpSpecSidecar read_op_spec(const fs::path& path) {
             }
         }
     }
+    if (js.as_object().count("legacy_ids") != 0U && js.at("legacy_ids").is_array()) {
+        for (const auto& v : js.at("legacy_ids").as_array()) {
+            if (v.is_string()) {
+                spec.legacy_ids.push_back(std::stoull(v.as_string()));
+            }
+        }
+    }
     return spec;
 }
 
@@ -351,6 +358,13 @@ std::vector<std::string> EpochReplay::run() const {
     if (snap_bytes_.has_value()) {
         Snapshot snap{.checkpoint_id = CheckpointId{state_id_}, .bytes = *snap_bytes_};
         backend->restore(snap);
+        // The checkpoint may predate the stable operator ids and hold the
+        // operator's state under one of its old ids.
+        OperatorIdAliases aliases;
+        for (const auto legacy : info_.spec.legacy_ids) {
+            aliases.push_back(OperatorIdAlias{OperatorId{legacy}, OperatorId{info_.op_id}});
+        }
+        backend->remap_operator_ids(aliases, kCurrentOperatorIdScheme);
     }
     cluster::OperatorBuildContext bctx;
     bctx.params = info_.spec.params;

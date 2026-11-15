@@ -355,9 +355,13 @@ the slots those ids hold.
    graph, or a SQL query changed so that one goes away. If its state is not wanted,
    resubmit with `--allow-unrestored-state`: the restore drops those rows, logs a
    warning naming them, and the job's manifest keeps the choice for a takeover.
-3. **The job was rebuilt on another platform.** The id hash is the standard library's
-   string hash, so a build with a different standard library derives different ids
-   from the same uids. Restore with a build like the one that took the checkpoint.
+3. **The checkpoint was taken by a build older than the stable operator ids, and the
+   operator has no uid.** A restore moves an older build's state to the new ids, through
+   the old uid hash for an operator with a uid and the old position hash for one
+   without. The position hash changes with the operator's place in its subtask, so after
+   an upgrade that also changed the job's parallelism or chaining, a uid-less operator's
+   old state is not found. Restore at the layout the checkpoint was taken with, then
+   change it.
 
 **Do not pass the flag to make a restore start** unless the answer is case 2: it drops
 the state for good.

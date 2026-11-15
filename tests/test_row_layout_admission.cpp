@@ -55,7 +55,7 @@ using namespace std::chrono_literals;
 // ----- The pure function -----
 
 TEST(RowLayoutAdmission, TheProtocolVersionThatReadsTheSecondLayoutIsThisBuilds) {
-    EXPECT_EQ(kClusterProtocolVersion, 3U);
+    EXPECT_EQ(kClusterProtocolVersion, 4U);
     EXPECT_EQ(kRowLayoutV2ProtocolVersion, 3U);
     EXPECT_LE(kRowLayoutV2ProtocolVersion, kClusterProtocolVersion)
         << "a build that cannot read the second layout must never admit it";
@@ -979,13 +979,17 @@ struct RlaHotStart {
     std::vector<RlaPlaced> placed;
 };
 
+// The hot-cutover cases run on v3 workers. A v3 worker reads the second layout
+// as a v4 one does, but only a worker older than v4 may join a job beside the
+// v2 workers these cases add: one job is never placed across v4 and an older
+// protocol, because the two derive different operator ids.
 RlaHotStart rla_hot_start(RlaCluster& c,
                           const std::string& win_type,
-                          std::uint32_t version_a = kClusterProtocolVersion) {
+                          std::uint32_t version_a = kRowLayoutV2ProtocolVersion) {
     RlaHotStart s;
     c.start();
     s.a = c.join("rla-a", version_a, 1);
-    s.b = c.join("rla-b", kClusterProtocolVersion, 3);
+    s.b = c.join("rla-b", kRowLayoutV2ProtocolVersion, 3);
     if (s.a == nullptr || s.b == nullptr) {
         ADD_FAILURE() << "a worker could not register";
         return s;
@@ -1129,4 +1133,39 @@ TEST(RowLayoutAdmissionCoordinator, AJobWithNoLayoutBearingOperatorCutsOverOntoA
     EXPECT_TRUE(rla_hosts_any(cutover.deployed, v2))
         << "the premise: the v2 worker takes new subtasks";
     EXPECT_TRUE(rla_stamps(cutover.deployed).empty());
+}
+
+// One job's subtasks read each other's operator state, and a worker older than
+// protocol v4 derives other operator ids than a v4 one, so a job is never placed
+// across both. With room on v4 workers alone it goes there; with room only
+// across both kinds the submit is refused, naming the older workers.
+TEST(RowLayoutAdmissionCoordinator, AJobIsNeverPlacedAcrossWorkersThatDeriveOtherOperatorIds) {
+    {
+        RlaCluster c("ids_split");
+        c.start();
+        ASSERT_NE(c.join("rla-a", kRowLayoutV2ProtocolVersion, 2), nullptr);
+        ASSERT_NE(c.join("rla-b", kClusterProtocolVersion, 2), nullptr);
+        try {
+            (void)c.submit(rla_graph(c.dir() / "out.txt"), 0);
+            ADD_FAILURE() << "a job was placed across v3 and v4 workers";
+        } catch (const std::exception& e) {
+            EXPECT_NE(std::string(e.what()).find("Workers rla-a run a protocol older than v4"),
+                      std::string::npos)
+                << e.what();
+        }
+    }
+    {
+        RlaCluster c("ids_one_kind");
+        c.start();
+        auto* old_worker = c.join("rla-a", kRowLayoutV2ProtocolVersion, 8);
+        auto* new_worker = c.join("rla-b", kClusterProtocolVersion, 8);
+        ASSERT_TRUE(old_worker != nullptr && new_worker != nullptr);
+        const auto job_id = c.submit(rla_graph(c.dir() / "out.txt"), 0);
+        ASSERT_GT(job_id, 0U);
+        const auto placed = c.take_deploys(job_id);
+        ASSERT_FALSE(placed.empty());
+        for (const auto& p : placed) {
+            EXPECT_EQ(p.worker, new_worker) << "a subtask of a v4 job went to a v3 worker";
+        }
+    }
 }

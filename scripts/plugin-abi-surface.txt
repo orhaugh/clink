@@ -73,6 +73,7 @@ include/clink/core/columnar_batcher.hpp
 include/clink/core/derived_codec.hpp
 include/clink/core/fields.hpp
 include/clink/core/hash_map.hpp
+include/clink/core/legacy_operator_ids.hpp
 include/clink/core/pane_info.hpp
 include/clink/core/record.hpp
 include/clink/core/stream_element.hpp

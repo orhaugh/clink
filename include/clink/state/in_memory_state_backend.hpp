@@ -322,6 +322,15 @@ public:
     static std::vector<std::byte> drop_keyed_state_of(std::span<const std::byte> snapshot_bytes,
                                                       const std::set<std::uint64_t>& operators);
 
+    // The snapshot with every op_id that `to_of` names rewritten to its new id,
+    // the version stamps and fingerprints in its metadata with them (a stamp
+    // already under the new id wins). A restore rewrites the snapshots it
+    // reads from the ids an older build derived to this build's, before it
+    // judges or merges them. Other metadata passes through.
+    static std::vector<std::byte> remap_snapshot_operator_ids(
+        std::span<const std::byte> snapshot_bytes,
+        const std::map<std::uint64_t, std::uint64_t>& to_of);
+
 private:
     // The snapshot with only the rows `keep(op, keyed)` accepts, written under
     // the input's own schema so its metadata survives. `what` names the caller

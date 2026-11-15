@@ -15,6 +15,7 @@
 #include <arrow/ipc/api.h>
 #include <gtest/gtest.h>
 
+#include "clink/operators/map_operator.hpp"
 #include "clink/operators/sink_operator.hpp"
 #include "clink/operators/source_operator.hpp"
 #include "clink/runtime/dag.hpp"
@@ -99,6 +100,8 @@ TEST(OperatorIdRemap, TheInMemoryBackendMovesRowsStampsAndFingerprints) {
 // Its operators are listed with their identities and row counts.
 TEST(OperatorIdRemap, ASnapshotRecordsItsSchemeAndItsOperators) {
     InMemoryStateBackend b;
+    // As a backend holding state an older build wrote, until a remap moves it.
+    b.remap_operator_ids({}, OperatorIdScheme::Legacy);
     b.put(kOld, keyed("a"), VV{"A"});
     b.put_operator_state(kOld, KV{"pos"}, VV{"P"});
     b.set_operator_identities({{kOld, OperatorIdentity{"orders-src", "op_1"}},
@@ -125,6 +128,11 @@ TEST(OperatorIdRemap, ASnapshotRecordsItsSchemeAndItsOperators) {
     EXPECT_EQ(restored.operator_id_scheme(), OperatorIdScheme::Legacy);
     restored.restore(stable);
     EXPECT_EQ(restored.operator_id_scheme(), OperatorIdScheme::Stable);
+
+    // A fresh backend's state is in the ids this build derives.
+    InMemoryStateBackend fresh;
+    fresh.put(kNew, keyed("a"), VV{"A"});
+    EXPECT_EQ(meta(fresh.snapshot(CheckpointId{3}).bytes, kSnapshotFormatVersionKey), "2");
 }
 
 // Version 2 means stable ids; a version-2 stream that names another scheme, or
@@ -293,4 +301,32 @@ TEST(OperatorIdRemap, LocalExecutorMovesRestoredStateBeforeTheJobRuns) {
     exec.run();
     EXPECT_EQ(text(backend->get(kNew, keyed("a"))), "A");
     EXPECT_EQ(text(backend->get(kOld, keyed("a"))), "<absent>");
+}
+
+// An operator without a uid takes its id from its graph node id, not from its
+// position in its subtask. A subtask has one input bridge per upstream subtask,
+// so the position, and every stateful SQL operator's id with it, used to change
+// when an upstream operator was rescaled. Its old position ids are kept, for a
+// checkpoint taken before the change.
+TEST(OperatorIdRemap, AnOperatorWithoutAUidKeepsItsIdWhateverIsUpstream) {
+    const auto id_after = [](int upstream_subtasks) {
+        Dag dag;
+        std::vector<StageHandle<std::int64_t>> inputs;
+        for (int i = 0; i < upstream_subtasks; ++i) {
+            inputs.push_back(dag.add_source<std::int64_t>(
+                std::make_shared<VectorSource<std::int64_t>>(std::vector<Record<std::int64_t>>{})));
+        }
+        auto in = inputs.size() == 1 ? inputs.front() : dag.union_streams<std::int64_t>(inputs);
+        auto op = std::make_shared<MapOperator<std::int64_t, std::int64_t>>(
+            [](const std::int64_t& v) { return v; }, "aggregate_row");
+        op->set_spec_node_id("agg_3");
+        auto h = dag.add_operator<std::int64_t, std::int64_t>(in, op);
+        return std::make_pair(dag.runner_id_at(h.runner_index), dag.legacy_ids_at(h.runner_index));
+    };
+    const auto [one, legacy_one] = id_after(1);
+    const auto [four, legacy_four] = id_after(4);
+    EXPECT_EQ(one, four);
+    EXPECT_EQ(one, stable_operator_id("node/agg_3").value());
+    EXPECT_NE(legacy_one, legacy_four) << "the old ids were positional";
+    EXPECT_EQ(legacy_one.size(), 2U) << "both standard libraries' old id";
 }

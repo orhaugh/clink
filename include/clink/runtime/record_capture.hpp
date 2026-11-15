@@ -393,6 +393,12 @@ struct OpSpecSidecar {
     std::string out_channel;
     std::string uid;
     std::map<std::string, std::string> params;
+    // The ids builds before the stable operator ids gave this operator (its
+    // runner's legacy ids). The checkpoint a capture replays from may predate
+    // the switch and hold the operator's state under one of them; replay moves
+    // it to the capture's id. Absent from captures written before the switch,
+    // whose id is the one their checkpoints used.
+    std::vector<std::uint64_t> legacy_ids;
 };
 
 inline void write_op_spec(const std::filesystem::path& capture_dir,
@@ -434,7 +440,11 @@ inline void write_op_spec(const std::filesystem::path& capture_dir,
             first = false;
             json += "\"" + esc(k) + "\":\"" + esc(v) + "\"";
         }
-        json += "}}";
+        json += "},\"legacy_ids\":[";
+        for (std::size_t i = 0; i < spec.legacy_ids.size(); ++i) {
+            json += (i == 0 ? "\"" : ",\"") + std::to_string(spec.legacy_ids[i]) + "\"";
+        }
+        json += "]}";
         std::ofstream out(subdir / "op.json", std::ios::binary | std::ios::trunc);
         out.write(json.data(), static_cast<std::streamsize>(json.size()));
     } catch (const std::exception&) {

@@ -26,6 +26,8 @@
 #include <string_view>
 #include <vector>
 
+#include "clink/cluster/job_graph.hpp"
+#include "clink/core/legacy_operator_ids.hpp"
 #include "clink/state/in_memory_state_backend.hpp"
 #include "clink/state/schema_version.hpp"
 #include "clink/state/state_backend.hpp"
@@ -85,13 +87,52 @@ void usage() {
 // (clink_core is statically linked, so this process's global() is a
 // separate, empty instance).
 int run_compat_check(const std::string& so_path,
-                     const std::string& stored_packed,
-                     const std::string& stored_fps_packed,
+                     std::string stored_packed,
+                     std::string stored_fps_packed,
+                     bool legacy_ids,
                      bool quiet) {
     void* handle = ::dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr) {
         std::cerr << "clink check-savepoint: dlopen failed: " << ::dlerror() << "\n";
         return 2;
+    }
+    // A savepoint an older build wrote stamped its versions under the operator
+    // ids that build derived (std::hash of "uid/<uid>"); the job declares its
+    // expectations under this build's ids. Move the stamps through the uids of
+    // the job's operators (a sink without one by its node id, which it takes as
+    // its uid), or every stamp would read as absent and v1.
+    if (legacy_ids) {
+        using BuildFn = int (*)(const char**, std::size_t*);
+        if (auto build_sym = ::dlsym(handle, "clink_job_build"); build_sym != nullptr) {
+            BuildFn build = nullptr;
+            std::memcpy(&build, &build_sym, sizeof(build));
+            const char* graph = nullptr;
+            std::size_t graph_size = 0;
+            if (build(&graph, &graph_size) == 0 && graph != nullptr) {
+                clink::OperatorIdAliases aliases;
+                try {
+                    const auto spec =
+                        clink::cluster::JobGraphSpec::from_json(std::string{graph, graph_size});
+                    for (const auto& op : spec.ops) {
+                        const auto& uid = op.uid.empty() ? op.id : op.uid;
+                        for (const auto legacy :
+                             clink::legacy_ids::legacy_operator_ids("uid/" + uid)) {
+                            aliases.push_back(
+                                clink::OperatorIdAlias{legacy, clink::operator_id_from_uid(uid)});
+                        }
+                    }
+                } catch (const std::exception&) {
+                    aliases.clear();
+                }
+                stored_packed =
+                    clink::remap_operators(clink::StateVersionMap::unpack(stored_packed), aliases)
+                        .pack();
+                stored_fps_packed =
+                    clink::remap_operators(clink::StateFingerprintMap::unpack(stored_fps_packed),
+                                           aliases)
+                        .pack();
+            }
+        }
     }
     using CheckFn = int (*)(const char*, const char**, std::size_t*);
     auto sym = ::dlsym(handle, "clink_job_check_restore_compatibility");
@@ -300,7 +341,11 @@ int clink_cmd_check_savepoint(int argc, char** argv) {
 
         // Pre-deploy compatibility check against a live job binary.
         if (!expected_so.empty()) {
-            return run_compat_check(expected_so, versions.pack(), fingerprints.pack(), quiet);
+            return run_compat_check(expected_so,
+                                    versions.pack(),
+                                    fingerprints.pack(),
+                                    backend.operator_id_scheme() == clink::OperatorIdScheme::Legacy,
+                                    quiet);
         }
         return 0;
     } catch (const std::exception& e) {

@@ -118,10 +118,19 @@ void LocalExecutor::start() {
             // State an older build wrote under the operator ids it derived moves
             // to the ids this build derives, version stamps with it, before the
             // migration below reads the stamps or any operator reads its state.
-            if (!config_.operator_id_aliases.empty()) {
-                config_.state_backend->remap_operator_ids(config_.operator_id_aliases,
-                                                          kCurrentOperatorIdScheme);
+            // The aliases are the caller's and every runner's own; the remap runs
+            // even with none to move, because it records that the backend's state
+            // is now in this build's scheme.
+            OperatorIdAliases aliases = config_.operator_id_aliases;
+            for (const auto& runner : dag_.runners()) {
+                for (const auto legacy : runner.legacy_uid_ids) {
+                    aliases.push_back(OperatorIdAlias{legacy, runner.id});
+                }
+                for (const auto legacy : runner.legacy_position_ids) {
+                    aliases.push_back(OperatorIdAlias{legacy, runner.id});
+                }
             }
+            config_.state_backend->remap_operator_ids(aliases, kCurrentOperatorIdScheme);
             // State schema evolution: migrate the restored state up to the
             // versions the live job expects, before any operator reads it.
             // has_path-gated; throws on a missing path (the pre-deploy
@@ -162,6 +171,12 @@ void LocalExecutor::start() {
         const auto& runner = dag_.runners()[i];
         contexts_.push_back(std::make_unique<RuntimeContext>(
             runner.id, runner.name, config_.state_backend.get(), config_.metrics));
+        {
+            std::vector<OperatorId> legacy = runner.legacy_uid_ids;
+            legacy.insert(
+                legacy.end(), runner.legacy_position_ids.begin(), runner.legacy_position_ids.end());
+            contexts_.back()->set_legacy_operator_ids(std::move(legacy));
+        }
         auto operator_budget = config_.memory_budget;
         if (auto limit = config_.operator_memory_limits.find(runner.id);
             limit != config_.operator_memory_limits.end()) {

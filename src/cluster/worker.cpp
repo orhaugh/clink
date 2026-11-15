@@ -3158,6 +3158,7 @@ void Worker::run_generic_subtask_(JobId job_id,
                         .out_channel = co.out_channel,
                         .uid = co.uid,
                         .params = co.params,
+                        .legacy_ids = dag.legacy_ids_at(handle.runner_index),
                     });
             }
             prev = std::move(handle.main_handle);
@@ -3377,7 +3378,9 @@ void Worker::run_generic_subtask_(JobId job_id,
                 job_id, task.subtask_idx, held_triggers, dag.source_injectors());
         }
         auto cfg = clink::plugin::detail::make_subtask_job_config(
-            rctx, clink::plugin::detail::hosted_operator_ids(dag));
+            rctx,
+            clink::plugin::detail::hosted_operator_ids(dag),
+            clink::plugin::detail::operator_aliases_of(dag));
         LocalExecutor exec(std::move(dag), std::move(cfg));
         // Constructed after exec so reverse destruction retires the commit
         // dispatch gate - draining any in-flight CommitCheckpoint/

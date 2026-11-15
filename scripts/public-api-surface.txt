@@ -573,6 +573,7 @@ include/clink/cluster/type_registry.hpp
 include/clink/config/flat_map.hpp
 include/clink/config/json.hpp
 include/clink/core/hash_map.hpp
+include/clink/core/legacy_operator_ids.hpp
 include/clink/fault/fault_injection.hpp
 include/clink/metrics/checkpoint_metrics.hpp
 include/clink/metrics/network_metrics.hpp

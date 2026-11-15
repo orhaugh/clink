@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include "clink/core/legacy_operator_ids.hpp"
 #include "clink/fault/fault_injection.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/file_backed_state_backend.hpp"
@@ -1599,4 +1600,81 @@ TEST(StateBackendFactory, APeersOperatorRowNeverOverwritesThisSubtasksOwn) {
            "store their position under one fixed key have one row per subtask under the same "
            "name, so unioning peers' rows hands every subtask the furthest position any of "
            "them reached and silently skips everything in between.";
+}
+
+// A checkpoint a build before the stable operator ids took holds each
+// operator's state under std::hash of its id string. The restore rewrites every
+// snapshot it reads to the new ids before it judges or merges anything: the
+// subtask's own with every alias, a peer's with its uid aliases, and with its
+// position aliases only when the marker shows the peer ran the same graph
+// operator, because two operators can share a position alias (two Kafka sources
+// of one SQL job were both "stage0/kafka_source").
+TEST(StateBackendFactory,
+     ALegacyCheckpointIsReadUnderTheNewIdsAndAPeersPositionAliasOnlyIfItsOurs) {
+    const auto base = make_temp_dir("legacy_ids");
+    const std::uint64_t ckpt_id = 9;
+    using KV = clink::StateBackend::KeyView;
+    using VV = clink::StateBackend::ValueView;
+    const auto uid_legacy = clink::legacy_ids::legacy_operator_ids("uid/orders")[1];
+    const auto position_legacy = clink::legacy_ids::legacy_operator_ids("stage0/kafka_source")[1];
+    const clink::OperatorId window = clink::operator_id_from_uid("orders");
+    const clink::OperatorId source = clink::stable_operator_id("node/src_a");
+    const auto publish = [&](std::uint32_t idx, clink::InMemoryStateBackend& backend) {
+        backend.remap_operator_ids({}, clink::OperatorIdScheme::Legacy);
+        auto snap = backend.snapshot(clink::CheckpointId{ckpt_id});
+        publish_snapshot(gen_dir(base, idx) / ("checkpoint-" + std::to_string(ckpt_id) + ".snap"),
+                         snap.bytes,
+                         ckpt_id);
+    };
+    {
+        clink::InMemoryStateBackend own;
+        own.put(uid_legacy, std::string(1, '\x03') + "k", VV{"W"});
+        own.put_operator_state(position_legacy, KV{"off:0"}, VV{"A0"});
+        publish(0, own);
+    }
+    {
+        clink::InMemoryStateBackend sibling;  // another subtask of src_a
+        sibling.put_operator_state(position_legacy, KV{"off:1"}, VV{"A1"});
+        publish(1, sibling);
+    }
+    {
+        clink::InMemoryStateBackend stranger;  // src_b, under the same position alias
+        stranger.put_operator_state(position_legacy, KV{"off:2"}, VV{"B2"});
+        publish(2, stranger);
+    }
+    const auto jobs_dir = base / "_jobs" / "1";
+    std::filesystem::create_directories(jobs_dir);
+    {
+        std::ofstream m(jobs_dir / ("COMPLETED-" + std::to_string(ckpt_id)));
+        m << "job=1\ncheckpoint=" << ckpt_id
+          << "\ngeneration=1\nsubtasks=0,1,2\nparticipant.0=0:src_a\nparticipant.1=1:src_a\n"
+             "participant.2=0:src_b\n";
+    }
+    const auto working = make_temp_dir("legacy_ids_dst");
+    clink::StateBackendSpec spec;
+    spec.uri = "file://" + working.string();
+    spec.subtask_idx = 0;
+    spec.restore_uri = "file://" + base.string();
+    spec.restore_checkpoint_id = ckpt_id;
+    spec.hosted_operators = {window.value(), source.value()};
+    spec.uid_aliases = {clink::OperatorIdAlias{uid_legacy, window}};
+    spec.position_aliases = {clink::OperatorIdAlias{position_legacy, source}};
+    spec.graph_op = "src_a";
+    auto built = clink::StateBackendFactory::default_instance().build(spec);
+    ASSERT_TRUE(built.restore_from.has_value());
+    clink::InMemoryStateBackend restored;
+    restored.restore(*built.restore_from);
+    const auto text = [](const std::optional<std::vector<std::byte>>& v) {
+        return v ? std::string(reinterpret_cast<const char*>(v->data()), v->size())
+                 : std::string{"<absent>"};
+    };
+    EXPECT_EQ(text(restored.get(window, std::string(1, '\x03') + "k")), "W")
+        << "the keyed state moved to the new id, and was not refused as another operator's";
+    EXPECT_EQ(text(restored.get_operator_state(source, KV{"off:0"})), "A0");
+    EXPECT_EQ(text(restored.get_operator_state(source, KV{"off:1"})), "A1")
+        << "a sibling's offsets are this source's";
+    EXPECT_EQ(text(restored.get_operator_state(source, KV{"off:2"})), "<absent>")
+        << "another source's offsets were taken as this one's";
+    std::filesystem::remove_all(working);
+    std::filesystem::remove_all(base);
 }

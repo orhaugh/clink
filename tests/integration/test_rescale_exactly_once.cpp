@@ -1416,6 +1416,13 @@ clink::itest::ProcOptions at_protocol_v2() {
     return clink::itest::ProcOptions{.env = {{"CLINK_TEST_REGISTER_PROTOCOL_VERSION", "2"}}};
 }
 
+// A worker that reads the second layout and, like a v2 one, predates the stable
+// operator ids: the only kind a job may share with a v2 worker, since one job is
+// never placed across v4 and an older protocol (Coordinator::deploy).
+clink::itest::ProcOptions at_protocol_v3() {
+    return clink::itest::ProcOptions{.env = {{"CLINK_TEST_REGISTER_PROTOCOL_VERSION", "3"}}};
+}
+
 // Two slots a worker, so the starting job (source, counter at 2, sink: four
 // tasks) fills the first two workers and a third has room only for new
 // subtasks.
@@ -1434,7 +1441,7 @@ TEST_F(RescaleExactlyOnceTest, AClusterWithAWorkerAtProtocolTwoRunsTheJobExactly
     Cluster c(admission_spec());
     ScopedDiagnostics diag(c);
     ASSERT_TRUE(c.start_coordinator());
-    ASSERT_TRUE(c.start_worker(0));
+    ASSERT_TRUE(c.start_worker(0, at_protocol_v3()));
     ASSERT_TRUE(c.start_worker(1, at_protocol_v2()));
     ASSERT_TRUE(c.await_workers_registered(2));
 
@@ -1494,8 +1501,8 @@ TEST_F(HotRescaleTest, AJobWithNoLayoutBearingOperatorCutsOverHotOntoAWorkerAtPr
     Cluster c(admission_spec());
     ScopedDiagnostics diag(c);
     ASSERT_TRUE(c.start_coordinator());
-    ASSERT_TRUE(c.start_worker(0));
-    ASSERT_TRUE(c.start_worker(1));
+    ASSERT_TRUE(c.start_worker(0, at_protocol_v3()));
+    ASSERT_TRUE(c.start_worker(1, at_protocol_v3()));
     ASSERT_TRUE(c.await_workers_registered(2));
 
     run_hot_and_assert(c, kMaxParallelism, "hot onto a joined v2 worker", [&] {
