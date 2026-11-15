@@ -147,6 +147,9 @@ inline void encode_body(MessageBuilder& b, const DeployMsg& m) {
     // Whether a restore drops the keyed state of operators a subtask does not
     // run. A peer that stops reading earlier makes no such check.
     b.put_u8(m.allow_unrestored_state ? 1 : 0);
+    // Whether each subtask reports its restore and waits for the verdict. A peer
+    // that stops reading earlier neither reports nor waits.
+    b.put_u8(m.await_restore_verdict ? 1 : 0);
 }
 
 inline void encode_body(MessageBuilder& b, const StartJobMsg& m) {
@@ -471,6 +474,41 @@ inline void encode_body(MessageBuilder& b, const SubtaskListeningMsg& m) {
     }
 }
 
+inline void encode_body(MessageBuilder& b, const SubtaskRestoredMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_string(m.worker_id);
+    b.put_string(m.role);
+    b.put_u32_be(m.subtask_idx);
+    const auto ids = [&b](const std::vector<std::uint64_t>& v) {
+        b.put_u32_be(static_cast<std::uint32_t>(v.size()));
+        for (const auto id : v) {
+            b.put_u64_be(id);
+        }
+    };
+    const auto ops = [&b](const std::vector<RestoredOperator>& v) {
+        b.put_u32_be(static_cast<std::uint32_t>(v.size()));
+        for (const auto& o : v) {
+            b.put_u64_be(o.op);
+            b.put_u64_be(o.keyed_rows);
+            b.put_u64_be(o.operator_rows);
+            b.put_string(o.name);
+        }
+    };
+    ids(m.hosted);
+    ids(m.claimed);
+    ops(m.restored);
+    ops(m.dropped);
+    b.put_u8(m.listing_complete ? 1 : 0);
+    b.put_u8(m.restored_legacy ? 1 : 0);
+}
+
+inline void encode_body(MessageBuilder& b, const RestoreVerdictMsg& m) {
+    b.put_u64_be(m.job_id);
+    b.put_u8(m.ok ? 1 : 0);
+    b.put_string(m.reason);
+    b.put_u64_be(m.coordinator_epoch);
+}
+
 inline void encode_body(MessageBuilder& b, const PeerUpdateMsg& m) {
     b.put_u64_be(m.job_id);
     b.put_u32_be(static_cast<std::uint32_t>(m.tasks.size()));
@@ -677,6 +715,10 @@ inline DeployMsg decode_deploy(MessageReader& r) {
     // keyed state of operators a subtask does not run.
     if (!r.eof()) {
         m.allow_unrestored_state = r.read_u8() != 0;
+    }
+    // Absent from older coordinator peers -> no verdict to wait for.
+    if (!r.eof()) {
+        m.await_restore_verdict = r.read_u8() != 0;
     }
     return m;
 }
@@ -1153,6 +1195,49 @@ inline SubtaskListeningMsg decode_subtask_listening(MessageReader& r) {
         ep.port = r.read_u16_be();
         m.edge_ports.push_back(std::move(ep));
     }
+    return m;
+}
+
+inline SubtaskRestoredMsg decode_subtask_restored(MessageReader& r) {
+    SubtaskRestoredMsg m;
+    m.job_id = r.read_u64_be();
+    m.worker_id = r.read_string();
+    m.role = r.read_string();
+    m.subtask_idx = r.read_u32_be();
+    const auto ids = [&r](std::vector<std::uint64_t>& v) {
+        const std::uint32_t n = r.read_count();
+        v.reserve(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            v.push_back(r.read_u64_be());
+        }
+    };
+    const auto ops = [&r](std::vector<RestoredOperator>& v) {
+        const std::uint32_t n = r.read_count();
+        v.reserve(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            RestoredOperator o;
+            o.op = r.read_u64_be();
+            o.keyed_rows = r.read_u64_be();
+            o.operator_rows = r.read_u64_be();
+            o.name = r.read_string();
+            v.push_back(std::move(o));
+        }
+    };
+    ids(m.hosted);
+    ids(m.claimed);
+    ops(m.restored);
+    ops(m.dropped);
+    m.listing_complete = r.read_u8() != 0;
+    m.restored_legacy = r.read_u8() != 0;
+    return m;
+}
+
+inline RestoreVerdictMsg decode_restore_verdict(MessageReader& r) {
+    RestoreVerdictMsg m;
+    m.job_id = r.read_u64_be();
+    m.ok = r.read_u8() != 0;
+    m.reason = r.read_string();
+    m.coordinator_epoch = r.eof() ? std::uint64_t{0} : r.read_u64_be();
     return m;
 }
 

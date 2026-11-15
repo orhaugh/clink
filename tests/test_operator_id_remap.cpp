@@ -330,3 +330,55 @@ TEST(OperatorIdRemap, AnOperatorWithoutAUidKeepsItsIdWhateverIsUpstream) {
     EXPECT_NE(legacy_one, legacy_four) << "the old ids were positional";
     EXPECT_EQ(legacy_one.size(), 2U) << "both standard libraries' old id";
 }
+
+// The restore verdict's hook: LocalExecutor reports what the subtask restored,
+// after the old ids have moved and before any operator runs, and a refusal
+// thrown from it stops the job before a record flows.
+TEST(OperatorIdRemap, TheExecutorReportsItsRestoreBeforeAnyRecordFlowsAndARefusalStopsIt) {
+    InMemoryStateBackend seed;
+    seed.put(kOld, keyed("a"), VV{"A"});
+    seed.put(OperatorId{777}, keyed("b"), VV{"B"});
+    seed.put(OperatorId{777}, std::string(1, '\xFF') + "pos", VV{"9"});
+    const auto snap = seed.snapshot(CheckpointId{1});
+
+    for (const bool refuse : {true, false}) {
+        Dag dag;
+        auto h = dag.add_source<std::int64_t>(std::make_shared<VectorSource<std::int64_t>>(
+            std::vector<Record<std::int64_t>>{Record<std::int64_t>{1}, Record<std::int64_t>{2}}));
+        auto sink = std::make_shared<CollectingSink<std::int64_t>>();
+        dag.add_sink<std::int64_t>(h, sink);
+        auto backend = std::make_shared<InMemoryStateBackend>();
+        JobConfig cfg;
+        cfg.state_backend = backend;
+        cfg.restore_from = snap;
+        cfg.operator_id_aliases = {OperatorIdAlias{kOld, kNew}};
+        cfg.restore_dropped_operator_rows = {{55, 4}};
+        cfg.restore_operator_names = {{777, "uid 'gone'"}};
+        std::optional<RestoreReport> seen;
+        cfg.on_restored = [&](const RestoreReport& report) {
+            seen = report;
+            if (refuse) {
+                throw clink::state::RestoreRefused("refused by the verdict");
+            }
+        };
+        LocalExecutor exec(std::move(dag), std::move(cfg));
+        if (refuse) {
+            EXPECT_THROW(exec.run(), clink::state::RestoreRefused);
+            EXPECT_TRUE(sink->collected().empty()) << "a record flowed before the verdict";
+        } else {
+            exec.run();
+            EXPECT_EQ(sink->collected().size(), 2U);
+        }
+        ASSERT_TRUE(seen.has_value()) << "the hook was not called";
+        EXPECT_EQ(seen->hosted.size(), 2U) << "the source and the sink";
+        ASSERT_TRUE(seen->restored.has_value());
+        const auto& restored = *seen->restored;
+        EXPECT_EQ(restored.count(kOld), 0U) << "reported before the old id moved";
+        ASSERT_EQ(restored.count(kNew), 1U);
+        EXPECT_EQ(restored.at(kNew), (std::pair<std::uint64_t, std::uint64_t>{1, 0}));
+        ASSERT_EQ(restored.count(OperatorId{777}), 1U);
+        EXPECT_EQ(restored.at(OperatorId{777}), (std::pair<std::uint64_t, std::uint64_t>{1, 1}));
+        EXPECT_EQ(seen->dropped, (std::map<std::uint64_t, std::uint64_t>{{55, 4}}));
+        EXPECT_EQ(seen->names.at(777), "uid 'gone'");
+    }
+}

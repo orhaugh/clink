@@ -84,6 +84,12 @@ public:
         // SubtaskListening. Beyond this the generic role aborts the
         // task with an error so the coordinator can retry/cancel cleanly.
         std::chrono::milliseconds peer_update_timeout{30000};
+        // How long a restored subtask waits for the coordinator's restore
+        // verdict (RestoreVerdict) before it gives up and fails, retryably.
+        // A backstop: the verdict waits for the slowest subtask's restore, so
+        // it is long enough for a large state, and a job that fails or
+        // restarts in the meantime ends the wait at once with its CancelJob.
+        std::chrono::milliseconds restore_verdict_timeout{std::chrono::minutes{10}};
         // HTTP port the worker reports to the coordinator on Register. The coordinator uses
         // it to proxy /api/v1/workers/:id/* through to this worker's
         // dashboard endpoints. 0 means "no HTTP" - the coordinator won't
@@ -451,8 +457,27 @@ private:
         // A restore drops the keyed state of operators a subtask does not run
         // instead of refusing (echoed from DeployMsg).
         bool allow_unrestored_state{false};
+        // Each subtask reports its restore and waits for the verdict.
+        bool await_restore_verdict{false};
     };
     std::unordered_map<JobId, JobCheckpointState> per_job_checkpoint_;
+    // The coordinator's verdict on each job's restore (RestoreVerdict), which
+    // the job's restored subtasks wait for (make_restore_reporter_). A Deploy
+    // that asks for one replaces it, so a redeploy waits for its own, while a
+    // subtask of the deploy before it keeps the state it captured, which the
+    // CancelJob ending that deploy marked cancelled. Guarded by mu_.
+    struct RestoreVerdictState {
+        bool received{false};
+        bool ok{true};
+        bool cancelled{false};
+        std::string reason;
+    };
+    std::unordered_map<JobId, std::shared_ptr<RestoreVerdictState>> restore_verdicts_;
+    std::condition_variable restore_verdict_cv_;
+    // The function a restored subtask reports through and waits in
+    // (RunnerContext::report_restore).
+    std::function<void(const clink::RestoreReport&)> make_restore_reporter_(
+        JobId job_id, const std::string& role, std::uint32_t subtask_idx);
 
     // Source-barrier injectors registered per running subtask. The
     // runner closure pushes its Dag::source_injectors() in here at

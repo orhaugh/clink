@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -147,6 +148,14 @@ struct BuiltStateBackend {
     // list the operators in its restored state leaves it false, and the factory
     // logs that the check was not made.
     bool unrestored_state_checked{false};
+    // Operator-state rows the restore left out because the subtask does not run
+    // their operator (OperatorId value -> rows), for the restore verdict: the
+    // subtask that runs the operator keeps them, and if none does, the job's
+    // restore is refused.
+    std::map<std::uint64_t, std::uint64_t> dropped_operator_rows;
+    // What the snapshots this restore read record each operator as
+    // (InMemoryStateBackend::operator_names), so a refusal can name it.
+    std::map<std::uint64_t, std::string> operator_names;
 };
 
 // Process-wide registry that maps a URI scheme to a builder closure.

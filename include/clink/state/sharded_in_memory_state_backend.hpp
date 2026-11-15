@@ -155,6 +155,17 @@ public:
     [[nodiscard]] OperatorIdScheme operator_id_scheme() const override {
         return shards_.front().operator_id_scheme();
     }
+    [[nodiscard]] std::optional<std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>>>
+    restored_operator_rows() const override {
+        std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>> out;
+        for (const auto& shard : shards_) {
+            for (const auto& [op, counts] : *shard.restored_operator_rows()) {
+                out[op].first += counts.first;
+                out[op].second += counts.second;
+            }
+        }
+        return out;
+    }
     void set_operator_identities(const OperatorIdentities& identities) override {
         for (auto& shard : shards_) {
             shard.set_operator_identities(identities);

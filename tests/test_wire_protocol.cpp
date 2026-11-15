@@ -607,11 +607,13 @@ TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
     in.tasks = {first, second};
     in.run_checkpoint_floor = 57;
     in.allow_unrestored_state = true;
+    in.await_restore_verdict = true;
     const auto full = body_of(encode_frame(MessageKind::Deploy, in));
     constexpr std::size_t kSuccession = 2 * 8;
     constexpr std::size_t kFloor = 1 + 8;
     constexpr std::size_t kAllow = 1;
-    ASSERT_GT(full.size(), kSuccession + kFloor + kAllow + 8);
+    constexpr std::size_t kVerdict = 1;
+    ASSERT_GT(full.size(), kSuccession + kFloor + kAllow + kVerdict + 8);
     const auto decode_prefix = [&](std::size_t drop) {
         std::vector<std::byte> body(full.begin(), full.end() - static_cast<std::ptrdiff_t>(drop));
         MessageReader r(std::move(body));
@@ -628,14 +630,21 @@ TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
     EXPECT_EQ(out.tasks[1].succeeds_count, 0U);
     EXPECT_EQ(out.run_checkpoint_floor, std::optional<std::uint64_t>{57});
     EXPECT_TRUE(out.allow_unrestored_state);
+    EXPECT_TRUE(out.await_restore_verdict);
+
+    // A sender that stopped after the allow byte: no verdict is awaited.
+    out = decode_prefix(kVerdict);
+    EXPECT_TRUE(out.allow_unrestored_state);
+    EXPECT_FALSE(out.await_restore_verdict);
 
     // A sender that stopped after the floor: the restore refuses.
-    out = decode_prefix(kAllow);
+    out = decode_prefix(kVerdict + kAllow);
     EXPECT_EQ(out.run_checkpoint_floor, std::optional<std::uint64_t>{57});
     EXPECT_FALSE(out.allow_unrestored_state);
+    EXPECT_FALSE(out.await_restore_verdict);
 
     // A sender that stopped after the succession: no floor.
-    out = decode_prefix(kAllow + kFloor);
+    out = decode_prefix(kVerdict + kAllow + kFloor);
     EXPECT_EQ(out.coordinator_epoch, 41U);
     EXPECT_EQ(out.tasks[0].succeeds_first, 3U);
     EXPECT_EQ(out.tasks[1].succeeds_count, 0U);
@@ -643,7 +652,7 @@ TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
 
     // A sender that stopped at the epoch, as v0.10.0 does: every task succeeds
     // itself, no floor, and the epoch is the one sent.
-    out = decode_prefix(kSuccession + kFloor + kAllow);
+    out = decode_prefix(kSuccession + kFloor + kAllow + kVerdict);
     EXPECT_EQ(out.coordinator_epoch, 41U);
     for (const auto& task : out.tasks) {
         EXPECT_EQ(task.succeeds_first, kRestoreFromSelf);
@@ -660,8 +669,9 @@ TEST(WireProtocol, DeployTailDecodesWhereverASenderStopped) {
     }
     bare.run_checkpoint_floor.reset();
     bare.allow_unrestored_state = false;
+    bare.await_restore_verdict = false;
     const auto bare_body = body_of(encode_frame(MessageKind::Deploy, bare));
-    const auto through_epoch = full.size() - kSuccession - kFloor - kAllow;
+    const auto through_epoch = full.size() - kSuccession - kFloor - kAllow - kVerdict;
     ASSERT_EQ(bare_body.size(), full.size());
     EXPECT_TRUE(std::equal(
         full.begin(), full.begin() + static_cast<std::ptrdiff_t>(through_epoch), bare_body.begin()))
@@ -694,6 +704,7 @@ TEST(WireProtocol, MessageKindsMayShareAValueOnlyAcrossDirections) {
         {MessageKind::Heartbeat, "Heartbeat"},
         {MessageKind::SubtaskFinished, "SubtaskFinished"},
         {MessageKind::SubtaskListening, "SubtaskListening"},
+        {MessageKind::SubtaskRestored, "SubtaskRestored"},
         {MessageKind::SubtaskCheckpointed, "SubtaskCheckpointed"},
         {MessageKind::CommitConfirmed, "CommitConfirmed"},
         {MessageKind::RequestFinalCheckpoint, "RequestFinalCheckpoint"},
@@ -709,6 +720,7 @@ TEST(WireProtocol, MessageKindsMayShareAValueOnlyAcrossDirections) {
         {MessageKind::RegisterAck, "RegisterAck"},
         {MessageKind::Deploy, "Deploy"},
         {MessageKind::PeerUpdate, "PeerUpdate"},
+        {MessageKind::RestoreVerdict, "RestoreVerdict"},
         {MessageKind::TriggerCheckpoint, "TriggerCheckpoint"},
         {MessageKind::CommitCheckpoint, "CommitCheckpoint"},
         {MessageKind::AbortCheckpoint, "AbortCheckpoint"},
@@ -1227,10 +1239,11 @@ TEST(WireProtocolFencing, AFrameFromAPreFencingPeerDecodesAsUnfenced) {
         // Deploy's tail has grown past the epoch: the per-task succession (8
         // bytes for this one task), then the run's checkpoint-id floor (a
         // presence byte and 8 bytes), then whether a restore drops unrestored
-        // state (1 byte). A peer that predates them all sends none, so 26
-        // bytes come off, not 8.
+        // state (1 byte), then whether it waits for a restore verdict (1
+        // byte). A peer that predates them all sends none, so 27 bytes come
+        // off, not 8.
         auto out = round_trip_without_epoch_field(
-            MessageKind::Deploy, in, decode_deploy, /*tail_bytes=*/26);
+            MessageKind::Deploy, in, decode_deploy, /*tail_bytes=*/27);
         EXPECT_EQ(out.job_id, 11U);
         ASSERT_EQ(out.tasks.size(), 1U);
         EXPECT_EQ(out.tasks[0].subtask_idx, 3U);
@@ -1646,4 +1659,54 @@ TEST(WireProtocol, SubmitJobAckWithoutIdentityTailDecodesEmpty) {
     EXPECT_TRUE(out.cluster_target_triple.empty());
     EXPECT_TRUE(out.cluster_toolchain.empty());
     EXPECT_TRUE(out.cluster_abi_manifest.empty());
+}
+
+TEST(WireProtocol, SubtaskRestoredRoundTripsEveryListAndTheOperatorsNames) {
+    SubtaskRestoredMsg in;
+    in.job_id = 7;
+    in.worker_id = "w-2";
+    in.role = "__clink_subtask";
+    in.subtask_idx = 3;
+    in.hosted = {11, 12};
+    in.claimed = {901, 902, 903};
+    in.restored = {RestoredOperator{11, 40, 2, "uid 'counts'"}, RestoredOperator{12, 0, 0, ""}};
+    in.dropped = {RestoredOperator{77, 0, 5, "uid 'orders-src'"}};
+    in.listing_complete = false;
+    in.restored_legacy = true;
+    const auto out = round_trip(MessageKind::SubtaskRestored, in, decode_subtask_restored);
+    EXPECT_EQ(out.job_id, 7U);
+    EXPECT_EQ(out.worker_id, "w-2");
+    EXPECT_EQ(out.role, "__clink_subtask");
+    EXPECT_EQ(out.subtask_idx, 3U);
+    EXPECT_EQ(out.hosted, in.hosted);
+    EXPECT_EQ(out.claimed, in.claimed);
+    ASSERT_EQ(out.restored.size(), 2U);
+    EXPECT_EQ(out.restored[0].op, 11U);
+    EXPECT_EQ(out.restored[0].keyed_rows, 40U);
+    EXPECT_EQ(out.restored[0].operator_rows, 2U);
+    EXPECT_EQ(out.restored[0].name, "uid 'counts'");
+    EXPECT_EQ(out.restored[1].name, "");
+    ASSERT_EQ(out.dropped.size(), 1U);
+    EXPECT_EQ(out.dropped[0].op, 77U);
+    EXPECT_EQ(out.dropped[0].operator_rows, 5U);
+    EXPECT_EQ(out.dropped[0].name, "uid 'orders-src'");
+    EXPECT_FALSE(out.listing_complete);
+    EXPECT_TRUE(out.restored_legacy);
+}
+
+TEST(WireProtocol, RestoreVerdictRoundTripsAndAnUnfencedSenderReadsAsEpochZero) {
+    RestoreVerdictMsg in;
+    in.job_id = 5;
+    in.ok = false;
+    in.reason = "refusing to restore: operator 9";
+    in.coordinator_epoch = 33;
+    const auto out = round_trip(MessageKind::RestoreVerdict, in, decode_restore_verdict);
+    EXPECT_EQ(out.job_id, 5U);
+    EXPECT_FALSE(out.ok);
+    EXPECT_EQ(out.reason, in.reason);
+    EXPECT_EQ(out.coordinator_epoch, 33U);
+    const auto unfenced = round_trip_without_epoch_field(
+        MessageKind::RestoreVerdict, in, decode_restore_verdict, /*tail_bytes=*/8);
+    EXPECT_EQ(unfenced.coordinator_epoch, 0U);
+    EXPECT_EQ(unfenced.reason, in.reason);
 }

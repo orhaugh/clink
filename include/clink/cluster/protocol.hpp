@@ -143,6 +143,11 @@ enum class MessageKind : std::uint8_t {
     // coordinator replies with FinalCheckpointAssigned carrying the assigned id (or 0
     // to decline if the job is already completing/cancelling).
     RequestFinalCheckpoint = 10,
+    // worker → coordinator. What a subtask restored, sent after its restore and
+    // before any of its operators runs, when the Deploy asked for a restore
+    // verdict (DeployMsg::await_restore_verdict). The subtask then waits for
+    // RestoreVerdict.
+    SubtaskRestored = 15,
     // Client → coordinator
     HelloClient = 4,
     SubmitJob = 5,
@@ -263,6 +268,10 @@ enum class MessageKind : std::uint8_t {
     // coordinator and the sequence makes the exchange observable in tests and
     // diagnostics.
     HeartbeatAck = 122,
+    // coordinator → worker. The verdict on a job's restore, once every subtask
+    // has reported what it restored (SubtaskRestored): go on, or refuse because
+    // the checkpoint holds state of an operator no subtask of the job runs.
+    RestoreVerdict = 123,
 };
 
 // Sentinel marking "no rescale-specific restore override" on a
@@ -503,6 +512,12 @@ struct DeployMsg {
     // makes no such check, and a worker reading an older coordinator's Deploy
     // leaves it false and refuses.
     bool allow_unrestored_state{false};
+    // Each subtask reports what it restored (SubtaskRestored) and waits for the
+    // coordinator's RestoreVerdict before its operators run. Set on a whole-job
+    // deploy that restores, onto workers of protocol v4 or later. After
+    // allow_unrestored_state on the wire; an older worker stops reading before
+    // it and neither reports nor waits.
+    bool await_restore_verdict{false};
 };
 
 struct StartJobMsg {
@@ -1207,6 +1222,45 @@ struct SubtaskListeningMsg {
     std::uint32_t subtask_idx{};
     std::string host;
     std::vector<EdgePort> edge_ports;
+};
+
+// worker → coordinator. What one subtask holds after its restore, before its
+// operators run: the operator ids it runs and the older ids they answer for
+// (OperatorRunner::legacy_*), the operator ids its backend restored with their
+// row counts, and the operator-state rows the restore left out because this
+// subtask does not run their operator (a source's offsets on a sink's subtask
+// are normal: the subtask that runs the source keeps them). The coordinator
+// refuses the restore when the job's subtasks together hold state no one of them
+// runs. `listing_complete` is false when the backend cannot list what it
+// restored, and `restored_legacy` true when the restored state was in the ids
+// builds before the stable operator ids derived.
+struct RestoredOperator {
+    std::uint64_t op{0};
+    std::uint64_t keyed_rows{0};
+    std::uint64_t operator_rows{0};
+    // "uid 'x'" or "node 'y'" from the snapshot that held the rows, when it
+    // recorded one; empty otherwise. Only ever shown to a person.
+    std::string name;
+};
+struct SubtaskRestoredMsg {
+    JobId job_id{};
+    std::string worker_id;
+    std::string role;
+    std::uint32_t subtask_idx{};
+    std::vector<std::uint64_t> hosted;
+    std::vector<std::uint64_t> claimed;
+    std::vector<RestoredOperator> restored;
+    std::vector<RestoredOperator> dropped;
+    bool listing_complete{true};
+    bool restored_legacy{false};
+};
+
+// coordinator → worker. The verdict for every waiting subtask of `job_id`.
+struct RestoreVerdictMsg {
+    JobId job_id{};
+    bool ok{true};
+    std::string reason;
+    std::uint64_t coordinator_epoch{0};
 };
 
 // coordinator → worker. Sent after every subtask of a job has reported listening, so

@@ -6253,6 +6253,14 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
             ++job->expected_listenings;
         }
     }
+    // A restore onto workers that derive stable operator ids waits for the
+    // whole job's verdict on what it restored before any operator runs: each
+    // generic subtask reports, and state no operator claims is refused.
+    job->awaiting_restore_verdict =
+        job->stable_operator_ids && checkpoint.restore_from_checkpoint_id != 0;
+    job->expected_restore_reports = job->expected_listenings;
+    job->restore_reports.clear();
+    job->restore_verdict_sent = false;
 
     // Group tasks by worker_id and build DeploymentTask entries with peers
     // resolved against the lookup. Generic-role peer ports are 0 here
@@ -6548,6 +6556,7 @@ JobId Coordinator::deploy_internal_(const JobPlan& plan,
         deploy_msg.restore_from_checkpoint_id = checkpoint.restore_from_checkpoint_id;
         deploy_msg.run_checkpoint_floor = job->run_checkpoint_floor;
         deploy_msg.allow_unrestored_state = checkpoint.allow_unrestored_state;
+        deploy_msg.await_restore_verdict = job->awaiting_restore_verdict;
         // Generation 1 is an initial deploy. A restore here reads a checkpoint
         // this deploy did not write (a savepoint, an explicit
         // --restore-from-checkpoint-id, the job's own before a takeover or a
@@ -6933,6 +6942,9 @@ void Coordinator::dispatch_worker_frame_(const std::shared_ptr<WorkerConnection>
         case MessageKind::SubtaskListening:
             handle_subtask_listening_(r, *worker);
             break;
+        case MessageKind::SubtaskRestored:
+            handle_subtask_restored_(r, *worker);
+            break;
         case MessageKind::Heartbeat:
             // The reader answers heartbeats itself and never queues one, so
             // this is reached only if that changes.
@@ -7051,6 +7063,157 @@ void Coordinator::handle_subtask_listening_(MessageReader& r, const WorkerConnec
         }
     }
     post_frames_(hot_frames);
+}
+
+RestoreVerdictDecision decide_restore_verdict(const std::vector<SubtaskRestoredMsg>& reports,
+                                              bool allow_unrestored_state,
+                                              bool keys_strings_by_identity_in_parallel) {
+    RestoreVerdictDecision out;
+    std::set<std::uint64_t> claimed;
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> present;
+    std::map<std::uint64_t, std::string> names;
+    bool legacy = false;
+    for (const auto& r : reports) {
+        claimed.insert(r.hosted.begin(), r.hosted.end());
+        claimed.insert(r.claimed.begin(), r.claimed.end());
+        // Keyed rows are partitioned between subtasks, so they add up.
+        // Operator-state rows are not: every subtask takes the union of its
+        // peers', so the most any one subtask saw is the operator's count.
+        for (const auto& o : r.restored) {
+            present[o.op].first += o.keyed_rows;
+            present[o.op].second = std::max(present[o.op].second, o.operator_rows);
+            if (!o.name.empty()) {
+                names.emplace(o.op, o.name);
+            }
+        }
+        for (const auto& o : r.dropped) {
+            present[o.op].second = std::max(present[o.op].second, o.operator_rows);
+            if (!o.name.empty()) {
+                names.emplace(o.op, o.name);
+            }
+        }
+        if (!r.listing_complete) {
+            out.notes.push_back("subtask " + r.role + "[" + std::to_string(r.subtask_idx) +
+                                "] on " + r.worker_id +
+                                " cannot list what it restored; its state is not checked");
+        }
+        legacy = legacy || r.restored_legacy;
+    }
+    std::string orphans;
+    std::size_t count = 0;
+    for (const auto& [op, rows] : present) {
+        if (claimed.count(op) != 0 || (rows.first == 0 && rows.second == 0)) {
+            continue;
+        }
+        ++count;
+        if (count <= 5) {
+            const auto name = names.find(op);
+            orphans += (orphans.empty() ? "" : ", ") + std::string{"operator "} +
+                       std::to_string(op) + " (" +
+                       (name == names.end() ? std::string{} : name->second + " when written; ") +
+                       std::to_string(rows.first) + " keyed, " + std::to_string(rows.second) +
+                       " operator-state rows)";
+        }
+    }
+    if (count > 5) {
+        orphans += ", and " + std::to_string(count - 5) + " more";
+    }
+    if (count > 0) {
+        if (allow_unrestored_state) {
+            out.notes.push_back("dropping the state of " + orphans +
+                                ", which no subtask of the job runs, as the submit allowed "
+                                "(--allow-unrestored-state)");
+        } else {
+            out.ok = false;
+            out.reason = "refusing to restore: the checkpoint holds state of " + orphans +
+                         " that no subtask of the job runs, so nothing would read it. An "
+                         "operator whose uid changed, or that has lost its uid, has a new id: "
+                         "give it back the uid it had and its state restores. If the operator "
+                         "left the job on purpose, resubmit with --allow-unrestored-state to "
+                         "drop its state.";
+            return out;
+        }
+    }
+    if (legacy && keys_strings_by_identity_in_parallel) {
+        out.ok = false;
+        out.reason =
+            "refusing to restore: the job keys a parallel operator with the built-in string "
+            "'identity' extractor, whose hash changed with the stable operator ids, and the "
+            "checkpoint was taken by a build before them, so its keys would now be routed to "
+            "other subtasks than the ones holding their state. Restore at parallelism 1 and "
+            "rescale afterwards, or start without the state.";
+    }
+    return out;
+}
+
+void Coordinator::handle_subtask_restored_(MessageReader& r, const WorkerConnection& sender) {
+    auto msg = decode_subtask_restored(r);
+    std::lock_guard lock(mu_);
+    auto it = jobs_.find(msg.job_id);
+    if (it == jobs_.end()) {
+        return;
+    }
+    // A session already lost was folded into a restart, which resets the
+    // reports: what it sent belongs to the deploy before. A live session's
+    // report of an earlier deploy cannot arrive after that restart either,
+    // since the restart waits for each such subtask's SubtaskFinished, which
+    // the worker sends after it on the same connection.
+    if (sender.lost) {
+        return;
+    }
+    auto& job = *it->second;
+    if (!job.awaiting_restore_verdict || job.restore_verdict_sent) {
+        return;
+    }
+    job.restore_reports[{msg.role, msg.subtask_idx}] = std::move(msg);
+    if (job.restore_reports.size() < job.expected_restore_reports) {
+        return;
+    }
+    std::vector<SubtaskRestoredMsg> reports;
+    reports.reserve(job.restore_reports.size());
+    for (const auto& [_, report] : job.restore_reports) {
+        reports.push_back(report);
+    }
+    bool identity_in_parallel = false;
+    try {
+        const auto graph = JobGraphSpec::from_json(job.graph_json);
+        std::map<std::string, const OperatorSpec*> by_id;
+        for (const auto& op : graph.ops) {
+            by_id.emplace(op.id, &op);
+        }
+        for (const auto& op : graph.ops) {
+            if (op.key_by != "identity" || op.parallelism <= 1) {
+                continue;
+            }
+            for (const auto& in : op.inputs) {
+                const auto up = by_id.find(in);
+                if (up != by_id.end() && up->second->out_channel == kChannelString) {
+                    identity_in_parallel = true;
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        identity_in_parallel = false;
+    }
+    const auto decision = decide_restore_verdict(
+        reports, job.checkpoint.allow_unrestored_state, identity_in_parallel);
+    for (const auto& note : decision.notes) {
+        log::warn("coordinator.restore", "job_id=" + std::to_string(job.id) + ": " + note);
+    }
+    if (!decision.ok) {
+        log::warn("coordinator.restore",
+                  "job_id=" + std::to_string(job.id) + ": " + decision.reason);
+    }
+    job.restore_verdict_sent = true;
+    RestoreVerdictMsg verdict{.job_id = job.id, .ok = decision.ok, .reason = decision.reason};
+    const auto frame = shared_frame(fenced_frame_(MessageKind::RestoreVerdict, verdict));
+    for (const auto& [worker_id, _] : job.tasks_by_worker) {
+        auto worker_it = registered_.find(worker_id);
+        if (worker_it == registered_.end() || worker_it->second->lost || !worker_it->second->conn) {
+            continue;
+        }
+        (void)post_to(worker_it->second->outbox, frame, FrameClass::Control);
+    }
 }
 
 void Coordinator::send_peer_updates_locked_(JobState& job) {
@@ -8584,6 +8747,17 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         by_worker[worker_port.first].push_back(std::move(d));
         ++job.expected_listenings;
     }
+    // The redeploy restores, so it waits for the whole job's verdict on what
+    // it restored, as the initial deploy does. Only generic subtasks report.
+    job.awaiting_restore_verdict = job.stable_operator_ids && restore_from_checkpoint_id != 0;
+    job.expected_restore_reports = 0;
+    for (const auto& [k, worker_port] : placement) {
+        if (k.role == kGenericSubtaskRole) {
+            ++job.expected_restore_reports;
+        }
+    }
+    job.restore_reports.clear();
+    job.restore_verdict_sent = false;
 
     // 6. Stash the new shape into job state for the rest of the coordinator
     //    to address: SubtaskListening etc. Stamped with the session the
@@ -8807,6 +8981,7 @@ std::vector<Coordinator::PendingDeploy> Coordinator::restart_job_locked_(JobStat
         // The same run: the floor its first submit fixed.
         deploy_msg.run_checkpoint_floor = job.run_checkpoint_floor;
         deploy_msg.allow_unrestored_state = job.checkpoint.allow_unrestored_state;
+        deploy_msg.await_restore_verdict = job.awaiting_restore_verdict;
         // Which generation this deploy WRITES, and which one produced the restore
         // point. They differ exactly when the restore crosses a rescale, and the
         // boundary is the same one that decides whether the parent INDEX needs
@@ -11329,7 +11504,8 @@ void Coordinator::checkpoint_trigger_loop_() {
                     }
                     continue;
                 }
-                if (!job.peer_updates_sent) {
+                if (!job.peer_updates_sent ||
+                    (job.awaiting_restore_verdict && !job.restore_verdict_sent)) {
                     const auto interval = std::chrono::milliseconds{job.checkpoint.interval_ms};
                     if (interval < sleep_for) {
                         sleep_for = interval;

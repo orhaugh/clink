@@ -4,10 +4,12 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "clink/checkpoint/checkpoint_barrier.hpp"
 #include "clink/core/types.hpp"
@@ -23,6 +25,23 @@ namespace clink {
 
 class MetricsRegistry;
 class DeadLetterQueue;
+
+// What one subtask holds after its restore, before any operator runs: the
+// operator ids it runs, the older ids they answer for, what its backend
+// restored (op id -> keyed rows, operator rows; nullopt when the backend cannot
+// list it), the operator-state rows the restore left out because the subtask
+// does not run their operator, and whether the restored state was in the ids
+// builds before the stable operator ids derived. JobConfig::on_restored.
+struct RestoreReport {
+    std::vector<OperatorId> hosted;
+    std::vector<OperatorId> claimed;
+    std::optional<std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>>> restored;
+    std::map<std::uint64_t, std::uint64_t> dropped;
+    // What the restored snapshots record each operator as ("uid 'x'"), to
+    // name an operator in a refusal.
+    std::map<std::uint64_t, std::string> names;
+    bool restored_legacy{false};
+};
 
 // JobConfig is the bag of optional knobs the LocalExecutor consults at
 // startup. It is intentionally a plain struct - every field can be omitted
@@ -76,6 +95,19 @@ struct JobConfig {
     // restore, LocalExecutor moves the restored state to the new ids
     // (StateBackend::remap_operator_ids). Empty moves nothing.
     OperatorIdAliases operator_id_aliases;
+
+    // Called by LocalExecutor once the restore (or the fresh start) is done and
+    // before any operator runs, with what the subtask holds. The cluster runner
+    // sets it when the Deploy asked for a restore verdict: it reports to the
+    // coordinator and returns when the verdict lets the job run, or throws
+    // clink::state::RestoreRefused. Unset, nothing waits.
+    std::function<void(const RestoreReport&)> on_restored;
+    // Operator-state rows the restore left out because the subtask does not run
+    // their operator (BuiltStateBackend::dropped_operator_rows), op id -> rows.
+    std::map<std::uint64_t, std::uint64_t> restore_dropped_operator_rows;
+    // What the restored snapshots record each operator as
+    // (BuiltStateBackend::operator_names), op id -> "uid 'x'".
+    std::map<std::uint64_t, std::string> restore_operator_names;
 
     // The run takes checkpoints a later run may restore from (the cluster
     // runner sets it when the job has a checkpoint directory). Operators see

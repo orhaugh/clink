@@ -466,6 +466,17 @@ public:
         return OperatorIdScheme::Legacy;
     }
 
+    // The operator ids this backend holds state under after a restore, each with
+    // its keyed and operator-state row counts, for the restore verdict (a job
+    // whose subtasks together hold state no one of them runs is refused). The
+    // default cannot list them and answers nullopt; the verdict then takes the
+    // subtask's report as incomplete.
+    [[nodiscard]] virtual std::optional<
+        std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>>>
+    restored_operator_rows() const {
+        return std::nullopt;
+    }
+
     // The identities of the operators the subtask runs, which a backend that
     // writes canonical snapshots records beside the rows (`clink.operators`).
     // LocalExecutor sets them before the job starts. The default ignores them.

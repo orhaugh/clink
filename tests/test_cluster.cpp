@@ -4247,3 +4247,156 @@ TEST(Cluster, ARestoreIntoADifferentSubtaskLayoutIsRefusedBeforeAnythingDeploys)
     coordinator.stop();
     std::filesystem::remove_all(root);
 }
+
+// A source whose uid changed holds only operator state: its offset. No subtask
+// can tell, on its own, that nobody runs the operator that wrote it, since
+// operator state crosses subtasks at a restore. The restore verdict sees the
+// whole job: restored from a real savepoint with the source's uid changed, the
+// job fails once as it deploys, naming the uid the source had, instead of
+// starting the source again from its first record. The same restore with the
+// submit's allowance runs, and the savepoint's own graph restores as before.
+TEST(Cluster, ASourceWhoseUidChangedIsRefusedByTheRestoreVerdictNamingItsOldUid) {
+    ensure_built_ins_registered();
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_restore_verdict_e2e_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto sp_dir = root / "savepoint";
+
+    Coordinator::Config cfg;
+    cfg.heartbeat_timeout = clink::test_support::scale_slack(cfg.heartbeat_timeout);
+    Coordinator coordinator(cfg);
+    const auto port = coordinator.start();
+    coordinator.expect_workers({"worker-verdict"});
+    Worker::Config wcfg;
+    wcfg.slot_count = 8;
+    wcfg.coordinator_heartbeat_timeout =
+        clink::test_support::scale_slack(wcfg.coordinator_heartbeat_timeout);
+    Worker worker("worker-verdict", "127.0.0.1", wcfg);
+    worker.connect_to_coordinator("127.0.0.1", port);
+    ASSERT_TRUE(coordinator.await_registrations(5s));
+
+    const auto graph = [](const std::string& source_uid, const std::filesystem::path& out) {
+        JobGraphSpec g;
+        OperatorSpec src;
+        src.type = "int64_range_source";
+        src.id = "verdict_src";
+        src.uid = source_uid;
+        src.parallelism = 1;
+        src.out_channel = std::string{kChannelInt64};
+        src.params = {{"count", "2000000"}, {"delay_ms", "1"}};
+        g.ops.push_back(src);
+        OperatorSpec snk;
+        snk.type = "file_int64_sink";
+        snk.id = "verdict_snk";
+        snk.inputs = {"verdict_src"};
+        snk.parallelism = 1;
+        snk.out_channel = std::string{kChannelInt64};
+        snk.params = {{"path", out.string()}};
+        g.ops.push_back(snk);
+        return g;
+    };
+
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = sp_dir.string();
+    ckpt.interval_ms = 200;
+    const auto job_id = coordinator.submit_job(graph("verdict-src-a", root / "taken.txt"),
+                                               OperatorRegistry::default_instance(),
+                                               std::vector<PluginBinary>{},
+                                               ckpt,
+                                               nullptr);
+    ASSERT_GT(job_id, 0U);
+    const auto completed_for = [&](JobId id) -> std::uint64_t {
+        const auto snap = coordinator.snapshot_job(id);
+        return snap ? snap->latest_completed_checkpoint_id : 0;
+    };
+    const auto await_completed_above = [&](JobId id, std::uint64_t above) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + clink::test_support::scale_slack(20s);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (completed_for(id) > above) {
+                return true;
+            }
+            std::this_thread::sleep_for(50ms);
+        }
+        return false;
+    };
+    ASSERT_TRUE(await_completed_above(job_id, 0)) << "the job never checkpointed";
+    const auto sp = coordinator.take_savepoint(job_id, 20s);
+    ASSERT_TRUE(sp.ok) << sp.message;
+    (void)coordinator.cancel_job(job_id);
+    ASSERT_TRUE(coordinator.await_job_completion(job_id, clink::test_support::scale_slack(30s)));
+
+    clink::application::JobSubmitter submitter("127.0.0.1", port);
+    const auto restore_options = [&](const std::string& own, bool allow) {
+        clink::application::SubmitOptions opts;
+        opts.wait_for_completion = false;
+        opts.ack_timeout = clink::test_support::scale_slack(opts.ack_timeout);
+        opts.checkpoint.checkpoint_dir = (root / own).string();
+        opts.checkpoint.interval_ms = 200;
+        opts.checkpoint.max_restarts_on_worker_loss = 3;
+        opts.checkpoint.restore_from_dir = sp_dir.string();
+        opts.checkpoint.restore_from_checkpoint_id = sp.checkpoint_id;
+        opts.checkpoint.allow_unrestored_state = allow;
+        return opts;
+    };
+
+    // Control: the savepoint's own graph restores and checkpoints.
+    {
+        const auto r = submitter.submit(graph("verdict-src-a", root / "same.txt").to_json(),
+                                        {},
+                                        restore_options("same", false));
+        ASSERT_TRUE(r.ok) << r.reject_message;
+        EXPECT_TRUE(await_completed_above(r.job_id, sp.checkpoint_id))
+            << "the job restored with its own graph never checkpointed";
+        (void)coordinator.cancel_job(r.job_id);
+        ASSERT_TRUE(
+            coordinator.await_job_completion(r.job_id, clink::test_support::scale_slack(30s)));
+    }
+
+    // The source's uid changed: refused once, before a record flows.
+    const auto changed_out = root / "changed.txt";
+    {
+        const auto r = submitter.submit(
+            graph("verdict-src-b", changed_out).to_json(), {}, restore_options("changed", false));
+        ASSERT_TRUE(r.ok) << "the submit itself is admitted: " << r.reject_message;
+        ASSERT_TRUE(
+            coordinator.await_job_completion(r.job_id, clink::test_support::scale_slack(60s)))
+            << "the refused job did not end";
+        const auto detail = coordinator.snapshot_job(r.job_id);
+        ASSERT_TRUE(detail.has_value());
+        ASSERT_FALSE(detail->subtask_errors.empty()) << "the job ended without a refusal";
+        bool named = false;
+        for (const auto& e : detail->subtask_errors) {
+            EXPECT_EQ(e.attempt, 0U) << "the refusal was retried: " << e.message;
+            if (e.message.find("no subtask of the job runs") != std::string::npos &&
+                e.message.find("uid 'verdict-src-a'") != std::string::npos) {
+                named = true;
+            }
+        }
+        EXPECT_TRUE(named) << "no subtask error carries the verdict naming the old uid: "
+                           << detail->subtask_errors.front().message;
+        EXPECT_EQ(detail->latest_completed_checkpoint_id, 0U)
+            << "the refused job took a checkpoint";
+        std::error_code ec;
+        EXPECT_TRUE(!std::filesystem::exists(changed_out, ec) ||
+                    std::filesystem::file_size(changed_out, ec) == 0)
+            << "records reached the sink before the verdict";
+    }
+
+    // With the submit's allowance it runs.
+    {
+        const auto r = submitter.submit(graph("verdict-src-b", root / "allowed.txt").to_json(),
+                                        {},
+                                        restore_options("allowed", true));
+        ASSERT_TRUE(r.ok) << r.reject_message;
+        EXPECT_TRUE(await_completed_above(r.job_id, 0)) << "the allowed restore never checkpointed";
+        (void)coordinator.cancel_job(r.job_id);
+        ASSERT_TRUE(
+            coordinator.await_job_completion(r.job_id, clink::test_support::scale_slack(30s)));
+    }
+
+    worker.stop();
+    coordinator.stop();
+    std::filesystem::remove_all(root);
+}

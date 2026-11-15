@@ -200,10 +200,14 @@ public:
         return ack.has_value() && ack->ok;
     }
 
+    // Register as a worker of an older protocol version.
+    void declare_protocol_version(std::uint32_t version) { protocol_version_ = version; }
+
     // The coordinator's answer to this worker's Register, accepted or not;
     // nullopt when there was none.
     [[nodiscard]] std::optional<RegisterAckMsg> register_reply() {
         RegisterMsg reg{.worker_id = id_, .data_host = "127.0.0.1", .slot_count = slots_};
+        reg.protocol_version = protocol_version_;
         if (!send_frame(*conn_, encode_frame(MessageKind::Register, reg))) {
             return std::nullopt;
         }
@@ -406,6 +410,26 @@ public:
         return send_frame(*conn_, frame);
     }
 
+    // What a real worker's subtasks send when a Deploy asks for the restore
+    // verdict: each reports, here that it restored nothing, which the
+    // coordinator lets run. A restored job takes no checkpoint before it.
+    [[nodiscard]] bool report_restored_if_asked(const DeployMsg& deploy) {
+        if (!deploy.await_restore_verdict) {
+            return true;
+        }
+        for (const auto& t : deploy.tasks) {
+            SubtaskRestoredMsg m;
+            m.job_id = deploy.job_id;
+            m.worker_id = id_;
+            m.role = t.role;
+            m.subtask_idx = t.subtask_idx;
+            if (!send_raw(encode_frame(MessageKind::SubtaskRestored, m))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // A heartbeat carrying `sequence`, beside the periodic ones (which carry
     // 0). Its answer is a barrier: the coordinator has read every frame sent
     // before it.
@@ -487,6 +511,7 @@ private:
 
     std::string id_;
     std::uint32_t slots_;
+    std::uint32_t protocol_version_{kClusterProtocolVersion};
     std::unique_ptr<network::Connection> conn_;
     // The socket conn_ owns, and its local port, when the constructor that
     // keeps them made this worker; -1 and 0 otherwise.
@@ -642,13 +667,14 @@ struct CheckpointFixture {
         }
         deployed_.clear();
         std::uint16_t fake_port = 40100;
-        for (const auto& t : decode_deploy(*deploy).tasks) {
+        const auto msg = decode_deploy(*deploy);
+        for (const auto& t : msg.tasks) {
             deployed_.emplace_back(t.role, t.subtask_idx);
             if (!worker->report_listening(job_id, t.role, t.subtask_idx, fake_port++)) {
                 return false;
             }
         }
-        return !deployed_.empty();
+        return !deployed_.empty() && worker->report_restored_if_asked(msg);
     }
 
     // Wait for a TriggerCheckpoint and return the id it carries.
@@ -4312,6 +4338,7 @@ TakeoverNumbering takeover_after_an_unanswered_barrier(
             for (const auto& t : msg.tasks) {
                 EXPECT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, port_seed++));
             }
+            EXPECT_TRUE(w.report_restored_if_asked(msg));
         } else {
             ADD_FAILURE() << "the new leader did not redeploy the job";
         }
@@ -5726,13 +5753,14 @@ TEST(CheckpointCompletion, ACompletedCheckpointResetsTheFailureRestartCount) {
         }
         tasks.clear();
         std::uint16_t fake_port = 47000;
-        for (const auto& t : decode_deploy(*deploy).tasks) {
+        const auto msg = decode_deploy(*deploy);
+        for (const auto& t : msg.tasks) {
             tasks.emplace_back(t.role, t.subtask_idx);
             if (!w.report_listening(job_id, t.role, t.subtask_idx, fake_port++)) {
                 return false;
             }
         }
-        return !tasks.empty();
+        return !tasks.empty() && w.report_restored_if_asked(msg);
     };
     ASSERT_TRUE(learn_deploy());
 
@@ -5909,13 +5937,14 @@ TEST(CheckpointCompletion, SeparatedRecoveredFaultsDoNotExhaustTheRestartBudget)
         }
         tasks.clear();
         std::uint16_t fake_port = 47100;
-        for (const auto& t : decode_deploy(*deploy).tasks) {
+        const auto msg = decode_deploy(*deploy);
+        for (const auto& t : msg.tasks) {
             tasks.emplace_back(t.role, t.subtask_idx);
             if (!w.report_listening(job_id, t.role, t.subtask_idx, fake_port++)) {
                 return false;
             }
         }
-        return !tasks.empty();
+        return !tasks.empty() && w.report_restored_if_asked(msg);
     };
     ASSERT_TRUE(learn_deploy());
 
@@ -7372,4 +7401,333 @@ TEST(CheckpointCompletion, ACoordinatorPauseLongerThanTheStallTimeoutIsNotTakenF
         << logged_loss_cause("a-mid-transfer", start_ms).value_or("");
     w.close();
     c.stop();
+}
+
+// --- the restore verdict -------------------------------------------------
+//
+// A deploy that restores onto workers deriving stable operator ids asks every
+// subtask to report what it restored (SubtaskRestored) and waits for one
+// RestoreVerdict for the whole job before anything runs. These drive the
+// coordinator's half with a scripted worker.
+namespace {
+
+struct VerdictRun {
+    std::optional<DeployMsg> deploy;
+    std::optional<RestoreVerdictMsg> verdict;
+    bool triggered_before_verdict{false};
+    bool triggered_after_verdict{false};
+};
+
+SubtaskRestoredMsg restored_report(JobId job_id,
+                                   const DeploymentTask& task,
+                                   std::vector<std::uint64_t> hosted,
+                                   std::vector<RestoredOperator> restored,
+                                   std::vector<RestoredOperator> dropped = {}) {
+    SubtaskRestoredMsg m;
+    m.job_id = job_id;
+    m.worker_id = "w";
+    m.role = task.role;
+    m.subtask_idx = task.subtask_idx;
+    m.hosted = std::move(hosted);
+    m.restored = std::move(restored);
+    m.dropped = std::move(dropped);
+    return m;
+}
+
+// Submits a two-subtask job restoring from an empty savepoint directory, lets
+// both subtasks listen, then sends `reports(task, index)` for each and reads
+// the verdict. With a `trigger_window`, it first waits that long for a
+// checkpoint trigger, which a 100 ms interval would long since have sent were
+// it not held for the verdict (a fresh job's first comes within three seconds).
+VerdictRun run_restore_verdict(
+    const std::string& tag,
+    bool allow_unrestored_state,
+    const std::function<SubtaskRestoredMsg(JobId, const DeploymentTask&, std::size_t)>& reports,
+    std::chrono::milliseconds trigger_window = 0ms) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_restore_verdict_" + tag + "_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "savepoint");
+    VerdictRun out;
+    Coordinator c;
+    const auto port = c.start();
+    c.expect_workers({"w"});
+    FakeWorker w(port, "w");
+    EXPECT_TRUE(w.valid());
+    EXPECT_TRUE(w.register_and_ack());
+    EXPECT_TRUE(c.await_registrations(2s));
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = (root / "ckpt").string();
+    ckpt.interval_ms = 100;
+    ckpt.max_restarts_on_worker_loss = 0;
+    ckpt.restore_from_dir = (root / "savepoint").string();
+    ckpt.restore_from_checkpoint_id = 7;
+    ckpt.allow_unrestored_state = allow_unrestored_state;
+    const auto job_id = c.submit_job(
+        two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    EXPECT_GT(job_id, 0U);
+    if (auto deploy = w.await_frame(MessageKind::Deploy); deploy.has_value()) {
+        out.deploy = decode_deploy(*deploy);
+    }
+    if (!out.deploy.has_value()) {
+        c.stop();
+        return out;
+    }
+    std::uint16_t fake_port = 42000;
+    for (const auto& t : out.deploy->tasks) {
+        EXPECT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, fake_port++));
+    }
+    EXPECT_TRUE(w.await_frame(MessageKind::PeerUpdate).has_value());
+    // Every subtask is listening: no trigger may reach a subtask that might
+    // still be refused.
+    if (trigger_window > 0ms) {
+        out.triggered_before_verdict =
+            w.await_frame(MessageKind::TriggerCheckpoint, trigger_window).has_value();
+    }
+    for (std::size_t i = 0; i < out.deploy->tasks.size(); ++i) {
+        EXPECT_TRUE(w.send_raw(
+            encode_frame(MessageKind::SubtaskRestored, reports(job_id, out.deploy->tasks[i], i))));
+    }
+    if (auto verdict = w.await_frame(MessageKind::RestoreVerdict); verdict.has_value()) {
+        out.verdict = decode_restore_verdict(*verdict);
+    }
+    if (out.verdict.has_value() && out.verdict->ok) {
+        out.triggered_after_verdict = w.await_frame(MessageKind::TriggerCheckpoint, 3s).has_value();
+    }
+    c.stop();
+    w.close();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    return out;
+}
+
+}  // namespace
+
+TEST(RestoreVerdict, ARestoreWhoseStateEveryOperatorClaimsRunsAndHoldsTriggersUntilTheVerdict) {
+    const auto run = run_restore_verdict(
+        "ok",
+        false,
+        [](JobId job, const DeploymentTask& t, std::size_t i) {
+            const std::uint64_t op = 100 + i;
+            return restored_report(job, t, {op}, {RestoredOperator{op, 12, 1, "uid 'mine'"}});
+        },
+        /*trigger_window=*/3s);
+    ASSERT_TRUE(run.deploy.has_value());
+    EXPECT_TRUE(run.deploy->await_restore_verdict)
+        << "a restore onto stable-id workers did not ask for a verdict";
+    EXPECT_FALSE(run.triggered_before_verdict)
+        << "a checkpoint was triggered before the restore verdict";
+    ASSERT_TRUE(run.verdict.has_value()) << "every subtask reported and no verdict came";
+    EXPECT_TRUE(run.verdict->ok) << run.verdict->reason;
+    EXPECT_TRUE(run.triggered_after_verdict) << "the verdict let the job run but nothing triggered";
+}
+
+// A source whose uid changed holds only operator state: no subtask checks it on
+// its own, and it reaches the coordinator as rows the file backend left out.
+TEST(RestoreVerdict, OperatorStateNoSubtaskRunsIsRefusedNamingItsUid) {
+    const auto run = run_restore_verdict(
+        "refused", false, [](JobId job, const DeploymentTask& t, std::size_t i) {
+            const std::uint64_t op = 100 + i;
+            return restored_report(job,
+                                   t,
+                                   {op},
+                                   {RestoredOperator{op, 3, 0, ""}},
+                                   {RestoredOperator{55, 0, 4, "uid 'orders-src'"}});
+        });
+    ASSERT_TRUE(run.verdict.has_value());
+    EXPECT_FALSE(run.verdict->ok);
+    EXPECT_NE(run.verdict->reason.find("operator 55"), std::string::npos) << run.verdict->reason;
+    EXPECT_NE(run.verdict->reason.find("uid 'orders-src'"), std::string::npos)
+        << run.verdict->reason;
+    EXPECT_NE(run.verdict->reason.find("4 operator-state rows"), std::string::npos)
+        << "the subtasks each saw the same 4 rows; the count must not add them up: "
+        << run.verdict->reason;
+    EXPECT_NE(run.verdict->reason.find("--allow-unrestored-state"), std::string::npos)
+        << run.verdict->reason;
+    EXPECT_FALSE(run.triggered_after_verdict);
+}
+
+TEST(RestoreVerdict, TheSubmitsAllowanceLetsTheJobRunWithoutTheOrphanedState) {
+    const auto run =
+        run_restore_verdict("allowed", true, [](JobId job, const DeploymentTask& t, std::size_t i) {
+            const std::uint64_t op = 100 + i;
+            return restored_report(job, t, {op}, {RestoredOperator{55, 9, 0, "uid 'gone'"}});
+        });
+    ASSERT_TRUE(run.verdict.has_value());
+    EXPECT_TRUE(run.verdict->ok) << run.verdict->reason;
+    EXPECT_TRUE(run.triggered_after_verdict);
+}
+
+TEST(RestoreVerdict, StateUnderAnIdAnotherSubtaskRunsOrClaimsIsNotOrphaned) {
+    const auto run = run_restore_verdict(
+        "claimed", false, [](JobId job, const DeploymentTask& t, std::size_t i) {
+            // Subtask 0 runs 100 and claims 900 (an old id of its operator);
+            // each holds a copy of the other's state.
+            auto m = i == 0 ? restored_report(job,
+                                              t,
+                                              {100},
+                                              {RestoredOperator{100, 1, 0, ""},
+                                               RestoredOperator{101, 0, 2, ""}})
+                            : restored_report(job,
+                                              t,
+                                              {101},
+                                              {RestoredOperator{101, 0, 2, ""}},
+                                              {RestoredOperator{900, 0, 1, ""}});
+            if (i == 0) {
+                m.claimed = {900};
+            }
+            return m;
+        });
+    ASSERT_TRUE(run.verdict.has_value());
+    EXPECT_TRUE(run.verdict->ok) << run.verdict->reason;
+}
+
+TEST(RestoreVerdict, AFreshStartAsksForNoVerdict) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_restore_verdict_fresh_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    Coordinator c;
+    const auto port = c.start();
+    c.expect_workers({"w"});
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    ASSERT_TRUE(w.register_and_ack());
+    ASSERT_TRUE(c.await_registrations(2s));
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = (root / "ckpt").string();
+    ckpt.interval_ms = 100;
+    const auto job_id = c.submit_job(
+        two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    auto deploy = w.await_frame(MessageKind::Deploy);
+    ASSERT_TRUE(deploy.has_value());
+    const auto msg = decode_deploy(*deploy);
+    EXPECT_FALSE(msg.await_restore_verdict);
+    // And it checkpoints once its subtasks listen, with no report from them.
+    std::uint16_t fake_port = 42100;
+    for (const auto& t : msg.tasks) {
+        ASSERT_TRUE(w.report_listening(job_id, t.role, t.subtask_idx, fake_port++));
+    }
+    EXPECT_TRUE(w.await_frame(MessageKind::TriggerCheckpoint, 3s).has_value());
+    c.stop();
+    w.close();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+// A worker older than protocol v4 derives the old ids and does not know the
+// verdict: a restore placed on it asks for none.
+TEST(RestoreVerdict, ARestoreOnAWorkerOlderThanV4AsksForNoVerdict) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("clink_restore_verdict_v3_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "savepoint");
+    Coordinator c;
+    const auto port = c.start();
+    c.expect_workers({"w"});
+    FakeWorker w(port, "w");
+    ASSERT_TRUE(w.valid());
+    w.declare_protocol_version(3);
+    ASSERT_TRUE(w.register_and_ack());
+    ASSERT_TRUE(c.await_registrations(2s));
+    CheckpointConfig ckpt;
+    ckpt.checkpoint_dir = (root / "ckpt").string();
+    ckpt.interval_ms = 600'000;
+    ckpt.restore_from_dir = (root / "savepoint").string();
+    ckpt.restore_from_checkpoint_id = 7;
+    const auto job_id = c.submit_job(
+        two_subtask_graph(root / "out.txt"), OperatorRegistry::default_instance(), {}, ckpt);
+    ASSERT_GT(job_id, 0U);
+    auto deploy = w.await_frame(MessageKind::Deploy);
+    ASSERT_TRUE(deploy.has_value());
+    const auto msg = decode_deploy(*deploy);
+    EXPECT_EQ(msg.restore_from_checkpoint_id, 7U) << "the premise: it restores";
+    EXPECT_FALSE(msg.await_restore_verdict);
+    c.stop();
+    w.close();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+namespace {
+
+RestoredOperator rows_of(std::uint64_t op,
+                         std::uint64_t keyed,
+                         std::uint64_t operator_rows,
+                         std::string name = {}) {
+    return RestoredOperator{op, keyed, operator_rows, std::move(name)};
+}
+
+SubtaskRestoredMsg report_of(std::uint32_t idx,
+                             std::vector<std::uint64_t> hosted,
+                             std::vector<RestoredOperator> restored,
+                             std::vector<RestoredOperator> dropped = {}) {
+    SubtaskRestoredMsg m;
+    m.role = "__clink_subtask";
+    m.subtask_idx = idx;
+    m.worker_id = "w";
+    m.hosted = std::move(hosted);
+    m.restored = std::move(restored);
+    m.dropped = std::move(dropped);
+    return m;
+}
+
+}  // namespace
+
+TEST(RestoreVerdictDecision, KeyedRowsAddUpAcrossSubtasksAndAnEmptyOperatorIsNoOrphan) {
+    const auto d = decide_restore_verdict({report_of(0, {1}, {rows_of(9, 3, 0), rows_of(5, 0, 0)}),
+                                           report_of(1, {2}, {rows_of(9, 4, 0, "node 'agg_2'")})},
+                                          /*allow_unrestored_state=*/false,
+                                          /*keys_strings_by_identity_in_parallel=*/false);
+    EXPECT_FALSE(d.ok);
+    EXPECT_NE(
+        d.reason.find("operator 9 (node 'agg_2' when written; 7 keyed, 0 operator-state rows)"),
+        std::string::npos)
+        << d.reason;
+    EXPECT_EQ(d.reason.find("operator 5"), std::string::npos)
+        << "an operator with no rows is nothing to lose: " << d.reason;
+}
+
+TEST(RestoreVerdictDecision, AtMostFiveOperatorsAreNamedAndTheRestCounted) {
+    std::vector<RestoredOperator> restored;
+    for (std::uint64_t op = 10; op < 17; ++op) {
+        restored.push_back(rows_of(op, 1, 0));
+    }
+    const auto d = decide_restore_verdict({report_of(0, {1}, restored)}, false, false);
+    EXPECT_FALSE(d.ok);
+    EXPECT_NE(d.reason.find("and 2 more"), std::string::npos) << d.reason;
+    EXPECT_EQ(d.reason.find("operator 15"), std::string::npos) << d.reason;
+}
+
+TEST(RestoreVerdictDecision, TheAllowanceRunsTheJobAndNotesWhatItLeavesUnread) {
+    const auto d = decide_restore_verdict({report_of(0, {1}, {rows_of(9, 1, 0)})}, true, false);
+    EXPECT_TRUE(d.ok);
+    ASSERT_EQ(d.notes.size(), 1U);
+    EXPECT_NE(d.notes.front().find("operator 9"), std::string::npos) << d.notes.front();
+}
+
+TEST(RestoreVerdictDecision, ASubtaskThatCannotListItsStateIsNotedNotRefused) {
+    auto blind = report_of(0, {1}, {});
+    blind.listing_complete = false;
+    const auto d = decide_restore_verdict({blind}, false, false);
+    EXPECT_TRUE(d.ok);
+    ASSERT_EQ(d.notes.size(), 1U);
+    EXPECT_NE(d.notes.front().find("not checked"), std::string::npos) << d.notes.front();
+}
+
+// The built-in string identity extractor's hash changed with the stable ids, so
+// a checkpoint in the old ids would route a parallel operator's keys away from
+// their state. Only that combination is refused.
+TEST(RestoreVerdictDecision, ALegacyRestoreOfAParallelStringIdentityKeyIsRefused) {
+    auto legacy = report_of(0, {1}, {rows_of(1, 2, 0)});
+    legacy.restored_legacy = true;
+    const auto refused = decide_restore_verdict({legacy}, false, true);
+    EXPECT_FALSE(refused.ok);
+    EXPECT_NE(refused.reason.find("'identity' extractor"), std::string::npos) << refused.reason;
+    EXPECT_TRUE(decide_restore_verdict({legacy}, false, false).ok)
+        << "a job not keyed by the extractor in parallel routes as it did";
+    auto stable = legacy;
+    stable.restored_legacy = false;
+    EXPECT_TRUE(decide_restore_verdict({stable}, false, true).ok)
+        << "a checkpoint in the stable ids already routes by the new hash";
 }

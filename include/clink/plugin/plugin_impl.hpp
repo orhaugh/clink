@@ -290,6 +290,9 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
     cfg.operator_id_aliases = aliases.uid;
     cfg.operator_id_aliases.insert(
         cfg.operator_id_aliases.end(), aliases.position.begin(), aliases.position.end());
+    // The restore verdict, when the Deploy asked for one: the executor reports
+    // what the subtask holds and waits before any operator runs.
+    cfg.on_restored = rctx.report_restore;
     // Build through the HOST's factory when provided (rctx.state_backend_factory):
     // a dlopen'd plugin's .so-local StateBackendFactory singleton only has the
     // ctor builtins (memory/file/changelog), NOT the dynamically-registered
@@ -301,6 +304,8 @@ inline clink::JobConfig make_subtask_job_config(const clink::cluster::RunnerCont
                                               : clink::StateBackendFactory::default_instance();
     auto built = factory.build(spec);
     cfg.state_backend = built.backend;
+    cfg.restore_dropped_operator_rows = built.dropped_operator_rows;
+    cfg.restore_operator_names = built.operator_names;
     // Hand the freshly-built backend to the worker (if it registered a hook)
     // so it can purge this subtask's superseded checkpoints under the
     // retention policy. Shared ownership: the executor and the worker both

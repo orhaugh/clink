@@ -2,6 +2,7 @@
 
 #include <chrono>
 
+#include "clink/config/json.hpp"
 #include "clink/metrics/state_metrics.hpp"
 #include "clink/runtime/log_buffer.hpp"
 #include "clink/state/snapshot_arrow_writer.hpp"
@@ -707,6 +708,64 @@ std::map<OperatorId, std::uint64_t> InMemoryStateBackend::remap_operator_ids(
 std::map<std::uint64_t, std::uint64_t> InMemoryStateBackend::keyed_rows_by_operator(
     std::span<const std::byte> snapshot_bytes) {
     std::map<std::uint64_t, std::uint64_t> out;
+    for (const auto& [op, counts] : rows_by_operator(snapshot_bytes)) {
+        if (counts.first > 0) {
+            out[op] = counts.first;
+        }
+    }
+    return out;
+}
+
+std::map<std::uint64_t, std::string> InMemoryStateBackend::operator_names(
+    std::span<const std::byte> snapshot_bytes) {
+    std::map<std::uint64_t, std::string> out;
+    if (snapshot_bytes.empty()) {
+        return out;
+    }
+    auto buffer =
+        std::make_shared<arrow::Buffer>(reinterpret_cast<const uint8_t*>(snapshot_bytes.data()),
+                                        static_cast<int64_t>(snapshot_bytes.size()));
+    auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(
+        std::make_shared<arrow::io::BufferReader>(buffer));
+    if (!reader_result.ok()) {
+        return out;
+    }
+    const auto& metadata = (*reader_result)->schema()->metadata();
+    if (!metadata) {
+        return out;
+    }
+    const auto idx = metadata->FindKey(kOperatorsMetadataKey);
+    if (idx == -1) {
+        return out;
+    }
+    // A description, never a decision: an entry that does not parse names
+    // nothing rather than failing the restore it would only have described.
+    try {
+        const auto doc = config::parse(metadata->value(idx));
+        if (!doc.is_array()) {
+            return out;
+        }
+        for (const auto& entry : doc.as_array()) {
+            if (!entry.is_object()) {
+                continue;
+            }
+            const auto op = std::stoull(entry.string_or("op_id", "0"));
+            const auto uid = entry.string_or("uid", "");
+            const auto node = entry.string_or("node", "");
+            if (op == 0 || (uid.empty() && node.empty())) {
+                continue;
+            }
+            out[op] = uid.empty() ? "node '" + node + "'" : "uid '" + uid + "'";
+        }
+    } catch (const std::exception&) {
+        return {};
+    }
+    return out;
+}
+
+std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>>
+InMemoryStateBackend::rows_by_operator(std::span<const std::byte> snapshot_bytes) {
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> out;
     if (snapshot_bytes.empty()) {
         return out;
     }
@@ -716,14 +775,14 @@ std::map<std::uint64_t, std::uint64_t> InMemoryStateBackend::keyed_rows_by_opera
     auto input = std::make_shared<arrow::io::BufferReader>(buffer);
     auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
     if (!reader_result.ok())
-        throw_arrow("keyed_rows_by_operator (open reader)", reader_result.status());
+        throw_arrow("rows_by_operator (open reader)", reader_result.status());
     auto reader = *reader_result;
     verify_snapshot_format_version(reader->schema()->metadata(),
-                                   "InMemoryStateBackend keyed_rows_by_operator");
+                                   "InMemoryStateBackend rows_by_operator");
     std::shared_ptr<arrow::RecordBatch> batch;
     while (true) {
-        if (auto s = reader->ReadNext(&batch); !s.ok())
-            throw_arrow("keyed_rows_by_operator (read batch)", s);
+        if (auto st = reader->ReadNext(&batch); !st.ok())
+            throw_arrow("rows_by_operator (read batch)", st);
         if (!batch)
             break;
         const auto* op_arr = static_cast<const arrow::UInt64Array*>(batch->column(0).get());
@@ -731,8 +790,11 @@ std::map<std::uint64_t, std::uint64_t> InMemoryStateBackend::keyed_rows_by_opera
         for (int64_t i = 0; i < batch->num_rows(); ++i) {
             int32_t klen = 0;
             const uint8_t* kptr = key_arr->GetValue(i, &klen);
+            auto& counts = out[op_arr->Value(i)];
             if (klen == 0 || static_cast<KeyGroup>(kptr[0]) < kNumKeyGroups) {
-                ++out[op_arr->Value(i)];
+                ++counts.first;
+            } else {
+                ++counts.second;
             }
         }
     }

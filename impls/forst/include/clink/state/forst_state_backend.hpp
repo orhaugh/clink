@@ -166,6 +166,8 @@ public:
     std::map<OperatorId, std::uint64_t> remap_operator_ids(const OperatorIdAliases& aliases,
                                                            OperatorIdScheme scheme) override;
     [[nodiscard]] OperatorIdScheme operator_id_scheme() const override;
+    [[nodiscard]] std::optional<std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>>>
+    restored_operator_rows() const override;
     void set_operator_identities(const OperatorIdentities& identities) override;
     // Shape fingerprints (design record 009) ride the same reserved-key
     // channel: written through on record/clear so every checkpoint carries

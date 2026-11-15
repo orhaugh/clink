@@ -717,6 +717,13 @@ void Worker::signal_disconnect_(const std::string& reason) {
             pt->cancelled = true;
             pt->cv.notify_all();
         }
+        // And every subtask waiting for a restore verdict that cannot come.
+        for (auto& [_, verdict] : restore_verdicts_) {
+            if (verdict) {
+                verdict->cancelled = true;
+            }
+        }
+        restore_verdict_cv_.notify_all();
         // Fence all work from the dead session immediately. Waiting for the
         // process supervisor to notice the disconnect leaves a window where a
         // partitioned worker can keep publishing while the coordinator has
@@ -827,6 +834,22 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
             case MessageKind::PeerUpdate:
                 handle_peer_update_(r);
                 break;
+            case MessageKind::RestoreVerdict: {
+                const auto verdict = decode_restore_verdict(r);
+                if (!accept_epoch_(verdict.coordinator_epoch, "RestoreVerdict")) {
+                    break;
+                }
+                std::lock_guard lock(mu_);
+                // Only a deploy that asked for a verdict waits for one.
+                if (auto v = restore_verdicts_.find(verdict.job_id);
+                    v != restore_verdicts_.end() && v->second) {
+                    v->second->received = true;
+                    v->second->ok = verdict.ok;
+                    v->second->reason = verdict.reason;
+                    restore_verdict_cv_.notify_all();
+                }
+                break;
+            }
             case MessageKind::HeartbeatAck: {
                 const auto ack = decode_heartbeat_ack(r);
                 if (!accept_epoch_(ack.coordinator_epoch, "HeartbeatAck")) {
@@ -862,6 +885,12 @@ void Worker::dispatch_control_frame_(MessageReader& r) {
                 // cancelled deployment (followups item 75b). run_task_
                 // consults the latch at registration.
                 cancelled_jobs_.insert(cj.job_id);
+                // Wake any subtask waiting for the job's restore verdict.
+                if (auto v = restore_verdicts_.find(cj.job_id);
+                    v != restore_verdicts_.end() && v->second) {
+                    v->second->cancelled = true;
+                    restore_verdict_cv_.notify_all();
+                }
                 // Wake any subtasks blocked in await_peer_update_ - for
                 // jobs cancelled before peer-update arrived.
                 for (auto& [key, pt] : pending_) {
@@ -1850,7 +1879,11 @@ void Worker::handle_deploy_(MessageReader& r) {
             .capture_records = msg.capture_records,
             .run_checkpoint_floor = msg.run_checkpoint_floor,
             .allow_unrestored_state = msg.allow_unrestored_state,
+            .await_restore_verdict = msg.await_restore_verdict,
         };
+        if (msg.await_restore_verdict) {
+            restore_verdicts_[msg.job_id] = std::make_shared<RestoreVerdictState>();
+        }
     }
     for (auto& task : msg.tasks) {
         const JobId jid = msg.job_id;
@@ -1959,6 +1992,70 @@ void Worker::handle_peer_update_(MessageReader& r) {
             pt->cv.notify_all();
         }
     }
+}
+
+std::function<void(const clink::RestoreReport&)> Worker::make_restore_reporter_(
+    JobId job_id, const std::string& role, std::uint32_t subtask_idx) {
+    std::shared_ptr<RestoreVerdictState> verdict;
+    {
+        std::lock_guard lock(mu_);
+        auto& slot = restore_verdicts_[job_id];
+        if (!slot) {
+            slot = std::make_shared<RestoreVerdictState>();
+        }
+        verdict = slot;
+    }
+    return [this, job_id, role, subtask_idx, verdict](const clink::RestoreReport& report) {
+        SubtaskRestoredMsg msg;
+        msg.job_id = job_id;
+        msg.worker_id = worker_id_;
+        msg.role = role;
+        msg.subtask_idx = subtask_idx;
+        for (const auto id : report.hosted) {
+            msg.hosted.push_back(id.value());
+        }
+        for (const auto id : report.claimed) {
+            msg.claimed.push_back(id.value());
+        }
+        const auto name_of = [&report](std::uint64_t op) {
+            const auto it = report.names.find(op);
+            return it == report.names.end() ? std::string{} : it->second;
+        };
+        if (report.restored.has_value()) {
+            for (const auto& [op, counts] : *report.restored) {
+                msg.restored.push_back(
+                    RestoredOperator{op.value(), counts.first, counts.second, name_of(op.value())});
+            }
+        } else {
+            msg.listing_complete = false;
+        }
+        for (const auto& [op, rows] : report.dropped) {
+            msg.dropped.push_back(RestoredOperator{op, 0, rows, name_of(op)});
+        }
+        msg.restored_legacy = report.restored_legacy;
+        if (!send_frame_(encode_frame(MessageKind::SubtaskRestored, msg))) {
+            throw std::runtime_error("subtask " + role + "[" + std::to_string(subtask_idx) +
+                                     "]: the restore report could not be sent");
+        }
+        std::unique_lock lock(mu_);
+        const auto deadline = std::chrono::steady_clock::now() + cfg_.restore_verdict_timeout;
+        while (true) {
+            if (verdict->cancelled || stop_.load(std::memory_order_acquire)) {
+                throw std::runtime_error("cancelled while waiting for the restore verdict");
+            }
+            if (verdict->received) {
+                if (verdict->ok) {
+                    return;
+                }
+                throw clink::state::RestoreRefused(verdict->reason);
+            }
+            if (restore_verdict_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                throw std::runtime_error("no restore verdict from the coordinator within " +
+                                         std::to_string(cfg_.restore_verdict_timeout.count()) +
+                                         " ms");
+            }
+        }
+    };
 }
 
 std::optional<Worker::ResolvedPeers> Worker::await_peer_update_(JobId job_id,
@@ -2263,6 +2360,8 @@ void Worker::run_generic_subtask_(JobId job_id,
     std::optional<std::uint64_t> run_checkpoint_floor;
     // Whether a restore drops keyed state no operator here reads (from the Deploy).
     bool allow_unrestored_state = false;
+    // Whether this subtask reports its restore and waits for the verdict.
+    bool await_restore_verdict = false;
     {
         std::lock_guard lock(mu_);
         auto it = per_job_bundle_.find(job_id);
@@ -2280,6 +2379,7 @@ void Worker::run_generic_subtask_(JobId job_id,
             capture_records = ck->second.capture_records;
             run_checkpoint_floor = ck->second.run_checkpoint_floor;
             allow_unrestored_state = ck->second.allow_unrestored_state;
+            await_restore_verdict = ck->second.await_restore_verdict;
         }
     }
     const auto& bundle_tr = *job_tr;
@@ -2854,6 +2954,9 @@ void Worker::run_generic_subtask_(JobId job_id,
                 .restore_from_parent_count = rescale_parent_count,
                 .restore_key_group_filter = kg_filter,
                 .allow_unrestored_state = allow_unrestored_state,
+                .report_restore = await_restore_verdict
+                                      ? make_restore_reporter_(job_id, task.role, task.subtask_idx)
+                                      : std::function<void(const clink::RestoreReport&)>{},
                 .restore_succession = succession_for(
                     task, chain.subtask_idx_in_op, generation, restore_from_generation),
                 .on_checkpoint_ack = std::move(ack_cb),
@@ -3323,6 +3426,9 @@ void Worker::run_generic_subtask_(JobId job_id,
                 task.restore_from_parent_count == 0 ? 1 : task.restore_from_parent_count,
             .restore_key_group_filter = {},
             .allow_unrestored_state = allow_unrestored_state,
+            .report_restore = await_restore_verdict
+                                  ? make_restore_reporter_(job_id, task.role, task.subtask_idx)
+                                  : std::function<void(const clink::RestoreReport&)>{},
             .restore_succession =
                 succession_for(task, chain.subtask_idx_in_op, generation, restore_from_generation),
             // Wire the checkpoint-ack callback so chained subtasks report
@@ -3423,6 +3529,15 @@ void Worker::run_generic_subtask_(JobId job_id,
     // The built-in dispatch arms run under the token registered above: it
     // cancels their executor, and decides whether an operator exception is a
     // genuine failure or the legitimate teardown throw of a cancelled subtask.
+
+    // They hold no state, but the coordinator waits for every subtask's report
+    // before its verdict, and they wait for the verdict like the rest, so no
+    // record flows before it.
+    if (await_restore_verdict) {
+        clink::RestoreReport empty;
+        empty.restored.emplace();
+        make_restore_reporter_(job_id, task.role, task.subtask_idx)(empty);
+    }
 
     if (op.kind == OperatorKind::Source) {
         const auto* fac = reg.find_source(op.type, op.out_channel);
@@ -3580,6 +3695,13 @@ void Worker::stop() {
             pt->cancelled = true;
             pt->cv.notify_all();
         }
+        // And every subtask waiting for a restore verdict that cannot come.
+        for (auto& [_, verdict] : restore_verdicts_) {
+            if (verdict) {
+                verdict->cancelled = true;
+            }
+        }
+        restore_verdict_cv_.notify_all();
         // Wind down every RUNNING subtask, not just the ones still waiting
         // to start.
         //

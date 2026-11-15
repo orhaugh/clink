@@ -97,6 +97,7 @@ void LocalExecutor::start() {
             config_.state_backend->set_operator_identities(identities);
         }
         // Restore state from snapshot before any operator starts processing.
+        bool restored_legacy = false;
         if (config_.state_backend && config_.restore_from.has_value()) {
             // FOUND-3: hand the backend the relocated savepoint dir (if any) so it
             // can rebase cp-dir references that embed a capture-time absolute path.
@@ -115,6 +116,8 @@ void LocalExecutor::start() {
             // the backend's own read finished.
             const auto restore_started = std::chrono::steady_clock::now();
             config_.state_backend->restore(*config_.restore_from, config_.restore_key_group_filter);
+            restored_legacy =
+                config_.state_backend->operator_id_scheme() == OperatorIdScheme::Legacy;
             // State an older build wrote under the operator ids it derived moves
             // to the ids this build derives, version stamps with it, before the
             // migration below reads the stamps or any operator reads its state.
@@ -149,6 +152,29 @@ void LocalExecutor::start() {
             // snapshots this job produces record them, enabling a future
             // restore to compare and migrate.
             config_.state_backend->set_state_versions(*config_.expected_state_versions);
+        }
+        // The restore verdict: report what this subtask holds and wait for the
+        // coordinator's word, before any operator runs (JobConfig::on_restored).
+        if (config_.on_restored) {
+            RestoreReport report;
+            for (const auto& runner : dag_.runners()) {
+                report.hosted.push_back(runner.id);
+                report.claimed.insert(report.claimed.end(),
+                                      runner.legacy_uid_ids.begin(),
+                                      runner.legacy_uid_ids.end());
+                report.claimed.insert(report.claimed.end(),
+                                      runner.legacy_position_ids.begin(),
+                                      runner.legacy_position_ids.end());
+            }
+            if (config_.state_backend) {
+                report.restored = config_.state_backend->restored_operator_rows();
+            } else {
+                report.restored.emplace();
+            }
+            report.dropped = config_.restore_dropped_operator_rows;
+            report.names = config_.restore_operator_names;
+            report.restored_legacy = restored_legacy;
+            config_.on_restored(report);
         }
     } catch (...) {
         running_.store(false, std::memory_order_release);

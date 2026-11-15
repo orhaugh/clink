@@ -59,6 +59,9 @@
 //      the KeyedProcessFunction example does. A restore that keeps the
 //      layout keeps them all; before it did, it routed them by the key
 //      group of the text and dropped about half
+//  12  source-uid-changed: the source is "uc-source-v2". Its only state is
+//      its position in the feed, operator state, which a restore used to let
+//      go without a word: the source started again from the first segment
 //
 // Environment, read by the process that submits the job:
 //   CLINK_UC_FEED  the directory of segments (required)
@@ -478,7 +481,7 @@ void define_job(clink::api::Pipeline& pipeline) {
     src.channel_type = "string";
     src.params["feed"] = feed;
     auto source = pipeline.source<std::string>(src, "source");
-    source.uid("uc-source");
+    source.uid(kVariant == 12 ? "uc-source-v2" : "uc-source");
 
     pipeline.set_parallelism(kKeyedParallelism);
     auto keyed = source.key_by("upgrade_check.by_account");

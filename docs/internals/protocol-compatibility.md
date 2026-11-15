@@ -83,7 +83,9 @@ may differ as long as each side can speak something the other accepts.
   byte and the id (u8, u64; absent, unset, and a 2PC sink keeps its older
   rule at restore point 0); then `allow_unrestored_state` (u8; absent, false,
   so a restore refuses keyed state of an operator the subtask does not run, and
-  a worker older than the check makes none). A decoder reads each in turn while bytes remain,
+  a worker older than the check makes none); then `await_restore_verdict` (u8;
+  absent, false, so the subtask runs without reporting its restore). A decoder
+  reads each in turn while bytes remain,
   so a frame from any sender since v0.10.0 decodes with the fields it carried
   and defaults for the rest, and a v0.10.0 worker reads the leading bytes it
   always read. `tests/fixtures/deploy-msg-v0.10.0.bin`, written by v0.10.0's
@@ -109,7 +111,14 @@ may differ as long as each side can speak something the other accepts.
   coordinator places a job on v4 workers when it can and on older ones
   otherwise, never across both, and keeps every later placement of the job (a
   restart, a rescale's new subtasks) on the kind it started on
-  (`JobState::stable_operator_ids`). v1 to v3 peers remain compatible.
+  (`JobState::stable_operator_ids`). A deploy that restores onto v4 workers
+  also asks for the restore verdict (`await_restore_verdict`): each subtask
+  sends `SubtaskRestored` (worker to coordinator, kind 15) once its state is
+  restored, and waits for the one `RestoreVerdict` (coordinator to worker, kind
+  123, fenced) the coordinator sends when every subtask has reported (see
+  [Fault tolerance](fault-tolerance-and-rescale.md#the-restore-verdict)). An
+  older worker is never asked and never receives either frame. v1 to v3 peers
+  remain compatible.
 - **Visibility:** the coordinator keeps the version each worker registered
   with, and `GET /api/v1/workers` and `GET /api/v1/cluster` report it per
   worker as `protocol_version` (0 for a peer that declared none), so a

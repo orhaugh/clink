@@ -182,7 +182,8 @@ std::pair<std::string, std::string> split_uri(const std::string& uri) {
 
 // "operator 123 (40 keyed rows)", or "3 operators: 1 (2 keyed rows), ...",
 // naming at most a few of them.
-std::string describe_unread_operators(const std::map<std::uint64_t, std::uint64_t>& unread) {
+std::string describe_unread_operators(const std::map<std::uint64_t, std::uint64_t>& unread,
+                                      const std::map<std::uint64_t, std::string>& names) {
     constexpr std::size_t kNamed = 5;
     std::string out =
         unread.size() == 1 ? "operator " : std::to_string(unread.size()) + " operators: ";
@@ -195,8 +196,10 @@ std::string describe_unread_operators(const std::map<std::uint64_t, std::uint64_
         if (named > 0) {
             out += ", ";
         }
-        out += std::to_string(op) + " (" + std::to_string(rows) +
-               (rows == 1 ? " keyed row)" : " keyed rows)");
+        const auto name = names.find(op);
+        out += std::to_string(op) + " (" +
+               (name == names.end() ? std::string{} : name->second + " when written; ") +
+               std::to_string(rows) + (rows == 1 ? " keyed row)" : " keyed rows)");
         ++named;
     }
     return out;
@@ -517,6 +520,7 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             if (!b.empty()) {
                 // This subtask's operator wrote it: every alias applies.
                 parts.push_back(InMemoryStateBackend::remap_snapshot_operator_ids(b, own_aliases));
+                out.operator_names.merge(InMemoryStateBackend::operator_names(parts.back()));
             }
         }
 
@@ -582,7 +586,7 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                 }
             }
             if (!unread.empty()) {
-                const auto what = describe_unread_operators(unread);
+                const auto what = describe_unread_operators(unread, out.operator_names);
                 if (!spec.allow_unrestored_state) {
                     throw clink::state::RestoreRefused(
                         "refusing to restore subtask " + std::to_string(spec.subtask_idx) +
@@ -730,6 +734,7 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
                                          ran->second == spec.graph_op;
                     b = InMemoryStateBackend::remap_snapshot_operator_ids(
                         b, sibling ? own_aliases : uid_aliases);
+                    out.operator_names.merge(InMemoryStateBackend::operator_names(b));
                     // A restore that keeps the layout takes no timers from its
                     // peers. An operator's timers are its own subtask's, for
                     // keys in its own key groups, so a peer's are never this
@@ -773,6 +778,12 @@ BuiltStateBackend build_file(const StateBackendSpec& spec) {
             // snapshots had to know to discard. Its own snapshot's copies from
             // before this rule go the same way.
             if (!hosted.empty()) {
+                for (const auto& [op, counts] :
+                     InMemoryStateBackend::rows_by_operator(final_bytes)) {
+                    if (counts.second > 0 && hosted.count(op) == 0) {
+                        out.dropped_operator_rows[op] = counts.second;
+                    }
+                }
                 final_bytes = InMemoryStateBackend::retain_operator_state_of(final_bytes, hosted);
             }
             // Handed over IN MEMORY, deliberately not staged as a file here.

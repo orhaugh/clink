@@ -1068,6 +1068,26 @@ OperatorIdScheme ForStStateBackend::operator_id_scheme() const {
     return impl_->scheme_;
 }
 
+// The column families holding keys, under the ids they are reported by (an
+// alias's new id for a moved operator), with RocksDB's estimate of their keys:
+// presence is what the restore verdict needs.
+std::optional<std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>>>
+ForStStateBackend::restored_operator_rows() const {
+    std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>> out;
+    std::shared_lock lk(impl_->cf_mu_);
+    const auto labels = labels_for(impl_->aliases_);
+    for (const auto& [op_id, cf] : impl_->cfs_) {
+        std::uint64_t keys = 0;
+        impl_->db->GetIntProperty(cf, "forstdb.estimate-num-keys", &keys);
+        if (keys == 0) {
+            continue;
+        }
+        const auto label = labels.find(op_id);
+        out[OperatorId{label == labels.end() ? op_id : label->second}].first += keys;
+    }
+    return out;
+}
+
 void ForStStateBackend::set_operator_identities(const OperatorIdentities& identities) {
     std::lock_guard lock(impl_->versions_mu);
     impl_->identities_ = identities;

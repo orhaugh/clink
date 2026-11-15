@@ -98,6 +98,9 @@ sequenceDiagram
   worker->>coordinator: SubtaskListening
   coordinator->>worker: PeerUpdate
   coordinator->>C: SubmitJobAck
+  Note over worker: a restore: each subtask restores its state
+  worker->>coordinator: SubtaskRestored
+  coordinator->>worker: RestoreVerdict
   Note over worker: subtasks run
   worker->>coordinator: SubtaskFinished
   coordinator->>C: JobCompleted
@@ -139,7 +142,10 @@ client                         Coordinator                        Worker
   |                                |--- Deploy (tasks+plugins) ------>|
   |                                |<---- SubtaskListening -----------|
   |                                |---- PeerUpdate ----------------->|
-  |<-- SubmitJobAck ---------------|        (subtasks run)            |
+  |<-- SubmitJobAck ---------------|                                  |
+  |                                |<---- SubtaskRestored (restore) --|
+  |                                |---- RestoreVerdict ------------->|
+  |                                |        (subtasks run)            |
   |                                |<---- SubtaskFinished ------------|
   |<-- JobCompleted ---------------|                                  |
 ```
@@ -148,7 +154,7 @@ client                         Coordinator                        Worker
 
 `Worker::connect_to_coordinator` (`src/cluster/worker.cpp`) opens the coordinator connection (plain TCP by default, via an injectable `ConnectFactory`), sends `Register` (carrying `worker_id`, `data_host`, `slot_count`, and an advertised HTTP port), and waits for `RegisterAck`. It then starts a reader thread (`reader_loop_`) and, if `heartbeat_interval > 0`, a heartbeat thread (`heartbeat_loop_`) that sends a `Heartbeat` frame on each tick (default interval 500 ms, `Worker::Config::heartbeat_interval`).
 
-`reader_loop_` dispatches inbound coordinator frames: `Deploy`, `PeerUpdate`, `CancelJob`, `StartJob`, `TriggerCheckpoint`, `CommitCheckpoint`, `AbortCheckpoint`, `FinalCheckpointAssigned`, `BeginRescale`, `CutoverPeerUpdate` and `CutoverRebind` (the last three are the hot-rescale control surface: an arming `BeginRescale` names the cutover checkpoint and the worker replies with `BeginRescaleAck` reporting what it armed; `CutoverRebind` binds new inbound listeners for the post-cutover subtasks; `CutoverPeerUpdate` carries per-feeding-task endpoint lists that swap the held output groups onto the new peers - see [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md)). When the coordinator connection drops (`read_frame` returns no value), the loop sets `disconnected_`, wakes any subtasks blocked waiting for a `PeerUpdate`, and returns.
+`reader_loop_` dispatches inbound coordinator frames: `Deploy`, `PeerUpdate`, `RestoreVerdict`, `CancelJob`, `StartJob`, `TriggerCheckpoint`, `CommitCheckpoint`, `AbortCheckpoint`, `FinalCheckpointAssigned`, `BeginRescale`, `CutoverPeerUpdate` and `CutoverRebind` (the last three are the hot-rescale control surface: an arming `BeginRescale` names the cutover checkpoint and the worker replies with `BeginRescaleAck` reporting what it armed; `CutoverRebind` binds new inbound listeners for the post-cutover subtasks; `CutoverPeerUpdate` carries per-feeding-task endpoint lists that swap the held output groups onto the new peers - see [./fault-tolerance-and-rescale.md](./fault-tolerance-and-rescale.md)). When the coordinator connection drops (`read_frame` returns no value), the loop sets `disconnected_`, wakes any subtasks blocked waiting for a `PeerUpdate`, and returns.
 
 On `Deploy` (`handle_deploy_`), the worker allocates (or reuses) a per-job `JobBundle`, loads any plugin libraries shipped with the deploy into that bundle's registry, registers a pending-task record per subtask, stashes the job's checkpoint config, and spawns one task thread per `DeploymentTask`. For the built-in generic subtask role (`kGenericSubtaskRole`, the string `"__clink_subtask"` in `include/clink/cluster/job_planner.hpp`), each task thread runs `run_generic_subtask_`, which:
 
@@ -156,7 +162,7 @@ On `Deploy` (`handle_deploy_`), the worker allocates (or reuses) a per-job `JobB
 2. binds one inbound network bridge per input edge,
 3. sends `SubtaskListening` reporting the bound port(s) (sources send an empty `edge_ports` list, which the coordinator uses purely as a "ready" tick),
 4. waits for the coordinator's `PeerUpdate` (bounded by `peer_update_timeout`, default 30 s), then
-5. builds and runs the operator chain through the local executor.
+5. builds the operator chain and starts it through the local executor, which restores its state and, when the `Deploy` asked for a restore verdict (`await_restore_verdict`), sends `SubtaskRestored` and waits for the coordinator's `RestoreVerdict` before any operator runs (bounded by `restore_verdict_timeout`, default ten minutes; see [the restore verdict](./fault-tolerance-and-rescale.md#the-restore-verdict)).
 
 A `CancelJob` reaches a task wherever it is in those steps. A task waiting for its `PeerUpdate` stops waiting and exits. Past that wait, every task registers a cancel token before step 5, and `CancelJob` flips the tokens registered at that moment: a task that runs one operator through its registered runner registers it just before the runner starts, and a chain of operators (or one with a fused source or sink), like an operator run by a built-in dispatch arm, registers it before it builds anything and hands it to its executor as `JobConfig::external_cancel_token`. Such a task still being set up when the cancel arrives finds its job in the worker's cancelled set (`cancelled_jobs_`, cleared by the job's next `Deploy`) and is not run, so it builds no operator at all. A cancel that arrives once the operators are being built waits for that build: a factory cannot be interrupted, and the executor reads the token only once it runs, cancelling every runner as soon as it starts. Before chains registered a token, a chain stopped only when its network peers closed, and one whose upstream chains failed while building, after the `PeerUpdate`, waited in its bridges for good: the job's restart drain waited for it until the watchdog failed the job, and the chain outlived the coordinator. `ErrorCancelConvergence.AChainWhoseUpstreamNeverConnectedIsCancelledWithItsJob` holds that shape. A cancelled task reports the operator errors its executor caught before the token was set (`LocalExecutor::operator_errors_before_cancel()`) and drops the rest, which are its teardown's: a closed channel, a refused send. An operator that failed on its own and was cancelled only afterwards, with its peers, therefore still names its own failure.
 
@@ -293,7 +299,7 @@ The version a worker registered at is also what the coordinator reads to admit t
 
 Losing leadership is not something a leader can detect on its own. A coordinator partitioned from the coordination store, or paused past its lease, keeps every worker connection open, keeps its in-memory job state, and keeps its checkpoint timer running. Fencing is what stops it acting on that stale belief.
 
-Every coordinator-to-worker control frame carries the sending coordinator's epoch: `RegisterAck`, `Deploy`, `PeerUpdate`, `CancelJob`, `TriggerCheckpoint`, `CommitCheckpoint`, `AbortCheckpoint`, `FinalCheckpointAssigned`, `BeginRescale`, `CutoverPeerUpdate` and `CutoverRebind`. `clink_node` calls `Coordinator::set_epoch` from the become-leader callback before the listener opens, and `Coordinator::fenced_frame_` stamps the epoch as it encodes, so no send site can forget it.
+Every coordinator-to-worker control frame carries the sending coordinator's epoch: `RegisterAck`, `Deploy`, `PeerUpdate`, `RestoreVerdict`, `CancelJob`, `TriggerCheckpoint`, `CommitCheckpoint`, `AbortCheckpoint`, `FinalCheckpointAssigned`, `BeginRescale`, `CutoverPeerUpdate` and `CutoverRebind`. `clink_node` calls `Coordinator::set_epoch` from the become-leader callback before the listener opens, and `Coordinator::fenced_frame_` stamps the epoch as it encodes, so no send site can forget it.
 
 A worker binds the epoch carried by the `RegisterAck` that admitted it. `Worker::accept_epoch_` then drops any later frame carrying a **lower** epoch, incrementing `clink_worker_fenced_frames_total` and logging at error - a non-zero count is a split-brain signal. A **higher** epoch re-binds the worker rather than being refused: a failover that keeps the connection up presents that way, and refusing it would fence the worker off from the legitimate new leader.
 
@@ -423,6 +429,7 @@ Worker (`Worker::Config`):
 - `heartbeat_interval` = 500 ms.
 - `slot_count` = 1; concurrent tasks this worker can host.
 - `peer_update_timeout` = 30000 ms; max wait for `PeerUpdate` before aborting a task.
+- `restore_verdict_timeout` = 10 minutes; max wait for `RestoreVerdict` after a restored subtask's `SubtaskRestored`, after which the task fails, retryably. A `CancelJob`, a lost session or `stop()` ends the wait first.
 - `http_port` = 0; advertised read-API port (0 = no HTTP, coordinator proxy skips it).
 - `checkpoint_num_retained` = 2 (clamped to >= 1); completed checkpoints kept per job: the latest and one to fall back to. A Worker that deploys a restored run counts the checkpoint it restored from among them, though it never saw that checkpoint complete: the restored run numbers its checkpoints past the discarded run's, so without it the first new checkpoint's sweep would take the restore point while it is still one of the newest.
 

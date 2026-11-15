@@ -39,8 +39,8 @@ RESULTS = os.path.join(WORK, "results")
 QUICK = os.environ.get("QUICK") == "1"
 ONLY = {s for s in os.environ.get("ONLY", "").split(",") if s}
 
-QUICK_SET = {"control", "wrong-aggregate", "lost-timers", "schema", "uid-changed", "wrong-digest",
-             "timeout", "agreeing-and-wrong"}
+QUICK_SET = {"control", "wrong-aggregate", "lost-timers", "schema", "uid-changed",
+             "source-uid-changed", "wrong-digest", "timeout", "agreeing-and-wrong"}
 
 
 def head(job="upgrade_check_job"):
@@ -282,6 +282,13 @@ def scenarios(q):
           ("restore.candidate", "--allow-unrestored-state"))),
         ("uid-missing", "uid_missing", {"restore.candidate": "failed", "recovery.candidate": "unavailable"},
          (("restore.candidate", "restored job failed"), ("restore.candidate", "does not run"))),
+        # The source's position is operator state, which no one subtask can
+        # judge: the Coordinator's restore verdict refuses it, naming the uid
+        # the source had, before the source reads a record.
+        ("source-uid-changed", "source_uid_changed",
+         {"restore.candidate": "failed", "recovery.candidate": "unavailable"},
+         (("restore.candidate", "restored job failed"), ("restore.candidate", "no subtask of the job runs"),
+          ("restore.candidate", "uid 'uc-source'"))),
         ("crash-restore", "crash_restore", {"restore.candidate": "failed", "recovery.candidate": "unavailable"},
          (("restore.candidate", "SIGKILL"),)),
         ("crash-continue", "crash_continue", {"restore.candidate": "passed", "recovery.candidate": "failed"},
@@ -293,7 +300,7 @@ def scenarios(q):
         print("%s: candidate %s" % (name, v))
         code, r, out = q.check(name, evidence_head(), H, variant(v))
         q.outcome(name, code, r, 1, want, reasons)
-        if name in ("schema", "uid-changed", "uid-missing"):
+        if name in ("schema", "uid-changed", "uid-missing", "source-uid-changed"):
             produced = os.path.join(out, "runs", "candidate", "cluster", "out")
             files = [f for f in os.listdir(produced) if os.path.getsize(os.path.join(produced, f))] \
                 if os.path.isdir(produced) else []

@@ -17,6 +17,7 @@
 #include "clink/cluster/operator_registry.hpp"
 #include "clink/cluster/protocol.hpp"
 #include "clink/runtime/cutover_gate.hpp"
+#include "clink/runtime/job_config.hpp"
 #include "clink/state/state_backend.hpp"
 
 namespace spdlog {
@@ -211,6 +212,9 @@ struct RunnerContext {
     // instead of refusing (DeployMsg::allow_unrestored_state, from the submit's
     // --allow-unrestored-state). StateBackendSpec::allow_unrestored_state.
     bool allow_unrestored_state{false};
+    // Reports what the subtask restored to the coordinator and waits for its
+    // verdict (JobConfig::on_restored), set when the Deploy asked for one.
+    std::function<void(const clink::RestoreReport&)> report_restore;
     // The previous run's subtasks (per-operator indices) this subtask
     // succeeds, with the topology generations; unset on in-process paths.
     std::optional<RestoreSuccession> restore_succession;

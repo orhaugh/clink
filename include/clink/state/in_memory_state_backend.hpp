@@ -247,6 +247,21 @@ public:
         std::lock_guard lock(mu_);
         return id_scheme_;
     }
+    [[nodiscard]] std::optional<std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>>>
+    restored_operator_rows() const override {
+        std::lock_guard lock(mu_);
+        std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>> out;
+        for (const auto& [op, rows] : state_) {
+            auto& counts = out[op];
+            for (const auto& [key, _] : rows) {
+                const bool keyed =
+                    key.empty() ||
+                    static_cast<KeyGroup>(static_cast<std::uint8_t>(key.front())) < kNumKeyGroups;
+                ++(keyed ? counts.first : counts.second);
+            }
+        }
+        return out;
+    }
     void set_operator_identities(const OperatorIdentities& identities) override {
         std::lock_guard lock(mu_);
         identities_ = identities;
@@ -315,6 +330,18 @@ public:
     // keyed state is read back only by the subtask that wrote it, so a keyed
     // row of an operator it does not run is read by nothing.
     static std::map<std::uint64_t, std::uint64_t> keyed_rows_by_operator(
+        std::span<const std::byte> snapshot_bytes);
+
+    // The uid, else the graph node id, that a snapshot's `clink.operators`
+    // entry records for each operator (OperatorId value -> "uid 'x'" or
+    // "node 'y'"). Empty for a snapshot written before the entry existed, or
+    // whose entry names neither. Read only to describe an operator to a person.
+    static std::map<std::uint64_t, std::string> operator_names(
+        std::span<const std::byte> snapshot_bytes);
+
+    // Keyed and operator-state rows per operator in a snapshot (OperatorId value
+    // -> {keyed, operator}).
+    static std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> rows_by_operator(
         std::span<const std::byte> snapshot_bytes);
 
     // The snapshot without the KEYED rows of `operators`. Operator-state rows

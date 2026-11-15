@@ -24,6 +24,26 @@ tested on macOS arm64 and Linux aarch64, and built and tested in CI on Linux
 x86_64, whose toolchain image installs the library. The runtime image builds
 it in. See `docs/connectors/relate.md`.
 
+**A restore is judged over the whole job before a record flows.** The keyed
+check below is made by each subtask on what it inherits, and could not see
+operator state, which crosses subtasks at a restore: a source whose uid changed
+restored empty and replayed from its start position without a refusal. A
+deploy that restores onto protocol v4 workers now asks for a restore verdict.
+Each subtask reports, once its backend has restored and old ids have moved,
+which operators it runs and the state it restored and left out
+(`SubtaskRestored`), and waits. The Coordinator, when every subtask has
+reported, refuses the restore if any state, keyed or operator, belongs to an
+operator no subtask runs (`RestoreVerdict`): the job fails once, the message
+naming each operator by id, by the uid it had when its snapshot was written,
+and by row counts. `--allow-unrestored-state` lets it run and logs what is left
+unread. The verdict also refuses a checkpoint in the old ids for a job that
+keys a parallel operator with the built-in string `identity` extractor, whose
+hash changed, rather than route its keys away from their state. Checkpoint
+triggers wait for the verdict. A backend that cannot list what it restored is
+reported as not checked; the hot and rescale cutovers, which deploy new
+subtasks of operators the job already runs, and deploys onto older workers ask
+for no verdict.
+
 **Operator ids are the same on every platform, and a savepoint restores
 wherever clink runs.** An operator's id was `std::hash` of `"uid/<uid>"`, or of
 `"stage<idx>/<name>"` for an operator without a uid, and libc++ and libstdc++
@@ -116,10 +136,9 @@ silently and is now refused. Submit with `--allow-unrestored-state` (on
 `CheckpointConfig::allow_unrestored_state`) to drop it instead; the choice is
 kept in the job's HA manifest and sent to Workers as trailing fields of
 `SubmitJob` and `Deploy` (a coordinator or client older than the field reads
-it as false). Operator-state rows are not judged, since they cross subtasks
-at a restore, so an operator that held only operator state is not caught; the
-check is made by the file backend, and other backends log that they did not
-make it. Upgrade validation found it.
+it as false). The check is made by the file backend on keyed rows; the restore
+verdict above extends it to operator state and to the other backends. Upgrade
+validation found it.
 
 **The fluent API's windows and reduce survive a restore.** Every fluent
 window aggregate but the tumbling emit form with a type registered on the

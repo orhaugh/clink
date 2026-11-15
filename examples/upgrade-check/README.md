@@ -25,6 +25,7 @@ It needs Python 3.10 or later and a built tree (`CLINK_BIN_DIR`, default `build/
 | `lost_timers` | `uc-idle` does not restore its timers |
 | `schema` | `uc-windows` declares state version 2 with no migration |
 | `uid_changed`, `uid_missing` | `uc-windows` has another uid, or none |
+| `source_uid_changed` | the source has another uid, so its position in the feed, its only state, belongs to no operator |
 | `crash_restore`, `crash_continue` | `uc-idle`'s process is killed (SIGKILL) while restoring its timers, or 40 events after the restore |
 | `memory_windows` | the accumulator type is not registered on the job's registry (no longer a defect: the window finds the built-in text codec and keeps its windows in keyed state) |
 | `string_timer_keys` | the timers are keyed by the account as text (no longer a defect: a restore that keeps the layout keeps them all) |
@@ -40,7 +41,7 @@ v0.15.0 at bbd63094 is the baseline of the `prior-release` scenario. `run.sh` bu
 | `control` | this build, twice | exit 0, every required check passed |
 | `compatible` | this build, the `compatible` variant | exit 0 |
 | `prior-release` | v0.15.0, this build | exit 0; both commits named; the baseline's operator-state copies (written by every restored subtask before 04963a61) reported and left out of the logical comparison |
-| each defect variant | this build, the variant | exit 1 with the check that names it: the aggregate and the boundary in `behaviour.output` and `reference.candidate` with the restore passed; lost timers and a crash while restoring in `restore.candidate`; a changed or missing uid in `restore.candidate` as the engine's refusal of keyed state no operator runs, the job failing as it deploys, with no output written; the schema in `schema.candidate` and as a refusal before anything ran, with no output written; a crash after the restore in `recovery.candidate` |
+| each defect variant | this build, the variant | exit 1 with the check that names it: the aggregate and the boundary in `behaviour.output` and `reference.candidate` with the restore passed; lost timers and a crash while restoring in `restore.candidate`; a changed or missing uid in `restore.candidate` as the engine's refusal of keyed state no operator runs, the job failing as it deploys, with no output written; a changed source uid the same way, as the Coordinator's restore verdict naming the uid `uc-source`; the schema in `schema.candidate` and as a refusal before anything ran, with no output written; a crash after the restore in `recovery.candidate` |
 | `agreeing-and-wrong` | `wrong_aggregate`, twice | `record` flags the baseline's output against the reference; the check exits 1 with `behaviour.*` passed and `reference.candidate` failed: two builds that agree and are both wrong |
 | `memory-windows` | the variant, twice | exit 0: the windows open at the savepoint survive the restore (until this release they were held in memory and lost, and this scenario failed like `agreeing-and-wrong`) |
 | `string-timer-keys` | the variant, twice | exit 0: timers keyed as text survive the restore (until this release about half were dropped, and this scenario failed like `memory-windows`) |

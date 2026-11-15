@@ -366,6 +366,37 @@ the slots those ids hold.
 **Do not pass the flag to make a restore start** unless the answer is case 2: it drops
 the state for good.
 
+## A job fails as it deploys with "refusing to restore: the checkpoint holds state of operator X ... that no subtask of the job runs"
+
+Not an alert - the Coordinator's restore verdict, which fails the job once as it
+deploys. Every subtask restored its state and reported what it holds; the checkpoint
+has state, keyed or operator state, of an operator that no subtask of the restored job
+runs, so nothing would read it. The per-subtask keyed check above cannot see operator
+state, a source's offsets among it, because that state crosses subtasks at a restore.
+
+**Look at:** each operator the message names, by id, by the uid it had when its
+snapshot was written (shown when the snapshot recorded one, from the build that added
+the stable ids on), and by row counts. An operator with operator-state rows only is
+usually a source: without the refusal it would start again from its configured start
+position, replaying or skipping its input.
+
+**Likely causes, in order:**
+
+1. **A uid changed, or was dropped.** Put the uid the message names back and resubmit.
+2. **The operator left the job on purpose.** Resubmit with `--allow-unrestored-state`:
+   the verdict lets the job run and the Coordinator logs what is left unread
+   (`coordinator.restore`).
+
+The same verdict refuses with "the job keys a parallel operator with the built-in
+string 'identity' extractor" when a checkpoint taken before the stable operator ids is
+restored into such a job: the extractor's hash changed, so its keys would route away
+from their state. Restore it at parallelism 1, take a checkpoint, then rescale.
+
+A job whose subtasks log "no restore verdict from the coordinator within ..." waited
+`restore_verdict_timeout` (ten minutes) for one: a subtask never reported, usually
+because its restore was still running or it is stuck. The job restarts as it would for
+any retryable failure; look at the subtask that did not report.
+
 ## A submit is refused with "refusing to restore checkpoint N ... this plan deploys M"
 
 Not an alert - a refusal before anything deploys. The submitter gets it as a failed

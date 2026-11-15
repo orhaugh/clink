@@ -142,6 +142,31 @@ struct PlacementWorker {
 [[nodiscard]] bool assign_task_placement(std::vector<PlannedTask>& tasks,
                                          std::vector<PlacementWorker>& workers);
 
+// The verdict on a job's restore, from what each of its subtasks reported it
+// holds (SubtaskRestoredMsg). State is present under an operator id when some
+// subtask restored rows under it, or left out operator-state rows under it
+// because it does not run that operator; it is claimed when some subtask runs
+// the operator, or runs one that answers for the id from before the stable
+// operator ids. State present and claimed by no subtask is read by nothing:
+// operator state is unioned into every subtask at a restore and kept only by
+// the one that runs its operator, so a source whose uid changed loses its
+// offsets this way, and no one subtask can see it. Refused unless
+// `allow_unrestored_state`. A job that keys a parallel operator by the built-in
+// string `identity` extractor and restores state in the old ids is refused too:
+// the extractor's hash changed with them, so its keys would now be routed to
+// other subtasks than the ones holding their state.
+struct RestoreVerdictDecision {
+    bool ok{true};
+    std::string reason;
+    // What the coordinator logs either way: operators whose state the job
+    // drops (allowed), subtasks that could not list what they restored.
+    std::vector<std::string> notes;
+};
+[[nodiscard]] RestoreVerdictDecision decide_restore_verdict(
+    const std::vector<SubtaskRestoredMsg>& reports,
+    bool allow_unrestored_state,
+    bool keys_strings_by_identity_in_parallel);
+
 // CompletedJobRecord - HistoryServer entry. Captured at job
 // termination and kept in a bounded ring buffer on the coordinator so operators
 // can answer "what happened to job N?" even after the live JobState
@@ -1231,6 +1256,15 @@ private:
         // other's operator state, so every later placement - a restart, a
         // rescale's new subtasks - stays on the same kind (scheme_fits_locked_).
         bool stable_operator_ids{true};
+        // The restore verdict (DeployMsg::await_restore_verdict): set on a
+        // whole-job deploy that restores onto v4 workers. Each subtask reports
+        // what it restored; once all have, the coordinator decides and sends
+        // RestoreVerdict, and holds periodic checkpoints until then. Reset by
+        // every such deploy.
+        bool awaiting_restore_verdict{false};
+        std::size_t expected_restore_reports{0};
+        std::map<std::pair<std::string, std::uint32_t>, SubtaskRestoredMsg> restore_reports;
+        bool restore_verdict_sent{false};
         // Where this job's state lives: job_state_root over its state base
         // (state_location.hpp). Fixed for the job's life, since neither its id
         // nor its base changes, and sent to every Deploy in place of the base,
@@ -2085,6 +2119,7 @@ private:
                                    const std::string& reason,
                                    std::vector<PendingDeploy>& out_frames);
     void handle_subtask_listening_(MessageReader& r, const WorkerConnection& sender);
+    void handle_subtask_restored_(MessageReader& r, const WorkerConnection& sender);
     void handle_rescale_job_(network::Connection& conn, MessageReader& r);
     // Per-operator rescale request dispatch.
     void handle_rescale_operator_(network::Connection& conn, MessageReader& r);

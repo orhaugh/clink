@@ -69,7 +69,7 @@ clink_add_job_module(clink_upgrade_check_job
     OUTPUT_NAME upgrade_check_job)
 set(_uc_variants compatible wrong_aggregate window_boundary lost_timers schema
     uid_changed uid_missing crash_restore crash_continue memory_windows
-    string_timer_keys)
+    string_timer_keys source_uid_changed)
 set(_uc_n 1)
 foreach(_uc IN LISTS _uc_variants)
     clink_add_job_module(clink_upgrade_check_job_${_uc}

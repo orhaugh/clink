@@ -83,6 +83,10 @@ public:
     [[nodiscard]] OperatorIdScheme operator_id_scheme() const override {
         return inner_->operator_id_scheme();
     }
+    [[nodiscard]] std::optional<std::map<OperatorId, std::pair<std::uint64_t, std::uint64_t>>>
+    restored_operator_rows() const override {
+        return inner_->restored_operator_rows();
+    }
     void set_operator_identities(const OperatorIdentities& identities) override {
         inner_->set_operator_identities(identities);
     }
