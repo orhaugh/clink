@@ -10,6 +10,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -158,6 +159,12 @@ TEST(Json, RejectsControlCharInString) {
 TEST(Json, RejectsEmptyInput) {
     EXPECT_THROW(parse(""), ParseError);
     EXPECT_THROW(parse("   "), ParseError);
+    // A default view has a null data(); handing that to the parser's copy was
+    // undefined (UBSan: null pointer passed as argument 2).
+    EXPECT_THROW(parse(std::string_view{}), ParseError);
+    EXPECT_FALSE(parse_object(std::string_view{}).has_value());
+    const std::vector<std::string> keep{"a"};
+    EXPECT_FALSE(parse_object(std::string_view{}, keep).has_value());
 }
 
 TEST(Json, EscapesControlCharsOnSerialize) {

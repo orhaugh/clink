@@ -499,10 +499,18 @@ simdjson::dom::parser& thread_parser() {
     return *parser;
 }
 
+// Every parse goes through here. An empty view may carry a null data(), and
+// simdjson copies the input with memcpy, where a null source is undefined even
+// for zero bytes (UBSan reports it).
+simdjson::simdjson_result<simdjson::dom::element> parse_dom(std::string_view input) {
+    const char* data = input.data() != nullptr ? input.data() : "";
+    return thread_parser().parse(data, input.size());
+}
+
 }  // namespace
 
 JsonValue parse(std::string_view input) {
-    auto result = thread_parser().parse(input.data(), input.size());
+    auto result = parse_dom(input);
     if (result.error() != simdjson::SUCCESS) {
         throw ParseError(simdjson::error_message(result.error()));
     }
@@ -516,7 +524,7 @@ std::optional<JsonObject> parse_object(std::string_view input) {
     // path would throw ParseError or yield a non-object, so callers that
     // previously did try { parse() } catch -> skip keep identical
     // behaviour. Duplicate keys keep the FIRST occurrence, as in parse().
-    auto result = thread_parser().parse(input.data(), input.size());
+    auto result = parse_dom(input);
     if (result.error() != simdjson::SUCCESS ||
         result.value_unsafe().type() != simdjson::dom::element_type::OBJECT) {
         return std::nullopt;
@@ -532,7 +540,7 @@ std::optional<JsonObject> parse_object(std::string_view input) {
 
 std::optional<JsonObject> parse_object(std::string_view input,
                                        std::span<const std::string> keep_keys) {
-    auto result = thread_parser().parse(input.data(), input.size());
+    auto result = parse_dom(input);
     if (result.error() != simdjson::SUCCESS ||
         result.value_unsafe().type() != simdjson::dom::element_type::OBJECT) {
         return std::nullopt;

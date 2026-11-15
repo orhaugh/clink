@@ -29,7 +29,8 @@ The sink read Relate's error string as a sibling argument of the call that set
 it, and C++ leaves the order of a call's arguments unspecified: GCC read it
 before the call, so on Linux a refused value said "Relate gave no detail" and
 the string leaked (found by the nightly ASan run). It is now read after the
-call.
+call. The JSON reader also no longer hands its parser a null pointer for an
+empty input, which UBSan reported through the Kafka source's identity row.
 
 **A restore is judged over the whole job before a record flows.** The keyed
 check below is made by each subtask on what it inherits, and could not see
