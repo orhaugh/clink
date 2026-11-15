@@ -1,6 +1,36 @@
 # Changelog
 
-## Unreleased
+## v0.16.0 (November 2026)
+
+Operator ids that are the same on every platform, a restore judged over the
+whole job before a record flows, and a job's state and results that can be
+checked from outside the engine. A completed checkpoint exports as one verified
+dataset that `state-diff`, `state-query` and any Parquet reader read; incident
+bundles collect a job's evidence and verify it offline, and reconcile what
+ClickHouse holds against a checkpoint; `clink-audit` audits a running job's
+results, windowed ones increment by increment, against an independent
+reference; and `clink-audit upgrade` checks a candidate build against a
+savepoint a baseline retained. A Relate sink writes SQL rows into a graph store
+embedded in the engine, MongoDB is available in SQL, and every connector was
+reviewed for what its guarantee rests on: sinks stay failed rather than forget
+a write, and acknowledging sources acknowledge only what a completed checkpoint
+covers.
+
+Upgrading: operator ids change, so every plugin job module must be rebuilt (the
+plugin ABI fingerprint rotates), and an HA takeover of a plugin job submitted
+before the upgrade needs it resubmitted with the rebuilt module. Existing
+checkpoints migrate on their first restore, from either platform. Checkpoints
+taken after the upgrade are snapshot format 2, which earlier builds refuse, so
+a rollback restores a checkpoint taken before the upgrade. The cluster protocol
+is v4, and one job is never placed across workers of both kinds. Operator ids
+in metrics labels change. A restore that would leave state no operator reads is
+refused unless the job is submitted with `--allow-unrestored-state`.
+
+Known issue: a rescale does not keep the state of an operator keyed by the
+built-in string `identity` extractor with its keys, so do not rescale such an
+operator until it is fixed (`docs/internals/fault-tolerance-and-rescale.md`,
+"Guarantees and caveats"). Restarts and failovers at the same parallelism are
+unaffected.
 
 **A Relate sink: SQL rows into a graph store embedded in the engine.**
 `connector='relate'` writes each batch into a [Relate](https://github.com/relatedb/relate)
