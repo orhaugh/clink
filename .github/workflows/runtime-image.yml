@@ -354,12 +354,21 @@ jobs:
         # sed, and the entrypoint has to route a subcommand rather than a
         # flag. Any of those can regress without a single test noticing, and
         # the person who finds out is someone trying clink for the first time.
+        #
+        # Each architecture runs by its own digest, never by the tag: `docker
+        # run --platform linux/arm64 <tag>` pulls the arm64 variant under the
+        # tag, and the steps after this one then ran arm64 under emulation
+        # while reporting on the amd64 image.
         run: |
           set -euo pipefail
           ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
           for platform in linux/amd64 linux/arm64; do
             echo "== ${platform} =="
-            out="$(docker run --rm --platform "${platform}" "${ref}" \
+            digest="$(docker buildx imagetools inspect "${ref}" \
+                        --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{.Digest}}{{"\n"}}{{end}}' \
+                      | awk -v p="${platform}" '$1 == p { print $2; exit }')"
+            [ -n "${digest}" ] || { echo "::error::${ref} has no ${platform} image"; exit 1; }
+            out="$(docker run --rm --platform "${platform}" "${ref%:*}@${digest}" \
                      run /opt/clink/examples/sql/hello.sql)"
             echo "${out}"
             echo "${out}" | grep -q '"region":"emea"' \
@@ -380,6 +389,9 @@ jobs:
         run: |
           set -euo pipefail
           ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          arch="$(docker image inspect -f '{{.Architecture}}' "${ref}")"
+          [ "${arch}" = amd64 ] \
+            || { echo "::error::${ref} is the ${arch} image on this amd64 runner; this check runs amd64 natively"; exit 1; }
           await() {
             for _ in $(seq 1 60); do
               curl -s -o /dev/null "$1" && return 0
@@ -413,6 +425,9 @@ jobs:
         run: |
           set -euo pipefail
           ref="$(echo '${{ steps.tags.outputs.tags }}' | cut -d, -f1)"
+          arch="$(docker image inspect -f '{{.Architecture}}' "${ref}")"
+          [ "${arch}" = amd64 ] \
+            || { echo "::error::${ref} is the ${arch} image on this amd64 runner; this check runs amd64 natively"; exit 1; }
           cd examples/quickstart
           CLINK_IMAGE="${ref}" docker compose -f compose.yml up -d
           for _ in $(seq 1 120); do
