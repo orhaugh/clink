@@ -7141,7 +7141,8 @@ RestoreVerdictDecision decide_restore_verdict(const std::vector<SubtaskRestoredM
             "'identity' extractor, whose hash changed with the stable operator ids, and the "
             "checkpoint was taken by a build before them, so its keys would now be routed to "
             "other subtasks than the ones holding their state. Restore at parallelism 1 and "
-            "rescale afterwards, or start without the state.";
+            "keep it there (a rescale of an operator keyed by this extractor does not move its "
+            "state with its keys), or start without the state.";
     }
     return out;
 }
