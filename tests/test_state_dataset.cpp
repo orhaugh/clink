@@ -21,8 +21,11 @@
 #include <gtest/gtest.h>
 
 #include "clink/cluster/in_doubt_resolution.hpp"
+#include "clink/cluster/job_graph.hpp"
 #include "clink/cluster/state_location.hpp"
 #include "clink/config/json.hpp"
+#include "clink/core/legacy_operator_ids.hpp"
+#include "clink/core/types.hpp"
 #include "clink/state/changelog_state_backend.hpp"
 #include "clink/state/checkpoint_integrity.hpp"
 #include "clink/state/file_materialization_store.hpp"
@@ -732,6 +735,133 @@ TEST_F(StateDatasetTest, OperatorsAreNamedAndComparedBySubtaskFromTheMarkersIden
     EXPECT_EQ(counts->added + counts->removed + counts->changed, 0U);
     EXPECT_GT(counts->relocated, 0U);
     EXPECT_EQ(r.exit_code(), 0);
+}
+
+// A checkpoint taken before the stable operator ids holds an operator with a
+// uid under the standard library's hash of it (here libc++'s, as on macOS),
+// and one without a uid under an id from its place in its chain; one taken
+// after holds them under the stable hash of the uid and of the node id. The
+// diff matches them through the job graph, by uid, and for the operator
+// without one by its graph operator, and compares their entries. A uid that
+// changed is another operator.
+TEST_F(StateDatasetTest, ADiffAcrossTheOperatorIdChangeMatchesOperatorsThroughTheGraph) {
+    namespace cl = clink::cluster;
+    const auto graph = [&](const std::string& audit_uid) {
+        cl::OperatorSpec src;
+        src.id = "src";
+        src.type = "kafka_source";
+        src.uid = "orders-source";
+        src.parallelism = 2;
+        cl::OperatorSpec counter;
+        counter.id = "counter";
+        counter.type = "keyed_reduce";
+        counter.inputs = {"src"};
+        counter.parallelism = 2;
+        cl::OperatorSpec audit;
+        audit.id = "audit";
+        audit.type = "audit_sink";
+        audit.uid = audit_uid;
+        audit.inputs = {"counter"};
+        cl::JobGraphSpec g;
+        g.ops = {src, counter, audit};
+        clink::config::JsonObject jm;
+        jm["graph_json"] = clink::config::JsonValue{g.to_json()};
+        jm["requires_commit_confirmation"] = clink::config::JsonValue{false};
+        const auto path = root / "ha" / "jobs" / std::to_string(kDatasetJob) / "manifest.json";
+        fs::create_directories(path.parent_path());
+        std::ofstream(path, std::ios::trunc)
+            << clink::config::JsonValue{std::move(jm)}.serialize(2);
+    };
+    const auto write = [&](std::uint64_t id,
+                           std::uint32_t generation,
+                           std::uint64_t src,
+                           std::uint64_t counter,
+                           std::uint64_t audit,
+                           const std::string& bob) {
+        std::map<std::uint32_t, cl::ParticipantIdentity> layout;
+        for (std::uint32_t i = 0; i < 2; ++i) {
+            write_snapshot(id,
+                           i,
+                           {{src, op_state("offsets", "partition"), "pos-" + std::to_string(id)}},
+                           generation);
+            layout[i] = {.op = "src", .subtask_in_op = i};
+        }
+        std::map<std::uint32_t, std::vector<StoredRow>> per;
+        for (const auto& e : kBase) {
+            per[owner(e.kg, 2)].push_back(StoredRow{
+                counter, keyed(e.kg, "counts", e.user_key), e.user_key == "bob" ? bob : e.value});
+        }
+        for (std::uint32_t i = 0; i < 2; ++i) {
+            write_snapshot(id, 2 + i, per[i], generation);
+            layout[2 + i] = {.op = "counter", .subtask_in_op = i};
+        }
+        write_snapshot(id, 4, {{audit, op_state("seen", "n"), "1"}}, generation);
+        layout[4] = {.op = "audit", .subtask_in_op = 0};
+        write_marker(id, {0, 1, 2, 3, 4}, generation, std::nullopt, layout);
+    };
+    const auto libcxx = [](const std::string& uid) {
+        return clink::legacy_ids::legacy_operator_ids("uid/" + uid)[1].value();
+    };
+    const auto old_src = libcxx("orders-source");
+    const std::uint64_t old_counter = 777;  // from its place in its chain
+    const auto old_audit = libcxx("audit-v1");
+    const auto new_src = clink::operator_id_from_uid("orders-source").value();
+    const auto new_counter = clink::stable_operator_id("node/counter").value();
+    const auto new_audit = clink::operator_id_from_uid("audit-v2").value();
+
+    graph("audit-v1");
+    write(1, 1, old_src, old_counter, old_audit, "b1");
+    auto o = options("a", 1);
+    o.ha_dir = (root / "ha").string();
+    (void)sp::export_checkpoint_dataset(o);
+    graph("audit-v2");
+    write(2, 2, new_src, new_counter, new_audit, "b2");
+    o = options("b", 2);
+    o.ha_dir = (root / "ha").string();
+    (void)sp::export_checkpoint_dataset(o);
+    const auto a = sp::open_dataset(root / "a");
+    const auto b = sp::open_dataset(root / "b");
+
+    const auto r = sp::diff_datasets(a, b, {});
+    const auto* counts = slot(r, new_counter, "counts", "keyed");
+    ASSERT_NE(counts, nullptr);
+    EXPECT_EQ(counts->status, "compared") << counts->note;
+    EXPECT_EQ(counts->changed, 1U);
+    EXPECT_EQ(counts->unchanged, 3U);
+    EXPECT_EQ(counts->added + counts->removed, 0U);
+    EXPECT_NE(counts->note.find("operator 777 in a, matched by the same graph operator 'counter'"),
+              std::string::npos)
+        << counts->note;
+    const auto* pos = slot(r, new_src, "offsets", "operator");
+    ASSERT_NE(pos, nullptr);
+    EXPECT_EQ(pos->status, "compared") << pos->note;
+    EXPECT_EQ(pos->changed, 2U);
+    EXPECT_NE(pos->note.find("the same uid 'orders-source'"), std::string::npos) << pos->note;
+    for (const auto& s : r.slots) {
+        EXPECT_NE(s.op, old_src);
+        EXPECT_NE(s.op, old_counter);
+    }
+    const auto* gone = slot(r, old_audit, "seen", "operator");
+    ASSERT_NE(gone, nullptr);
+    EXPECT_EQ(gone->status, "operator-only-in-a");
+    const auto* added = slot(r, new_audit, "seen", "operator");
+    ASSERT_NE(added, nullptr);
+    EXPECT_EQ(added->status, "operator-only-in-b");
+    bool told = false;
+    for (const auto& l : r.lineage) {
+        told = told || l.find("2 operator(s) have another id in b") != std::string::npos;
+    }
+    EXPECT_TRUE(told);
+    EXPECT_TRUE(r.established);
+    EXPECT_EQ(r.exit_code(), 1);
+
+    // Either way round.
+    const auto back = sp::diff_datasets(b, a, {});
+    const auto* back_counts = slot(back, old_counter, "counts", "keyed");
+    ASSERT_NE(back_counts, nullptr);
+    EXPECT_EQ(back_counts->status, "compared") << back_counts->note;
+    EXPECT_EQ(back_counts->changed, 1U);
+    EXPECT_EQ(back_counts->unchanged, 3U);
 }
 
 TEST_F(StateDatasetTest, WithoutTheIdentitiesMovedIndicesMakeOperatorStateIncomparable) {

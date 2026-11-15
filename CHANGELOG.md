@@ -81,7 +81,11 @@ restores a checkpoint taken before the upgrade. The cluster protocol is v4: a
 worker older than v4 derives the old ids, so one job is never placed across
 workers of both kinds, on a submit, a restart or a rescale. An in-process job
 whose PostgreSQL 2PC sink has no uid names its transactions after the sink's
-id, which changes, so give such a sink a uid before upgrading.
+id, which changes, so give such a sink a uid before upgrading. `state-diff` of
+two checkpoint datasets matches an operator whose id changed through the job
+graphs, by uid or, for an operator without one, by graph operator and type, so
+a checkpoint taken before the upgrade compares with one taken after; an
+operator whose uid changed is reported as another operator.
 
 **Snapshots name their operators and the scheme of their operator ids, and
 every backend can move restored state to new ids.** Each canonical snapshot

@@ -1299,11 +1299,18 @@ int compare_identity(const DatasetEntry& x, const DatasetEntry& y) {
     return 0;
 }
 
-// One participant's row group, read a batch at a time.
+// One participant's row group, read a batch at a time. With `only_op`, only
+// that operator's rows, read as operator `as_op`: a row group is in identity
+// order, so they are contiguous and the cursor ends after the last of them.
 class GroupCursor {
 public:
-    GroupCursor(const fs::path& file, int row_group, std::uint32_t participant, std::uint32_t owner)
-        : participant_(participant), owner_(owner) {
+    GroupCursor(const fs::path& file,
+                int row_group,
+                std::uint32_t participant,
+                std::uint32_t owner,
+                std::optional<std::uint64_t> only_op = std::nullopt,
+                std::uint64_t as_op = 0)
+        : participant_(participant), owner_(owner), only_op_(only_op), as_op_(as_op) {
         parquet::arrow::FileReaderBuilder builder;
         check(builder.OpenFile(file.string()), "cannot open entries.parquet");
         parquet::ArrowReaderProperties props;
@@ -1325,6 +1332,17 @@ public:
     void advance() {
         while (true) {
             if (batch_ && row_ < batch_->num_rows()) {
+                if (only_op_) {
+                    const auto op = op_->Value(row_);
+                    if (op < *only_op_) {
+                        ++row_;
+                        continue;
+                    }
+                    if (op > *only_op_) {
+                        done_ = true;
+                        return;
+                    }
+                }
                 load(row_++);
                 return;
             }
@@ -1380,6 +1398,9 @@ private:
         if ((e.scope == kKeyed) != (e.key_group >= 0 && e.key_group < kNumKeyGroups)) {
             throw DatasetInvalid("entries.parquet: a key group that does not match its scope");
         }
+        if (only_op_) {
+            e.op = as_op_;
+        }
         if (started_ && compare_identity(cur_, e) >= 0) {
             throw DatasetInvalid("entries.parquet: participant " + std::to_string(participant_) +
                                  "'s rows are not in identity order");
@@ -1390,6 +1411,8 @@ private:
 
     std::uint32_t participant_;
     std::uint32_t owner_;
+    std::optional<std::uint64_t> only_op_;
+    std::uint64_t as_op_;
     std::unique_ptr<parquet::arrow::FileReader> reader_;
     std::unique_ptr<arrow::RecordBatchReader> batches_;
     std::shared_ptr<arrow::RecordBatch> batch_;
@@ -1407,16 +1430,59 @@ private:
 };
 
 // Every participant's row group merged into one stream in identity order.
+// With `segments`, (stored id, id to read it as) in the order to read them:
+// one operator's entries at a time, each read under the id beside it, so a
+// side whose operators the diff renames still streams in the order of the
+// names it is compared under. Each segment reads every row group again up to
+// its operator's last row.
 class EntryStream {
 public:
-    explicit EntryStream(const Dataset& d) {
-        for (const auto& p : d.participants) {
+    explicit EntryStream(const Dataset& d) : d_(d) { open(std::nullopt, 0); }
+
+    EntryStream(const Dataset& d, std::vector<std::pair<std::uint64_t, std::uint64_t>> segments)
+        : d_(d), segments_(std::move(segments)) {}
+
+    EntryStream(const EntryStream&) = delete;
+    EntryStream& operator=(const EntryStream&) = delete;
+
+    // The next entry, or nullptr at the end. Valid until the next call.
+    const DatasetEntry* next() {
+        while (true) {
+            if (last_ != kNone) {
+                cursors_[last_]->advance();
+                if (!cursors_[last_]->done()) {
+                    heap_.push(last_);
+                }
+                last_ = kNone;
+            }
+            if (!heap_.empty()) {
+                last_ = heap_.top();
+                heap_.pop();
+                return &cursors_[last_]->current();
+            }
+            if (segment_ >= segments_.size()) {
+                return nullptr;
+            }
+            const auto [stored, as] = segments_[segment_++];
+            open(stored, as);
+        }
+    }
+
+private:
+    void open(std::optional<std::uint64_t> only_op, std::uint64_t as_op) {
+        heap_ = decltype(heap_){Greater{&cursors_}};
+        cursors_.clear();
+        for (const auto& p : d_.participants) {
             if (p.row_group < 0) {
                 continue;
             }
-            const auto owner = d.by_subtask ? d.layout.at(p.index).second : p.index;
-            cursors_.push_back(std::make_unique<GroupCursor>(
-                d.root / kEntriesFile, static_cast<int>(p.row_group), p.index, owner));
+            const auto owner = d_.by_subtask ? d_.layout.at(p.index).second : p.index;
+            cursors_.push_back(std::make_unique<GroupCursor>(d_.root / kEntriesFile,
+                                                             static_cast<int>(p.row_group),
+                                                             p.index,
+                                                             owner,
+                                                             only_op,
+                                                             as_op));
         }
         for (std::size_t i = 0; i < cursors_.size(); ++i) {
             if (!cursors_[i]->done()) {
@@ -1425,24 +1491,9 @@ public:
         }
     }
 
-    // The next entry, or nullptr at the end. Valid until the next call.
-    const DatasetEntry* next() {
-        if (last_ != kNone) {
-            cursors_[last_]->advance();
-            if (!cursors_[last_]->done()) {
-                heap_.push(last_);
-            }
-            last_ = kNone;
-        }
-        if (heap_.empty()) {
-            return nullptr;
-        }
-        last_ = heap_.top();
-        heap_.pop();
-        return &cursors_[last_]->current();
-    }
-
-private:
+    const Dataset& d_;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> segments_;
+    std::size_t segment_{0};
     static constexpr std::size_t kNone = static_cast<std::size_t>(-1);
     struct Greater {
         const std::vector<std::unique_ptr<GroupCursor>>* c;
@@ -1454,6 +1505,111 @@ private:
     std::priority_queue<std::size_t, std::vector<std::size_t>, Greater> heap_{Greater{&cursors_}};
     std::size_t last_{kNone};
 };
+
+// ---- operators whose id differs between two datasets --------------------------
+
+// Every operator a dataset holds an entry of or stamps a schema for. Not the
+// ids its graph lists: for an operator whose state is under no id this build
+// derives, the graph lists the id this build would give it, which holds
+// nothing.
+std::set<std::uint64_t> operators_with_state(const Dataset& d) {
+    std::set<std::uint64_t> ops;
+    for (const auto& [k, n] : d.slots) {
+        ops.insert(std::get<0>(k));
+    }
+    for (const auto& [k, s] : d.schemas) {
+        ops.insert(k.first);
+    }
+    return ops;
+}
+
+struct OperatorName {
+    std::string uid;
+    std::string graph;  // the graph operator it is named as
+    std::string type;
+};
+
+std::map<std::uint64_t, OperatorName> operator_names(const Dataset& d) {
+    std::map<std::uint64_t, OperatorName> out;
+    const auto text = [](const JsonValue& o, const char* field) {
+        return o.contains(field) && o.at(field).is_string() ? o.at(field).as_string()
+                                                            : std::string{};
+    };
+    for (const auto& o : d.doc.at("operators").as_array()) {
+        out[parse_u64(o.at("op_id").as_string(), "op_id")] =
+            OperatorName{text(o, "uid"), text(o, "graph_id"), text(o, "type")};
+    }
+    return out;
+}
+
+// a's operators that b holds under another id, as the job graphs name them:
+// the same uid, or for an operator without one the same graph operator of
+// the same type. An operator's id changes when the rule that derives it does
+// (the stable operator ids replaced the standard library's hash, and the id
+// of an operator without a uid stopped depending on its place in its chain),
+// and its state is the same. Only a pairing that is one to one, between
+// operators the other side does not hold under the same id, is kept.
+std::map<std::uint64_t, std::pair<std::uint64_t, std::string>> renamed_operators(const Dataset& a,
+                                                                                 const Dataset& b) {
+    const auto ops_a = operators_with_state(a);
+    const auto ops_b = operators_with_state(b);
+    const auto names_b = operator_names(b);
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::string>> pairs;
+    std::map<std::uint64_t, int> taken;
+    for (const auto& [op, n] : operator_names(a)) {
+        if (ops_b.contains(op) || (n.uid.empty() && n.graph.empty())) {
+            continue;
+        }
+        std::vector<std::uint64_t> matches;
+        for (const auto& [bop, m] : names_b) {
+            const bool same = !n.uid.empty() ? m.uid == n.uid
+                                             : m.uid.empty() && m.graph == n.graph &&
+                                                   m.type == n.type && !n.type.empty();
+            if (same && !ops_a.contains(bop)) {
+                matches.push_back(bop);
+            }
+        }
+        if (matches.size() != 1) {
+            continue;
+        }
+        pairs[op] = {matches.front(),
+                     !n.uid.empty() ? "the same uid '" + n.uid + "'"
+                                    : "the same graph operator '" + n.graph + "' (" + n.type + ")"};
+        ++taken[matches.front()];
+    }
+    std::erase_if(pairs, [&](const auto& p) { return taken[p.second.first] != 1; });
+    return pairs;
+}
+
+// `d` with its operators renamed: every map keyed by operator.
+Dataset with_operator_ids(const Dataset& d, const std::map<std::uint64_t, std::uint64_t>& to) {
+    const auto id = [&](std::uint64_t op) {
+        const auto it = to.find(op);
+        return it == to.end() ? op : it->second;
+    };
+    Dataset r = d;
+    const auto rekey = [&](auto& m) {
+        std::remove_reference_t<decltype(m)> out;
+        for (auto& [op, v] : m) {
+            out.emplace(id(op), std::move(v));
+        }
+        m = std::move(out);
+    };
+    rekey(r.operator_participants);
+    rekey(r.graph_ops);
+    rekey(r.op_host);
+    rekey(r.op_subtasks);
+    rekey(r.op_names);
+    r.schemas.clear();
+    for (const auto& [k, s] : d.schemas) {
+        r.schemas.emplace(std::pair{id(k.first), k.second}, s);
+    }
+    r.slots.clear();
+    for (const auto& [k, n] : d.slots) {
+        r.slots.emplace(SlotKey{id(std::get<0>(k)), std::get<1>(k), std::get<2>(k)}, n);
+    }
+    return r;
+}
 
 // ---- rendering --------------------------------------------------------------
 
@@ -1708,10 +1864,47 @@ int DatasetDiff::exit_code() const {
     return differences() ? 1 : 0;
 }
 
-DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOptions& options) {
+DatasetDiff diff_datasets(const Dataset& a_stored,
+                          const Dataset& b,
+                          const StateDiffOptions& options) {
     const auto started = Clock::now();
     DatasetDiff r;
     r.max_samples = options.max_samples;
+
+    // a's operators that b holds under another id are compared under b's id:
+    // `a` is a_stored renamed, and a's entries are read operator by operator
+    // under the new names.
+    const auto renamed = renamed_operators(a_stored, b);
+    std::map<std::uint64_t, std::uint64_t> to_b;
+    std::map<std::uint64_t, std::string> renamed_note;  // b's id -> how it was matched
+    for (const auto& [op, to] : renamed) {
+        to_b[op] = to.first;
+        renamed_note[to.first] =
+            "operator " + std::to_string(op) + " in a, matched by " + to.second;
+    }
+    const Dataset renamed_a = to_b.empty() ? Dataset{} : with_operator_ids(a_stored, to_b);
+    const Dataset& a = to_b.empty() ? a_stored : renamed_a;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> a_segments;
+    if (!to_b.empty()) {
+        std::set<std::pair<std::uint64_t, std::uint64_t>> by_name;  // (read as, stored)
+        for (const auto& [k, n] : a_stored.slots) {
+            const auto op = std::get<0>(k);
+            const auto it = to_b.find(op);
+            by_name.emplace(it == to_b.end() ? op : it->second, op);
+        }
+        for (const auto& [as, stored] : by_name) {
+            a_segments.emplace_back(stored, as);
+        }
+        std::string list;
+        for (const auto& [op, to] : renamed) {
+            list += (list.empty() ? "" : ", ") + std::to_string(op) + " -> " +
+                    std::to_string(to.first) + " (" + to.second + ")";
+        }
+        r.lineage.push_back(std::to_string(renamed.size()) +
+                            " operator(s) have another id in b and are matched by the job "
+                            "graph: " +
+                            list);
+    }
     const auto side = [](const Dataset& d) {
         return DiffSide{.path = d.root.string(),
                         .job = d.job,
@@ -1729,14 +1922,16 @@ DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOpt
     // Lineage: what relates the two checkpoints.
     if (!r.same_job) {
         r.lineage.push_back("different jobs (" + std::to_string(a.job) + " and " +
-                            std::to_string(b.job) + "): operators are matched by id");
+                            std::to_string(b.job) +
+                            "): operators are matched by id, or by the job graph where their "
+                            "ids differ");
     }
     if (a.graph_sha256.empty() || b.graph_sha256.empty()) {
         r.lineage.push_back("a side holds no job graph, so whether the graphs match is unknown");
     } else if (!r.same_graph) {
         r.lineage.push_back(
             "the job graphs differ (a rescale, or another build of the job): operators are "
-            "matched by id");
+            "matched by id, or by the job graph where their ids differ");
     }
     if (r.same_job && a.generation != b.generation) {
         r.lineage.push_back("different runs: generation " + std::to_string(a.generation) + " and " +
@@ -1792,6 +1987,12 @@ DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOpt
         ops_b.insert(op);
     }
     std::map<SlotKey, SlotComparison> plan;
+    // A slot of a renamed operator says which operator of a it is.
+    const auto name_renamed = [&](SlotComparison& c) {
+        if (const auto it = renamed_note.find(c.op); it != renamed_note.end()) {
+            c.note = it->second + (c.note.empty() ? "" : "; " + c.note);
+        }
+    };
     const auto schema_of = [](const Dataset& d, std::uint64_t op, const std::string& slot) {
         const auto it = d.schemas.find({op, slot});
         return it == d.schemas.end() ? SlotSchema{} : it->second;
@@ -1911,6 +2112,7 @@ DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOpt
             r.reasons.push_back("operator " + std::to_string(op) + " slot " + slot + " (" +
                                 c.scope + ") was not compared: " + c.note);
         }
+        name_renamed(c);
         plan.emplace(k, std::move(c));
     }
     // Slots a schema stamp names on both sides but neither holds an entry of.
@@ -1931,11 +2133,18 @@ DatasetDiff diff_datasets(const Dataset& a, const Dataset& b, const StateDiffOpt
         c.status = options.raw_bytes ? "raw-compared" : "schema-changed";
         c.note = "schema changed (" + describe(s) + " -> " + describe(b.schemas.at(k)) +
                  "); the slot holds no entry on either side";
+        name_renamed(c);
         plan.emplace(key, std::move(c));
     }
 
     // The merge.
-    EntryStream sa(a);
+    std::optional<EntryStream> sa_stream;
+    if (to_b.empty()) {
+        sa_stream.emplace(a_stored);
+    } else {
+        sa_stream.emplace(a_stored, a_segments);
+    }
+    EntryStream& sa = *sa_stream;
     EntryStream sb(b);
     const DatasetEntry* ea = sa.next();
     const DatasetEntry* eb = sb.next();
