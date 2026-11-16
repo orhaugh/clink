@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.16.1 (November 2026)
 
 A cancelled subtask no longer waits indefinitely on a Worker that stops
 answering without closing its connections (its host lost, or a close the
