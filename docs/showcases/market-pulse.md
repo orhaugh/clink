@@ -12,7 +12,7 @@ process, with no cluster to stand up, and the same SQL also runs on a cluster
 reading from Kafka.
 
 [Repository](https://github.com/orhaugh/market-pulse) · pinned to clink
-v0.16.0 · checked by its own CI on every push
+v0.16.1 · checked by its own CI on every push
 
 ## What it does
 

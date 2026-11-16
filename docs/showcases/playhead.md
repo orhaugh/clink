@@ -14,7 +14,7 @@ Storage, and write finance's billing ledger to Azure. Once the half hour is
 over, the CDN job scales to zero: it parks itself, holding no slots, until the
 vendor's next batch of logs wakes it.
 
-[Repository](https://github.com/orhaugh/playhead) · pinned to clink v0.16.0
+[Repository](https://github.com/orhaugh/playhead) · pinned to clink v0.16.1
 
 ## What it does
 
@@ -129,7 +129,7 @@ recorded.
 
 You need Docker with about 8 GB of memory, kind, kubectl, Python 3 and OpenSSL,
 and a clink checkout beside the repository, from which the run builds the
-operator at the v0.16.0 tag. It runs clink's published v0.16.0 runtime image.
+operator at the v0.16.1 tag. It runs clink's published v0.16.1 runtime image.
 
 ```bash
 git clone https://github.com/orhaugh/playhead && cd playhead

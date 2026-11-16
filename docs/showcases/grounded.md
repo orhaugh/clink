@@ -10,7 +10,7 @@ into chunks, embedded and held as a live vector index; a stream of questions is
 embedded, matched against that index, and answered only from the chunks it
 retrieves. The whole pipeline is two SQL files that clink runs in one process.
 
-[Repository](https://github.com/orhaugh/grounded) · pinned to clink v0.16.0
+[Repository](https://github.com/orhaugh/grounded) · pinned to clink v0.16.1
 
 ## What it does
 
