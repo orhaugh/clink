@@ -157,3 +157,14 @@ race:alloc..
 # callbacks take no lock, so nothing of clink's is hidden; revisit this rule if
 # a callback ever takes one.
 mutex:libmosquitto.so
+
+# The DataStax C/C++ driver (libcassandra) and the libuv it runs on are not
+# built with TSan, so the driver's own reference counting, which orders a
+# future's last release after the caller's wait, is invisible to it. A
+# CassFuture's mutex destroyed on the driver's I/O thread then reads as racing
+# the main thread's earlier lock of it in cass_future_wait
+# (CassandraSink.OpenAgainstDeadEndpointFailsCleanly, scheduled sanitizer run
+# 43845224386; the same commit passed TSan in run 43821911101). Both racing
+# accesses are libuv's own mutex calls; clink's frame only waits on the future.
+race:libuv.so
+race:libcassandra.so
