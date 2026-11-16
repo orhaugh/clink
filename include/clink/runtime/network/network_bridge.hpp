@@ -54,9 +54,21 @@ public:
         // connect()/any send, on the runner thread.
         if (auto* rt = this->runtime()) {
             channel_.set_op_bytes_target(rt->metrics(), rt->attributed_op_id());
+            watch_cancel(rt->cancel_signal());
         }
         clink::metrics::net::connect_attempt("sink");
         channel_.connect();
+    }
+
+    // Lets the task's cancel end this sink's blocking waits (credit, and a
+    // send the socket cannot take). The runner's cancel only closes the
+    // sink's input channel, which cannot reach a thread blocked in on_data
+    // on a peer that stopped reading and never closed. open() calls it with
+    // the runtime's signal; a wrapper that owns this sink without attaching
+    // it to a runtime (SwappableBridgeSink) calls it before open().
+    void watch_cancel(CancelSignal signal) {
+        cancel_ = signal;
+        channel_.set_cancel_check([signal = std::move(signal)] { return signal.requested(); });
     }
 
     void on_data(const Batch<T>& batch) override {
@@ -121,8 +133,11 @@ private:
     //
     // Exempt only during our own shutdown: close() sets closing_ before closing the
     // channel, so an element racing teardown is an orderly stop rather than loss.
+    // A cancelled task is shutting down too: its output is not checkpointed, and a
+    // push it gave up on, or that met a peer torn down by the same cancel, is not
+    // a failure of the job.
     void require_sent_(bool ok, const std::string& what) const {
-        if (ok || closing_) {
+        if (ok || closing_ || cancel_.requested()) {
             return;
         }
         throw std::runtime_error(
@@ -135,6 +150,8 @@ private:
 
     NetworkChannelSink<T> channel_;
     std::string name_;
+    // The task's cancel state, from watch_cancel; never requested without it.
+    CancelSignal cancel_;
     // Set by close(). Distinguishes "we are shutting this down" from "the send
     // failed mid-job", which is the difference between a clean stop and data loss.
     //
@@ -339,6 +356,11 @@ public:
 
     void open() override {
         std::lock_guard lock(mu_);
+        // Kept for every inner sink, including those swap() connects later
+        // from another thread: they are never attached to a runtime.
+        if (auto* rt = this->runtime()) {
+            cancel_ = rt->cancel_signal();
+        }
         if (pending_endpoint_.has_value()) {
             connect_locked_(*pending_endpoint_);
             pending_endpoint_.reset();
@@ -422,6 +444,7 @@ public:
 private:
     void connect_locked_(const Endpoint& ep) {
         inner_ = connect_(ep);
+        inner_->watch_cancel(cancel_);
         inner_->open();
     }
 
@@ -431,6 +454,8 @@ private:
     std::optional<Endpoint> pending_endpoint_;
     std::shared_ptr<GroupCutoverGate> gate_;
     std::string name_;
+    // The task's cancel state, captured at open(); guarded by mu_.
+    CancelSignal cancel_;
 };
 
 }  // namespace clink::network

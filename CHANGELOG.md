@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+A cancelled subtask no longer waits indefinitely on a Worker that stops
+answering without closing its connections (its host lost, or a close the
+network dropped). A subtask sending to such a Worker, and waiting for credit or
+for room in the socket buffer, did not see the cancel: it never exited, its
+Worker never re-registered with the Coordinator, and jobs that needed that
+Worker's slots stayed parked for capacity. Its network sink now gives up those
+waits once the task is cancelled.
+
+A sender cancelled on another Worker now closes its stream as cancelled at the
+receiver. The receiver read the close reason from the frame's kind byte, so
+since v0.8.0 every such close arrived as a clean finish, which could advance a
+downstream window's watermark to end-of-time when a job was cancelled.
+
+Upgrading: the network headers are part of the plugin ABI surface, so the
+plugin ABI fingerprint rotates and plugin job modules must be rebuilt. SQL jobs
+need nothing. The cluster protocol and the state format are unchanged.
+
 ## v0.16.0 (November 2026)
 
 Operator ids that are the same on every platform, a restore judged over the

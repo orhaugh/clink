@@ -527,6 +527,44 @@ bool NetworkSocket::send_all(int fd, const std::byte* buf, std::size_t len) {
     return true;
 }
 
+bool NetworkSocket::set_send_timeout(int fd, std::chrono::milliseconds timeout) {
+    timeval tv{};
+    tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout.count() % 1000) * 1000);
+    return ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+}
+
+bool NetworkSocket::send_all_unless(int fd,
+                                    const std::byte* buf,
+                                    std::size_t len,
+                                    const std::function<bool()>& cancelled) {
+    // Not MSG_DONTWAIT and poll(): Darwin does not honour MSG_DONTWAIT on a
+    // blocking socket's send, and the fd stays blocking because the sink's
+    // credit reader shares it. SO_SNDTIMEO bounds each send() on both.
+    while (len > 0) {
+        const auto n = ::send(fd, buf, len, 0);
+        if (n > 0) {
+            buf += n;
+            len -= static_cast<std::size_t>(n);
+            continue;
+        }
+        if (n == 0) {
+            return false;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return false;
+        }
+        if (cancelled && cancelled()) {
+            errno = ECANCELED;
+            return false;
+        }
+    }
+    return true;
+}
+
 bool NetworkSocket::recv_all(int fd, std::byte* buf, std::size_t len) {
     while (len > 0) {
         const auto n = ::recv(fd, buf, len, 0);

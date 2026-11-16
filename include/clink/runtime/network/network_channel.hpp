@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -114,6 +115,10 @@ public:
             throw std::runtime_error("NetworkChannelSink::connect failed for " + host_ + ":" +
                                      std::to_string(port_));
         }
+        // Bounded sends, so a send the socket cannot take comes back to look
+        // at the cancel check (see send_bytes_).
+        sends_bounded_ = cancel_check_ && NetworkSocket::set_send_timeout(fd_, kCancelPollInterval);
+        stream_abandoned_ = false;
         // Reader thread for receiver -> sender credit grants. Holds the
         // sink's fd; closing the fd in stop_reader_ unblocks the
         // recv_all() and lets the thread join.
@@ -306,6 +311,16 @@ public:
         op_id_for_bytes_ = op_id;
     }
 
+    // A check the sink's blocking waits poll: the wait for credit, and a send
+    // the socket buffer cannot take. Once it returns true they give up within
+    // kCancelPollInterval and push() returns false. Without it, a peer that
+    // stopped reading and never closed (its host gone, its close lost) holds
+    // the sending thread until TCP gives up, and a cancelled task with it.
+    // Bytes the socket takes are still sent, so a peer that keeps reading
+    // still gets the cancelled Close frame. Set before connect(), on the
+    // runner thread; the check is called from it, so it must be thread-safe.
+    void set_cancel_check(std::function<bool()> check) { cancel_check_ = std::move(check); }
+
     int fd() const noexcept { return fd_; }
     // Current send credit. Exposed for metrics / tests; the value can
     // race with concurrent acquire_credit_ / credit_reader_loop_, so
@@ -335,13 +350,13 @@ public:
 private:
     bool send_frame(const std::vector<std::byte>& payload) {
         std::lock_guard lock(send_mu_);
-        std::vector<std::byte> header;
-        put_u32_be(header, static_cast<std::uint32_t>(payload.size()));
-        if (!NetworkSocket::send_all(fd_, header.data(), header.size())) {
-            clink::metrics::net::send_error();
+        if (stream_abandoned_) {
             return false;
         }
-        if (!NetworkSocket::send_all(fd_, payload.data(), payload.size())) {
+        std::vector<std::byte> header;
+        put_u32_be(header, static_cast<std::uint32_t>(payload.size()));
+        if (!send_bytes_(header.data(), header.size()) ||
+            !send_bytes_(payload.data(), payload.size())) {
             clink::metrics::net::send_error();
             return false;
         }
@@ -351,9 +366,26 @@ private:
         return true;
     }
 
+    // How often a blocked wait looks at the cancel check.
+    static constexpr std::chrono::milliseconds kCancelPollInterval{50};
+
+    // One frame's bytes. With a cancel check, a send the socket cannot take
+    // gives up once it is true. A failed or abandoned send ends the stream
+    // here: no later frame, the Close above all, is written after a fragment
+    // of this one, which the peer would read as a corrupt frame.
+    bool send_bytes_(const std::byte* buf, std::size_t len) {
+        const bool sent = sends_bounded_
+                              ? NetworkSocket::send_all_unless(fd_, buf, len, cancel_check_)
+                              : NetworkSocket::send_all(fd_, buf, len);
+        if (!sent) {
+            stream_abandoned_ = true;
+        }
+        return sent;
+    }
+
     // Wait until at least `n` credits are available, then deduct. Returns
     // false if the channel was torn down while waiting (reader thread
-    // signalled closed_).
+    // signalled closed_), or if the cancel check turned true first.
     bool acquire_credit_(std::uint32_t n) {
         auto before = remaining_credit_.load(std::memory_order_acquire);
         while (before >= n) {
@@ -369,15 +401,23 @@ private:
         clink::metrics::net::credit_exhaustion();
         const auto wait_start = std::chrono::steady_clock::now();
         std::unique_lock lock(credit_mu_);
-        credit_cv_.wait(lock, [&] {
-            const auto cur = remaining_credit_.load(std::memory_order_acquire);
-            return cur >= n || closed_.load(std::memory_order_acquire);
-        });
+        // In slices, so the cancel check is seen: a peer that stopped reading
+        // and never closed sends neither a grant nor an EOF, and nothing else
+        // would end this wait.
+        bool gave_up = false;
+        while (remaining_credit_.load(std::memory_order_acquire) < n &&
+               !closed_.load(std::memory_order_acquire)) {
+            if (cancel_check_ && cancel_check_()) {
+                gave_up = true;
+                break;
+            }
+            credit_cv_.wait_for(lock, kCancelPollInterval);
+        }
         const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wait_start)
                                 .count();
         blocked_ns_total_.fetch_add(static_cast<std::uint64_t>(waited), std::memory_order_relaxed);
-        if (closed_.load(std::memory_order_acquire)) {
+        if (gave_up || closed_.load(std::memory_order_acquire)) {
             return false;
         }
         // Re-attempt the deduction; we held the lock so racing acquires
@@ -449,6 +489,13 @@ private:
     ArrowBatcher<T> batcher_;
     int fd_{-1};
     std::mutex send_mu_;
+    // See set_cancel_check. Set before connect(); read by the sending thread.
+    std::function<bool()> cancel_check_;
+    // Set when a send failed or gave up; guarded by send_mu_.
+    bool stream_abandoned_{false};
+    // True once connect() bounded each send() so send_bytes_ can see the
+    // cancel check; set before the first send, on the runner thread.
+    bool sends_bounded_{false};
     // Credit budget. Starts at 0; receiver bootstraps with an initial
     // grant after accept. push() decrements (or blocks); the reader
     // thread tops up on CreditUpdate.
@@ -877,7 +924,10 @@ private:
                     // as the Barrier mode byte): absent = a legacy clean
                     // finish; 1 = the sender was CANCELLED, and this close
                     // must not read as end-of-input downstream (item 79).
-                    recv_close_reason_ = (!body.empty() && body[0] == std::byte{1})
+                    // The reason byte follows the kind byte, at `pos`: reading
+                    // body[0] read the kind (3), so every cancelled close
+                    // arrived as a clean finish.
+                    recv_close_reason_ = (body.size() > pos && body[pos] == std::byte{1})
                                              ? ChannelCloseReason::Cancelled
                                              : ChannelCloseReason::Finished;
                     return;

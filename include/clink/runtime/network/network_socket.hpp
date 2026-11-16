@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -159,6 +160,24 @@ public:
 
     // Send all `len` bytes of `buf`. Returns true on success.
     static bool send_all(int fd, const std::byte* buf, std::size_t len);
+
+    // Bound how long one send() on `fd` may block (SO_SNDTIMEO); zero clears
+    // it. A send that times out returns what it had sent, or -1 with EAGAIN.
+    // False when the option cannot be set.
+    static bool set_send_timeout(int fd, std::chrono::milliseconds timeout);
+
+    // send_all for a socket with a send timeout: a send that times out is
+    // retried until `cancelled()` returns true, and then this returns false
+    // with errno ECANCELED. A send() into a full buffer to a peer that stopped
+    // reading and never closed otherwise blocks until TCP gives up, which
+    // takes many minutes; this is what lets a cancelled task stop waiting.
+    // Bytes the socket takes are sent as before, cancelled or not. Giving up
+    // part-way through `buf` leaves a partial frame on the stream. Without a
+    // send timeout on `fd` this is send_all.
+    static bool send_all_unless(int fd,
+                                const std::byte* buf,
+                                std::size_t len,
+                                const std::function<bool()>& cancelled);
 
     // Receive exactly `len` bytes into `buf`. Returns true on success,
     // false on connection close or error.

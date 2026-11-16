@@ -9,9 +9,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
@@ -3263,6 +3265,135 @@ TEST_F(KafkaWindowRecoveryTest, ASqlWindowRescaledLiveKeepsEveryWindowExact) {
 
 TEST_F(KafkaWindowRecoveryTest, ASqlWindowRescaledLiveUnderHaKeepsEveryWindowExact) {
     rescale_a_sql_window_live(*kafka_, input_topic_, output_topic_, /*ha=*/true);
+}
+
+// Lines of `log` that contain every one of `needles`.
+std::size_t count_lines_with(const std::string& log,
+                             std::initializer_list<std::string_view> needles) {
+    std::size_t n = 0;
+    std::size_t start = 0;
+    while (start < log.size()) {
+        auto end = log.find('\n', start);
+        if (end == std::string::npos) {
+            end = log.size();
+        }
+        const std::string_view line{log.data() + start, end - start};
+        bool all = true;
+        for (const auto needle : needles) {
+            all = all && line.find(needle) != std::string_view::npos;
+        }
+        n += all ? 1 : 0;
+        start = end + 1;
+    }
+    return n;
+}
+
+// A Worker that stops answering without closing its sockets - its host gone,
+// or a close the network lost - must not hold its peers' subtasks when the job
+// is cancelled. Its peers' senders wait on it for credit, or in send() into a
+// full buffer, and nothing from it will ever end that wait. Before the network
+// sink watched the task's cancel, such a subtask never exited, the Worker's
+// drain waited for it, and every job that needed its slots stayed parked for
+// capacity. The frozen Worker is stopped before the backlog arrives, so the
+// survivor's sources are certain to be waiting on it when the cancel comes.
+TEST_F(KafkaWindowRecoveryTest, AFrozenWorkerDoesNotHoldItsPeersSubtasksWhenTheJobIsCancelled) {
+    constexpr std::int64_t kBase = 1'000'000;
+
+    ClusterSpec spec;
+    spec.node_binary = node_binary();
+    spec.workers = 2;
+    // The job fills all eight slots at parallelism 2, so it spans both
+    // Workers and the keyed edge into its windows crosses between them.
+    spec.slots_per_worker = 4;
+    spec.http = true;
+    Cluster cluster(spec);
+    ScopedDiagnostics diagnostics(cluster);
+    ASSERT_TRUE(cluster.start_coordinator());
+    ASSERT_TRUE(cluster.start_worker(0));
+    ASSERT_TRUE(cluster.start_worker(1));
+    ASSERT_TRUE(cluster.await_workers_registered(2));
+
+    const std::string sql =
+        "CREATE TABLE q_in (event_id TEXT, k BIGINT, amount BIGINT, ts BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + input_topic_ +
+        "', group_id='frozen-peer', auto_offset_reset='earliest', "
+        "event_time_column='ts', watermark_lag_ms='0'); "
+        "CREATE TABLE q_out (k BIGINT, ws BIGINT, cnt BIGINT, total BIGINT) WITH "
+        "(connector='kafka', format='json', brokers='" +
+        kafka_->brokers() + "', topic='" + output_topic_ +
+        "'); "
+        "INSERT INTO q_out SELECT k, window_start AS ws, COUNT(*) AS cnt, "
+        "SUM(amount) AS total FROM q_in GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), k;";
+    Process submit;
+    ASSERT_TRUE(submit.spawn("submit-sql",
+                             sql_binary(),
+                             {sql_binary().string(),
+                              "-e",
+                              sql,
+                              "--coordinator-host",
+                              "127.0.0.1",
+                              "--coordinator-port",
+                              std::to_string(cluster.http_port()),
+                              "--name",
+                              "frozen-peer",
+                              "--checkpoint-dir",
+                              cluster.checkpoint_dir().string(),
+                              "--checkpoint-interval-ms",
+                              "200",
+                              "--max-restarts-on-worker-loss",
+                              "8",
+                              "--parallelism",
+                              "2"},
+                             cluster.log_dir()));
+    const auto submit_code = submit.await_exit(30s);
+    ASSERT_TRUE(submit_code.has_value());
+    ASSERT_EQ(*submit_code, 0) << submit.read_log();
+
+    // Every channel is connected once a checkpoint has completed.
+    produce_json(kafka_->brokers(), input_topic_, window_records(kBase, 10));
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return latest_marker(cluster.checkpoint_dir(), "COMPLETED-") > 0; }, 45s))
+        << "no checkpoint completed, so the job never ran";
+
+    // The survivor must run a source, so that it sends to a window on the
+    // Worker that freezes.
+    const auto runs_a_source = [&](std::size_t i) {
+        return cluster.worker(i).log_contains("/2 assigned ");
+    };
+    const std::size_t live = runs_a_source(0) ? 0 : 1;
+    const std::size_t frozen = 1 - live;
+    ASSERT_TRUE(runs_a_source(live)) << "neither Worker logged a source assignment";
+
+    cluster.worker(frozen).signal(SIGSTOP);
+    produce_json(kafka_->brokers(), input_topic_, sustained_window_records(kBase, 64, 2'000));
+
+    ASSERT_TRUE(
+        clink::itest::await([&] { return cluster.coordinator().log_contains("worker lost"); }, 30s))
+        << "the coordinator never declared the frozen Worker lost";
+    ASSERT_TRUE(clink::itest::await(
+        [&] { return cluster.worker(live).log_contains("job_id=1 cancel received"); }, 30s))
+        << "the surviving Worker never received the cancel";
+
+    // "cancel received; flipped N cancel token(s)": N subtasks must exit.
+    const auto log = cluster.worker(live).read_log();
+    const auto at = log.find("job_id=1 cancel received; flipped ");
+    ASSERT_NE(at, std::string::npos);
+    const auto flipped =
+        std::stoul(log.substr(at + std::string_view{"job_id=1 cancel received; flipped "}.size()));
+    ASSERT_GT(flipped, 0U);
+    const bool all_exited = clink::itest::await(
+        [&] {
+            return count_lines_with(cluster.worker(live).read_log().substr(at),
+                                    {"job_id=1 __clink_subtask[", "exited after"}) >= flipped;
+        },
+        15s);
+
+    cluster.worker(frozen).signal(SIGCONT);
+    cluster.worker(frozen).kill_and_reap();
+    EXPECT_TRUE(all_exited) << "the surviving Worker's subtasks did not exit within 15 s of the "
+                               "cancel while the Worker they send to was frozen:\n"
+                            << cluster.worker(live).read_log();
 }
 
 }  // namespace
