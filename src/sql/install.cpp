@@ -1862,7 +1862,13 @@ public:
             for (const std::int64_t idx : groups[g]) {
                 fold_record_into_(by_window, rows[static_cast<std::size_t>(idx)], nullptr, horizon);
             }
-            working_.commit(group_keys[g]);
+            if (by_window.empty()) {
+                if (persist_inmem_)
+                    keyed_state_().erase(group_keys[g]);
+                working_.erase(group_keys[g]);
+            } else {
+                working_.commit(group_keys[g]);
+            }
         }
         return true;
     }
@@ -1905,6 +1911,19 @@ public:
         // between storage modes across restarts.
         persist_inmem_ =
             !effective_async_ && this->runtime() != nullptr && this->runtime()->has_state_backend();
+
+        if (persist_inmem_) {
+            // Older checkpoints can contain empty maps for expired accounts.
+            // Collect first: erasing during a backend scan is not portable.
+            auto kv = keyed_state_();
+            std::vector<std::string> expired;
+            kv.scan([&](const auto& key, const auto& windows) {
+                if (windows.empty())
+                    expired.push_back(key);
+            });
+            for (const auto& key : expired)
+                kv.erase(key);
+        }
 
         if (entries_.bind(
                 this->runtime(), "win.entries", window_map_codec(), [](const auto& values) {
@@ -2146,7 +2165,10 @@ public:
         batch.push(std::move(fired));
         by_window.erase(wit);
         out.emit_data(std::move(batch));
-        kv.put(key, by_window);  // empty map is harmless; next get rebuilds
+        if (by_window.empty())
+            kv.erase(key);
+        else
+            kv.put(key, by_window);
     }
 
     // Async fire (the overlap path): ONE co_await get_async point-read of the due
@@ -2187,7 +2209,10 @@ public:
             out.emit_data(std::move(batch));
         }
         if (changed) {
-            kv.put(key, by_window);  // one write-back for all of this group's fired windows
+            if (by_window.empty())
+                kv.erase(key);
+            else
+                kv.put(key, by_window);
         }
     }
 
@@ -2732,7 +2757,14 @@ private:
             sit = state_.emplace(std::string(key), std::map<std::int64_t, WindowBucket>{}).first;
         }
         fold_record_into_(sit->second, row, nullptr, drop_horizon_());
-        working_.commit(sit->first);
+        if (sit->second.empty()) {
+            const std::string owned = sit->first;
+            if (persist_inmem_)
+                keyed_state_().erase(owned);
+            working_.erase(owned);
+        } else {
+            working_.commit(sit->first);
+        }
     }
 
     // Append one fired pane straight into the typed output builders: group values
@@ -2910,6 +2942,12 @@ private:
                 emit_batch.push(std::move(fired));
                 it = by_window.erase(it);
             }
+            if (by_window.empty()) {
+                if (persist_inmem_)
+                    keyed_state_().erase(k);
+                return false;
+            }
+            return true;
         });
 
         // The scan erased every due window, so the previous bound is stale (too low).

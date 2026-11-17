@@ -201,6 +201,21 @@ Every value an expression produces is of the type the binder declares for it, wh
 | `cluster::UdfSpec`, `pack_udf_specs()` | The declaration's wire form on `JobGraphSpec::udfs` / `DeployMsg.udfs_packed` (types as Arrow ToString() names, module payload base64) |
 | `FunctionDef`, `Catalog::register_function()` | The declaration's catalog form; persists to `functions/<name>.json` and reloads with the catalog |
 
+### Fixed-window state reclamation
+
+When the last window for a group expires, the SQL fixed-window operator removes
+its working-map entry and durable `win` entry. Other live windows, including
+those inside their allowed-lateness band, keep the group alive. Both timer
+paths erase the durable entry after the final window fires. Fully late input
+must not create an empty group. The persisted watermark still rejects expired
+records after restore; a returning group can start a later window normally.
+
+Synchronous restore removes empty legacy `win` maps left by older checkpoints,
+including before migration to partitioned entries. It collects keys before
+backend deletion so it does not mutate a backend scan. The state encoding is
+unchanged. Deferring-backend startup remains lazy and does not sweep historical
+empty entries; newly expired windows are reclaimed by their timer callbacks.
+
 ## Configuration and knobs
 
 - `PhysicalPlanner::set_async_state_for_aggregation(bool)` (default off). When on, unbounded `GROUP BY` `aggregate_row` ops are marked `async_state=true`, so they hold per-group state in keyed state and take the async-read path when the backend can defer reads. See [./async-state-execution.md](./async-state-execution.md).

@@ -2261,3 +2261,127 @@ INSTANTIATE_TEST_SUITE_P(Values,
                                            "string_agg",
                                            "array_agg",
                                            "array_agg_distinct"));
+
+TEST(SqlMemoryBudget, FixedWindowDrainErasesDurableKeysAndReturningAccountsWork) {
+    for (bool budgeted : {false, true}) {
+        InMemoryStateBackend backend;
+        const auto id = operator_id_from_uid("memory-test-aggregate");
+        RuntimeContext context(id, "window", &backend, nullptr);
+        if (budgeted)
+            context.set_memory_budget(std::make_shared<MemoryBudget>(1024 * 1024));
+        auto op = make_operator("tumbling_window_row");
+        op->attach_runtime(&context);
+        op->open();
+        int emitted = 0;
+        Emitter<Row> out([&](StreamElement<Row> e) {
+            if (e.is_data())
+                emitted += static_cast<int>(e.as_data().size());
+            return true;
+        });
+        auto keys = [&] {
+            std::size_t count = 0;
+            backend.scan(id, [&](auto key, auto) {
+                if (key.size() > 5 && key.substr(1, 4) == "win|")
+                    ++count;
+            });
+            return count;
+        };
+        for (int cohort = 0; cohort < 3; ++cohort) {
+            for (int key = 0; key < 50; ++key)
+                feed(*op, out, cohort * 50 + key, config::JsonValue{1}, cohort * 1000);
+            // Persist live state first so cleanup must erase a durable value.
+            op->snapshot_timers(backend, id);
+            EXPECT_EQ(keys(), 50u);
+            op->process(StreamElement<Row>::watermark(
+                            Watermark{EventTime::from_millis((cohort + 1) * 1000)}),
+                        out);
+            op->snapshot_timers(backend, id);
+            EXPECT_EQ(keys(), 0u);
+        }
+        EXPECT_EQ(emitted, 150);
+        feed(*op, out, 999, config::JsonValue{1}, 0);
+        op->snapshot_timers(backend, id);
+        EXPECT_EQ(keys(), 0u);  // fully late new accounts must not create empty state
+        op.reset();
+        auto snapshot = backend.snapshot(CheckpointId{1});
+        InMemoryStateBackend restored;
+        restored.restore(snapshot);
+        RuntimeContext next(id, "window", &restored, nullptr);
+        op = make_operator("tumbling_window_row");
+        op->attach_runtime(&next);
+        op->restore_timers(restored, id);
+        op->open();
+        feed(*op, out, 0, config::JsonValue{7}, 0);  // expired data must stay expired
+        feed(*op, out, 0, config::JsonValue{7}, 3000);
+        feed(*op, out, 0, config::JsonValue{8}, 4000);
+        op->snapshot_timers(restored, id);
+        op->process(StreamElement<Row>::watermark(Watermark{EventTime::from_millis(4000)}), out);
+        EXPECT_EQ(emitted, 151);
+        op->process(StreamElement<Row>::watermark(Watermark{EventTime::from_millis(5000)}), out);
+        EXPECT_EQ(emitted, 152);
+    }
+}
+
+TEST(SqlMemoryBudget, FixedWindowRestoreRemovesLegacyEmptyMaps) {
+    InMemoryStateBackend backend;
+    const auto id = operator_id_from_uid("memory-test-aggregate");
+    RuntimeContext context(id, "window", &backend, nullptr);
+    auto op = make_operator("tumbling_window_row");
+    op->attach_runtime(&context);
+    op->open();
+    Emitter<Row> out([](StreamElement<Row>) { return true; });
+    feed(*op, out, 1, config::JsonValue{1});
+    op->snapshot_timers(backend, id);
+    std::string stored_key;
+    backend.scan(id, [&](auto key, auto) {
+        if (key.size() > 5 && key.substr(1, 4) == "win|")
+            stored_key = std::string(key);
+    });
+    ASSERT_FALSE(stored_key.empty());
+    backend.put(id, stored_key, std::string(4, '\0'));
+    op.reset();
+    op = make_operator("tumbling_window_row");
+    op->attach_runtime(&context);
+    op->open();
+    EXPECT_FALSE(backend.get(id, stored_key).has_value());
+}
+
+TEST(SqlMemoryBudget, FixedWindowTimerPathsEraseOnlyTheLastWindow) {
+    for (bool asynchronous : {false, true}) {
+        InMemoryStateBackend backend;
+        const auto id = operator_id_from_uid("memory-test-aggregate");
+        RuntimeContext context(id, "window", &backend, nullptr);
+        auto op = make_operator("tumbling_window_row");
+        op->attach_runtime(&context);
+        op->open();
+        int emitted = 0;
+        Emitter<Row> out([&](StreamElement<Row> e) {
+            if (e.is_data())
+                emitted += static_cast<int>(e.as_data().size());
+            return true;
+        });
+        feed(*op, out, 1, config::JsonValue{2}, 0);
+        feed(*op, out, 1, config::JsonValue{3}, 1000);
+        op->snapshot_timers(backend, id);
+        auto keys = [&] {
+            std::size_t count = 0;
+            backend.scan(id, [&](auto key, auto) {
+                if (key.size() > 5 && key.substr(1, 4) == "win|")
+                    ++count;
+            });
+            return count;
+        };
+        for (int end : {1000, 2000}) {
+            if (asynchronous) {
+                auto task = op->on_event_time_timers_async({end}, "1", out);
+                task.resume();
+                ASSERT_TRUE(task.done());
+                task.get();
+            } else {
+                op->on_event_time_timer(end, "1", out);
+            }
+            EXPECT_EQ(keys(), end == 1000 ? 1u : 0u);
+        }
+        EXPECT_EQ(emitted, 2);
+    }
+}
