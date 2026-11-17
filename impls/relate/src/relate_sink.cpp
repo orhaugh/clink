@@ -1,6 +1,7 @@
 #include "relate_sink.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -67,6 +68,19 @@ std::string tagged(const char* metric,
            "=\"" + std::string(value) + "\"}";
 }
 
+// Whether a schema statement already says IF NOT EXISTS, so that a refusal
+// does not tell its author to add it.
+bool says_if_not_exists(std::string_view statement) {
+    constexpr std::string_view kPhrase = "if not exists";
+    return std::search(statement.begin(),
+                       statement.end(),
+                       kPhrase.begin(),
+                       kPhrase.end(),
+                       [](char a, char b) {
+                           return std::tolower(static_cast<unsigned char>(a)) == b;
+                       }) != statement.end();
+}
+
 }  // namespace
 
 RelateSink::RelateSink(SinkOptions options) : opts_(std::move(options)) {}
@@ -114,7 +128,7 @@ void RelateSink::open() {
                          " retry_window_ms=" + std::to_string(opts_.retry_window_ms));
 }
 
-// Each schema statement runs on its own, as Relate runs a schema change. It is
+// Each schema statement runs on its own, in a transaction of its own. It is
 // first explained, which runs nothing, so that a statement that would write
 // data is refused before it can: the option is for constraints and indexes.
 void RelateSink::apply_schema_() {
@@ -133,12 +147,78 @@ void RelateSink::apply_schema_() {
                       "and CREATE INDEX statements, and rows are written by the statement "
                       "option");
         }
-        const Reply applied = conn_->run(statement, nullptr);
-        if (!applied.ok) {
+        apply_schema_statement_(which, statement);
+    }
+}
+
+// Sinks on one store apply their schema one at a time, but a sink already open
+// may commit a batch meanwhile, and Relate then refuses the schema change's
+// commit as a conflict a retry can win. It is tried again as a batch is: after
+// a jittered wait, until retry_window_ms has passed since the first refusal.
+// Any other refusal ends the open.
+void RelateSink::apply_schema_statement_(const std::string& which, const std::string& statement) {
+    MetricsRegistry* reg = runtime() != nullptr ? runtime()->metrics() : nullptr;
+    const std::uint64_t op = runtime() != nullptr ? runtime()->operator_id().value() : id().value();
+    Backoff backoff;
+    std::optional<Clock::time_point> window_end;
+    for (std::uint32_t attempt = 1;; ++attempt) {
+        if (cancel_.requested()) {
+            fail_(code::kCancelled, which + " was not applied: the task was cancelled");
+        }
+        Reply r = conn_->begin();
+        if (r.ok) {
+            r = conn_->run(statement, nullptr);
+        }
+        if (r.ok) {
+            (void)CLINK_FAULT_POINT(points::kBeforeSchemaCommit);
+            r = conn_->commit();
+        }
+        if (r.ok) {
+            if (attempt > 1) {
+                clink::log::info(kLog,
+                                 "relate sink: " + where_() + ": " + which +
+                                     " applied on attempt " + std::to_string(attempt));
+            }
+            return;
+        }
+        conn_->rollback();
+        ++counts_.attempts_failed;
+        if (reg != nullptr) {
+            reg->counter(tagged(metric::kAttemptsFailedTotal,
+                                op,
+                                "retryable",
+                                r.error.retryable ? "true" : "false"))
+                .increment();
+        }
+        if (!r.error.retryable) {
             fail_(code::kSchemaRefused,
-                  which + " failed: " + applied.error.describe() +
-                      ". The sink applies it every time it opens, so write it with IF NOT "
-                      "EXISTS");
+                  which + " failed: " + r.error.describe() +
+                      (says_if_not_exists(statement)
+                           ? ""
+                           : ". The sink applies it every time it opens, so write it with IF "
+                             "NOT EXISTS"));
+        }
+        const auto now = Clock::now();
+        if (!window_end) {
+            window_end = now + std::chrono::milliseconds{opts_.retry_window_ms};
+        }
+        const auto wait = backoff.next();
+        if (opts_.retry_window_ms == 0 || now + wait > *window_end) {
+            fail_(code::kRetriesExhausted,
+                  which + " was not applied after " + std::to_string(attempt) +
+                      " attempt(s) within retry_window_ms=" +
+                      std::to_string(opts_.retry_window_ms) + "; last: " + r.error.describe());
+        }
+        ++counts_.retries;
+        if (reg != nullptr) {
+            reg->counter(tagged(metric::kRetriesTotal, op)).increment();
+        }
+        clink::log::warn(kLog,
+                         "relate sink: " + where_() + ": " + which + " attempt " +
+                             std::to_string(attempt) + " was rolled back: " + r.error.describe() +
+                             "; retrying in " + std::to_string(wait.count()) + " ms");
+        if (!cancellable_wait(wait, cancel_)) {
+            fail_(code::kCancelled, which + " was not applied: the task was cancelled");
         }
     }
 }

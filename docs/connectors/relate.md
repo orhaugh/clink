@@ -85,7 +85,7 @@ Options are parsed strictly when the sink is built: an unknown option is refused
 | `batch_size` | no | `1000` | Rows per batch, 1 to 100000 (the most Relate takes in one list). |
 | `batch_bytes` | no | `4194304` | Weight per batch, 1024 to 12582912, under the 16 MiB Relate allows one statement's parameters. A row weighs its names and strings plus 16 bytes for every value and container, and 8 more for a number or a boolean. A single row heavier than this is refused (`relate.row_too_large`). |
 | `flush_interval_ms` | no | `1000` | A partial batch older than this is committed when the next rows arrive; 0 turns it off. With no input arriving, rows wait for the next checkpoint barrier or the end of the input. |
-| `retry_window_ms` | no | `30000` | How long a batch's retries may go on after its first conflict; 0 makes one attempt. |
+| `retry_window_ms` | no | `30000` | How long the retries of a batch, or of a schema statement as the sink opens, may go on after the first conflict; 0 makes one attempt. |
 
 The sink accepts and ignores the keys the SQL planner puts on every sink op (`schema_columns`, `primary_key`, `bounded` and the like). It refuses what would change its guarantee, here as well as in the planner, since a job built directly on the Dag never passes through the planner: `delivery_guarantee` other than `at_least_once`, `mode='upsert'`, `changelog='true'` and `write_mode='overwrite'` (`relate.guarantee_unsupported`). `json_non_finite` is refused as meaningless: values are typed, and NaN and the infinities are stored as floats.
 
@@ -130,6 +130,8 @@ What a property can hold is Relate's rule, not the sink's: a map is for the stat
 
 Several transactions can be open on one store at once: one from each sink subtask and each sink table that writes it. Relate lets one of two transactions that wrote the same node commit and refuses the other at its commit as a write-write conflict, marked as one a retry can win. The sink rolls the refused transaction back, waits a short pause that grows with each attempt, jittered and at most 500 ms, and runs the batch again; nothing of a refused attempt is in the store. Relate does not report every overlap as a conflict: two transactions that each create a relationship between the same two nodes both commit (see [Replay-safe statements](#replay-safe-statements)). Retries go on for `retry_window_ms` from the batch's first conflict, then the task fails with `relate.retries_exhausted`.
 
+A schema statement can meet a conflict too. Sinks opening on one store apply their schemas one at a time, but a sink that is already open can commit a batch while another applies its schema, and Relate then refuses the schema change at its commit in the same way. It is rolled back and retried in the same way, within `retry_window_ms`. Three jobs starting at once on one store open their sinks in this overlap.
+
 Every other refusal is final: a constraint violation, a type error or a statement Relate cannot run fails the task at once with `relate.batch_refused`, the batch rolled back whole.
 
 ## Replay-safe statements
@@ -154,7 +156,7 @@ schema = 'CREATE CONSTRAINT account_id IF NOT EXISTS FOR (a:Account) REQUIRE a.i
           CREATE INDEX account_name IF NOT EXISTS FOR (a:Account) ON (a.name)'
 ```
 
-Each one is applied every time the sink opens, in order, on its own. Write them with `IF NOT EXISTS`: without it the second open fails. Only schema statements are taken. Each is first explained, which runs nothing, and one that Relate does not class as a schema change is refused (`relate.schema_refused`) before it can write. Sinks opening on one store apply their schemas one sink at a time.
+Each one is applied every time the sink opens, in order, in a transaction of its own. Write them with `IF NOT EXISTS`: without it the second open fails. Only schema statements are taken. Each is first explained, which runs nothing, and one that Relate does not class as a schema change is refused (`relate.schema_refused`) before it can write. Sinks opening on one store apply their schemas one sink at a time, and a schema statement that meets a conflict with a sink already writing is retried (see [Conflicts and retries](#conflicts-and-retries)).
 
 ## What the open check refuses
 
@@ -186,13 +188,13 @@ The sink's own series are in the task's registry, tagged with its `op_id`:
 | --- | --- |
 | `clink_relate_batches_committed_total`, `clink_relate_rows_committed_total` | what Relate committed |
 | `clink_relate_commit_latency_ns` | the committing attempt, from its begin to its commit (histogram) |
-| `clink_relate_attempts_failed_total{retryable}` | attempts that were rolled back, by whether Relate said a retry can succeed |
+| `clink_relate_attempts_failed_total{retryable}` | attempts, at a batch or at a schema statement, that were rolled back, by whether Relate said a retry can succeed |
 | `clink_relate_retries_total` | attempts retried |
 | `clink_relate_buffered_rows`, `clink_relate_buffered_bytes` | the pending batch (gauges) |
 
 The cross-connector series carry `connector="relate"`: `clink_connector_records_total`, `clink_connector_bytes_total` and `clink_connector_commit_latency_ns` count committed batches only, and `clink_connector_errors_total` counts failures.
 
-Log lines, on the `sink.relate` channel: `relate sink open:` (subtask, store, the number of schema statements, batch limits), one warning per attempt that was rolled back with Relate's reason and the wait before the retry, a line when a batch commits after retries, and `relate sink closed:` or `relate sink cancelled:` with the counts, the rows not written and the last bookmark.
+Log lines, on the `sink.relate` channel: `relate sink open:` (subtask, store, the number of schema statements, batch limits), one warning per attempt that was rolled back with Relate's reason and the wait before the retry, a line when a batch commits or a schema statement is applied after retries, and `relate sink closed:` or `relate sink cancelled:` with the counts, the rows not written and the last bookmark.
 
 ## Refusals
 
@@ -208,7 +210,7 @@ Log lines, on the `sink.relate` channel: `relate sink open:` (subtask, store, th
 | `relate.row_too_large` | one row heavier than `batch_bytes` |
 | `relate.batch_refused` | Relate rolled a batch back for a reason a retry would meet again (a constraint, a type error) |
 | `relate.retries_exhausted` | `retry_window_ms` passed without a commit |
-| `relate.cancelled` | the task was cancelled before the batch committed |
+| `relate.cancelled` | the task was cancelled before the batch committed, or before a schema statement was applied |
 | `relate.engine_failure` | the connection to the store failed, or rows reached a sink that is not open |
 
 ## Limitations
@@ -229,7 +231,7 @@ Log lines, on the `sink.relate` channel: `relate sink open:` (subtask, store, th
 
 Two suites, both under `ctest --test-dir build -L relate`, and nothing in them is skipped: Relate is embedded, so no case needs a server.
 
-- `clink_relate_tests`, the sink on its own: options and refusals, the declared types and each one written into a store and read back, the values that are refused, the batch weight against Relate's own limits, and the sink against real stores under the temporary directory: batching by rows, bytes and age, barriers, a replayed batch, the open check and the schema option, a refused batch rolled back whole with its rows still buffered, two sinks sharing one store and retrying their conflicts, a store that cannot be opened, cancellation, and both store layouts. A second process, `clink_relate_store_holder`, holds a store while a sink tries to open it, for each layout, and is then killed with `SIGKILL`, after which the sink opens the store and writes.
+- `clink_relate_tests`, the sink on its own: options and refusals, the declared types and each one written into a store and read back, the values that are refused, the batch weight against Relate's own limits, and the sink against real stores under the temporary directory: batching by rows, bytes and age, barriers, a replayed batch, the open check and the schema option, a schema statement whose commit meets a conflict (forced at a fault point) retried, and past the retry window refused, a refused batch rolled back whole with its rows still buffered, two sinks sharing one store and retrying their conflicts, a store that cannot be opened, cancellation, and both store layouts. A second process, `clink_relate_store_holder`, holds a store while a sink tries to open it, for each layout, and is then killed with `SIGKILL`, after which the sink opens the store and writes.
 - `clink_relate_sql_tests`, through the SQL frontend: the op the planner builds and the plans it refuses, an embedded pipeline written into a store and run again into the same store, three jobs writing one store at once (events, a windowed aggregate pointing at its events, and links from an interval join) and converging, and a statement the open check refuses failing its job.
 
 Every case reads the store back through Relate's C library on a connection of its own, so what it counts is what the store holds.

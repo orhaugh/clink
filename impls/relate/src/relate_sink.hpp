@@ -54,6 +54,7 @@ private:
     void add_row_(const clink::sql::Row& row);
     void commit_pending_(const char* why);
     void apply_schema_();
+    void apply_schema_statement_(const std::string& which, const std::string& statement);
     void check_statement_();
     void release_();
     [[nodiscard]] std::string where_() const;

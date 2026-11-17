@@ -18,10 +18,12 @@
 #include <gtest/gtest.h>
 
 #include "clink/config/json.hpp"
+#include "clink/fault/fault_injection.hpp"
 #include "clink/metrics/metrics_registry.hpp"
 #include "clink/runtime/runtime_context.hpp"
 #include "clink/sql/row.hpp"
 
+#include "fault_points.hpp"
 #include "options.hpp"
 #include "relate_sink.hpp"
 #include "store.hpp"
@@ -415,6 +417,101 @@ TEST(RelateSink, RowsThatReachAClosedSinkAreRefused) {
     rig.sink->on_data(rows(0, 1));
     EXPECT_EQ(refusal([&] { rig.sink->flush(); }).code, code::kEngineFailure);
 }
+
+TEST(RelateSink, ASchemaStatementThatSaysIfNotExistsIsNotToldToAddIt) {
+    // Relate refuses a uniqueness constraint over values already duplicated,
+    // and no retry can change that. The statement says IF NOT EXISTS, so the
+    // refusal does not tell its author to add it.
+    const TempDir dir;
+    const auto store = dir.path("case.rl");
+    {
+        const auto hold = Store::open(store);
+        clink::relate::Connection c(*hold);
+        ASSERT_TRUE(c.run("CREATE (:Account {id: 1}), (:Account {id: 1})", nullptr).ok);
+    }
+    Rig rig(store);
+    const auto r = refusal([&] { rig.sink->open(); });
+    EXPECT_EQ(r.code, code::kSchemaRefused);
+    EXPECT_EQ(r.message.find("write it with IF NOT EXISTS"), std::string::npos) << r.message;
+    EXPECT_EQ(rig.sink->counts().retries, 0U) << "Relate said a retry cannot succeed";
+}
+
+#ifdef CLINK_FAULT_INJECTION
+namespace {
+
+// Parks the calling case until `point` has been reached `n` times, for at most
+// 20 seconds.
+bool wait_for_hits(std::string_view point, std::uint64_t n) {
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    while (clink::fault::Registry::instance().hits(point) < n) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    return true;
+}
+
+// Opens the sink on a thread of its own and holds it after its first schema
+// statement has run and before that statement's transaction commits. Meanwhile
+// a write elsewhere on the store commits, as a sink already open commits a
+// batch, so Relate refuses the schema change's commit as a conflict. Returns
+// how the open ended.
+Refusal open_across_a_commit(Rig& rig, const std::string& store) {
+    namespace fault = clink::fault;
+    constexpr const char* kPoint = clink::relate::points::kBeforeSchemaCommit;
+    const fault::ScopedFault hold_open(
+        fault::Rule{.point = kPoint, .ordinal = 1, .action = fault::Action::Block});
+    Refusal ended;
+    std::thread opening([&] { ended = refusal([&] { rig.sink->open(); }); });
+    const bool held = wait_for_hits(kPoint, 1);
+    if (held) {
+        const auto shared = Store::open(store);
+        clink::relate::Connection elsewhere(*shared);
+        EXPECT_TRUE(elsewhere.run("CREATE (:Elsewhere {n: 1})", nullptr).ok);
+    }
+    fault::Registry::instance().release(kPoint);
+    opening.join();
+    EXPECT_TRUE(held) << "the open never reached " << kPoint;
+    return ended;
+}
+
+}  // namespace
+
+TEST(RelateSink, ASchemaStatementRefusedAsAConflictIsAppliedAgain) {
+    // Sinks on one store apply their schema one at a time, but a sink already
+    // open may commit a batch while another opens. Relate refuses the schema
+    // change's commit as a conflict a retry can win, and the open retries it as
+    // a batch would be retried, rather than failing the job.
+    const TempDir dir;
+    const auto store = dir.path("case.rl");
+    Rig rig(store);
+    const auto r = open_across_a_commit(rig, store);
+    EXPECT_EQ(r.code, "") << r.message;
+    EXPECT_EQ(rig.sink->counts().attempts_failed, 1U);
+    EXPECT_EQ(rig.sink->counts().retries, 1U);
+    EXPECT_EQ(rig.counter("clink_relate_retries_total"), 1U);
+    EXPECT_EQ(count(store, "SHOW CONSTRAINTS YIELD name WHERE name = 'account_id' RETURN count(*)"),
+              1);
+    rig.sink->on_data(rows(0, 3));
+    rig.sink->flush();
+    EXPECT_EQ(count(store, kAccounts), 3) << "the sink opened, and writes";
+}
+
+TEST(RelateSink, ASchemaConflictBeyondTheRetryWindowEndsTheOpen) {
+    const TempDir dir;
+    const auto store = dir.path("case.rl");
+    Rig rig(store, {{"retry_window_ms", "0"}});
+    const auto r = open_across_a_commit(rig, store);
+    EXPECT_EQ(r.code, code::kRetriesExhausted);
+    EXPECT_NE(r.message.find("schema statement 1 of 1 was not applied after 1 attempt(s)"),
+              std::string::npos)
+        << r.message;
+    EXPECT_NE(r.message.find("Neo.TransientError.Transaction.Outdated"), std::string::npos)
+        << r.message;
+    EXPECT_EQ(r.message.find("IF NOT EXISTS"), std::string::npos) << r.message;
+}
+#endif  // CLINK_FAULT_INJECTION
 
 TEST(RelateSink, AStoreWrittenAsADirectoryReadsTheSameAsOneWrittenAsAFile) {
     const TempDir dir;
