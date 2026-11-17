@@ -3,7 +3,7 @@
 [![ci](https://github.com/orhaugh/clink/actions/workflows/ci.yml/badge.svg)](https://github.com/orhaugh/clink/actions/workflows/ci.yml)
 [![docs](https://github.com/orhaugh/clink/actions/workflows/docs.yml/badge.svg)](https://orhaugh.github.io/clink/)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
-[![changelog](https://img.shields.io/badge/changelog-v0.16.1-lightgrey.svg)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/changelog-v0.16.2-lightgrey.svg)](CHANGELOG.md)
 
 `clink` is a stream processing engine that stays correct when processes die.
 You write a pipeline in SQL or typed C++; clink keeps its event-time windows

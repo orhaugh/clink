@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.16.2 (November 2026)
+
+A Relate sink no longer fails its job when another sink on the same store
+commits while it opens. A sink applies the statements of its `schema` option
+as it opens, one sink at a time on a store, but a sink that is already open can
+commit a batch meanwhile, and Relate then refuses the schema change as a
+write-write conflict that a retry can win. A batch has always retried such a
+conflict; the open failed its job at once. Jobs that start together on one
+store, such as three jobs writing one graph, failed about twice in a hundred
+runs under load, and published nothing. A schema statement now runs in a
+transaction of its own and is retried as a batch is, within `retry_window_ms`,
+and a refusal no longer tells the author to add `IF NOT EXISTS` to a statement
+that already says it.
+
+SQL fixed-window aggregates no longer keep an entry for every group they have
+seen. When a group's last window fired, its entry stayed in the working set and
+in durable state as an empty map, so state grew with every distinct key ever
+seen rather than with the keys that have a live window. The entry is now
+removed when the group's last window expires, input that is entirely late no
+longer creates one, and a synchronous restore removes the empty entries older
+checkpoints carry. On a backend that defers reads, a restore leaves those older
+empty entries in place; windows that expire after the upgrade are reclaimed.
+
+Upgrading: nothing to rebuild. The plugin ABI fingerprint, the cluster
+protocol and the state format are unchanged.
+
 ## v0.16.1 (November 2026)
 
 A cancelled subtask no longer waits indefinitely on a Worker that stops
