@@ -302,6 +302,11 @@ TEST_F(HaFailoverTest, AWorkerJoiningTheNewLeaderIsNotFencedOff) {
     // only path that survives a failover.
     ASSERT_TRUE(c.start_ha_worker(0));
     ASSERT_TRUE(c.await_workers_registered(1)) << "the worker never registered with the new leader";
+    // The coordinator logs the registration before its reply reaches the
+    // worker, and the worker writes the epoch it bound only once it has that
+    // reply, so wait for the worker's own line rather than reading it at once.
+    ASSERT_TRUE(clink::itest::await([&] { return c.worker_discovered_epoch(0).has_value(); }))
+        << "the worker never logged the epoch it bound";
 
     EXPECT_EQ(c.worker_discovered_epoch(0), second_epoch)
         << "the worker bound an epoch other than the new leader's";
