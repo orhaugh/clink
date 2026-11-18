@@ -15,7 +15,7 @@ running in event time, with clocks that have to survive a restart.
 coldchain builds that on clink's typed C++ API, with no SQL. The whole graph is
 one function, and both a single binary and a cluster job build from it.
 
-[Repository](https://github.com/orhaugh/coldchain) · pinned to clink v0.16.1
+[Repository](https://github.com/orhaugh/coldchain) · pinned to clink v0.16.2
 
 ## What it does
 

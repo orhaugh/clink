@@ -11,7 +11,7 @@ card authorisation is decided, and each alert and decision is delivered to the
 systems that act on it, exactly once, even when a Worker dies mid-stream and
 the payment feed delivers a batch twice.
 
-[Repository](https://github.com/orhaugh/card-sentry) · pinned to clink v0.16.1
+[Repository](https://github.com/orhaugh/card-sentry) · pinned to clink v0.16.2
 
 ## What it does
 
